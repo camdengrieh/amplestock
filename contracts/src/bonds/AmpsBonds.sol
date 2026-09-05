@@ -364,18 +364,28 @@ contract AmpsBonds is IAmpsBonds {
         _rollEpoch(marketId, stored);
         _rollDay();
 
-        // 3. Price it: checkpoint, `m`, `P_i`, the policy, and the shell's own accretion floor.
+        // 3. Settle the collateral. The vault checkpoints *before* it settles, so the NAV read in step 4 is this
+        //    block's pre-deposit NAV: a bond never prices against a checkpoint an earlier bond, a redemption or a
+        //    feed move has already left below the live value (I27 against the live NAV, not a stale word). The
+        //    deposit is an interaction ahead of the effects in step 6; both contracts hold their transient locks
+        //    across it, and a revert anywhere below unwinds it.
+        uint256 settled = IAmpsVault(vault).depositBonded(marketId, stored.collateral, msg.sender, amountIn);
+        if (settled != amountIn) revert DepositMismatch(settled, amountIn);
+
+        // 4. Price it: the same-block checkpoint, `m`, `P_i`, the policy, and the shell's own accretion floor.
         _Priced memory priced = _price(stored, amountIn, haircutBps);
 
-        // 4. Capacity: per market per epoch, then globally per day. A clamp to zero closes the market until the
-        //    epoch rolls; a partial clamp is disclosed by {quote} and bounded by the caller's `minAmpsOut`.
+        // 5. Capacity: per market per epoch, then globally per day. A clamp to zero closes the market until the
+        //    epoch rolls; a partial clamp is disclosed by {quote} and bounded by the caller's `minAmpsOut`. The
+        //    clamp reduces the AMPS issued, never the collateral already settled: `minAmpsOut` is the bonder's
+        //    protection against handing over a whole deposit for a capped issue.
         (uint256 available,,) = _capacity(stored);
         if (available == 0) revert CapacityExceeded(priced.ampsOut, 0);
         ampsOut = priced.ampsOut > available ? available : priced.ampsOut;
         if (ampsOut == 0) revert ZeroAmount();
         if (ampsOut < minAmpsOut) revert SlippageExceeded(ampsOut, minAmpsOut);
 
-        // 5. Effects, before any interaction.
+        // 6. Effects, before the mint.
         uint128 issued = ampsOut.toUint128();
         stored.issuedThisEpoch += issued;
         stored.totalIssued += issued;
@@ -393,14 +403,14 @@ contract AmpsBonds is IAmpsBonds {
             })
         );
 
-        // 6. Interactions, the event and `sweepClean`.
-        _settle(marketId, stored.collateral, amountIn, ampsOut, positionId, priced);
+        // 7. The mint, the event and `sweepClean`.
+        _issue(marketId, stored.collateral, amountIn, ampsOut, positionId, priced);
     }
 
-    /// @dev Everything `bond` does after its effects are written: the collateral moves bonder -> PoolManager
-    ///      without ever resting here, the AMPS is minted to this contract and is in `totalSupply` from this
-    ///      instant (I30), and I12 is asserted against the market's own collateral.
-    function _settle(
+    /// @dev Everything `bond` does after its effects are written: the AMPS is minted to this contract and is in
+    ///      `totalSupply` from this instant (I30), and I12 is asserted against the market's own collateral, which
+    ///      moved bonder -> PoolManager in step 3 without ever resting here.
+    function _issue(
         uint16 marketId,
         address collateral,
         uint256 amountIn,
@@ -408,10 +418,7 @@ contract AmpsBonds is IAmpsBonds {
         uint256 positionId,
         _Priced memory priced
     ) internal {
-        address vaultAddress = vault;
-        uint256 settled = IAmpsVault(vaultAddress).depositBonded(marketId, collateral, msg.sender, amountIn);
-        if (settled != amountIn) revert DepositMismatch(settled, amountIn);
-        IAmpsVault(vaultAddress).mintVesting(address(this), ampsOut);
+        IAmpsVault(vault).mintVesting(address(this), ampsOut);
 
         emit Bond(
             msg.sender,
@@ -432,7 +439,9 @@ contract AmpsBonds is IAmpsBonds {
     /// @dev The reverting half of the pricing path: the checkpoint staleness bound, `m` from the spoke's own
     ///      30-minute truncated TWAP, `P_i` from the last Chainlink answer (staleness allowed on purpose), the
     ///      policy call, and the shell's independent accretion floor. The floor re-check is what makes the policy
-    ///      pointer safe: a hostile policy can refuse to price, never issue a dilutive bond.
+    ///      pointer safe: a hostile policy can refuse to price, never issue a dilutive bond. Inside {bond} the
+    ///      checkpoint is always this block's, written by `depositBonded` a moment earlier; the staleness bound
+    ///      is what {quote} enforces and what a vault that did not refresh would trip.
     function _price(BondMarket storage record, uint256 amountIn, uint16 haircutBps)
         internal
         view

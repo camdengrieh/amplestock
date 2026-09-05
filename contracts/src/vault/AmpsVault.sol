@@ -793,6 +793,14 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // A bonded collateral must be valued in `A` and paid out by redemption, so it joins the asset list here.
         _registerAsset(collateral);
 
+        // Checkpoint *before* the collateral lands. `AmpsBonds` prices this bond against `checkpointData()` right
+        // after this call returns, so the NAV it reads is this block's pre-deposit NAV — never one a previous bond,
+        // a redemption or a feed move inside `CHECKPOINT_MAX_AGE` has already left behind. Without this, a second
+        // bond inside the staleness window could issue against a NAV its predecessor had raised and dilute every
+        // holder; with it, I27 holds against the live NAV under every gate state the bond policy admits, because
+        // the checkpoint runs under that policy rather than behind the management gate of {checkpoint}.
+        _checkpoint();
+
         _setUnlockAction(ACTION_SETTLE);
         bytes memory result = IPoolManager(_POOL_MANAGER).unlock(abi.encode(collateral, from, amount));
         _setUnlockAction(0);

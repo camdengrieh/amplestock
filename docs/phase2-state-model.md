@@ -59,8 +59,10 @@ slot 3   address creator                   [  0..159]
          bool    wiringFrozen              [200..207]   set by genesis(); set-once pointers refuse afterwards
          (free)                            [208..255]
 slot 4-7   address registry / bonds / staking / bountyPot        set-once, frozen by genesis()
-slot 8     address marketReference                               set-once (mock in Phase 2), re-pointed once to
-                                                                 AmpsHook under the 7-day timelock
+slot 8     address marketReference                               pointer-upgradeable (7 d) through setPolicyPointer,
+                                                                 exactly like slots 9-13: a mock in Phase 2, pointed
+                                                                 at AmpsHook in Phase 3, and re-pointable again after
+                                                                 that (it is not latched by genesis())
 slot 9-13  address oracleGate / feedRegistry / positionValuer /
            ladderPolicy / rolloutPolicy                          pointer-upgradeable (7 d); the last two are
                                                                  Phase 3, positionValuer is the zero-position stub
@@ -269,17 +271,22 @@ genesis (once)
 bond
   bonder -> bonds.bond(marketId, amountIn, minAmpsOut, to)
     lock; gate.checkBond(constituentId) -> hSessionBps   (reverts only on CA freeze / guardian / DIVERGED)
-    _rollEpoch(marketId); vault.checkpointData() -> navPerShareX18 + staleness check
+    _rollEpoch(marketId); _rollDay()
+    vault.depositBonded(marketId, collateral, msg.sender, amountIn)      -- the deposit comes BEFORE the price
+        vault: lock; _requireBondsHealthy (7.1); _registerAsset(collateral)
+               _checkpoint()                        <- same-block, PRE-deposit NAV, under the bond gate policy
+               poolManager.unlock(SETTLE) -> transferFrom(bonder -> poolManager); settle -> ERC-6909 claim
+    vault.checkpointData() -> navPerShareX18 (this block's) + staleness check (always 0 here; it guards quote())
     marketReference.twapTick30m(spokePool) -> m
     feedRegistry.latestAnswer(collateral)  -> P_i (stale is allowed; it feeds q_floor with the haircut)
     policy.quote(input) -> ampsOut, q, discount;  require(q <= qFloor recomputed in the shell)
-    clamp ampsOut to per-epoch then global daily capacity
+    clamp ampsOut to per-epoch then global daily capacity   (the AMPS out is clamped; the deposit is not)
     require(ampsOut >= minAmpsOut)
-    vault.depositBonded(marketId, collateral, msg.sender, amountIn)
-        vault: lock; poolManager.unlock(SETTLE) -> transferFrom(bonder -> poolManager); settle -> ERC-6909 claim
-    vault.mintVesting(address(bonds), ampsOut)         -> Amps.mint; T rises immediately (I30)
     positions[to].push(VestingPosition{principal: ampsOut, start: now, vestSeconds, marketId})
+    vault.mintVesting(address(bonds), ampsOut)         -> Amps.mint; T rises immediately (I30)
     emit Bond; sweepClean assert
+    -- the deposit is an interaction ahead of the shell's effects; both locks are held across it and any revert
+       below it unwinds the settle, so the order buys the fresh NAV without a reentrancy surface
 
 claim  (structurally ungated)
   owner -> bonds.claim(positionId, to)
@@ -366,6 +373,13 @@ Three overrides are checked before `cand` is used at all, and each sets `pRef = 
 `GateState.WATCHDOG` (no observation or block for longer than `graceSeconds`); and observation coverage below
 `twapWindow` on a young pool, which additionally records `pMkt` as 0.
 
+The coverage branch is **not reachable through `checkpoint()`**: the same missing coverage makes the gate report
+`WATCHDOG` for the hub, and `checkpoint()` takes the management policy, so it reverts with `GateNotHealthy` before
+`_checkpoint` runs and the previous checkpoint (which already has `P_ref == NAV`) stands. It *is* reached through
+the bond path, because `depositBonded` checkpoints under the bond policy, which admits `WATCHDOG`: a bond on an
+unobserved hub writes `pMkt = 0`, `P_ref = navPerShareX18` and a fresh timestamp. `Phase2IntegrationTest.
+test_a_referenceFallsBackToNavWhenTheHubIsUnobserved` asserts all three halves.
+
 `premium = pRef / navPerShare - 1` is disclosure only. `P_mkt` is what the hook's fee wall, the bond `m` and the
 quoter read; `P_ref` is what NAV valuation and (Phase 3) placement anchors read. An attacker who moves one spoke
 moves neither: `P_mkt` comes from the hub, and both are truncated TWAPs.
@@ -404,9 +418,28 @@ buy (the best a spoke-dumper can do is remove their own discount) and bounds wee
 (0 / 50 / 150 / 300 bp) on the bonded amount, which is why markets stay open 24/7 through stale feeds and closed
 sessions instead of shutting. Capacity is applied *after* pricing: `ampsOut` is clamped to
 `capBpsPerEpoch * T / BPS - issuedThisEpoch`, then to `dailyCapBps * T / BPS - dailyIssued`; a clamp to zero closes
-the market until the epoch rolls and does not revert the quote view. The shell recomputes `qFloor` itself and
-rejects any `q` above it with `AccretionFloorViolated`, so a hostile or buggy `BondPolicy` pointer can refuse to
-price but can never issue a dilutive bond.
+the market until the epoch rolls and does not revert the quote view. **The clamp reduces the AMPS issued, never the
+collateral**: the shell settles the whole `amountIn` and issues the capped `ampsOut`, so an over-capacity bond hands
+over its entire deposit for the capped issue unless `minAmpsOut` refuses it. `quote()` discloses the clamp and the
+dApp must always pass the quoted amount as `minAmpsOut`; the protocol side of an over-capacity bond is a large
+accretion, never a loss. The shell recomputes `qFloor` itself and rejects any `q` above it with
+`AccretionFloorViolated`, so a hostile or buggy `BondPolicy` pointer can refuse to price but can never issue a
+dilutive bond.
+
+**Which NAV the price reads.** `navPerShareX18` comes from `vault.checkpointData()`, and the shell settles the
+collateral *before* it prices (§3). `depositBonded` writes a checkpoint under the bond gate policy immediately before
+it settles, so the NAV a bond is priced against is always this block's pre-deposit NAV — never a value an earlier
+bond, a redemption or a feed move inside `CHECKPOINT_MAX_AGE` (1,800 s) has already left below the live one. This is
+what makes I27 exact against the *live* NAV under every gate state bonds are open in, including `DEGRADED` and
+`WATCHDOG`, where the management-gated `checkpoint()` refuses and no keeper could have refreshed it. Without it a
+second bond inside the window priced off the NAV its predecessor had already raised; with an over-capacity first
+bond (whole deposit in, capped AMPS out) the gap was several-fold and the second bond diluted every holder
+(`Phase2IntegrationTest.test_b_secondBondInTheSameBlockPricesAgainstTheLiveNav` is the regression). The
+`StaleCheckpoint` bound in `_price` is therefore what `quote()` enforces, and what a vault that did *not* refresh
+would trip; inside `bond()` the age is zero by construction. A `quote()` and the `bond()` that follows it can differ
+by exactly what changed NAV in between, in the protocol's favour. Cost: one checkpoint per bond (the fixture measures
+1,165,037 gas for a bond against 707,584 without it, with five constituents and the zero valuer; it scales with the
+asset list and, in Phase 3, with the positions the valuer decomposes), independent of placement.
 
 ## 7. The structurally ungated surface
 
@@ -429,6 +462,7 @@ transient reentrancy lock — a lock nobody else can hold, released in the same 
 |---|---|---|---|
 | `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
 | `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
+| either policy, gate pointer **reverts** | every gated selector | nothing | everything (fail-open, see below) |
 
 The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
 `h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
@@ -497,6 +531,28 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
   short string, and reads its bound from `Constants`. Do not restate a bound as a literal.
 * Every external function asserts `sweepClean` at exit: the ERC-20 balance of every registered asset on the vault,
   the hook and `AmpsBonds` must be zero.
+
+## 9.1 Bootstrap ordering: the gate and the first pool are circular
+
+`AmpsVault.initializePool` and `genesis()` take `_requireHealthy`, and `OracleGate._referenceIntegrity` reports
+`WATCHDOG` whenever the hub pool is unregistered *or* its observation ring covers less than `twapWindow`. A freshly
+initialised hook pool has no observations at all, so with the gate already wired **no pool can be registered and
+`genesis()` cannot run**: both revert with `GateNotHealthy(WATCHDOG)` until the hub has thirty minutes of history it
+cannot acquire without existing. The Phase 2 integration fixture resolves it the only way the contracts allow, and
+the deploy runbook (`script/05_Registry`, `script/06_Genesis`) must use the same order:
+
+1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`) and the
+   pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave `oracleGate` unset**
+   (`_requireGate` returns when the pointer is zero);
+2. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate);
+3. wait until the hook's hub ring covers `twapWindow` — on Robinhood Chain that is thirty minutes of blocks after
+   the hub's first observation; on a test chain, seed the ring;
+4. point the vault at `OracleGate` through `setPolicyPointer`, confirm `gate.state(0) == GREEN`;
+5. run `genesis()`.
+
+Nothing is lost by the order: a gate that is absent is exactly as permissive as a gate that is `GREEN` (§7.1), the
+vault holds no assets before `genesis()`, and the `wiringFrozen` latch that `genesis()` sets does not cover the
+gate pointer, which stays governable for the life of the vault.
 
 ## 10. How Phase 2 actually builds: libraries, lenses and per-path compilation
 

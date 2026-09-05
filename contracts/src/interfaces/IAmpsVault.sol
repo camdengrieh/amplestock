@@ -560,6 +560,10 @@ interface IAmpsVault {
     /// @dev The collateral never rests on `AmpsBonds` or on the vault: the transfer is
     ///      `from -> PoolManager` inside one `unlock`, so the `sweepClean` invariant (I12) holds at function exit
     ///      for both contracts. The bonder therefore approves the **vault**.
+    /// @dev Writes a fresh {checkpointData} **before** settling, under the bond gate policy. `AmpsBonds` calls
+    ///      this first and prices afterwards, so every bond is priced against this block's pre-deposit NAV rather
+    ///      than a checkpoint up to `CHECKPOINT_MAX_AGE` old that an earlier bond, a redemption or a feed move may
+    ///      have left below the live value (the vault half of I27).
     /// @param marketId The bond market, for the event and for routing the proceeds.
     /// @param collateral The token.
     /// @param from The bonder.
