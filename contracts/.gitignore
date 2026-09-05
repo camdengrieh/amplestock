@@ -1,0 +1,9 @@
+out/
+out-*/
+cache/
+cache-*/
+broadcast/
+.forge-snapshots/
+lcov.info
+coverage/
+*.log
