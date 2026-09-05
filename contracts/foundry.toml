@@ -45,3 +45,25 @@ lint_on_build = false
 [rpc_endpoints]
 robinhood = "${ROBINHOOD_RPC_URL}"
 robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"
+
+# `AmpsVault` implements the whole of `IAmpsVault` and does not fit EIP-170 under the project-wide
+# `optimizer_runs = 1_000_000` legacy pipeline (45,818 B as one contract, 26,509 B at `runs = 1` even after the
+# read side moved into `VaultNavLib`). Compiling `src/vault/**` alone through the IR pipeline at 200 runs brings it
+# to ~23 kB with margin, and leaves every other contract's codegen — and every gas baseline — untouched.
+[[profile.default.additional_compiler_profiles]]
+name = "vault"
+optimizer_runs = 200
+via_ir = true
+
+[[profile.default.compilation_restrictions]]
+paths = "src/vault/*"
+optimizer_runs = 200
+via_ir = true
+
+# `AmpsBonds` carries the whole bond call graph plus the collateral registry and twelve governed setters; at the
+# project-wide 1,000,000 optimizer runs solc inlines it past EIP-170. Compiled on its own at 200 runs through the
+# IR pipeline it fits with room to spare, and nothing else in `src/` changes.
+[[profile.default.compilation_restrictions]]
+paths = "src/bonds/*"
+optimizer_runs = 200
+via_ir = true
