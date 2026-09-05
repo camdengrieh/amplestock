@@ -1,0 +1,551 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+/// @title Constants
+/// @notice Every hard-coded bound in Amplestocks, in one place. These are the *bands*, not the values: governance
+///         moves a parameter inside its band through the timelock, and can never move it outside. Widening a band
+///         means new bytecode plus a migration, which is the point.
+///
+/// @dev Naming convention, enforced by review:
+///      - `*_DEFAULT`  the launch value from the confirmed launch-parameter table. Deployment scripts read these;
+///                     no contract enforces them after genesis.
+///      - `*_MIN` / `*_MAX`  the hard band. The consuming contract `require`s membership on every setter, and the
+///                     interface exposes a view getter for each so the dApp and the governance drills can read the
+///                     bound rather than restate it.
+///      - `*_CAP`      a one-sided hard band (`<= CAP`, no lower bound beyond zero).
+///
+/// @dev Units: `Bps` is basis points of 10,000 (`BPS`); `X18` is 1e18 fixed point; `Pips` is hundredths of a basis
+///      point, the unit Uniswap v4 charges LP fees in (`MAX_LP_FEE == 1_000_000` pips == 100%); seconds are plain
+///      `uint32` timestamps; AMPS amounts are 18-decimal wei.
+library Constants {
+    // -------------------------------------------------------------------------------------------------------------
+    // Scales
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Basis-point scale. 10,000 bps == 100%.
+    uint256 internal constant BPS = 10_000;
+
+    /// @notice 1e18 fixed-point scale.
+    uint256 internal constant WAD = 1e18;
+
+    /// @notice Chainlink answer scale on Robinhood Chain: 8 decimals.
+    uint256 internal constant USD_PRICE_SCALE = 1e8;
+
+    /// @notice Uniswap v4's fee unit: hundredths of a basis point. One bp is 100 pips.
+    uint24 internal constant PIPS_PER_BPS = 100;
+
+    /// @notice Uniswap v4's maximum LP fee, in pips (100%). Every fee the hook returns is far below this.
+    uint24 internal constant MAX_LP_FEE = 1_000_000;
+
+    /// @notice Seconds in an hour, the period the reference rate limit is quoted over.
+    uint32 internal constant ONE_HOUR = 3600;
+
+    /// @notice Seconds in a day.
+    uint32 internal constant ONE_DAY = 86_400;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Supply and genesis (immutable: `S0` and the split are not governable at all)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice `S0`: the entire genesis supply, minted exactly once. 5,000 AMPS.
+    uint256 internal constant S0 = 5000e18;
+
+    /// @notice Team tranche: 5% of `S0` into an OZ `VestingWallet`, 2-month linear, no cliff.
+    uint256 internal constant TEAM_SHARES = 250e18;
+
+    /// @notice Protocol-owned-liquidity tranche: 95% of `S0`, held by the vault as ask inventory.
+    uint256 internal constant POL_SHARES = 4750e18;
+
+    /// @notice Team vest length: 60 days, linear, no cliff.
+    uint32 internal constant TEAM_VEST_SECONDS = 60 * ONE_DAY;
+
+    /// @notice The divide-by-zero guard in `navPerShare = (A + 1) / (T + VIRTUAL_SHARES)`. 1e3 wei of AMPS, i.e.
+    ///         1e-15 AMPS: enough to make the denominator non-zero in every reachable state (I22) and far too small
+    ///         to matter against a 5,000e18 supply. There is no genesis burn because there is no NAV mint.
+    uint256 internal constant VIRTUAL_SHARES = 1e3;
+
+    /// @notice ERC-4626 decimals offset used by `AmpsStaking` (xAMPS), matching `VIRTUAL_SHARES = 10**3`.
+    uint8 internal constant STAKING_DECIMALS_OFFSET = 3;
+
+    /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 47.5 AMPS per spoke.
+    uint16 internal constant SPOKE_SEED_BPS_DEFAULT = 100;
+
+    /// @notice Lower bound of the governed `spokeSeedBps`.
+    uint16 internal constant SPOKE_SEED_BPS_MIN = 10;
+
+    /// @notice Upper bound of the governed `spokeSeedBps`. 10% of the POL tranche into one new spoke is already an
+    ///         aggressive registration; anything larger should be several proposals.
+    uint16 internal constant SPOKE_SEED_BPS_MAX = 1000;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Fees (48 h timelock)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch `sellFeeBps`: 5% on every AMPS-in swap in all 32 pools, less any rotation credit.
+    uint16 internal constant SELL_FEE_BPS_DEFAULT = 500;
+
+    /// @notice Hard floor of `sellFeeBps`. 1%.
+    uint16 internal constant SELL_FEE_BPS_MIN = 100;
+
+    /// @notice Hard ceiling of `sellFeeBps`. 6%.
+    uint16 internal constant SELL_FEE_BPS_MAX = 600;
+
+    /// @notice Launch buy fee in the two entry pools (`AMPS/WETH`, `AMPS/USDG`). 30 bp.
+    uint16 internal constant BUY_FEE_BPS_ENTRY_DEFAULT = 30;
+
+    /// @notice Hard floor of an entry pool's buy fee.
+    uint16 internal constant BUY_FEE_BPS_ENTRY_MIN = 5;
+
+    /// @notice Hard ceiling of an entry pool's buy fee.
+    uint16 internal constant BUY_FEE_BPS_ENTRY_MAX = 100;
+
+    /// @notice Launch buy fee in a spoke. 5 bp.
+    uint16 internal constant BUY_FEE_BPS_SPOKE_DEFAULT = 5;
+
+    /// @notice Launch buy fee in a high-volatility spoke (annualised sigma above 60%). 10 bp.
+    uint16 internal constant BUY_FEE_BPS_SPOKE_HIGH_VOL_DEFAULT = 10;
+
+    /// @notice Hard floor of a spoke's buy fee.
+    uint16 internal constant BUY_FEE_BPS_SPOKE_MIN = 1;
+
+    /// @notice Hard ceiling of a spoke's buy fee.
+    uint16 internal constant BUY_FEE_BPS_SPOKE_MAX = 50;
+
+    /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 1%, paid to the remaining holders.
+    uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 100;
+
+    /// @notice Hard ceiling of `redeemFeeBps`. 5%. There is no floor: governance may set it to zero.
+    uint16 internal constant REDEEM_FEE_BPS_MAX = 500;
+
+    /// @notice Launch `burnBps`: 10% of the AMPS-side fees left after the creator and staker slices is burned.
+    uint16 internal constant BURN_BPS_DEFAULT = 1000;
+
+    /// @notice Hard ceiling of `burnBps`. 25%.
+    uint16 internal constant BURN_BPS_MAX = 2500;
+
+    /// @notice Launch `stakerBps`: 30% of the AMPS-side fees are streamed to xAMPS.
+    uint16 internal constant STAKER_BPS_DEFAULT = 3000;
+
+    /// @notice Hard ceiling of `stakerBps`. 50%.
+    uint16 internal constant STAKER_BPS_MAX = 5000;
+
+    /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `sellFeeBps`, never added on top.
+    /// @dev The whole schedule is immutable. There is no setter, no band and no governance path that can extend,
+    ///      restart or enlarge it; only the current `creator` may reassign the destination address.
+    uint16 internal constant CREATOR_FEE_BPS = 100;
+
+    /// @notice The creator fee decays linearly to zero over 30 days from genesis, then is structurally zero.
+    uint32 internal constant CREATOR_DECAY_SECONDS = 30 * ONE_DAY;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Staking (48 h timelock)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch `rewardStreamSeconds`: notified rewards vest into xAMPS linearly over 24 h, which is what
+    ///         makes a stake/unstake sandwich around `compound()` worthless.
+    uint32 internal constant REWARD_STREAM_SECONDS_DEFAULT = 24 * ONE_HOUR;
+
+    /// @notice Hard floor of `rewardStreamSeconds`. 1 h.
+    uint32 internal constant REWARD_STREAM_SECONDS_MIN = ONE_HOUR;
+
+    /// @notice Hard ceiling of `rewardStreamSeconds`. 7 d.
+    uint32 internal constant REWARD_STREAM_SECONDS_MAX = 7 * ONE_DAY;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Bonds (48 h timelock for parameters, 7 d for the collateral set and the policy pointer)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch base discount `dBase`: 12.5%.
+    uint16 internal constant BOND_D_BASE_BPS_DEFAULT = 1250;
+
+    /// @notice Launch discount floor `dMin`: 10%.
+    uint16 internal constant BOND_D_MIN_BPS_DEFAULT = 1000;
+
+    /// @notice Launch discount ceiling `dMax`: 15%.
+    uint16 internal constant BOND_D_MAX_BPS_DEFAULT = 1500;
+
+    /// @notice Hard floor of every discount parameter. 5%.
+    uint16 internal constant DISCOUNT_BPS_MIN = 500;
+
+    /// @notice Hard ceiling of every discount parameter. 25%.
+    uint16 internal constant DISCOUNT_BPS_MAX = 2500;
+
+    /// @notice Launch `k_w`: discount added per unit of index deficit, 1e18 fixed point. 0.5 at launch, so a name
+    ///         at half its target weight earns +250 bp of discount before clamping.
+    uint64 internal constant BOND_K_WEIGHT_X18_DEFAULT = 0.5e18;
+
+    /// @notice Launch `k_c`: discount removed per unit of epoch fill, 1e18 fixed point. 0.25 at launch, so a full
+    ///         epoch removes 250 bp before clamping.
+    uint64 internal constant BOND_K_FILL_X18_DEFAULT = 0.25e18;
+
+    /// @notice Hard ceiling on either bond coefficient. Beyond 2.0 the clamp to `[dMin, dMax]` binds everywhere and
+    ///         the term stops being a control.
+    uint64 internal constant BOND_COEFFICIENT_X18_MAX = 2e18;
+
+    /// @notice Launch per-market capacity: 50 bp of `Amps.totalSupply()` per 6-hour epoch.
+    uint16 internal constant BOND_CAP_BPS_PER_EPOCH_DEFAULT = 50;
+
+    /// @notice Hard ceiling of `capBpsPerEpoch`. 200 bp of total supply per epoch, per market.
+    uint16 internal constant BOND_CAP_BPS_PER_EPOCH_MAX = 200;
+
+    /// @notice Launch global capacity: 200 bp of `Amps.totalSupply()` per rolling day, across all markets.
+    uint16 internal constant BOND_DAILY_CAP_BPS_DEFAULT = 200;
+
+    /// @notice Hard ceiling of `dailyCapBps`. 500 bp of total supply per day.
+    uint16 internal constant BOND_DAILY_CAP_BPS_MAX = 500;
+
+    /// @notice Launch `epochSeconds`: 6 h.
+    uint32 internal constant BOND_EPOCH_SECONDS_DEFAULT = 6 * ONE_HOUR;
+
+    /// @notice Hard floor of `epochSeconds`. 1 h.
+    uint32 internal constant BOND_EPOCH_SECONDS_MIN = ONE_HOUR;
+
+    /// @notice Hard ceiling of `epochSeconds`. 7 d.
+    uint32 internal constant BOND_EPOCH_SECONDS_MAX = 7 * ONE_DAY;
+
+    /// @notice Launch `vestSeconds`: 12 h linear, no cliff.
+    uint32 internal constant BOND_VEST_SECONDS_DEFAULT = 12 * ONE_HOUR;
+
+    /// @notice Hard floor of `vestSeconds`. 1 h.
+    uint32 internal constant BOND_VEST_SECONDS_MIN = ONE_HOUR;
+
+    /// @notice Hard ceiling of `vestSeconds`. 7 d.
+    uint32 internal constant BOND_VEST_SECONDS_MAX = 7 * ONE_DAY;
+
+    /// @notice Launch `minAccretionBps`: every bond must issue at or above `navPerShare x (1 + 50 bp)`, so a bond
+    ///         is accretive even when the market discount has vanished.
+    uint16 internal constant MIN_ACCRETION_BPS_DEFAULT = 50;
+
+    /// @notice Hard ceiling of `minAccretionBps`. Above 500 bp the floor binds so hard that no bond ever fills.
+    uint16 internal constant MIN_ACCRETION_BPS_MAX = 500;
+
+    /// @notice Launch stale-feed haircut in the Regular session: none.
+    uint16 internal constant H_SESSION_REGULAR_BPS_DEFAULT = 0;
+
+    /// @notice Launch stale-feed haircut in Pre/Post: 50 bp.
+    uint16 internal constant H_SESSION_PRE_POST_BPS_DEFAULT = 50;
+
+    /// @notice Launch stale-feed haircut Overnight: 150 bp.
+    uint16 internal constant H_SESSION_OVERNIGHT_BPS_DEFAULT = 150;
+
+    /// @notice Launch stale-feed haircut when Closed (weekends, holidays): 300 bp. This is the modelled bound on
+    ///         weekend gap exposure for the bonded amount.
+    uint16 internal constant H_SESSION_CLOSED_BPS_DEFAULT = 300;
+
+    /// @notice Hard ceiling of any `h_session` entry. 10%.
+    uint16 internal constant H_SESSION_BPS_MAX = 1000;
+
+    /// @notice Hard ceiling on the number of bond collaterals: `MAX_CONSTITUENTS` plus WETH and USDG.
+    uint16 internal constant MAX_COLLATERALS = MAX_CONSTITUENTS + 2;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Reference price and oracle gate (48 h timelock; feed addresses and pointers 7 d)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch `refUpRateBps`: `P_ref` may rise at most 10% per hour. Downward moves are immediate.
+    uint16 internal constant REF_UP_RATE_BPS_DEFAULT = 1000;
+
+    /// @notice Hard floor of `refUpRateBps`. 1% per hour.
+    uint16 internal constant REF_UP_RATE_BPS_MIN = 100;
+
+    /// @notice Hard ceiling of `refUpRateBps`. 50% per hour.
+    uint16 internal constant REF_UP_RATE_BPS_MAX = 5000;
+
+    /// @notice The period `refUpRateBps` is quoted over: one hour. Not governable.
+    uint32 internal constant REF_UP_RATE_PERIOD = ONE_HOUR;
+
+    /// @notice Launch `refDivergenceBps`: the `AMPS/USDG` hub and `AMPS/WETH x ETH/USD` must agree within 5%, or
+    ///         the reference falls back to NAV and the breaker flags `REF_DIVERGED`.
+    uint16 internal constant REF_DIVERGENCE_BPS_DEFAULT = 500;
+
+    /// @notice Hard floor of `refDivergenceBps`. Below 1% ordinary spreads would trip it constantly.
+    uint16 internal constant REF_DIVERGENCE_BPS_MIN = 100;
+
+    /// @notice Hard ceiling of `refDivergenceBps`. 20%.
+    uint16 internal constant REF_DIVERGENCE_BPS_MAX = 2000;
+
+    /// @notice Launch TWAP window: 30 minutes, matching `TruncatedOracleLib.TWAP_WINDOW`.
+    uint32 internal constant TWAP_WINDOW_DEFAULT = 1800;
+
+    /// @notice Hard floor of the TWAP window. 5 minutes.
+    uint32 internal constant TWAP_WINDOW_MIN = 300;
+
+    /// @notice Hard ceiling of the TWAP window. 2 hours.
+    uint32 internal constant TWAP_WINDOW_MAX = 7200;
+
+    /// @notice Launch per-block truncation cap for the observation ring. Calibrated in Phase 0 from 7 days of
+    ///         sampled cadence; this placeholder is the value the Phase 1 gas baselines were taken at.
+    int24 internal constant MAX_TICK_MOVE_PER_BLOCK_DEFAULT = 200;
+
+    /// @notice Hard floor of `maxTickMovePerBlock`. A zero cap would freeze the oracle; 10 ticks is 0.1%.
+    int24 internal constant MAX_TICK_MOVE_PER_BLOCK_MIN = 10;
+
+    /// @notice Hard ceiling of `maxTickMovePerBlock`. Beyond ~20% per block the truncation stops bounding anything
+    ///         useful (I25).
+    int24 internal constant MAX_TICK_MOVE_PER_BLOCK_MAX = 2000;
+
+    /// @notice Layer A: no block and no observation for this long trips the watchdog. 1 hour.
+    uint32 internal constant GRACE_SECONDS_DEFAULT = ONE_HOUR;
+
+    /// @notice Hard floor of `GRACE`. 5 minutes.
+    uint32 internal constant GRACE_SECONDS_MIN = 300;
+
+    /// @notice Hard ceiling of `GRACE`. 24 hours.
+    uint32 internal constant GRACE_SECONDS_MAX = ONE_DAY;
+
+    /// @notice Layer A: the expected worst-case inter-block gap on a 100 ms chain. Placeholder pending the Phase 0
+    ///         7-day cadence sample.
+    uint32 internal constant GAP_SECONDS_DEFAULT = 120;
+
+    /// @notice Hard ceiling of `GAP_SECONDS`. It must stay well inside `GRACE`.
+    uint32 internal constant GAP_SECONDS_MAX = 1800;
+
+    /// @notice Layer C freshness multiplier in the Regular session, in hundredths: 1.5 x heartbeat.
+    uint16 internal constant FRESHNESS_MULTIPLIER_REGULAR_DEFAULT = 150;
+
+    /// @notice Layer C freshness multiplier in Pre/Post, in hundredths: 3 x heartbeat.
+    uint16 internal constant FRESHNESS_MULTIPLIER_PRE_POST_DEFAULT = 300;
+
+    /// @notice Layer C freshness multiplier Overnight, in hundredths: 6 x heartbeat.
+    uint16 internal constant FRESHNESS_MULTIPLIER_OVERNIGHT_DEFAULT = 600;
+
+    /// @notice Hard floor of a freshness multiplier: 1.0 x heartbeat.
+    uint16 internal constant FRESHNESS_MULTIPLIER_MIN = 100;
+
+    /// @notice Hard ceiling of a freshness multiplier: 24 x heartbeat. The Closed session disables the check
+    ///         entirely rather than using a multiplier.
+    uint16 internal constant FRESHNESS_MULTIPLIER_MAX = 2400;
+
+    /// @notice Layer C: a single-round move larger than this arms the two-confirmation rule. 10%.
+    uint16 internal constant ANSWER_JUMP_BPS = 1000;
+
+    /// @notice Layer E: the divergence breaker trips above this deviation. 5%.
+    uint16 internal constant DIVERGENCE_BPS_DEFAULT = 500;
+
+    /// @notice Hard ceiling of the breaker threshold. 20%.
+    uint16 internal constant DIVERGENCE_BPS_MAX = 2000;
+
+    /// @notice Layer E: the deviation must persist this long before `DIVERGED` latches. 60 s.
+    uint32 internal constant DIVERGENCE_SUSTAIN_SECONDS_DEFAULT = 60;
+
+    /// @notice Hard ceiling of the breaker's sustain window. 1 hour.
+    uint32 internal constant DIVERGENCE_SUSTAIN_SECONDS_MAX = ONE_HOUR;
+
+    /// @notice Layer D: a pending `effectiveAt` within this distance of now freezes the constituent. +/- 30 min.
+    uint32 internal constant CORPORATE_ACTION_WINDOW_DEFAULT = 1800;
+
+    /// @notice Hard ceiling of the corporate-action window. 24 hours.
+    uint32 internal constant CORPORATE_ACTION_WINDOW_MAX = ONE_DAY;
+
+    /// @notice Gas forwarded to every bounded `staticcall` into a Stock Token (`uiMultiplier`, `oraclePaused`,
+    ///         `isBlocked`, `effectiveAt`). A hostile or upgraded issuer implementation cannot grief a swap or a
+    ///         placement by burning gas: the call is capped and a failure is read as "unknown", not as a revert.
+    uint256 internal constant STOCK_TOKEN_PROBE_GAS = 50_000;
+
+    /// @notice The largest `uiMultiplier()` step the hook treats as a dividend reinvestment rather than a corporate
+    ///         action. 2%: above this the constituent is frozen instead of fee-captured.
+    uint16 internal constant DIVIDEND_STEP_BPS_MAX = 200;
+
+    /// @notice Share of a detected dividend step converted into an asymmetric capture fee: 0.8 x delta.
+    uint16 internal constant DIVIDEND_CAPTURE_NUMERATOR_BPS = 8000;
+
+    /// @notice Half-life of the dividend capture fee. 300 s.
+    uint32 internal constant DIVIDEND_CAPTURE_HALF_LIFE = 300;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Hook fee shape (48 h timelock; Phase 3 consumes these, Phase 2 only exposes them)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Absolute floor on the fee the hook returns, in bps. 3 bp.
+    uint16 internal constant F_MIN_BPS = 3;
+
+    /// @notice Cap on the dynamic component when the gate is GREEN. 300 bp.
+    uint16 internal constant DYN_CAP_NORMAL_BPS = 300;
+
+    /// @notice Cap on the dynamic component when the gate is DEGRADED, DIVERGED or WATCHDOG. 1,000 bp.
+    uint16 internal constant DYN_CAP_DEGRADED_BPS = 1000;
+
+    /// @notice Cap on the dynamic component during band escalation (beyond the inner band, inside the rail).
+    uint16 internal constant DYN_CAP_ESCALATION_BPS = 2000;
+
+    /// @notice Floor added to the dynamic component while the gate is not GREEN: a degraded gate raises the fee, it
+    ///         never reverts a swap (I15).
+    uint16 internal constant FROZEN_FEE_FLOOR_BPS = 100;
+
+    /// @notice Cap on the volatility component `f_vol = k_vol x sigma^2`. 100 bp.
+    uint16 internal constant F_VOL_CAP_BPS = 100;
+
+    /// @notice Maximum surge fee, armed after every placement, session open, multiplier step and reference jump
+    ///         above 25 bp. 500 bp.
+    uint16 internal constant SURGE_MAX_BPS = 500;
+
+    /// @notice Surge half-life. 60 s.
+    uint32 internal constant SURGE_HALF_LIFE = 60;
+
+    /// @notice Reference jump that arms the surge. 25 bp.
+    uint16 internal constant SURGE_REF_JUMP_BPS = 25;
+
+    /// @notice Session fee add-on in the Regular session (stock legs only).
+    uint16 internal constant F_SESSION_REGULAR_BPS = 0;
+
+    /// @notice Session fee add-on in Pre/Post.
+    uint16 internal constant F_SESSION_PRE_POST_BPS = 5;
+
+    /// @notice Session fee add-on Overnight.
+    uint16 internal constant F_SESSION_OVERNIGHT_BPS = 10;
+
+    /// @notice Session fee add-on when Closed.
+    uint16 internal constant F_SESSION_CLOSED_BPS = 25;
+
+    /// @notice Spoke inner band half-width in the Regular session, in ticks.
+    int24 internal constant INNER_BAND_REGULAR_TICKS = 200;
+
+    /// @notice Spoke inner band half-width in Pre/Post, in ticks.
+    int24 internal constant INNER_BAND_PRE_POST_TICKS = 300;
+
+    /// @notice Spoke inner band half-width Overnight, in ticks.
+    int24 internal constant INNER_BAND_OVERNIGHT_TICKS = 500;
+
+    /// @notice Spoke inner band half-width when Closed, in ticks, before the per-closed-hour widening.
+    int24 internal constant INNER_BAND_CLOSED_TICKS = 770;
+
+    /// @notice Extra inner-band ticks per hour the market has been closed.
+    int24 internal constant INNER_BAND_CLOSED_TICKS_PER_HOUR = 25;
+
+    /// @notice Hard ceiling on the spoke inner band, in ticks. Monotone non-decreasing in closedness (I19).
+    int24 internal constant INNER_BAND_MAX_TICKS = 1500;
+
+    /// @notice Spoke outer rail floor, in ticks: the rail is `max(3 x innerBand, 800)`.
+    int24 internal constant OUTER_RAIL_MIN_TICKS = 800;
+
+    /// @notice Multiple of the inner band that sets the spoke outer rail.
+    int24 internal constant OUTER_RAIL_BAND_MULTIPLE = 3;
+
+    /// @notice Entry-pool outer rail, in ticks: +/-22% per window, so price discovery is never reverted inside it.
+    int24 internal constant OUTER_RAIL_ENTRY_TICKS = 2000;
+
+    /// @notice The highest total fee the hook can ever return, in bps: `SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS`.
+    ///         26% is far below `MAX_LP_FEE`, which is what invariant I16 asserts.
+    uint16 internal constant TOTAL_FEE_BPS_MAX = SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS;
+
+    /// @notice The mined hook address must satisfy `address & 0x3FFF == HOOK_FLAGS`:
+    ///         `BEFORE_INITIALIZE | AFTER_INITIALIZE | BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP`.
+    uint16 internal constant HOOK_FLAGS = 0x38C0;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Ladder and rollout (48 h timelock; future placements only, never a reshape of existing positions)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch `ladderTilt`: each doubling holds 1.25x the AMPS of the one below it.
+    uint64 internal constant LADDER_TILT_X18_DEFAULT = 1.25e18;
+
+    /// @notice Hard floor of `ladderTilt`: a flat ladder.
+    uint64 internal constant LADDER_TILT_X18_MIN = 1e18;
+
+    /// @notice Hard ceiling of `ladderTilt`.
+    uint64 internal constant LADDER_TILT_X18_MAX = 1.5e18;
+
+    /// @notice Launch `ladderDoublings`: 10 buckets, $1 to $1,024.
+    uint8 internal constant LADDER_DOUBLINGS_DEFAULT = 10;
+
+    /// @notice Hard floor of `ladderDoublings`.
+    uint8 internal constant LADDER_DOUBLINGS_MIN = 6;
+
+    /// @notice Hard ceiling of `ladderDoublings`, matching `LadderLib.MAX_BUCKETS`.
+    uint8 internal constant LADDER_DOUBLINGS_MAX = 14;
+
+    /// @notice Launch `seedHalvings`: the genesis seed sits as 4 bid buckets below $1.
+    uint8 internal constant SEED_HALVINGS_DEFAULT = 4;
+
+    /// @notice Launch `bondBidHalvings`: bonded stock is placed as 4 bid buckets below the spoke price.
+    uint8 internal constant BOND_BID_HALVINGS_DEFAULT = 4;
+
+    /// @notice Hard floor of either halving count, matching `LadderLib.MIN_BUCKETS`.
+    uint8 internal constant HALVINGS_MIN = 2;
+
+    /// @notice Hard ceiling of either halving count.
+    uint8 internal constant HALVINGS_MAX = 8;
+
+    /// @notice Launch `rolloutBpsPerDay`: at most 2% of the POL tranche migrates from the entry pools into the
+    ///         spokes per day.
+    uint16 internal constant ROLLOUT_BPS_PER_DAY_DEFAULT = 200;
+
+    /// @notice Hard ceiling of `rolloutBpsPerDay`. 10% of the POL tranche per day.
+    uint16 internal constant ROLLOUT_BPS_PER_DAY_MAX = 1000;
+
+    /// @notice Launch `entryFloorBps`: rollout never takes the entry pools below 30% of the POL tranche.
+    uint16 internal constant ENTRY_FLOOR_BPS_DEFAULT = 3000;
+
+    /// @notice Hard ceiling of `entryFloorBps`. Above 80% rollout could never do anything.
+    uint16 internal constant ENTRY_FLOOR_BPS_MAX = 8000;
+
+    /// @notice The R1 post-condition: a placement or a compound may not lower `navPerShare` by more than 2 bp.
+    ///         Enforced as a revert, not a warning (I11).
+    uint16 internal constant PLACEMENT_BLEED_BPS_MAX = 2;
+
+    /// @notice The relaxed R1 bound, applicable only inside `emergencyMigrate`. 50 bp.
+    uint16 internal constant MIGRATION_BLEED_BPS_MAX = 50;
+
+    /// @notice Minimum seconds between two placements in the same pool.
+    uint32 internal constant PLACEMENT_COOLDOWN_SECONDS = 60;
+
+    /// @notice Maximum `|slot0.tick - tickOf(P_mkt / P_i)|` accepted at the entry *and* exit of any placement.
+    int24 internal constant PLACEMENT_DIVERGENCE_TICKS = 800;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Registry and index (7 d timelock)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Hard ceiling on the constituent set. Ids are 1-based, so valid ids are `[1, MAX_CONSTITUENTS]`.
+    uint16 internal constant MAX_CONSTITUENTS = 64;
+
+    /// @notice The launch constituent set size (Decision 2). Not a bound: the registry starts here and moves.
+    uint16 internal constant LAUNCH_CONSTITUENTS = 30;
+
+    /// @notice The launch pool count: 30 spokes plus `AMPS/WETH` and `AMPS/USDG`.
+    uint16 internal constant LAUNCH_POOLS = 32;
+
+    /// @notice Index weight cap for `n` constituents: `max(3000, ceilDiv(10000, n))` bps. This is the floor of the
+    ///         cap, i.e. no name is ever capped below 30%.
+    uint16 internal constant INDEX_CAP_FLOOR_BPS = 3000;
+
+    /// @notice Index weight floor for `n` constituents: `min(500, 10000 / (2n))` bps. This is the ceiling of the
+    ///         floor, i.e. no name is ever floored above 5%.
+    uint16 internal constant INDEX_FLOOR_CEILING_BPS = 500;
+
+    /// @notice Minimum days of price history the inclusion rule requires.
+    uint32 internal constant MIN_HISTORY_DAYS = 30;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Governance and keeper
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Fast timelock: fees, bands, bond parameters, ladder shape, rollout, staking, keeper. 48 h.
+    uint32 internal constant TIMELOCK_FAST_SECONDS = 48 * ONE_HOUR;
+
+    /// @notice Slow timelock: constituent lifecycle, collateral set, index weights, policy pointers. 7 d.
+    uint32 internal constant TIMELOCK_SLOW_SECONDS = 7 * ONE_DAY;
+
+    /// @notice Standby-vault registration. 14 d.
+    uint32 internal constant TIMELOCK_STANDBY_SECONDS = 14 * ONE_DAY;
+
+    /// @notice The longest a guardian freeze can last before it expires by itself. 7 d. The guardian cannot renew a
+    ///         freeze past this without a new action, and can never block `redeemProRata`.
+    uint32 internal constant GUARDIAN_FREEZE_MAX_SECONDS = 7 * ONE_DAY;
+
+    /// @notice How stale the vault checkpoint may be before a gated path refuses to use it. 30 minutes. Redemption
+    ///         ignores this, as it ignores every other gate.
+    uint32 internal constant CHECKPOINT_MAX_AGE = 1800;
+
+    /// @notice Launch keeper tip: $0.05, 18-decimal USD.
+    uint256 internal constant KEEPER_TIP_USD18_DEFAULT = 0.05e18;
+
+    /// @notice Launch keeper chip: 2% of the work value.
+    uint16 internal constant KEEPER_CHIP_BPS_DEFAULT = 200;
+
+    /// @notice Launch keeper dust guard `chost`: $1 of work value before a paid job is worth calling.
+    uint256 internal constant KEEPER_CHOST_USD18_DEFAULT = 1e18;
+
+    /// @notice Multiple of the observed gas cost the bounty may never exceed.
+    uint16 internal constant KEEPER_GAS_CAP_MULTIPLE = 3;
+}
