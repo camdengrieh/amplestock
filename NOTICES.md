@@ -113,6 +113,16 @@ network by this repository and is never reachable from `contracts/src/**`. Deplo
 PoolManager already live on Robinhood Chain
 (`0x8366a39cc670b4001a1121b8f6a443a643e40951`), deployed by Uniswap, not by us.
 
+## Agent-audit skills (tooling, not shipped code)
+
+`.claude/skills/{x-ray,solidity-auditor,fizz}` are vendored verbatim from
+[`pashov/skills`](https://github.com/pashov/skills) at commit `c577eb7799c349de0acb187ba00ca98e14e436fd`
+(MIT; the licence text is kept alongside as `.claude/skills/PASHOV-LICENSE`). They are Claude Code
+skills used for the Phase 6 agent audits (pre-audit x-ray, the multi-agent Solidity audit, and
+Echidna/Medusa suite generation). They are developer tooling: nothing under `.claude/` is imported by,
+compiled into or deployed with `contracts/src/**`, and the licence gate does not scan it. Audit
+reports produced with them are committed under `docs/audits/`.
+
 ## Reference data
 
 Address books, feed addresses and the launch token list in `packages/config` are public on-chain and
