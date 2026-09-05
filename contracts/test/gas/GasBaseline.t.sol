@@ -73,7 +73,12 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     uint256 internal constant STOCK_IN = 55e18; // ~$9.9k rotation
 
     string internal constant BASELINE_PATH = "./gas/baseline.json";
-    string internal constant FOUNDRY_VERSION = "1.5.1";
+    /// @dev Pinned in .github/workflows/ci.yml; the baseline is only comparable under the same toolchain.
+    ///      Foundry >= 1.8 clears transient storage between top-level calls made by a test (each such call is its
+    ///      own transaction), while 1.5 kept it for the whole test. Every scenario that seeds and spends the
+    ///      rotation credit therefore runs inside a single self-call (`this.<entry>()`), which is faithful to the
+    ///      EVM under both behaviours.
+    string internal constant FOUNDRY_VERSION = "1.8.1";
 
     struct Measurements {
         uint256 beforeSwap;
@@ -208,25 +213,35 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         BalanceDelta buyDelta = toBalanceDelta(int128(int256(AMPS_IN)), -int128(int256(USDG_IN)));
 
         // Warm the hook account and the pool's packed slot.
-        hook.debugSetRotationCredit(AMPS_IN * 2);
         vm.prank(address(poolManager));
         hook.beforeSwap(address(swapRouter), usdgKey, sell, "");
         vm.prank(address(poolManager));
         hook.afterSwap(address(swapRouter), usdgKey, buy, buyDelta, "");
 
+        // The credit is transient state, so setting it and spending it must happen inside ONE top-level call
+        // (see the contract-level note on Foundry's transient-storage semantics).
+        gasBeforeSwap = this.creditedBeforeSwapEntry(sell);
+
+        _cool();
+        vm.prank(address(poolManager));
+        uint256 start = gasleft();
+        hook.afterSwap(address(swapRouter), usdgKey, buy, buyDelta, "");
+        gasAfterSwap = start - gasleft();
+
+        hook.debugSetRotationCredit(0);
+    }
+
+    /// @dev Self-call entry point: seeds the rotation credit and measures a credited exact-input `beforeSwap` in the
+    ///      same transaction. Only callable by this test contract (through `this.`).
+    function creditedBeforeSwapEntry(SwapParams calldata sell) external returns (uint256 gasBeforeSwap) {
+        require(msg.sender == address(this), "self-call only");
         hook.debugSetRotationCredit(AMPS_IN * 2);
         _cool();
         vm.prank(address(poolManager));
         uint256 start = gasleft();
         hook.beforeSwap(address(swapRouter), usdgKey, sell, "");
         gasBeforeSwap = start - gasleft();
-
-        _cool();
-        vm.prank(address(poolManager));
-        start = gasleft();
-        hook.afterSwap(address(swapRouter), usdgKey, buy, buyDelta, "");
-        gasAfterSwap = start - gasleft();
-
+        assertEq(hook.rotationCredit(), AMPS_IN, "credited sell must consume exactly amountIn of the credit");
         hook.debugSetRotationCredit(0);
     }
 
@@ -263,19 +278,29 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     function _measureBuyThenSell() private returns (uint256 gasUsed) {
         hook.debugSetRotationCredit(0);
         vm.recordLogs();
-        _cool();
 
-        uint256 start = gasleft();
-        (, uint256 ampsOut) = _buyAmpsWithUsdg(USDG_IN);
-        _sellAmpsForUsdg(ampsOut);
-        gasUsed = start - gasleft();
+        // Both legs run inside one top-level call so they share a transaction's transient storage.
+        uint256 creditAfter;
+        (gasUsed, creditAfter) = this.roundTripEntry();
 
         uint24[] memory fees = _swapFees(vm.getRecordedLogs());
         assertEq(fees.length, 2, "round trip must emit two Swap events");
         assertEq(fees[0], EXPECTED_BUY_FEE_PIPS, "buy leg fee");
         assertEq(fees[1], EXPECTED_BUY_FEE_PIPS, "credited sell leg fee");
-        assertEq(hook.rotationCredit(), 0, "round trip must consume the whole credit");
+        assertEq(creditAfter, 0, "round trip must consume the whole credit");
         hook.debugSetRotationCredit(0);
+    }
+
+    /// @dev Self-call entry point for the same-transaction buy-then-sell round trip. Returns the gas of both legs
+    ///      and the credit left in the hook, read before the transaction ends. Only callable through `this.`.
+    function roundTripEntry() external returns (uint256 gasUsed, uint256 creditAfter) {
+        require(msg.sender == address(this), "self-call only");
+        _cool();
+        uint256 start = gasleft();
+        (, uint256 ampsOut) = _buyAmpsWithUsdg(USDG_IN);
+        _sellAmpsForUsdg(ampsOut);
+        gasUsed = start - gasleft();
+        creditAfter = hook.rotationCredit();
     }
 
     /// @dev Runs the rotation and the equivalent uncredited exit from the *same* pool state, so the difference in

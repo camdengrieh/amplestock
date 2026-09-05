@@ -6,7 +6,7 @@ Foundry package for the $AMPS protocol on Robinhood Chain (chain id 4663, testne
 
 | Component | Pin | Notes |
 |---|---|---|
-| Foundry | 1.5.1-stable | `forge`, `cast`, `anvil` |
+| Foundry | 1.8.1 (pinned in CI) | `forge`, `cast`, `anvil` |
 | solc | 0.8.30 (pinned in `foundry.toml`) | evm `cancun`, `bytecode_hash = "none"`, optimizer 1,000,000 runs |
 | forge-std | 1.16.2 | `lib/forge-std` |
 | OpenZeppelin uniswap-hooks | 1.2.2 | `lib/uniswap-hooks` (`BaseHook`); nests v4-core 1.0.2 and v4-periphery 1.0.3 |

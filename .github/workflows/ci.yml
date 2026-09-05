@@ -35,7 +35,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
 
       - name: Show toolchain
         run: forge --version
@@ -106,7 +106,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -205,7 +205,7 @@ jobs:
         if: steps.probe.outputs.present == 'true'
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
 
       # The hook's address encodes its permission flags (0x38C0), so the salt is only valid for
       # one exact creation-code hash. Any change to AmpsHook or its constructor arguments

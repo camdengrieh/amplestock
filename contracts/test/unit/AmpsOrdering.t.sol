@@ -5,6 +5,7 @@ import {MineAmps} from "../../script/01_MineAmps.s.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 import {Test} from "forge-std/Test.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 
 /// @notice Guards the reason AMPS is CREATE2-mined at all: it must be `currency0` in every Amplestocks pool, i.e.
 ///         its address must sort below WETH9, USDG and every Robinhood Stock Token the protocol can ever list.
@@ -77,7 +78,10 @@ contract AmpsOrderingTest is Test {
     /// @notice The recorded hash is the hash of the init code the current sources actually produce.
     /// @dev    A failure here means the salt is stale: re-run `python3 script/mine-amps.py` (any change to
     ///         `Amps.sol`, to the constructor argument or to the compiler settings moves the init code hash).
-    function test_recordedInitCodeHashMatchesCurrentBytecode() public view {
+    function test_recordedInitCodeHashMatchesCurrentBytecode() public {
+        // `forge coverage` compiles without the optimizer, so the creation code (and its hash) legitimately differs
+        // there; the check is only meaningful on the production compiler settings.
+        vm.skip(vm.isContext(VmSafe.ForgeContext.Coverage));
         bytes32 computed = keccak256(abi.encodePacked(type(Amps).creationCode, abi.encode(recordedVault)));
         assertEq(computed, initCodeHash, "init code hash is stale - re-mine the salt");
         assertEq(miner.ampsInitCodeHash(recordedVault), initCodeHash, "script init code hash");
