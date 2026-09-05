@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: MIT
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  # -------------------------------------------------------------------------------------------
+  # Foundry: build, format, tests, coverage, gas regression
+  # -------------------------------------------------------------------------------------------
+  contracts:
+    name: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
+
+      - name: Show toolchain
+        run: forge --version
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Format check
+        run: forge fmt --check
+
+      # `--isolate` runs every call in its own EVM context, which is what makes the correctness
+      # suite trustworthy but makes gas measurements meaningless (cold-storage and warm-access
+      # accounting differ from a real transaction). The gas suite is therefore excluded here and
+      # run non-isolated in its own step below.
+      - name: Test (isolate, ci profile)
+        env:
+          FOUNDRY_PROFILE: ci
+        run: forge test --isolate --no-match-path 'test/gas/*' -vvv
+
+      # Coverage is best effort: `forge coverage` can OOM or fail on via-ir/stack-too-deep long
+      # before the test suite does, and a coverage hiccup must not gate a correct build.
+      - name: Coverage (lcov, best effort)
+        id: coverage
+        continue-on-error: true
+        run: forge coverage --no-match-path 'test/gas/*' --report lcov --report summary
+
+      - name: Upload coverage artifact
+        if: steps.coverage.outcome == 'success' && hashFiles('contracts/lcov.info') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-lcov
+          path: contracts/lcov.info
+          if-no-files-found: ignore
+
+      # Gas regression gate. Deliberately NOT `--isolate`: isolation changes storage warm/cold
+      # accounting, so isolated numbers cannot be compared against a baseline measured from a
+      # normal transaction. The suite reads contracts/gas/baseline.json and fails if any
+      # measurement exceeds baseline x 1.2; if the baseline file is missing it logs SKIP rather
+      # than failing, so this step is safe on a branch that has not recorded one yet.
+      - name: Gas regression (non-isolated)
+        run: |
+          if [ -f gas/baseline.json ]; then
+            echo "::group::gas baseline"
+            cat gas/baseline.json
+            echo "::endgroup::"
+          else
+            echo "::warning::contracts/gas/baseline.json is absent — the gas suite will log SKIP."
+          fi
+          forge test --match-path 'test/gas/*' -vv
+
+      - name: Gas report (informational)
+        continue-on-error: true
+        run: forge test --match-path 'test/gas/*' --gas-report
+
+  # -------------------------------------------------------------------------------------------
+  # Licence gate: no BUSL/AGPL/GPL reachable from contracts/src/**, no missing SPDX headers
+  # -------------------------------------------------------------------------------------------
+  licence-gate:
+    name: licence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The gate needs solc standard-JSON build-info, which a plain `forge build` does not write.
+      # It builds one itself into a private out/cache pair so it never collides with the
+      # `contracts` job's artifacts.
+      - name: Licence gate
+        run: python3 scripts/licence-gate.py --out out-licence --cache cache-licence --json licence-report.json
+
+      - name: Upload licence report
+        if: always() && hashFiles('licence-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: licence-report
+          path: licence-report.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------------------------
+  # Node workspace: typecheck, build, test the TS packages
+  # -------------------------------------------------------------------------------------------
+  node:
+    name: node
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # `--frozen-lockfile` is the rule; the fallback exists only for the first push, before
+      # pnpm-lock.yaml is committed. Once the lockfile lands, the fallback stops being reachable.
+      - name: Install
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "::warning::pnpm-lock.yaml is missing — installing unpinned. Commit the lockfile."
+            pnpm install --no-frozen-lockfile
+          fi
+
+      - name: Typecheck (packages)
+        run: pnpm turbo run typecheck --filter='./packages/*' --filter='./apps/*'
+
+      - name: Build (packages)
+        run: pnpm turbo run build --filter='./packages/*' --filter='./apps/*'
+
+      - name: Test (packages)
+        run: pnpm turbo run test --filter='./packages/*' --filter='./apps/*'
+
+      # launch.json is a generated mirror of packages/config/src/index.ts. If someone edits one
+      # and not the other the config test already fails; this makes the drift obvious in the diff.
+      - name: Config JSON mirror is up to date
+        run: |
+          pnpm --filter @amplestocks/config gen:json
+          git diff --exit-code -- packages/config/launch.json
+
+  # -------------------------------------------------------------------------------------------
+  # Hook address re-check (placeholder until the mined address is committed)
+  # -------------------------------------------------------------------------------------------
+  hook-address:
+    name: hook address re-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Does a mined hook address exist yet?
+        id: probe
+        run: |
+          if [ -f contracts/script/config/hook-address.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Found contracts/script/config/hook-address.json"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "contracts/script/config/hook-address.json not present — nothing to re-check."
+          fi
+
+      - name: Install Foundry
+        if: steps.probe.outputs.present == 'true'
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
+
+      # The hook's address encodes its permission flags (0x38C0), so the salt is only valid for
+      # one exact creation-code hash. Any change to AmpsHook or its constructor arguments
+      # invalidates it, and a stale salt would deploy a hook the PoolManager rejects. This
+      # re-mines from the committed salt and fails if the address moved.
+      - name: Re-check the mined hook address
+        if: steps.probe.outputs.present == 'true'
+        working-directory: contracts
+        run: |
+          echo "::group::committed hook address"
+          cat script/config/hook-address.json
+          echo "::endgroup::"
+          forge test --isolate --match-path 'test/unit/HookAddress*.t.sol' -vv
+
+  # -------------------------------------------------------------------------------------------
+  # Single required check
+  # -------------------------------------------------------------------------------------------
+  ci:
+    name: ci
+    if: always()
+    needs: [contracts, licence-gate, node, hook-address]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed
+        run: |
+          echo "contracts=${{ needs.contracts.result }}"
+          echo "licence-gate=${{ needs.licence-gate.result }}"
+          echo "node=${{ needs.node.result }}"
+          echo "hook-address=${{ needs.hook-address.result }}"
+          for r in "${{ needs.contracts.result }}" "${{ needs.licence-gate.result }}" \
+                   "${{ needs.node.result }}" "${{ needs.hook-address.result }}"; do
+            case "$r" in
+              success|skipped) ;;
+              # a superseded run is cancelled by the concurrency group; the newer head carries the real verdict
+              cancelled) echo "::notice::a job was cancelled (superseded run)"; ;;
+              *) echo "::error::a required job did not succeed"; exit 1 ;;
+            esac
+          done

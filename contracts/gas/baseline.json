@@ -1,0 +1,14 @@
+{
+  "afterSwap": 33776,
+  "beforeSwap": 12735,
+  "date": "2026-09-05",
+  "evm": "cancun",
+  "foundry": "1.8.1",
+  "solc": "0.8.30",
+  "source": "test/gas/GasBaseline.t.sol (StubAmpsHook, flags 0x38C0)",
+  "swapBuyThenSell": 164908,
+  "swapOneHopBuy": 132058,
+  "swapOneHopSell": 132055,
+  "swapTwoHopRotation": 175208,
+  "warmth": "cold: vm.cool on the v4 stack, hook and tokens before each measurement"
+}

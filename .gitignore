@@ -1,0 +1,54 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+.next/
+out/
+cache/
+generated/
+*.tsbuildinfo
+
+# foundry (contracts/ has its own .gitignore too; these cover the
+# per-agent scratch profiles used to avoid sharing out/cache dirs)
+contracts/out-*/
+contracts/cache-*/
+contracts/broadcast/
+contracts/.forge-snapshots/
+contracts/lcov.info
+
+# turbo
+.turbo/
+
+# env
+.env
+.env.*
+!.env.example
+
+# coverage
+coverage/
+lcov.info
+*.lcov
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+
+# wagmi CLI output (regenerate with `pnpm --filter @amplestocks/abis generate`)
+packages/abis/src/generated.ts
+
+# licence gate report (CI artifact)
+licence-report.json

@@ -1,0 +1,24 @@
+{
+  "name": "@amplestocks/keeper",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Amplestocks keeper (compound, rollout, bounty) — placeholder, not scaffolded yet (Phase 4)",
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"console.error('[keeper] not scaffolded yet — see apps/keeper/README.md'); process.exit(1)\"",
+    "build": "node -e \"console.log('[keeper] placeholder — nothing to build yet')\"",
+    "test": "node -e \"console.log('[keeper] placeholder — no tests yet')\"",
+    "typecheck": "node -e \"console.log('[keeper] placeholder — no sources to typecheck yet')\"",
+    "lint": "node -e \"console.log('[keeper] placeholder — nothing to lint yet')\""
+  },
+  "dependencies": {
+    "@amplestocks/abis": "workspace:*",
+    "@amplestocks/config": "workspace:*",
+    "viem": "^2.56.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

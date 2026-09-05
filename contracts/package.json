@@ -1,0 +1,13 @@
+{
+  "name": "@amplestocks/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Amplestocks Foundry workspace (token, vault, hook, bonds, staking, policy, oracle, registry)",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "fmt": "forge fmt --check",
+    "lint": "forge lint"
+  }
+}

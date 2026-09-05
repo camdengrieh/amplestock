@@ -1,0 +1,25 @@
+{
+  "name": "@amplestocks/indexer",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Ponder indexer for Amplestocks — placeholder, not scaffolded yet (Phase 5)",
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"console.error('[indexer] not scaffolded yet — see apps/indexer/README.md'); process.exit(1)\"",
+    "build": "node -e \"console.log('[indexer] placeholder — nothing to build yet')\"",
+    "test": "node -e \"console.log('[indexer] placeholder — no tests yet')\"",
+    "typecheck": "node -e \"console.log('[indexer] placeholder — no sources to typecheck yet')\"",
+    "lint": "node -e \"console.log('[indexer] placeholder — nothing to lint yet')\""
+  },
+  "dependencies": {
+    "@amplestocks/abis": "workspace:*",
+    "@amplestocks/config": "workspace:*",
+    "ponder": "^0.17.9",
+    "viem": "^2.56.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

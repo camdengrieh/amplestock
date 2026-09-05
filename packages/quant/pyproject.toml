@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amplestocks-quant"
+version = "0.0.0"
+description = "Phase 0B quantitative gate for Amplestocks: ladder/rollout backtests and parameter sweeps"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Amplestocks contributors"}]
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/amplestocks_quant"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,29 @@
+{
+  "name": "@amplestocks/web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Amplestocks dApp — placeholder, not scaffolded yet (Phase 5)",
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"console.error('[web] not scaffolded yet — see apps/web/README.md'); process.exit(1)\"",
+    "build": "node -e \"console.log('[web] placeholder — nothing to build yet')\"",
+    "test": "node -e \"console.log('[web] placeholder — no tests yet')\"",
+    "typecheck": "node -e \"console.log('[web] placeholder — no sources to typecheck yet')\"",
+    "lint": "node -e \"console.log('[web] placeholder — nothing to lint yet')\""
+  },
+  "dependencies": {
+    "@amplestocks/abis": "workspace:*",
+    "@amplestocks/config": "workspace:*",
+    "@tanstack/react-query": "^5.102.8",
+    "next": "^16.3.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "viem": "^2.56.3",
+    "wagmi": "^2.19.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "note": "Mined against a PLACEHOLDER vault. The salt is bound to this exact init code hash: re-mine with the real AmpsVault address (and after any Amps.sol or compiler-setting change) before deploying. Regenerate with script/mine-amps.py, verify with script/01_MineAmps.s.sol.",
+  "factory": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "vault": "0x000000000000000000000000000000000000dEaD",
+  "vaultIsPlaceholder": true,
+  "initCodeHash": "0x1baf7567a376c34d58aecda125e883633bee0bb76ca8ca53a86be665f6e47624",
+  "salt": "0x11bcda2484ab2e028357dfe2719b0c180000000000000000000000000054b20c",
+  "predictedAddress": "0x000000dD2F33b84B4430E5Bc69c5d4BF1eE9fd4d",
+  "leadingZeroBytes": 3,
+  "attempts": 22078861,
+  "saltsPerSecond": 521158,
+  "minedAt": "2026-09-05T11:40:21Z",
+  "compiler": {
+    "solc": "0.8.30",
+    "optimizer": true,
+    "optimizerRuns": 1000000,
+    "viaIr": false,
+    "evmVersion": "cancun",
+    "bytecodeHash": "none",
+    "cborMetadata": false
+  }
+}

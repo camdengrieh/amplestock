@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import {FeedConfig, Session} from "../types/Types.sol";
+
+/// @title IFeedRegistry
+/// @notice The single place Amplestocks reads a Chainlink answer. Layer C of the oracle design: per-feed
+///         heartbeats and bounds, session-scaled freshness, and the sanity checks that stand between a bad answer
+///         and the NAV.
+///
+/// @dev Pointer-upgradeable behind the 7-day timelock (it holds no funds); individual feed addresses are also 7-day
+///      changes because a swapped feed is indistinguishable from a swapped price.
+///
+/// @dev **Rules that are not negotiable**, each of which has bitten a protocol on a public chain:
+///        1. **Standard proxy only.** Chainlink's SVR (secondary/"smart value recapture") proxies for the same
+///           ticker return the same number with different liveness guarantees. {setFeed} hard-`require`s the
+///           Standard proxy; there is no override.
+///        2. **`answer > 0` and `updatedAt != 0`.** A zero or negative answer is rejected, never floored to zero.
+///        3. **Per-ticker bounds.** `minAnswerUsd8 <= answer <= maxAnswerUsd8`, recorded per feed. This is the
+///           check that survives an aggregator returning its own circuit-breaker floor.
+///        4. **Two-confirmation rule on jumps.** A single-round move above `Constants.ANSWER_JUMP_BPS` (10%) is
+///           not accepted until a second round confirms it; until then the previous answer stands and the feed is
+///           reported as unconfirmed rather than stale.
+///        5. **Never multiplied by `uiMultiplier()`.** A Stock Token's display multiplier and its Chainlink answer
+///           are already in the same units. See `IStockToken`.
+///
+/// @dev **Session-scaled freshness.** The equity feeds are 24/5 with an 86,400 s heartbeat and hold Friday's close
+///      over the weekend, so a single `maxAge` is either uselessly loose in the Regular session or trips every
+///      Saturday. The bound is `heartbeat x freshnessMultiplier[session] / 100`, with the check **disabled
+///      entirely** when the session is `CLOSED` — a closed market's held answer is not stale, it is correct, and
+///      the bond path prices it with a haircut instead.
+///
+/// @dev **Staleness policy is per path, not global**, and is enforced by the *caller*, not here:
+///
+///      | Path                | Behaviour on a stale feed |
+///      |---------------------|---------------------------|
+///      | placements, compound | pause |
+///      | bonds               | continue, priced at `q_floor` with `h_session` |
+///      | swaps               | continue (fees widen; a swap never reverts for a gate reason) |
+///      | `redeemProRata`     | feeds are not read at all |
+interface IFeedRegistry {
+    /// @notice Emitted when a token's feed is set or replaced. 7-day timelock.
+    /// @param token The asset the feed prices.
+    /// @param previousAggregator The aggregator being replaced, or `address(0)`.
+    /// @param aggregator The new Chainlink Standard proxy.
+    event FeedSet(address indexed token, address indexed previousAggregator, address indexed aggregator);
+
+    /// @notice Emitted when a feed's heartbeat, threshold or sanity bounds change. 48-hour timelock.
+    /// @param token The asset.
+    /// @param heartbeat The new heartbeat in seconds.
+    /// @param thresholdBps The new deviation threshold in bps.
+    /// @param minAnswerUsd8 The new lower sanity bound.
+    /// @param maxAnswerUsd8 The new upper sanity bound.
+    event FeedConfigured(
+        address indexed token, uint32 heartbeat, uint16 thresholdBps, uint128 minAnswerUsd8, uint128 maxAnswerUsd8
+    );
+
+    /// @notice Emitted when a session freshness multiplier changes. 48-hour timelock.
+    /// @param session The session the multiplier applies to.
+    /// @param multiplier The new multiplier, in hundredths (150 == 1.5x).
+    event FreshnessMultiplierSet(Session indexed session, uint16 multiplier);
+
+    /// @notice Emitted when a jump above `ANSWER_JUMP_BPS` is seen and held pending confirmation.
+    /// @param token The asset.
+    /// @param previousAnswerUsd8 The answer still in force.
+    /// @param pendingAnswerUsd8 The unconfirmed answer.
+    /// @param roundId The round the jump appeared in.
+    event AnswerJumpPending(
+        address indexed token, uint256 previousAnswerUsd8, uint256 pendingAnswerUsd8, uint80 roundId
+    );
+
+    /// @notice No feed is configured for `token`.
+    /// @param token The asset queried.
+    error FeedNotSet(address token);
+
+    /// @notice The feed answered non-positively, or with `updatedAt == 0`.
+    /// @param token The asset.
+    /// @param answer The rejected answer.
+    error InvalidAnswer(address token, int256 answer);
+
+    /// @notice The answer is outside the per-ticker sanity bounds.
+    /// @param token The asset.
+    /// @param answerUsd8 The rejected answer.
+    /// @param minAnswerUsd8 The lower bound.
+    /// @param maxAnswerUsd8 The upper bound.
+    error AnswerOutOfBounds(address token, uint256 answerUsd8, uint128 minAnswerUsd8, uint128 maxAnswerUsd8);
+
+    /// @notice The answer is older than the session-scaled freshness bound. Thrown only by {priceUsd8}; callers
+    ///         that must degrade rather than revert use {latestAnswer}.
+    /// @param token The asset.
+    /// @param age The answer's age in seconds.
+    /// @param maxAge The bound in force.
+    error StaleAnswer(address token, uint32 age, uint32 maxAge);
+
+    /// @notice The supplied aggregator is not the ticker's Standard proxy.
+    /// @param aggregator The rejected aggregator.
+    error NotStandardProxy(address aggregator);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Reads (permissionless)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The configured feed record for `token`.
+    /// @param token The asset.
+    /// @return config The record; `config.set == false` when no feed is configured.
+    function feedConfig(address token) external view returns (FeedConfig memory config);
+
+    /// @notice The aggregator address for `token`, or `address(0)`.
+    /// @param token The asset.
+    /// @return aggregator The Chainlink Standard proxy.
+    function feedOf(address token) external view returns (address aggregator);
+
+    /// @notice The last accepted answer for `token`, without reverting on staleness.
+    /// @dev The non-reverting read every gate-aware path uses: it reports `fresh` so the caller can apply its own
+    ///      per-path policy, and it applies the positivity, bounds and two-confirmation rules before returning.
+    ///      Returns `answerUsd8 == 0` only when no usable answer exists at all.
+    /// @param token The asset.
+    /// @return answerUsd8 The answer, 8 decimals.
+    /// @return updatedAt When the answer was published.
+    /// @return fresh Whether the answer is within the session-scaled bound (always true when the session is
+    ///         `CLOSED`, where the check is disabled by design).
+    function latestAnswer(address token) external view returns (uint256 answerUsd8, uint32 updatedAt, bool fresh);
+
+    /// @notice The last accepted answer for `token`, reverting unless it is valid *and* fresh.
+    /// @dev Used by the placement path, which must pause rather than price on a stale feed.
+    /// @param token The asset.
+    /// @return answerUsd8 The answer, 8 decimals.
+    function priceUsd8(address token) external view returns (uint256 answerUsd8);
+
+    /// @notice The same answer converted to 18-decimal USD through `PriceLib`.
+    /// @param token The asset.
+    /// @return price18 The answer, 18 decimals.
+    function priceUsd18(address token) external view returns (uint256 price18);
+
+    /// @notice The freshness bound in force for `token` in `session`.
+    /// @param token The asset.
+    /// @param session The equity session.
+    /// @return bound The bound in seconds. `type(uint32).max` when the session is `CLOSED` (check disabled).
+    function maxAge(address token, Session session) external view returns (uint32 bound);
+
+    /// @notice The session freshness multiplier table, in hundredths.
+    /// @param session The equity session.
+    /// @return multiplier 150 / 300 / 600 for Regular / Pre-Post / Overnight; unused when `CLOSED`.
+    function freshnessMultiplier(Session session) external view returns (uint16 multiplier);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Hard bands
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Hard floor of a freshness multiplier, in hundredths. 100 (1.0x heartbeat).
+    /// @return value The bound.
+    function FRESHNESS_MULTIPLIER_MIN() external view returns (uint16 value);
+
+    /// @notice Hard ceiling of a freshness multiplier, in hundredths. 2,400 (24x heartbeat).
+    /// @return value The bound.
+    function FRESHNESS_MULTIPLIER_MAX() external view returns (uint16 value);
+
+    /// @notice The single-round move that arms the two-confirmation rule, in bps. 1,000.
+    /// @return value The bound.
+    function ANSWER_JUMP_BPS() external view returns (uint16 value);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Governance
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Sets or replaces the aggregator for `token`. **Only timelock (7 d).**
+    /// @dev Reverts with {NotStandardProxy} for an SVR proxy. Replacing a feed does not touch any position or any
+    ///      NAV number by itself; the next `checkpoint()` re-reads.
+    /// @param token The asset.
+    /// @param aggregator The Chainlink Standard proxy.
+    /// @param config The heartbeat, threshold and sanity bounds to record with it.
+    function setFeed(address token, address aggregator, FeedConfig calldata config) external;
+
+    /// @notice Updates a feed's heartbeat, threshold and sanity bounds. **Only timelock (48 h).**
+    /// @param token The asset.
+    /// @param heartbeat The heartbeat in seconds.
+    /// @param thresholdBps The deviation threshold in bps.
+    /// @param minAnswerUsd8 The lower sanity bound.
+    /// @param maxAnswerUsd8 The upper sanity bound.
+    function configureFeed(
+        address token,
+        uint32 heartbeat,
+        uint16 thresholdBps,
+        uint128 minAnswerUsd8,
+        uint128 maxAnswerUsd8
+    ) external;
+
+    /// @notice Sets a session's freshness multiplier. **Only timelock (48 h).**
+    /// @param session The equity session.
+    /// @param multiplier The multiplier in hundredths, inside
+    ///        `[FRESHNESS_MULTIPLIER_MIN, FRESHNESS_MULTIPLIER_MAX]`.
+    function setFreshnessMultiplier(Session session, uint16 multiplier) external;
+}
