@@ -7,3 +7,6 @@ broadcast/
 lcov.info
 coverage/
 *.log
+
+# forge gas snapshots (rewritten on every run; gas/baseline.json is the regression reference)
+snapshots/
