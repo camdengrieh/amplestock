@@ -1,0 +1,22 @@
+{
+  "name": "amplestocks",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Amplestocks ($AMPS) \u2014 NAV-floored index share on Robinhood Chain, monorepo root",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "fmt": "turbo run fmt",
+    "licence-gate": "python3 scripts/licence-gate.py --out out-licence --cache cache-licence"
+  },
+  "devDependencies": {
+    "turbo": "^2.10.12"
+  }
+}
