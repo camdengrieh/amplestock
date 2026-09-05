@@ -7,7 +7,7 @@ import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
 import {LengthMismatch, NotTimelock, OutOfBand, ZeroAddress} from "../types/Errors.sol";
-import {FeedConfig, Session} from "../types/Types.sol";
+import {FeedConfig, FeedStatus, Session} from "../types/Types.sol";
 
 /// @title FeedRegistry
 /// @notice Layer C of the oracle design and the single place Amplestocks reads a Chainlink answer. Pointer-
@@ -56,50 +56,10 @@ contract FeedRegistry is IFeedRegistry {
     // -------------------------------------------------------------------------------------------------------------
     // Types
     // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice The answer currently in force for a token. One slot.
-    /// @dev Bit layout: `[0..127] answerUsd8 | [128..159] updatedAt | [160..239] roundId`.
-    /// @param answerUsd8 The accepted answer, 8 decimals. Zero means "never latched".
-    /// @param updatedAt The `updatedAt` of the round the answer came from.
-    /// @param roundId The round the answer came from.
-    struct Accepted {
-        uint128 answerUsd8;
-        uint32 updatedAt;
-        uint80 roundId;
-    }
-
-    /// @notice A candidate answer held back by the two-confirmation rule. One slot.
-    /// @dev Bit layout: `[0..127] answerUsd8 | [128..159] seenAt | [160..239] roundId`.
-    /// @param answerUsd8 The unconfirmed answer, 8 decimals.
-    /// @param seenAt When the jump was first recorded, for the `confirmSeconds` escape.
-    /// @param roundId The round the jump appeared in.
-    struct Pending {
-        uint128 answerUsd8;
-        uint32 seenAt;
-        uint80 roundId;
-    }
-
-    /// @notice Everything {feedStatus} reports about one feed, in the shape the quoter renders.
-    /// @param answerUsd8 The effective answer, 8 decimals; 0 when no usable answer exists at all.
-    /// @param updatedAt The effective answer's publication timestamp.
-    /// @param roundId The round the effective answer came from.
-    /// @param age The effective answer's age in seconds.
-    /// @param maxAgeSeconds The freshness bound in force, `type(uint32).max` when the session disables it.
-    /// @param fresh Whether the answer is within the bound.
-    /// @param live Whether the aggregator answered this very call with a valid, in-bounds round.
-    /// @param unconfirmed Whether a jump above `ANSWER_JUMP_BPS` is being held back right now.
-    /// @param configured Whether a feed is configured for the token at all.
-    struct FeedStatus {
-        uint256 answerUsd8;
-        uint32 updatedAt;
-        uint80 roundId;
-        uint32 age;
-        uint32 maxAgeSeconds;
-        bool fresh;
-        bool live;
-        bool unconfirmed;
-        bool configured;
-    }
+    //
+    // `Accepted` and `Pending` are declared by `IFeedRegistry` and inherited here; `FeedStatus` lives in
+    // `types/Types.sol` because it crosses the interface boundary as a return value. There is one declaration of
+    // each, and this contract owns none of them.
 
     /// @dev Why a candidate round was not usable. `OK` is the only value that adopts the live answer.
     enum ProbeResult {
@@ -124,21 +84,19 @@ contract FeedRegistry is IFeedRegistry {
     ///      already misconfigured.
     uint256 public constant SESSION_PROBE_GAS = 4 * Constants.STOCK_TOKEN_PROBE_GAS;
 
-    /// @notice Hard floor of a feed heartbeat. Reuses the layer-A liveness floor: nothing in the protocol treats a
-    ///         window shorter than this as meaningful.
-    uint32 public constant HEARTBEAT_SECONDS_MIN = Constants.GRACE_SECONDS_MIN;
+    /// @notice Hard floor of a feed heartbeat. 60 s: the fastest publication cadence any Chainlink feed the
+    ///         protocol could adopt.
+    uint32 public constant HEARTBEAT_SECONDS_MIN = Constants.FEED_HEARTBEAT_SECONDS_MIN;
 
     /// @notice Hard ceiling of a feed heartbeat. 86,400 s, which is exactly the RDD heartbeat of every Robinhood
     ///         Chain equity feed.
-    uint32 public constant HEARTBEAT_SECONDS_MAX = Constants.GRACE_SECONDS_MAX;
+    uint32 public constant HEARTBEAT_SECONDS_MAX = Constants.FEED_HEARTBEAT_SECONDS_MAX;
 
-    /// @notice Hard floor of `confirmSeconds`.
-    /// @dev `Constants` carries no dedicated band for the two-confirmation escape yet, so this reuses the layer-A
-    ///      liveness band, which covers the same range for the same reason.
-    uint32 public constant CONFIRM_SECONDS_MIN = Constants.GRACE_SECONDS_MIN;
+    /// @notice Hard floor of `confirmSeconds`. 5 minutes.
+    uint32 public constant CONFIRM_SECONDS_MIN = Constants.ANSWER_CONFIRM_SECONDS_MIN;
 
-    /// @notice Hard ceiling of `confirmSeconds`.
-    uint32 public constant CONFIRM_SECONDS_MAX = Constants.GRACE_SECONDS_MAX;
+    /// @notice Hard ceiling of `confirmSeconds`. 24 hours.
+    uint32 public constant CONFIRM_SECONDS_MAX = Constants.ANSWER_CONFIRM_SECONDS_MAX;
 
     /// @notice Largest feed decimals this registry accepts. Every Robinhood Chain feed answers with 8.
     uint8 public constant FEED_DECIMALS_MAX = 18;
@@ -179,37 +137,18 @@ contract FeedRegistry is IFeedRegistry {
     /// @dev slot 3: the unconfirmed jump per token, if any.
     mapping(address token => Pending answer) internal _pending;
 
-    /// @notice Whether an aggregator has been recorded as a ticker's Chainlink **Standard** proxy.
-    /// @dev Governance sets this from the Reference Data Directory. An SVR proxy is simply never added, which is
-    ///      what makes {setFeed}'s `NotStandardProxy` check a whitelist rather than a heuristic.
-    mapping(address aggregator => bool standard) public isStandardProxy;
+    /// @inheritdoc IFeedRegistry
+    mapping(address aggregator => bool standard) public override isStandardProxy;
 
     // -------------------------------------------------------------------------------------------------------------
-    // Extra events and errors (beyond `IFeedRegistry`)
+    // Extra events (beyond `IFeedRegistry`)
     // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice Emitted by {refresh} whenever a new answer becomes the accepted one.
-    /// @param token The asset.
-    /// @param answerUsd8 The newly accepted answer, 8 decimals.
-    /// @param updatedAt The answer's publication timestamp.
-    /// @param roundId The round it came from.
-    event AnswerLatched(address indexed token, uint256 answerUsd8, uint32 updatedAt, uint80 roundId);
-
-    /// @notice Emitted when an aggregator is added to or removed from the Standard-proxy allowlist.
-    /// @param aggregator The aggregator.
-    /// @param standard Whether it is now recorded as a Standard proxy.
-    event StandardProxySet(address indexed aggregator, bool standard);
 
     /// @notice Emitted on every governed scalar change in this contract.
     /// @param parameter The parameter name as a short string.
     /// @param previousValue The value before.
     /// @param newValue The value after.
     event FeedRegistryParameterChanged(bytes32 indexed parameter, uint256 previousValue, uint256 newValue);
-
-    /// @notice The aggregator could not be read at all: no code, a revert, or a run out of the probe's gas budget.
-    /// @param token The asset.
-    /// @param aggregator The aggregator that failed to answer.
-    error FeedDead(address token, address aggregator);
 
     // -------------------------------------------------------------------------------------------------------------
     // Construction
@@ -226,7 +165,7 @@ contract FeedRegistry is IFeedRegistry {
         _freshnessPrePost = Constants.FRESHNESS_MULTIPLIER_PRE_POST_DEFAULT;
         _freshnessOvernight = Constants.FRESHNESS_MULTIPLIER_OVERNIGHT_DEFAULT;
         _freshnessClosed = Constants.FRESHNESS_MULTIPLIER_MIN;
-        _confirmSeconds = Constants.GRACE_SECONDS_DEFAULT;
+        _confirmSeconds = Constants.ANSWER_CONFIRM_SECONDS_DEFAULT;
     }
 
     /// @dev Every governed setter in this contract, and nothing else.
@@ -254,50 +193,36 @@ contract FeedRegistry is IFeedRegistry {
         return latestAnswerIn(token, sessionNow());
     }
 
-    /// @notice {latestAnswer} against an explicitly supplied session.
-    /// @dev The gate has already computed the session before it asks layer C anything, so this saves it the
-    ///      round trip back into {sessionNow} — and keeps `FeedRegistry -> OracleGate -> FeedRegistry` off every
-    ///      hot path. The session only ever selects the freshness bound; it never changes the answer.
-    /// @param token The asset.
-    /// @param session The equity session to apply.
-    /// @return answerUsd8 The answer, 8 decimals; 0 when no usable answer exists.
-    /// @return updatedAt When the answer was published.
-    /// @return fresh Whether it is inside the session-scaled bound.
+    /// @inheritdoc IFeedRegistry
     function latestAnswerIn(address token, Session session)
         public
         view
+        override
         returns (uint256 answerUsd8, uint32 updatedAt, bool fresh)
     {
         FeedStatus memory status = _read(token, session);
         return (status.answerUsd8, status.updatedAt, status.fresh);
     }
 
-    /// @notice The 18-decimal form of {latestAnswer}, for callers that value balances rather than quote prices.
-    /// @param token The asset.
-    /// @return price18 The answer, 18 decimals; 0 when no usable answer exists.
-    /// @return updatedAt When the answer was published.
-    /// @return fresh Whether it is inside the session-scaled bound.
-    function latestAnswerUsd18(address token) external view returns (uint256 price18, uint32 updatedAt, bool fresh) {
+    /// @inheritdoc IFeedRegistry
+    function latestAnswerUsd18(address token)
+        external
+        view
+        override
+        returns (uint256 price18, uint32 updatedAt, bool fresh)
+    {
         FeedStatus memory status = _read(token, sessionNow());
         price18 = status.answerUsd8 == 0 ? 0 : PriceLib.counterValueUsd18(PriceLib.WAD, 18, status.answerUsd8);
         return (price18, status.updatedAt, status.fresh);
     }
 
-    /// @notice The complete, never-reverting read of one feed: the shape `AmpsQuoter` renders and the shape a
-    ///         degraded dApp falls back to.
-    /// @dev Returns an all-zero struct with `configured == false` for a token with no feed, and never reverts for
-    ///      any input, any aggregator behaviour or any session.
-    /// @param token The asset.
-    /// @return status Everything known about the feed right now.
-    function feedStatus(address token) external view returns (FeedStatus memory status) {
+    /// @inheritdoc IFeedRegistry
+    function feedStatus(address token) external view override returns (FeedStatus memory status) {
         return _read(token, sessionNow());
     }
 
-    /// @notice {feedStatus} against an explicitly supplied session.
-    /// @param token The asset.
-    /// @param session The equity session to apply.
-    /// @return status Everything known about the feed in that session.
-    function feedStatusIn(address token, Session session) external view returns (FeedStatus memory status) {
+    /// @inheritdoc IFeedRegistry
+    function feedStatusIn(address token, Session session) external view override returns (FeedStatus memory status) {
         return _read(token, session);
     }
 
@@ -341,40 +266,30 @@ contract FeedRegistry is IFeedRegistry {
         return _freshnessClosed;
     }
 
-    /// @notice The two-confirmation escape window: how long an unconfirmed jump is held before it is adopted
-    ///         without a second round.
-    /// @return value The window in seconds.
-    function confirmSeconds() external view returns (uint32 value) {
+    /// @inheritdoc IFeedRegistry
+    function confirmSeconds() external view override returns (uint32 value) {
         return _confirmSeconds;
     }
 
-    /// @notice The gate this registry asks for the current session.
-    /// @return gate The `OracleGate` address, or `address(0)` when unset.
-    function oracleGate() external view returns (address gate) {
+    /// @inheritdoc IFeedRegistry
+    function oracleGate() external view override returns (address gate) {
         return _oracleGate;
     }
 
-    /// @notice The answer currently in force for `token`, as latched by {refresh} or {setFeed}.
-    /// @param token The asset.
-    /// @return answer The latched record; `answer.answerUsd8 == 0` when nothing has been latched.
-    function acceptedAnswer(address token) external view returns (Accepted memory answer) {
+    /// @inheritdoc IFeedRegistry
+    function acceptedAnswer(address token) external view override returns (Accepted memory answer) {
         return _accepted[token];
     }
 
-    /// @notice The unconfirmed jump held for `token`, if any.
-    /// @param token The asset.
-    /// @return answer The pending record; `answer.roundId == 0` when no jump is pending.
-    function pendingAnswer(address token) external view returns (Pending memory answer) {
+    /// @inheritdoc IFeedRegistry
+    function pendingAnswer(address token) external view override returns (Pending memory answer) {
         return _pending[token];
     }
 
-    /// @notice The equity session the gate reports, or `REGULAR` when no gate is configured or the gate is
-    ///         unreadable.
-    /// @dev `REGULAR` is the *tightest* freshness bound, so an unreachable gate degrades paths rather than
-    ///      loosening them. The call is bounded exactly like an aggregator probe: this contract is read by
-    ///      `AmpsQuoter` and must never revert because a governance pointer was set badly.
-    /// @return session The session in force.
-    function sessionNow() public view returns (Session session) {
+    /// @inheritdoc IFeedRegistry
+    /// @dev The call is bounded exactly like an aggregator probe: this contract is read by `AmpsQuoter` and must
+    ///      never revert because a governance pointer was set badly.
+    function sessionNow() public view override returns (Session session) {
         address gate = _oracleGate;
         if (gate == address(0) || gate.code.length == 0) return Session.REGULAR;
         try IOracleGate(gate).sessionNow{gas: SESSION_PROBE_GAS}() returns (Session reported) {
@@ -407,15 +322,8 @@ contract FeedRegistry is IFeedRegistry {
     // Mutative: the permissionless latch
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Advances the accepted/pending latch for `token` from the aggregator's current round.
-    /// @dev **Permissionless and unpaid**, like `OracleGate.poke()`. It never reverts for a feed reason: a dead
-    ///      aggregator, a bad answer or an out-of-bounds answer simply leave the latch untouched, because the
-    ///      whole point of the latch is to hold the last answer that passed every check.
-    /// @param token The asset to refresh.
-    /// @return answerUsd8 The answer in force after the call, 8 decimals.
-    /// @return updatedAt Its publication timestamp.
-    /// @return fresh Whether it is inside the session-scaled bound.
-    function refresh(address token) public returns (uint256 answerUsd8, uint32 updatedAt, bool fresh) {
+    /// @inheritdoc IFeedRegistry
+    function refresh(address token) public override returns (uint256 answerUsd8, uint32 updatedAt, bool fresh) {
         FeedConfig memory config = _feeds[token];
         if (!config.set) revert FeedNotSet(token);
 
@@ -443,11 +351,8 @@ contract FeedRegistry is IFeedRegistry {
         return (status.answerUsd8, status.updatedAt, status.fresh);
     }
 
-    /// @notice {refresh} for several tokens in one transaction.
-    /// @dev Skips tokens with no configured feed instead of reverting, so a keeper can hand it the whole
-    ///      constituent set without first filtering it.
-    /// @param tokens The assets to refresh.
-    function refreshMany(address[] calldata tokens) external {
+    /// @inheritdoc IFeedRegistry
+    function refreshMany(address[] calldata tokens) external override {
         for (uint256 i = 0; i < tokens.length; ++i) {
             if (_feeds[tokens[i]].set) refresh(tokens[i]);
         }
@@ -457,22 +362,19 @@ contract FeedRegistry is IFeedRegistry {
     // Governance
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Records or clears an aggregator's status as a ticker's Chainlink **Standard** proxy.
-    ///         **Only timelock (7 d).**
-    /// @dev Sourced from the Reference Data Directory. {setFeed} and {configureFeed} both refuse an aggregator
-    ///      that is not on this list, which is how SVR proxies are kept out with no heuristic and no override.
-    /// @param aggregator The aggregator.
-    /// @param standard Whether it is the Standard proxy.
-    function setStandardProxy(address aggregator, bool standard) external onlyTimelock {
+    /// @inheritdoc IFeedRegistry
+    function setStandardProxy(address aggregator, bool standard) external override onlyTimelock {
         if (aggregator == address(0)) revert ZeroAddress();
         isStandardProxy[aggregator] = standard;
         emit StandardProxySet(aggregator, standard);
     }
 
-    /// @notice Records several Standard proxies at once. **Only timelock (7 d).**
-    /// @param aggregators The aggregators.
-    /// @param standard Parallel flags.
-    function setStandardProxies(address[] calldata aggregators, bool[] calldata standard) external onlyTimelock {
+    /// @inheritdoc IFeedRegistry
+    function setStandardProxies(address[] calldata aggregators, bool[] calldata standard)
+        external
+        override
+        onlyTimelock
+    {
         if (aggregators.length != standard.length) revert LengthMismatch();
         for (uint256 i = 0; i < aggregators.length; ++i) {
             if (aggregators[i] == address(0)) revert ZeroAddress();
@@ -569,9 +471,8 @@ contract FeedRegistry is IFeedRegistry {
         emit FeedRegistryParameterChanged("freshnessMultiplier", previous, multiplier);
     }
 
-    /// @notice Sets the two-confirmation escape window. **Only timelock (48 h).**
-    /// @param value The window in seconds, inside `[CONFIRM_SECONDS_MIN, CONFIRM_SECONDS_MAX]`.
-    function setConfirmSeconds(uint32 value) external onlyTimelock {
+    /// @inheritdoc IFeedRegistry
+    function setConfirmSeconds(uint32 value) external override onlyTimelock {
         if (value < CONFIRM_SECONDS_MIN || value > CONFIRM_SECONDS_MAX) {
             revert OutOfBand("confirmSeconds", value, CONFIRM_SECONDS_MIN, CONFIRM_SECONDS_MAX);
         }
@@ -580,10 +481,8 @@ contract FeedRegistry is IFeedRegistry {
         emit FeedRegistryParameterChanged("confirmSeconds", previous, value);
     }
 
-    /// @notice Re-points the gate this registry reads the session from. **Only timelock (7 d).**
-    /// @dev `OracleGate` is itself pointer-upgradeable, so this pointer moves with it.
-    /// @param gate The new gate.
-    function setOracleGate(address gate) external onlyTimelock {
+    /// @inheritdoc IFeedRegistry
+    function setOracleGate(address gate) external override onlyTimelock {
         if (gate == address(0)) revert ZeroAddress();
         address previous = _oracleGate;
         _oracleGate = gate;

@@ -12,26 +12,6 @@ import {ConstituentConfig, GateSnapshot, GateState, PoolConfig, Session} from ".
 import {GatePriceMath} from "./GatePriceMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
-/// @title ISessionAwareFeedRegistry
-/// @notice The one read `FeedRegistry` adds on top of `IFeedRegistry`: the same answer, against a session the
-///         caller has already computed.
-/// @dev Declared locally rather than imported so the gate stays coupled to the *interface* it needs and not to a
-///      particular `FeedRegistry` implementation. {OracleGate} probes this first and falls back to
-///      `IFeedRegistry.latestAnswer` when a registry does not offer it, so an older or third-party layer-C
-///      implementation still works — it just pays for the session round trip.
-interface ISessionAwareFeedRegistry {
-    /// @notice The last accepted answer for `token`, judged fresh against `session`.
-    /// @param token The asset.
-    /// @param session The equity session to apply.
-    /// @return answerUsd8 The answer, 8 decimals.
-    /// @return updatedAt When the answer was published.
-    /// @return fresh Whether it is inside the session-scaled bound.
-    function latestAnswerIn(address token, Session session)
-        external
-        view
-        returns (uint256 answerUsd8, uint32 updatedAt, bool fresh);
-}
-
 /// @title OracleGate
 /// @notice Layers A-F of the oracle, liveness and freeze design. Pointer-upgradeable behind the 7-day timelock;
 ///         holds no funds, moves no token and has no power to stop a redemption.
@@ -129,11 +109,10 @@ contract OracleGate is IOracleGate {
     /// @notice The guardian Safe. Immutable, and its entire power is a disable-only expiring freeze.
     address public immutable guardian;
 
-    /// @notice The gate's `PriceLib` boundary, deployed by this contract's constructor.
-    /// @dev Immutable and pure, so there is nothing to govern and nothing to re-point. Every call into it is a
-    ///      bounded `try`: an AMPS price that falls outside the v4 tick range is "no fair tick", never a revert
-    ///      out of {snapshot}.
-    GatePriceMath public immutable priceMath;
+    /// @dev The gate's `PriceLib` boundary, deployed by this contract's constructor and read through
+    ///      {priceMath}. Held as the concrete type so the two bounded `try` call sites stay typed; exposed as an
+    ///      `address` because `IOracleGate` must not depend on an implementation contract.
+    GatePriceMath internal immutable _priceMath;
 
     /// @dev slot 0 `[0..31]`: the block number of the last layer-A stamp, truncated.
     uint32 internal _lastBlock;
@@ -232,7 +211,7 @@ contract OracleGate is IOracleGate {
         if (timelock_ == address(0) || guardian_ == address(0)) revert ZeroAddress();
         timelock = timelock_;
         guardian = guardian_;
-        priceMath = new GatePriceMath();
+        _priceMath = new GatePriceMath();
         _feedRegistry = feedRegistry_;
         _registry = registry_;
         _marketReference = marketReference_;
@@ -342,33 +321,24 @@ contract OracleGate is IOracleGate {
         return hrs >= type(uint16).max ? type(uint16).max : uint16(hrs);
     }
 
-    /// @notice Whether the local calendar day containing `timestamp` is marked closed in the holiday bitmap.
-    /// @param timestamp The instant to classify.
-    /// @return holiday Whether the day carries a set bit.
+    /// @inheritdoc IOracleGate
     function isHoliday(uint256 timestamp) external view returns (bool holiday) {
         uint256 offset = _utcOffsetAt(timestamp);
         if (timestamp < offset) return false;
         return _isHolidayDay((timestamp - offset) / SECONDS_PER_DAY);
     }
 
-    /// @notice The holiday bitmap recorded for one calendar year.
-    /// @param year The calendar year.
-    /// @return bitmap The 512-bit map; bit `d - 1` set means day-of-year `d` is closed.
+    /// @inheritdoc IOracleGate
     function holidayBitmap(uint16 year) external view returns (uint256[2] memory bitmap) {
         return _holidayBitmap[year];
     }
 
-    /// @notice The DST transition table, as parallel ascending arrays of UTC timestamps.
-    /// @return starts The window starts.
-    /// @return ends The window ends.
+    /// @inheritdoc IOracleGate
     function dstTable() external view returns (uint32[] memory starts, uint32[] memory ends) {
         return (_dstStarts, _dstEnds);
     }
 
-    /// @notice The UTC offset ET is behind UTC at `timestamp`, in seconds: 14,400 on daylight time, 18,000 on
-    ///         standard time.
-    /// @param timestamp The instant to classify.
-    /// @return offsetSeconds The offset.
+    /// @inheritdoc IOracleGate
     function utcOffsetAt(uint256 timestamp) external view returns (uint256 offsetSeconds) {
         return _utcOffsetAt(timestamp);
     }
@@ -392,9 +362,7 @@ contract OracleGate is IOracleGate {
         return snapshot(constituentId).state;
     }
 
-    /// @notice {state} addressed by pool.
-    /// @param poolId The pool.
-    /// @return gateState The state.
+    /// @inheritdoc IOracleGate
     function stateByPool(PoolId poolId) external view returns (GateState gateState) {
         return snapshotByPool(poolId).state;
     }
@@ -410,6 +378,10 @@ contract OracleGate is IOracleGate {
     /// @dev A stale feed and a closed session are deliberately *not* refusals: they widen the haircut instead,
     ///      which is the 24/7 bond decision. Only a corporate-action freeze, a guardian freeze and the divergence
     ///      breaker close a market.
+    /// @dev `constituentId == 0` is the protocol-wide `ENTRY`-class check, and reaches this through {snapshot}:
+    ///      {_poolOf} answers `bytes32(0)` for id 0, so {_snapshot} skips layers C, D and E entirely and the only
+    ///      refusal left is the guardian's protocol freeze. Nothing on the path can revert with
+    ///      `UnknownConstituent` — the gate never looks id 0 up in the registry.
     function isBondAllowed(uint16 constituentId) public view returns (bool allowed, uint16 hSessionBps_) {
         GateSnapshot memory gate = snapshot(constituentId);
         allowed = gate.state != GateState.SCHEDULED_FREEZE && gate.state != GateState.DIVERGED;
@@ -431,6 +403,9 @@ contract OracleGate is IOracleGate {
     }
 
     /// @inheritdoc IOracleGate
+    /// @dev `constituentId == 0` is valid: see {isBondAllowed}. The refusal it can give is `SCHEDULED_FREEZE`
+    ///      under a guardian protocol freeze, and the pool it blames is `bytes32(0)` because an entry-class market
+    ///      has no spoke.
     function checkBond(uint16 constituentId) external view returns (uint16 hSessionBps_) {
         GateSnapshot memory gate = snapshot(constituentId);
         if (gate.state == GateState.SCHEDULED_FREEZE || gate.state == GateState.DIVERGED) {
@@ -473,8 +448,7 @@ contract OracleGate is IOracleGate {
         return _corporateActionWindow;
     }
 
-    /// @notice Layer F: how far the hub TWAP and `AMPS/WETH x ETH/USD` may disagree before `REF_DIVERGED`.
-    /// @return value The tolerance in bps. 500 at launch.
+    /// @inheritdoc IOracleGate
     function refDivergenceBps() external view returns (uint16 value) {
         return _refDivergenceBps;
     }
@@ -497,29 +471,29 @@ contract OracleGate is IOracleGate {
         return _constituentFreezeUntil[constituentId];
     }
 
-    /// @notice Layer E: when the deviation first left the band for a pool, or 0.
-    /// @param poolId The pool.
-    /// @return since The arming timestamp.
+    /// @inheritdoc IOracleGate
     function divergedSince(PoolId poolId) external view returns (uint32 since) {
         return _divergedSince[poolId];
     }
 
-    /// @notice The layer-C registry.
-    /// @return registryAddress The `FeedRegistry` address.
+    /// @inheritdoc IOracleGate
     function feedRegistry() external view returns (address registryAddress) {
         return _feedRegistry;
     }
 
-    /// @notice The pool and constituent registry.
-    /// @return registryAddress The `PoolRegistry` address.
+    /// @inheritdoc IOracleGate
     function registry() external view returns (address registryAddress) {
         return _registry;
     }
 
-    /// @notice The tick source layers E and F read.
-    /// @return referenceAddress The `IMarketReference` implementation.
+    /// @inheritdoc IOracleGate
     function marketReference() external view returns (address referenceAddress) {
         return _marketReference;
+    }
+
+    /// @inheritdoc IOracleGate
+    function priceMath() external view returns (address priceMathAddress) {
+        return address(_priceMath);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -566,14 +540,12 @@ contract OracleGate is IOracleGate {
         return Constants.GUARDIAN_FREEZE_MAX_SECONDS;
     }
 
-    /// @notice Hard floor of `refDivergenceBps`. 100.
-    /// @return value The bound.
+    /// @inheritdoc IOracleGate
     function REF_DIVERGENCE_BPS_MIN() external pure returns (uint16 value) {
         return Constants.REF_DIVERGENCE_BPS_MIN;
     }
 
-    /// @notice Hard ceiling of `refDivergenceBps`. 2,000.
-    /// @return value The bound.
+    /// @inheritdoc IOracleGate
     function REF_DIVERGENCE_BPS_MAX() external pure returns (uint16 value) {
         return Constants.REF_DIVERGENCE_BPS_MAX;
     }
@@ -589,19 +561,15 @@ contract OracleGate is IOracleGate {
         _stamp();
     }
 
-    /// @notice Stamps layer A and re-evaluates the sustained-divergence timer for one pool. **Permissionless and
-    ///         unpaid.**
-    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation returns.
-    ///      The effective `DIVERGED` verdict always re-checks the *current* deviation as well, so an armed timer
+    /// @inheritdoc IOracleGate
+    /// @dev The effective `DIVERGED` verdict always re-checks the *current* deviation as well, so an armed timer
     ///      that nobody clears cannot hold a pool closed by itself.
-    /// @param poolId The pool to re-evaluate.
     function pokePool(PoolId poolId) public {
         _stamp();
         _updateDivergence(poolId);
     }
 
-    /// @notice {pokePool} for several pools in one transaction.
-    /// @param poolIds The pools to re-evaluate.
+    /// @inheritdoc IOracleGate
     function pokePools(PoolId[] calldata poolIds) external {
         _stamp();
         for (uint256 i = 0; i < poolIds.length; ++i) {
@@ -609,12 +577,7 @@ contract OracleGate is IOracleGate {
         }
     }
 
-    /// @notice Stamps layer A, re-evaluates one constituent's pool and records the layer-D observation.
-    ///         **Permissionless and unpaid.**
-    /// @dev The `CorporateActionFreeze` event is an *observation record*, not a state change: layer D holds no
-    ///      storage, so this is the only place an indexer can see both edges of a corporate-action freeze without
-    ///      polling.
-    /// @param constituentId The constituent to re-evaluate.
+    /// @inheritdoc IOracleGate
     function pokeConstituent(uint16 constituentId) external {
         _stamp();
         PoolId poolId = _poolOf(constituentId);
@@ -714,8 +677,7 @@ contract OracleGate is IOracleGate {
         emit GateParameterChanged("corporateActionWindow", previous, value);
     }
 
-    /// @notice Sets the layer-F tolerance. **Only timelock (48 h).**
-    /// @param value The new value, inside `[REF_DIVERGENCE_BPS_MIN, REF_DIVERGENCE_BPS_MAX]`.
+    /// @inheritdoc IOracleGate
     function setRefDivergenceBps(uint16 value) external onlyTimelock {
         if (value < Constants.REF_DIVERGENCE_BPS_MIN || value > Constants.REF_DIVERGENCE_BPS_MAX) {
             revert OutOfBand(
@@ -776,8 +738,7 @@ contract OracleGate is IOracleGate {
         emit GateParameterChanged("dstTable", 0, starts.length);
     }
 
-    /// @notice Re-points layer C. **Only timelock (7 d).**
-    /// @param value The new `FeedRegistry`.
+    /// @inheritdoc IOracleGate
     function setFeedRegistry(address value) external onlyTimelock {
         if (value == address(0)) revert ZeroAddress();
         address previous = _feedRegistry;
@@ -785,8 +746,7 @@ contract OracleGate is IOracleGate {
         emit GateParameterChanged("feedRegistry", uint256(uint160(previous)), uint256(uint160(value)));
     }
 
-    /// @notice Re-points the pool and constituent registry. **Only timelock (7 d).**
-    /// @param value The new `PoolRegistry`.
+    /// @inheritdoc IOracleGate
     function setRegistry(address value) external onlyTimelock {
         if (value == address(0)) revert ZeroAddress();
         address previous = _registry;
@@ -794,9 +754,7 @@ contract OracleGate is IOracleGate {
         emit GateParameterChanged("registry", uint256(uint160(previous)), uint256(uint160(value)));
     }
 
-    /// @notice Re-points the tick source layers E and F read. **Only timelock (7 d).**
-    /// @dev This is the pointer that moves from the Phase 2 mock to `AmpsHook` in Phase 3.
-    /// @param value The new `IMarketReference`.
+    /// @inheritdoc IOracleGate
     function setMarketReference(address value) external onlyTimelock {
         if (value == address(0)) revert ZeroAddress();
         address previous = _marketReference;
@@ -995,6 +953,10 @@ contract OracleGate is IOracleGate {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Layer C, through a bounded call so a mis-pointed registry degrades rather than reverts.
+    /// @dev `latestAnswerIn` first, `latestAnswer` second. Handing the registry the session this contract has
+    ///      already computed keeps `OracleGate -> FeedRegistry -> OracleGate` off every path the hook pays for;
+    ///      the fallback exists so that a layer-C pointer which answers the older read but not the session-scoped
+    ///      one still degrades to a working answer rather than to "no answer at all".
     function _feedAnswer(address token, Session session)
         internal
         view
@@ -1002,9 +964,7 @@ contract OracleGate is IOracleGate {
     {
         address feeds = _feedRegistry;
         if (token == address(0) || feeds == address(0) || feeds.code.length == 0) return (0, 0, false);
-        // Hand the registry the session that has already been computed here, so layer C never calls back into
-        // this contract's calendar on a path the hook pays for.
-        try ISessionAwareFeedRegistry(feeds).latestAnswerIn{gas: PROBE_GAS * 4}(token, session) returns (
+        try IFeedRegistry(feeds).latestAnswerIn{gas: PROBE_GAS * 4}(token, session) returns (
             uint256 answerUsd8_, uint32 updatedAt_, bool fresh_
         ) {
             return (answerUsd8_, updatedAt_, fresh_);
@@ -1067,7 +1027,9 @@ contract OracleGate is IOracleGate {
         if (counterUsd8 == 0) return (false, 0, observed, 0);
 
         int24 fair;
-        try priceMath.fairTick{gas: PROBE_GAS}(ampsUsd18, counterUsd8, pool.counterDecimals, pool.tickSpacing) returns (
+        try _priceMath.fairTick{gas: PROBE_GAS}(
+            ampsUsd18, counterUsd8, pool.counterDecimals, pool.tickSpacing
+        ) returns (
             int24 fair_
         ) {
             fair = fair_;
@@ -1109,7 +1071,7 @@ contract OracleGate is IOracleGate {
         (uint256 counterUsd8,,) = _feedAnswer(pool.counter, session);
         if (counterUsd8 == 0) return (false, 0);
 
-        try priceMath.ampsPriceUsd18{gas: PROBE_GAS}(meanTick, counterUsd8, pool.counterDecimals) returns (
+        try _priceMath.ampsPriceUsd18{gas: PROBE_GAS}(meanTick, counterUsd8, pool.counterDecimals) returns (
             uint256 price18
         ) {
             return (price18 != 0, price18);

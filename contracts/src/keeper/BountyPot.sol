@@ -48,56 +48,39 @@ contract BountyPot is IBountyPot {
     using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------------------------------------------------
-    // Errors and events (contract-local: no other Amplestocks contract can throw or emit them)
-    // -----------------------------------------------------------------------------------------------------------
-
-    /// @notice The pot token reports more than 18 decimals, so 18-decimal USD amounts could not be scaled down to
-    ///         its raw units without a loss the accounting does not model.
-    /// @param decimals The token's decimals.
-    error UnsupportedDecimals(uint8 decimals);
-
-    /// @notice Emitted when the vault role is handed on during a migration.
-    /// @param previousVault The old vault.
-    /// @param newVault The new vault.
-    event VaultChanged(address indexed previousVault, address indexed newVault);
-
-    // -----------------------------------------------------------------------------------------------------------
     // Hard bands
     // -----------------------------------------------------------------------------------------------------------
     //
-    // `Constants` carries the launch values for the keeper (`KEEPER_TIP_USD18_DEFAULT`, `KEEPER_CHIP_BPS_DEFAULT`,
-    // `KEEPER_CHOST_USD18_DEFAULT`, `KEEPER_GAS_CAP_MULTIPLE`) but no bands, so the bands live here, in the
-    // consuming contract, exactly as the plan requires of every settable parameter. They belong in `Constants`
-    // next time that file is opened; the values below are the ones this contract enforces today.
+    // Each of these is `Constants`'s band, restated as a getter so the dApp and the governance drills can read the
+    // bound off the contract that enforces it rather than off a literal (state model §9). `Constants` is the one
+    // declaration; nothing below is a second one.
 
     /// @notice Hard ceiling of `tipUsd18`. $5 is a hundred times the launch tip and already far past the point
     ///         where a flat tip is the dominant term for a $5k book.
-    uint256 public constant TIP_USD18_MAX = 5e18;
+    uint256 public constant TIP_USD18_MAX = Constants.TIP_USD18_MAX;
 
     /// @notice Hard ceiling of `chipBps`. 10% of realised work value; there is no floor beyond zero.
-    uint16 public constant CHIP_BPS_MAX = 1000;
+    uint16 public constant CHIP_BPS_MAX = Constants.CHIP_BPS_MAX;
 
     /// @notice Hard ceiling of `chostUsd18`. A dust guard above $1,000 of work value would silence every job the
     ///         launch book can generate, which is a migration decision, not a parameter change.
-    uint256 public constant CHOST_USD18_MAX = 1000e18;
+    uint256 public constant CHOST_USD18_MAX = Constants.CHOST_USD18_MAX;
 
     /// @notice Hard floor of `gasCapMultiple`. Zero would mean no job is ever paid, whatever the other parameters
     ///         say, which is what a zero `dailyCeilingUsd18` is for.
-    uint16 public constant GAS_CAP_MULTIPLE_MIN = 1;
+    uint16 public constant GAS_CAP_MULTIPLE_MIN = Constants.GAS_CAP_MULTIPLE_MIN;
 
     /// @notice Hard ceiling of `gasCapMultiple`. Beyond 10x the observed gas cost the cap stops bounding a gas
     ///         spike at all.
-    uint16 public constant GAS_CAP_MULTIPLE_MAX = 10;
+    uint16 public constant GAS_CAP_MULTIPLE_MAX = Constants.GAS_CAP_MULTIPLE_MAX;
 
-    /// @notice Hard ceiling of `dailyCeilingUsd18`. $100k a day is twenty times the launch seed; there is no
-    ///         floor, because setting the ceiling to zero is the governance path for pausing paid keeping without
-    ///         pausing the jobs themselves.
-    uint256 public constant DAILY_CEILING_USD18_MAX = 100_000e18;
+    /// @notice Hard ceiling of `dailyCeilingUsd18`. $100k a day is four thousand times the launch ceiling; there is
+    ///         no floor, because setting the ceiling to zero is the governance path for pausing paid keeping
+    ///         without pausing the jobs themselves.
+    uint256 public constant DAILY_CEILING_USD18_MAX = Constants.DAILY_CEILING_USD18_MAX;
 
-    /// @notice Launch `dailyCeilingUsd18`: $25 a day, sized to the $5k launch. At the launch tip and chip that is
-    ///         roughly two hundred paid jobs a day with headroom, and it is governed upward with TVL alongside the
-    ///         tip and the dust guard.
-    uint256 public constant DAILY_CEILING_USD18_DEFAULT = 25e18;
+    /// @notice Launch `dailyCeilingUsd18`: $25 a day, sized to the $5k launch.
+    uint256 public constant DAILY_CEILING_USD18_DEFAULT = Constants.DAILY_CEILING_USD18_DEFAULT;
 
     // -----------------------------------------------------------------------------------------------------------
     // Immutables
@@ -106,10 +89,8 @@ contract BountyPot is IBountyPot {
     /// @inheritdoc IBountyPot
     address public immutable override token;
 
-    /// @notice The 48-hour timelock: the only address that may {sweep} or move a parameter.
-    /// @dev Immutable, for the same reason as in `AmpsStaking`: there is no governance path that can re-point the
-    ///      parameter setters at a new owner, only a migration.
-    address public immutable timelock;
+    /// @inheritdoc IBountyPot
+    address public immutable override timelock;
 
     /// @dev `10 ** (18 - token.decimals())`: the divisor from 18-decimal USD to the token's raw units. Read once,
     ///      at construction, so a 6-decimal USDG and an 18-decimal test token both work without a magic number.
@@ -165,8 +146,7 @@ contract BountyPot is IBountyPot {
     /// @param token_ The pot's token: USDG on chain 4663, 6 decimals.
     /// @param vault_ The initial `AmpsVault`: the sole caller of {pay} and {setVault}.
     /// @param timelock_ The 48-hour timelock, the sole caller of {sweep} and of every `set*`.
-    /// @dev Every parameter starts at its launch value from `Constants` (and {DAILY_CEILING_USD18_DEFAULT}, which
-    ///      `Constants` does not carry yet), each inside its band by construction.
+    /// @dev Every parameter starts at its launch value from `Constants`, each inside its band by construction.
     constructor(address token_, address vault_, address timelock_) {
         if (token_ == address(0) || vault_ == address(0) || timelock_ == address(0)) revert ZeroAddress();
 
@@ -180,7 +160,7 @@ contract BountyPot is IBountyPot {
         vault = vault_;
         tipUsd18 = Constants.KEEPER_TIP_USD18_DEFAULT;
         chostUsd18 = Constants.KEEPER_CHOST_USD18_DEFAULT;
-        dailyCeilingUsd18 = DAILY_CEILING_USD18_DEFAULT;
+        dailyCeilingUsd18 = Constants.DAILY_CEILING_USD18_DEFAULT;
         chipBps = Constants.KEEPER_CHIP_BPS_DEFAULT;
         gasCapMultiple = Constants.KEEPER_GAS_CAP_MULTIPLE;
 
@@ -213,32 +193,24 @@ contract BountyPot is IBountyPot {
         return _quote(workValueUsd18, gasCostUsd18);
     }
 
-    /// @notice What the daily ceiling still allows to be paid inside the open window, 18-decimal USD.
-    /// @dev Not part of {IBountyPot}; the keeper reads it to decide whether a job is worth submitting at all, and
-    ///      the dashboards render it as "budget left today".
-    /// @return value `dailyCeilingUsd18 - spentLast24h()`, floored at zero.
-    function budgetLeftUsd18() public view returns (uint256 value) {
+    /// @inheritdoc IBountyPot
+    function budgetLeftUsd18() public view override returns (uint256 value) {
         return Math.saturatingSub(dailyCeilingUsd18, spentLast24h());
     }
 
-    /// @notice The same figure as {budgetLeftUsd18}, in the token's raw units and floored to a whole unit.
-    /// @dev Not part of {IBountyPot}. This is the amount {pay} could still transfer today if the pot held it.
-    /// @return valueRaw The remaining budget in raw token units.
-    function budgetLeftRaw() external view returns (uint256 valueRaw) {
+    /// @inheritdoc IBountyPot
+    /// @dev This is the amount {pay} could still transfer today if the pot held it.
+    function budgetLeftRaw() external view override returns (uint256 valueRaw) {
         return budgetLeftUsd18() / _usdScale;
     }
 
-    /// @notice When the open rolling window started, or zero before the first payment.
-    /// @dev Not part of {IBountyPot}; the indexer uses it to align its own ceiling accounting with the chain.
-    /// @return timestamp The window start.
-    function windowStart() external view returns (uint32 timestamp) {
+    /// @inheritdoc IBountyPot
+    function windowStart() external view override returns (uint32 timestamp) {
         return _windowStart;
     }
 
-    /// @notice The divisor from 18-decimal USD to the token's raw units, `10 ** (18 - token.decimals())`.
-    /// @dev Not part of {IBountyPot}; exposed so a keeper can reproduce {quote} off-chain exactly.
-    /// @return scale The divisor.
-    function usdScale() external view returns (uint256 scale) {
+    /// @inheritdoc IBountyPot
+    function usdScale() external view override returns (uint256 scale) {
         return _usdScale;
     }
 
@@ -288,12 +260,8 @@ contract BountyPot is IBountyPot {
         emit PotSwept(to, amountRaw);
     }
 
-    /// @notice Hands the vault role on. **Only vault**, so a migration moves it atomically in the same transaction
-    ///         that moves the liquidity, exactly as `Amps.setVault` and `AmpsStaking.setVault` do.
-    /// @dev Not part of {IBountyPot}, which declares the `vault()` read but no setter; the migration surface in
-    ///      `docs/phase2-state-model.md` §1.6 requires one ("reassigned only by migration").
-    /// @param newVault The new vault.
-    function setVault(address newVault) external onlyVault {
+    /// @inheritdoc IBountyPot
+    function setVault(address newVault) external override onlyVault {
         if (newVault == address(0)) revert ZeroAddress();
 
         address previousVault = vault;

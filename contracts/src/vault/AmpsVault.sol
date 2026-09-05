@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmps} from "../interfaces/IAmps.sol";
 import {IAmpsBonds} from "../interfaces/IAmpsBonds.sol";
 import {IAmpsStaking} from "../interfaces/IAmpsStaking.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
+import {IBountyPot} from "../interfaces/IBountyPot.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {Constants} from "../types/Constants.sol";
@@ -34,29 +36,6 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-
-/// @notice The one-function surface `Amps`, `AmpsBonds`, `AmpsStaking` and `BountyPot` all expose to the vault, so
-///         that `emergencyMigrate` can hand the vault role on to the standby atomically.
-/// @dev    `IBountyPot` does not declare `setVault` today; see the Phase 2 report. The pointer is reached through
-///         this local interface so that the vault's ABI does not depend on that gap being closed.
-interface IVaultPointer {
-    /// @notice Hands the vault role to `newVault`. Callable only by the current vault.
-    /// @param newVault The new vault.
-    function setVault(address newVault) external;
-}
-
-/// @notice The AMPS token surface the vault uses: a plain ERC-20 plus the vault-only mint, burn and role handover.
-interface IAmpsToken is IERC20, IVaultPointer {
-    /// @notice Mints `amount` to `to`. Vault only.
-    /// @param to The recipient.
-    /// @param amount The AMPS wei to mint.
-    function mint(address to, uint256 amount) external;
-
-    /// @notice Burns `amount` from `from`. Vault only; no allowance is consumed.
-    /// @param from The account to burn from.
-    /// @param amount The AMPS wei to burn.
-    function burn(address from, uint256 amount) external;
-}
 
 /// @title AmpsVault
 /// @notice The Phase 2 custody boundary, NAV authority, reference price, redemption floor and sole
@@ -102,26 +81,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
-
-    // -------------------------------------------------------------------------------------------------------------
-    // Errors declared by this contract
-    // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice A Phase 3 entry point was called. `place`, `compound`, `rollout` and `deployBonded` are part of the
-    ///         final ABI but have no implementation until `AmpsHook` and the ladder machinery exist.
-    error Phase3NotImplemented();
-
-    /// @notice `unlockCallback` was entered without the vault having set an action discriminator, i.e. the unlock
-    ///         did not originate here.
-    error UnknownUnlockAction();
-
-    /// @notice A pointer name handed to {setPolicyPointer} is not one of the vault's pointer slots.
-    /// @param slot The rejected slot name.
-    error UnknownPointerSlot(bytes32 slot);
-
-    /// @notice A value that must fit a packed `uint128` field did not.
-    /// @param value The offending value.
-    error ValueTooLarge(uint256 value);
 
     // -------------------------------------------------------------------------------------------------------------
     // Transient slots (EIP-1153), `keccak256("amplestocks.vault.<name>")`, hard-coded (section 1.1)
@@ -524,7 +483,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         view
         returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned)
     {
-        Redemption memory result = _redemption(shares, IAmpsToken(_AMPS).totalSupply());
+        Redemption memory result = _redemption(shares, IAmps(_AMPS).totalSupply());
         return (result.tokens, result.amounts, result.inventoryBurned);
     }
 
@@ -766,21 +725,21 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (to == address(0)) revert ZeroAddress();
 
         // `T` is read once, before the burn, so a redemption cannot inflate its own share.
-        uint256 supply = IAmpsToken(_AMPS).totalSupply();
+        uint256 supply = IAmps(_AMPS).totalSupply();
 
         Redemption memory result = _redemption(shares, supply);
         tokens = result.tokens;
         amounts = result.amounts;
 
         // Effects before interactions: the redeemer's shares are gone before a single asset moves.
-        IAmpsToken(_AMPS).burn(msg.sender, shares);
+        IAmps(_AMPS).burn(msg.sender, shares);
 
         _setUnlockAction(ACTION_PAYOUT);
         IPoolManager(_POOL_MANAGER).unlock(abi.encode(tokens, result.fromClaims, result.fromIdle, to));
         _setUnlockAction(0);
 
         if (result.inventoryBurned != 0) {
-            IAmpsToken(_AMPS).burn(address(this), result.inventoryBurned);
+            IAmps(_AMPS).burn(address(this), result.inventoryBurned);
             emit Burn(result.inventoryBurned, bytes32("redeemInventory"));
         }
 
@@ -855,7 +814,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (to != bonds_) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
-        IAmpsToken(_AMPS).mint(to, amount);
+        IAmps(_AMPS).mint(to, amount);
         emit VestingMinted(to, amount);
         _sweepClean();
     }
@@ -877,8 +836,8 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (params.seedTokens.length != params.seedAmounts.length) revert LengthMismatch();
         if (_registry == address(0)) revert ZeroAddress();
 
-        IAmpsToken(_AMPS).mint(params.teamVestingWallet, params.teamShares);
-        IAmpsToken(_AMPS).mint(address(this), params.polShares);
+        IAmps(_AMPS).mint(params.teamVestingWallet, params.teamShares);
+        IAmps(_AMPS).mint(address(this), params.polShares);
 
         _registerRegistryAssets();
 
@@ -961,14 +920,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _phase3();
     }
 
-    /// @notice Moves a retired constituent's unfilled bid inventory out of its pool and into idle claims, where it
-    ///         is valued in `A` and paid out by redemption. **Only registry**, from `withdrawRetiredBids` under the
-    ///         7-day timelock.
-    /// @dev **Phase 3.** Bids are ladder positions and no ladder exists yet, so this reverts with
-    ///      {Phase3NotImplemented} after the caller and gate checks. Declared now so `PoolRegistry`'s retirement
-    ///      path can be written against the final ABI.
-    /// @param constituentId The retired constituent.
-    /// @return amountMoved The raw amount moved into claims.
+    /// @inheritdoc IAmpsVault
+    /// @dev **Phase 3.** See {place}. The caller check comes before the gate check here because the registry is
+    ///      the only legitimate caller and a wrong caller is not a gate refusal.
     function withdrawRetiredBids(uint16 constituentId) external locked returns (uint256 amountMoved) {
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
         _requireHealthy();
@@ -1195,10 +1149,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (ampsIdle != 0) IERC20(_AMPS).safeTransfer(standby, ampsIdle);
 
         // The four `onlyVault` role handovers, in the same transaction. Nobody else can perform any of them.
-        IAmpsToken(_AMPS).setVault(standby);
+        IAmps(_AMPS).setVault(standby);
         if (_bonds != address(0)) IAmpsBonds(_bonds).setVault(standby);
         if (_staking != address(0)) IAmpsStaking(_staking).setVault(standby);
-        if (_bountyPot != address(0)) IVaultPointer(_bountyPot).setVault(standby);
+        if (_bountyPot != address(0)) IBountyPot(_bountyPot).setVault(standby);
 
         // The relaxed R1 bound, enforced only when the standby can actually be priced. A dead feed must never stand
         // between the guardian and an evacuation: in Phase 2 there are no positions to bleed, every claim moves one
@@ -1418,7 +1372,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      `Amps.totalSupply()` and nothing else (I6), and `VIRTUAL_SHARES` makes it non-zero in every reachable
     ///      state (I22).
     function _navPerShare(uint256 assetsUsd18) private view returns (uint256) {
-        uint256 supply = IAmpsToken(_AMPS).totalSupply();
+        uint256 supply = IAmps(_AMPS).totalSupply();
         return FullMath.mulDiv(assetsUsd18 + 1, Constants.WAD, supply + Constants.VIRTUAL_SHARES);
     }
 
@@ -1426,7 +1380,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function _checkpoint() private returns (Checkpoint memory snapshot) {
         VaultNavLib.Sources memory src = _sources();
         uint256 assetsUsd18 = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
-        uint256 supply = IAmpsToken(_AMPS).totalSupply();
+        uint256 supply = IAmps(_AMPS).totalSupply();
         // The one formula, from the one place: {previewNavPerShareX18} and the checkpoint can never disagree.
         uint256 nav = _navPerShare(assetsUsd18);
 

@@ -204,7 +204,9 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsVault` | `emergencyMigrate` | guardian, predicate-gated | none |
 | `AmpsBonds` | `bond` | **P** | — |
 | `AmpsBonds` | `claim`, `claimAll` | **P, U** (position owner) | — |
-| `AmpsBonds` | `addCollateral`, `removeCollateral`, `setPolicy` | timelock | 7 d |
+| `AmpsBonds` | `removeCollateral`, `setPolicy` | timelock | 7 d |
+| `AmpsBonds` | `addCollateral` | timelock, **or `PoolRegistry`** | 7 d |
+| `AmpsBonds` | `setMarketOpen` | timelock, **or `PoolRegistry`** | 48 h |
 | `AmpsBonds` | every other `set*` (the `h_session` table lives in `OracleGate`) | timelock | 48 h |
 | `AmpsBonds` | `setVault` | vault | — |
 | `AmpsStaking` | `deposit`/`mint`/`withdraw`/`redeem`, `accrue` | **P** | — |
@@ -212,7 +214,7 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsStaking` | `setRewardStreamSeconds` | timelock | 48 h |
 | `PoolRegistry` | every read | **P** | — |
 | `PoolRegistry` | `addConstituent`, `retire`, `reinstate`, `reconfigure`, `setIndexWeights`, `registerEntryPool`, `withdrawRetiredBids` | timelock | 7 d |
-| `OracleGate` | `poke` | **P** (unpaid) | — |
+| `OracleGate` | `poke`, `pokePool`, `pokePools`, `pokeConstituent` | **P** (unpaid) | — |
 | `OracleGate` | `freeze*` (disable-only, auto-expiring) / `unfreeze*` | guardian | none |
 | `OracleGate` | every `set*`, `unfreeze*` | timelock | 48 h |
 | `FeedRegistry` | `setFeed` / `configureFeed`, `setFreshnessMultiplier` | timelock | 7 d / 48 h |
@@ -225,6 +227,32 @@ slot 4   address vault                                   reassigned only by migr
 The guardian's entire power is: cancel a timelock operation, freeze one constituent or the protocol (disable-only,
 expiring within 7 days), and trigger `emergencyMigrate` when the on-chain denylist predicate holds. It can move no
 funds and can block neither `redeemProRata` nor `claim`.
+
+### 2.1 Why `PoolRegistry` is an accepted caller on `AmpsBonds`
+
+`AmpsBonds.addCollateral` and `setMarketOpen` accept two callers: the timelock, and the registry. The registry is not
+a second governance root — every one of its own mutators is timelock-only behind the 7-day delay — so the delay and
+the proposal review are identical either way. What the second caller buys is **atomicity**: `addConstituent` opens the
+new name's bond market inside its own operation, and `retireConstituent` closes it inside its own, so "a new
+constituent has a bond market" and "a retired constituent has no open bond market" (I37) hold at every block rather
+than only after a second proposal lands. The alternative leaves a window in which the index and the bond board
+disagree, and a window is exactly what an issuer halt exploits.
+
+The shell reaches the registry through its own set-once `registry` pointer, and the registry reaches the shell through
+`IAmpsVault.bonds()` — the vault is the single system of record for every protocol pointer, and §1.4 gives the
+registry no slot for a second one. `test/unit/RegistryBondsWiring.t.sol` is the one place both real contracts are
+deployed together, because every other suite mocks one side of that boundary and therefore answers the access-control
+question for itself.
+
+### 2.2 `checkBond(0)` and `isBondAllowed(0)`
+
+`constituentId == 0` is a **valid, protocol-wide bond check**, not an unknown constituent. WETH and USDG are bond
+collateral without being index constituents, so `AmpsBonds` hands the gate id 0 for every `ENTRY`-class market. On
+that path the gate resolves no pool (`poolIdOf(0)` is `bytes32(0)`), reads no feed, runs no corporate-action probe
+and measures no divergence: layers C, D and E have nothing to say about an id that names no token. What is left is
+the guardian's protocol-wide freeze and the session haircut table, which is exactly what an entry market should
+price. It must never revert with `UnknownConstituent` — the gate never looks id 0 up in the registry at all, so a
+hostile, mis-pointed or absent registry cannot close an entry market either.
 
 ## 3. Call graphs
 
@@ -361,6 +389,16 @@ Every direction favours the protocol, which is what makes I27 (`NAV/share after 
 rather than up-to-dust. `amountIn18` is the raw deposit normalised to 18 decimals, so USDG's 6 decimals are scaled
 up once, in the shell, before the policy sees anything.
 
+`w_current` is `IPoolRegistry.currentWeightBps(constituentId)`, read through a bounded `try` whose every failure —
+a revert, an out-of-range answer, a registry deployed before the view existed — prices `deficit == 0`. **Phase 2's
+registry answers the target weight**, so the deficit is exactly zero on every market: the realised weight is the
+vault's valuation of that spoke's position divided by the whole index, and Phase 2 ships `ZeroPositionValuer`, so
+there is no position to value and any other answer would be invented. Zero is also the protocol-favourable reading —
+a smaller deficit is a smaller discount and less AMPS issued for the same collateral — so an input that is unknowable
+in Phase 2 cannot dilute anyone. Phase 3 sources the numerator from the vault's valuation with no ABI change and no
+new bond bytecode. A registry that cannot answer must never be able to close a bond market, which is why the read is
+a bounded probe and not a plain call.
+
 `qFloor` is computed from the **last Chainlink answer**, never from the pool: that caps what TWAP manipulation can
 buy (the best a spoke-dumper can do is remove their own discount) and bounds weekend-gap exposure to `hSessionBps`
 (0 / 50 / 150 / 300 bp) on the bonded amount, which is why markets stay open 24/7 through stale feeds and closed
@@ -383,14 +421,44 @@ Exactly two external state-changing functions are exempt from `_requireHealthy`:
 `guardian`, `standbyVault`, a freeze timestamp, a pause bool, `feedRegistry`, or any price. Both still take the
 transient reentrancy lock — a lock nobody else can hold, released in the same transaction, is not a gate.
 
+### 7.1 The vault has two gate policies, not one
+
+`AmpsVault` reads the gate through one helper with two policies, and the difference is load-bearing:
+
+| Policy | Taken by | Refuses | Passes |
+|---|---|---|---|
+| `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
+
+The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
+`h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
+than the design* rather than safer: it would shut every bond market every weekend. It mirrors `IOracleGate.checkBond`
+exactly, which makes the vault defence in depth behind the shell — a buggy or replaced `AmpsBonds` still cannot
+deposit or mint through a market the gate has closed — rather than a second, disagreeing gate.
+
+Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
+
+* **`emergencyMigrate` is not `_requireHealthy`-gated.** It is gated by the on-chain denylist predicate, which is
+  strictly narrower. The incident it exists for — an issuer denylisting the vault while pausing its oracle — is
+  precisely a state in which `_requireHealthy` refuses, so gating it would brick the evacuation path of an immutable
+  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`).
+* **A gate pointer that *reverts* is read as absent, not as a refusal.** The gate is the one pointer that can refuse
+  every governance call; if a broken one refused, nobody could call `setPolicyPointer` to replace it and a contract
+  holding no funds would have bricked the protocol. Failing open grants an attacker nothing they would not already
+  have with a `GREEN` gate.
+
 **How the I14 enumeration test verifies it** (`test/unit/GuardSymmetry.t.sol`):
 
-1. *Enumerate.* The test holds a `bytes4[] EXTERNAL_MUTATING` per contract plus an expected count; a CI step reads
-   `out-ifaces/<Contract>.sol/<Contract>.json` and compares the ABI's non-`view`/non-`pure` selectors against that
-   list, so adding a function without classifying it fails CI. (`ffi` is off and `fs_permissions` does not cover
-   `out-*`, so this comparison lives in the CI script, not in Solidity.)
+1. *Enumerate.* The test holds one classification entry per external mutating selector of `AmpsVault` (the
+   `_buildSelectorTable` list, three buckets: `MANAGEMENT`, `BONDS`, `EXEMPT`) and of `AmpsBonds` (the
+   `selector-gate:AmpsBonds` block, three buckets: gated, exempt, governed), plus an expected count for each. The CI
+   step `scripts/selector-gate.py` reads `out/<Contract>.sol/<Contract>.json`, lists the ABI's non-`view`/non-`pure`
+   selectors and fails on any name missing from those tables, so adding a function without deciding how it is
+   guarded cannot merge. (`ffi` is off and `fs_permissions` does not cover `out*`, so this comparison lives in the
+   CI script, not in Solidity.)
 2. *Assert refusal.* With the gate forced to each of `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG`,
-   every listed selector except the two exemptions must revert with `GateNotHealthy` or `ConstituentFrozen`.
+   every management-gated selector must revert with `GateNotHealthy` or `ConstituentFrozen`, and the two
+   bond-gated ones must refuse under `DIVERGED` and `SCHEDULED_FREEZE` and succeed under the other two.
 3. *Assert the exemptions succeed.* With every feed reverting, the watchdog tripped, the guardian freeze active and
    the timelock replaced by a contract that reverts on any call, `redeemProRata` and `claim` must succeed, and the
    redemption must pay exactly `(1 - redeemFeeBps/BPS) * shares / T` of every non-AMPS balance (I23).
@@ -429,3 +497,60 @@ transient reentrancy lock — a lock nobody else can hold, released in the same 
   short string, and reads its bound from `Constants`. Do not restate a bound as a literal.
 * Every external function asserts `sweepClean` at exit: the ERC-20 balance of every registered asset on the vault,
   the hook and `AmpsBonds` must be zero.
+
+## 10. How Phase 2 actually builds: libraries, lenses and per-path compilation
+
+Three facts about the build are not visible from the source alone and every deployment script depends on all three.
+
+### 10.1 `VaultNavLib` is a **linked** library, not an inlined one
+
+`AmpsVault` implements the whole of `IAmpsVault` and does not fit EIP-170 with the read side inlined: 45,818 B as
+one contract under the project-wide `optimizer_runs = 1_000_000`, and still 26,509 B at `runs = 1`. The read side —
+`A`, `P_mkt`, the reference overrides, the inventory disclosure and the migration predicate — therefore lives in
+`src/vault/VaultNavLib.sol`, which has `public`/`external` functions and is consequently a **deployed** library
+reached by `DELEGATECALL`, not an internal one folded into the caller.
+
+What that means in practice:
+
+* **Deploy scripts must deploy `VaultNavLib` first and link `AmpsVault` against it.** An unlinked `AmpsVault`
+  artefact carries `__$...$__` placeholders in its bytecode and cannot be deployed. `forge script` links
+  automatically from the artefact's link references; a raw `create` from bytecode does not, and will deploy a
+  contract whose every NAV read reverts.
+* **The library address is fixed at link time and is not governable.** There is no pointer to re-point and no
+  storage in the library, so it is part of `AmpsVault` for every governance and audit purpose: a change to
+  `VaultNavLib` is a change to the vault, and a vault migration.
+* **Splitting the reads out, not the writes, is deliberate.** `redeemProRata` stays entirely inside `AmpsVault` and
+  makes no `DELEGATECALL` at all, which is what keeps §7's structural argument true: the ungated path cannot reach
+  a gate, a feed or a price even through a library.
+
+### 10.2 Two contracts are compiled under per-path restrictions
+
+`foundry.toml` carries `[[profile.default.compilation_restrictions]]` entries for `src/vault/*` and `src/bonds/*`,
+both at `optimizer_runs = 200` with `via_ir = true`, while everything else stays on the project-wide legacy
+pipeline at `optimizer_runs = 1_000_000`.
+
+| Path | Why |
+|---|---|
+| `src/vault/*` | Even with the read side in `VaultNavLib`, the vault is 26,509 B at `runs = 1` on the legacy pipeline. The IR pipeline at 200 runs brings it to ~23.8 kB, inside EIP-170 with margin. |
+| `src/bonds/*` | `AmpsBonds` carries the whole bond call graph plus the collateral registry and twelve governed setters; at 1,000,000 runs solc inlines it past EIP-170. At 200 runs through IR it fits with room to spare. |
+
+The restriction is **per path, not per profile**, precisely so that nothing else moves: every other contract's
+codegen — and therefore every gas baseline in `test/gas/` — is byte-identical to what it was before either
+restriction was added. Widening the compiler profile globally instead would silently re-price every measurement in
+the gas suite, which is why an addition that pushes `AmpsVault` over the limit must move logic into `VaultNavLib`
+rather than relax the profile. The vault's remaining margin is small (roughly 0.8 kB) and should be treated as a
+budget.
+
+### 10.3 The read-only lens contracts
+
+Two contracts exist only to hold reads that would otherwise not fit inside EIP-170:
+
+* **`PoolRegistryLens`** — the active-constituent list, the index weight vector, and the cap/floor rule evaluated at
+  an arbitrary `n`. All of it is derived from `IPoolRegistry`'s getters.
+* **`AmpsBondsLens`** — position enumeration and the whole-board quote, both pure aggregations of `IAmpsBonds`'s
+  views.
+
+Neither holds storage, neither is referenced by any other contract, and neither is governed or upgradeable: they are
+stateless views over the contract they name, redeployable at will, and nothing on any protocol path reads them.
+`PoolRegistry.wiring()` returns its four immutables as one tuple for the same reason — four separate getters cost
+bytecode the registry does not have.

@@ -31,6 +31,13 @@ import {BondMarket, CollateralClass, Session, VestingPosition} from "../types/Ty
 ///      held by this contract until claimed, so NAV/share reflects the issuance the moment it happens and cannot be
 ///      gamed by claim timing. AMPS held here for vesting is never counted as protocol inventory.
 ///
+/// @dev **The unit of `m` and `q`.** Both the spoke TWAP `m` (`IBondPolicy.QuoteInput.mX18`) and the applied
+///      price `q` are **AMPS wei per 1e18 of `amountIn18`, i.e. per one whole collateral unit** — never per raw
+///      unit. The shell normalises the deposit to 18 decimals once, before the policy sees anything, so USDG's 6
+///      decimals are scaled up in exactly one place and `ampsOut = amountIn18 x q / 1e18` needs no second
+///      conversion. A price quoted per raw unit would be a hundred-billion-fold error on USDG and exactly right on
+///      an 18-decimal Stock Token, which is the kind of bug that only shows up in production.
+///
 /// @dev **`claim()` is structurally ungated.** It reads no gate, no guardian and no pause flag, and it succeeds
 ///      regardless of collateral removal, market pause, policy swap or guardian freeze (I38). It is the second and
 ///      last exemption from the `_requireHealthy` enumeration (I14); `AmpsVault.redeemProRata` is the first.
@@ -42,7 +49,7 @@ interface IAmpsBonds {
     /// @param amountIn The deposit, in the collateral's raw units.
     /// @param ampsOut The AMPS wei purchased, minted immediately to this contract.
     /// @param positionId The bonder's position index.
-    /// @param qX18 The applied price, AMPS wei per 1e18 of collateral.
+    /// @param qX18 The applied price: AMPS wei per 1e18 of `amountIn18`, i.e. per one whole collateral unit.
     /// @param discountBps The discount actually applied.
     /// @param floorBinding Whether the accretion floor, rather than the market discount, set the price.
     event Bond(
@@ -357,9 +364,13 @@ interface IAmpsBonds {
     // Mutative — governance
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Adds a collateral and opens its market. **Only timelock (7 d).**
-    /// @dev A `CONSTITUENT`-class add requires the token to be an active constituent; the same proposal may carry
-    ///      `PoolRegistry.addConstituent`, which is how a bond market creates a new spoke's depth.
+    /// @notice Adds a collateral and opens its market. **Only timelock (7 d), or `PoolRegistry`.**
+    /// @dev A `CONSTITUENT`-class add requires the token to be an active constituent.
+    /// @dev **The registry is an accepted caller.** `PoolRegistry.addConstituent` calls this directly, at the
+    ///      launch defaults from `Constants`, so that "a new constituent opens its bond market" happens inside the
+    ///      registry's own 7-day operation rather than as a second racing proposal. The registry is itself
+    ///      timelock-only, so the delay is the same either way, and every band below is enforced identically
+    ///      whichever of the two calls.
     /// @param collateral The token.
     /// @param class Where proceeds are routed.
     /// @param dBaseBps Base discount, inside `[DISCOUNT_BPS_MIN, DISCOUNT_BPS_MAX]`.
@@ -383,7 +394,12 @@ interface IAmpsBonds {
     /// @param collateral The token.
     function removeCollateral(address collateral) external;
 
-    /// @notice Opens or closes one market. **Only timelock (48 h).**
+    /// @notice Opens or closes one market. **Only timelock (48 h), or `PoolRegistry`.**
+    /// @dev **The registry is an accepted caller**, for the same reason as {addCollateral}:
+    ///      `PoolRegistry.retireConstituent` closes the retired name's market and
+    ///      `PoolRegistry.reinstateConstituent` reopens it, inside the registry's own 7-day operation, which is
+    ///      what makes "a retired constituent has no open bond market" (I37) atomic rather than a two-proposal
+    ///      race. Vesting positions on a closed market still claim to completion (I38).
     /// @param marketId The market.
     /// @param open Whether it accepts new bonds.
     function setMarketOpen(uint16 marketId, bool open) external;

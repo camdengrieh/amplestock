@@ -204,6 +204,27 @@ interface IPoolRegistry {
     /// @return constituentId The 1-based id.
     function constituentOfPool(PoolId poolId) external view returns (uint16 constituentId);
 
+    /// @notice The constituent's **realised** share of the index right now, in bps of the whole index.
+    ///
+    /// @dev This is the other half of the bond discount's deficit term: `AmpsBonds` widens a market's discount by
+    ///      `k_w x (targetWeightBps - currentWeightBps) / targetWeightBps`, so a name the protocol is under-weight
+    ///      in buys its collateral at a bigger discount than one it already holds enough of.
+    ///
+    /// @dev **Phase 2 answers the target weight.** The realised weight is a function of the vault's valuation of
+    ///      each spoke's position, and Phase 2 ships `ZeroPositionValuer`, so there is no realised weight to
+    ///      report and every ratio would be `0/0`. Returning the target makes the deficit exactly zero — the
+    ///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued
+    ///      for the same collateral. Phase 3 sources it from the vault's valuation with no ABI change here.
+    ///
+    /// @dev **Callers must tolerate this reverting.** `AmpsBonds` reads it through a bounded `staticcall` and
+    ///      treats any failure — a revert, an out-of-range answer, a registry that predates this function — as
+    ///      "unknown", which also prices `deficit == 0`. A registry that cannot answer must never be able to close
+    ///      a bond market.
+    ///
+    /// @param constituentId The 1-based constituent id. Unknown ids answer zero rather than reverting.
+    /// @return weightBps The realised weight in bps.
+    function currentWeightBps(uint16 constituentId) external view returns (uint16 weightBps);
+
     /// @notice The `AMPS/USDG` settlement hub: the pool `P_mkt` is read from.
     /// @return poolId The hub pool.
     function hubPoolId() external view returns (PoolId poolId);

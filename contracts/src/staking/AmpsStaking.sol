@@ -49,25 +49,11 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 ///      subsidy so that inflating the share price ahead of a victim's deposit costs more than it can ever return.
 contract AmpsStaking is ERC4626, IAmpsStaking {
     // -----------------------------------------------------------------------------------------------------------
-    // Errors (contract-local: no other Amplestocks contract can throw them)
-    // -----------------------------------------------------------------------------------------------------------
-
-    /// @notice {notifyReward} was called without the AMPS having been transferred in first, so honouring the
-    ///         notification would push `pendingRewards` above the contract's balance and make {totalAssets}
-    ///         underflow for every subsequent caller.
-    /// @param required The undistributed remainder the notification implies.
-    /// @param held The AMPS the contract actually holds.
-    error RewardNotFunded(uint256 required, uint256 held);
-
-    // -----------------------------------------------------------------------------------------------------------
     // Immutables
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice The 48-hour timelock: the only address that may call {setRewardStreamSeconds}.
-    /// @dev Immutable. Moving governance means migrating the vault, which hands the vault role on through
-    ///      {setVault} and redeploys this contract; there is no governance path that can point the parameter
-    ///      setter at a new owner.
-    address public immutable timelock;
+    /// @inheritdoc IAmpsStaking
+    address public immutable override timelock;
 
     // -----------------------------------------------------------------------------------------------------------
     // Storage (slot 5, 6, 7 of `docs/phase2-state-model.md` §1.3; ERC20 + ERC4626 occupy 0-4)
@@ -184,18 +170,14 @@ contract AmpsStaking is ERC4626, IAmpsStaking {
         return _rewardRatePerSecond;
     }
 
-    /// @notice AMPS wei released into {totalAssets} since deployment: `totalNotified` minus what is still pending.
-    /// @dev Not part of {IAmpsStaking}; the dApp pairs it with {totalNotified} for the realised-APR panel, and the
-    ///      I36 tests assert `releasedRewards() <= totalNotified()` after every step.
-    /// @return amount The cumulative released total.
-    function releasedRewards() external view returns (uint256 amount) {
+    /// @inheritdoc IAmpsStaking
+    function releasedRewards() external view override returns (uint256 amount) {
         return totalNotified - _unreleasedAt(block.timestamp);
     }
 
-    /// @notice Seconds left in the current stream, zero when nothing is streaming.
-    /// @dev Not part of {IAmpsStaking}; the dApp uses it to render the stream countdown.
-    /// @return seconds_ The remaining stream length.
-    function streamSecondsRemaining() external view returns (uint32 seconds_) {
+    /// @inheritdoc IAmpsStaking
+    /// @dev The dApp uses it to render the stream countdown.
+    function streamSecondsRemaining() external view override returns (uint32 secondsRemaining) {
         uint256 end = streamEnd;
         return block.timestamp >= end ? 0 : uint32(end - block.timestamp);
     }

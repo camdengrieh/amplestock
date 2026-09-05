@@ -55,6 +55,52 @@ contract GuardSymmetryTest is AmpsVaultFixture {
     /// @dev Every external state-changing selector on `AmpsVault`. Update the count deliberately, never silently.
     uint256 internal constant EXPECTED_MUTATING_COUNT = 26;
 
+    // -------------------------------------------------------------------------------------------------------------
+    // The `AmpsBonds` half of step 1
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // The bond shell's refusals are drilled in `AmpsBonds.t.sol`, which has the fixture for them; what belongs
+    // *here* is the classification, because this is the file `scripts/selector-gate.py` reads. The CI step lists
+    // the non-view/non-pure selectors of `AmpsVault` and `AmpsBonds` from the compiled ABI and fails on any name
+    // that appears in neither table, so a function added to either contract without a decision about how it is
+    // guarded cannot merge.
+    //
+    // The buckets are not the vault's, because the shell is guarded differently: exactly one of its selectors
+    // reads the gate at all.
+
+    // selector-gate:AmpsBonds:begin
+
+    /// @dev Gate-guarded: `bond` takes `IOracleGate.checkBond(constituentId)`, which refuses only a
+    ///      corporate-action freeze, a guardian freeze and the divergence breaker — a stale feed and a closed
+    ///      session widen `h_session` instead (Decision 10).
+    string[1] internal BONDS_GATED = ["bond"];
+
+    /// @dev Classified exemptions. `claim` and `claimAll` are the second structural exemption of section 7 (I38):
+    ///      their code path touches the caller's position array and the immutable AMPS address and nothing else —
+    ///      no gate, no guardian, no pause flag, not even the `vault` storage slot. `setVault` is guarded by
+    ///      caller identity (`onlyVault`), which is what lets `AmpsVault.emergencyMigrate` hand the role on
+    ///      atomically and is strictly narrower than the gate.
+    string[3] internal BONDS_EXEMPT = ["claim", "claimAll", "setVault"];
+
+    /// @dev Governed: the timelock, and for the first three the pool registry as well, so that a constituent's
+    ///      lifecycle and its bond market move in one operation (I37). None of these reads the gate; a governance
+    ///      call must not be refusable by an oracle.
+    string[11] internal BONDS_GOVERNED = [
+        "addCollateral",
+        "removeCollateral",
+        "setMarketOpen",
+        "setDiscountParams",
+        "setCoefficients",
+        "setCapBpsPerEpoch",
+        "setEpochSeconds",
+        "setDailyCapBps",
+        "setVestSeconds",
+        "setMinAccretionBps",
+        "setPolicy"
+    ];
+
+    // selector-gate:AmpsBonds:end
+
     /// @dev The four states section 7 step 2 forces.
     GateState[4] internal REFUSING_STATES =
         [GateState.DEGRADED, GateState.DIVERGED, GateState.SCHEDULED_FREEZE, GateState.WATCHDOG];
@@ -108,6 +154,37 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         assertEq(exempt, 3, "redeemProRata, emergencyMigrate and unlockCallback, and nothing else");
         assertEq(bondsGated, 2, "depositBonded and mintVesting, and nothing else");
         assertEq(entries.length - exempt - bondsGated, 21, "the rest take the management policy");
+    }
+
+    /// @notice The `AmpsBonds` classification is complete, disjoint and the size the ABI says it should be.
+    /// @dev The count is asserted here and the *membership* is asserted by `scripts/selector-gate.py` against the
+    ///      compiled ABI, which is the half Solidity cannot do (`ffi` is off and `fs_permissions` does not cover
+    ///      the artifact directories).
+    function test_step1_bondsEnumerationIsCompleteAndClassified() public view {
+        uint256 total = BONDS_GATED.length + BONDS_EXEMPT.length + BONDS_GOVERNED.length;
+        assertEq(total, 15, "every mutating selector on AmpsBonds is classified exactly once");
+        assertEq(BONDS_GATED.length, 1, "bond, and nothing else, reads the gate");
+        assertEq(BONDS_EXEMPT.length, 3, "claim, claimAll and setVault, and nothing else");
+
+        // Disjointness, so a name cannot be counted twice to make the total come out right.
+        string[15] memory all;
+        uint256 n;
+        for (uint256 i; i < BONDS_GATED.length; ++i) {
+            all[n++] = BONDS_GATED[i];
+        }
+        for (uint256 i; i < BONDS_EXEMPT.length; ++i) {
+            all[n++] = BONDS_EXEMPT[i];
+        }
+        for (uint256 i; i < BONDS_GOVERNED.length; ++i) {
+            all[n++] = BONDS_GOVERNED[i];
+        }
+        for (uint256 i; i < all.length; ++i) {
+            for (uint256 j = i + 1; j < all.length; ++j) {
+                assertTrue(
+                    keccak256(bytes(all[i])) != keccak256(bytes(all[j])), "AmpsBonds selectors are classified once"
+                );
+            }
+        }
     }
 
     // -------------------------------------------------------------------------------------------------------------

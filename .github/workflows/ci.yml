@@ -43,6 +43,32 @@ jobs:
       - name: Build
         run: forge build --sizes
 
+      # contracts/foundry.lock pins the four submodules to the same commits the gitlinks carry, so
+      # `actions/checkout` with `submodules: recursive` already produces a tree the lock agrees
+      # with and forge never has to reach the network to satisfy it. If the two ever disagree,
+      # forge rewrites the lock during the build and this fails — which is the drift we want to
+      # see, rather than a silent fetch.
+      - name: Lockfile is in sync with the submodules
+        run: git diff --exit-code -- foundry.lock
+
+      # Step 1 of the I14 enumeration proof (docs/phase2-state-model.md §7). GuardSymmetry.t.sol
+      # holds one classification entry per external state-changing selector of AmpsVault and
+      # AmpsBonds and asserts the counts, but `ffi` is off and `fs_permissions` does not cover the
+      # artifact directories, so Solidity cannot compare that list against the compiled ABI. This
+      # does, and fails on any mutating selector nobody classified. It runs straight after the
+      # build because it reads contracts/out, which the build has just written.
+      - name: Selector gate (I14 enumeration)
+        working-directory: .
+        run: python3 scripts/selector-gate.py --out contracts/out --json selector-report.json
+
+      - name: Upload selector report
+        if: always() && hashFiles('selector-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: selector-report
+          path: selector-report.json
+          if-no-files-found: ignore
+
       - name: Format check
         run: forge fmt --check
 

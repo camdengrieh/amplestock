@@ -4,13 +4,14 @@ pragma solidity 0.8.30;
 import {MockPoolRegistry} from "./MockPoolRegistry.sol";
 
 /// @title MockRegistryForBonds
-/// @notice {MockPoolRegistry} plus the one view `AmpsBonds` probes for and `IPoolRegistry` does not declare yet:
-///         the constituent's *realised* index weight, which is the other half of the bond discount's deficit term.
+/// @notice {MockPoolRegistry} with a **settable** `IPoolRegistry.currentWeightBps`, so the bond suite can drive a
+///         constituent's realised index weight — the other half of the bond discount's deficit term — away from
+///         its target and watch the discount widen.
 ///
-/// @dev `AmpsBonds` reads it through a bounded `staticcall` and treats any failure as "unknown", so the plain
-///      {MockPoolRegistry} exercises the `deficit == 0` branch and this subclass exercises the live one. When the
-///      view is promoted into `IPoolRegistry`, this contract collapses into the base mock and the shell needs no
-///      new bytecode.
+/// @dev The base mock answers the target weight (Phase 2's real behaviour), which prices `deficit == 0`. This one
+///      answers whatever a test sets, and {setWeightSourceEnabled} makes it revert outright: `AmpsBonds` reads the
+///      view through a bounded `try` and treats any failure as "unknown", so that switch is how the suite proves a
+///      registry which cannot report a weight still cannot close a bond market.
 contract MockRegistryForBonds is MockPoolRegistry {
     /// @notice When false, {currentWeightBps} reverts, which is how a test forces the "registry cannot report a
     ///         weight" branch on a registry that otherwise answers everything.
@@ -34,10 +35,9 @@ contract MockRegistryForBonds is MockPoolRegistry {
         weightSourceEnabled = enabled;
     }
 
-    /// @notice The constituent's current share of the index, in bps.
-    /// @param constituentId The 1-based constituent id.
-    /// @return weightBps The realised weight.
-    function currentWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
+    /// @inheritdoc MockPoolRegistry
+    /// @dev Answers the settable realised weight, and reverts entirely while the weight source is disabled.
+    function currentWeightBps(uint16 constituentId) external view override returns (uint16 weightBps) {
         if (!weightSourceEnabled) revert WeightSourceDisabled();
         weightBps = _currentWeightBps[constituentId];
     }

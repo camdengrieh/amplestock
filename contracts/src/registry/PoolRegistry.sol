@@ -33,18 +33,6 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
-/// @notice The Phase 3 vault entry point that moves a retired spoke's remaining bid inventory into idle claims.
-/// @dev    Declared here rather than in `IAmpsVault` because the vault interface does not carry it yet; the
-///         registry is the only caller, and `PoolRegistry.withdrawRetiredBids` is the only call site. When
-///         `IAmpsVault` gains the function this local declaration is deleted and the import switched, with no
-///         change to the registry's own ABI. See the task report for the requested interface addition.
-interface IVaultRetiredBids {
-    /// @notice Moves the unfilled bid inventory of a retired spoke into idle claims. **Only registry.**
-    /// @param constituentId The retired constituent.
-    /// @return moved The counter-asset amount moved, in raw units.
-    function withdrawRetiredBids(uint16 constituentId) external returns (uint256 moved);
-}
-
 /// @title PoolRegistry
 /// @notice The allowlist and the index: which pools exist, which Stock Tokens are constituents, what each one
 ///         weighs, and what fee bucket its pool sits in. Immutable bytecode, 7-day-timelock-governed state
@@ -473,7 +461,7 @@ contract PoolRegistry is IPoolRegistry {
         ConstituentConfig storage config = _requireKnown(constituentId);
         if (config.status != ConstituentStatus.RETIRED) revert InvalidStatusTransition(constituentId, config.status);
 
-        uint256 moved = IVaultRetiredBids(_vault).withdrawRetiredBids(constituentId);
+        uint256 moved = IAmpsVault(_vault).withdrawRetiredBids(constituentId);
         emit RetiredBidsWithdrawn(constituentId, moved);
     }
 
@@ -520,6 +508,19 @@ contract PoolRegistry is IPoolRegistry {
     /// @inheritdoc IPoolRegistry
     function constituentOfPool(PoolId poolId) external view returns (uint16 constituentId) {
         constituentId = _pools[poolId].constituentId;
+    }
+
+    /// @inheritdoc IPoolRegistry
+    /// @dev Phase 2 answers the constituent's **target** weight, which makes `AmpsBonds`'s deficit term exactly
+    ///      zero. The realised weight is the vault's valuation of that spoke's position divided by the whole
+    ///      index, and Phase 2 ships `ZeroPositionValuer`: there is no position to value, so any other answer
+    ///      would be invented. Zero deficit is also the protocol-favourable reading — a smaller deficit means a
+    ///      smaller discount and less AMPS issued — so a wrong-because-unknowable input cannot dilute anyone.
+    ///      Phase 3 sources the numerator from `AmpsVault`'s valuation; the ABI and this call site do not change.
+    ///      An unknown id reads zero rather than reverting, so a bond market on a retired or never-registered
+    ///      name still prices.
+    function currentWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
+        weightBps = _constituents[constituentId].targetWeightBps;
     }
 
     /// @inheritdoc IPoolRegistry

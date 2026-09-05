@@ -153,7 +153,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
     /// @notice An unknown pointer name is rejected rather than silently ignored.
     function test_setPolicyPointer_rejectsUnknownSlot() public {
         vm.prank(TIMELOCK);
-        vm.expectRevert(abi.encodeWithSelector(AmpsVault.UnknownPointerSlot.selector, bytes32("nope")));
+        vm.expectRevert(abi.encodeWithSelector(IAmpsVault.UnknownPointerSlot.selector, bytes32("nope")));
         vault.setPolicyPointer(bytes32("nope"), address(0xBEEF));
     }
 
@@ -557,20 +557,20 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.withdrawRetiredBids(1);
 
         vm.prank(address(registry));
-        vm.expectRevert(AmpsVault.Phase3NotImplemented.selector);
+        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
         vault.withdrawRetiredBids(1);
     }
 
     /// @notice The four Phase 3 keeper entry points are in the ABI and refuse until the hook exists.
     function test_phase3EntryPointsRevert() public {
         runGenesis();
-        vm.expectRevert(AmpsVault.Phase3NotImplemented.selector);
+        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
         vault.place(spokePool, true, 1e18);
-        vm.expectRevert(AmpsVault.Phase3NotImplemented.selector);
+        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
         vault.compound(spokePool);
-        vm.expectRevert(AmpsVault.Phase3NotImplemented.selector);
+        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
         vault.rollout(1);
-        vm.expectRevert(AmpsVault.Phase3NotImplemented.selector);
+        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
         vault.deployBonded(1);
     }
 
@@ -584,7 +584,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
     /// @notice An unsolicited unlock cannot drive the callback: without a discriminator there is nothing to do.
     function test_unlockCallback_rejectsUnknownAction() public {
         vm.prank(address(poolManager));
-        vm.expectRevert(AmpsVault.UnknownUnlockAction.selector);
+        vm.expectRevert(IAmpsVault.UnknownUnlockAction.selector);
         vault.unlockCallback("");
     }
 

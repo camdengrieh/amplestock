@@ -65,7 +65,7 @@ contract OracleGateFuzzTest is OracleGateFixture {
             address(nvda), address(nvdaFeed), spokePool, PoolClass.SPOKE, TICK_SPACING, 1000
         );
 
-        GatePriceMath math = gate.priceMath();
+        GatePriceMath math = GatePriceMath(gate.priceMath());
         uint256 ampsUsd18 = math.ampsPriceUsd18(HUB_TICK, 1e8, 6);
         fairTick = math.fairTick(ampsUsd18, 180e8, 18, TICK_SPACING);
         int24 wethTick = math.fairTick(ampsUsd18, 3000e8, 18, 1);

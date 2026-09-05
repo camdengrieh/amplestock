@@ -190,6 +190,25 @@ interface IAmpsVault {
     /// @param standby The registered standby.
     error NotStandbyVault(address proposed, address standby);
 
+    /// @notice A Phase 3 entry point was called. {place}, {compound}, {rollout}, {deployBonded} and
+    ///         {withdrawRetiredBids} are part of the final ABI — the bytecode is immutable, so they have to be —
+    ///         but have no implementation until `AmpsHook` and the ladder machinery exist. Each still performs its
+    ///         caller and gate checks first, so the guard-symmetry enumeration sees the same refusal every other
+    ///         mutating selector gives.
+    error Phase3NotImplemented();
+
+    /// @notice `unlockCallback` was entered without the vault having set an action discriminator, i.e. the unlock
+    ///         did not originate here.
+    error UnknownUnlockAction();
+
+    /// @notice A pointer name handed to {setPolicyPointer} is not one of the vault's pointer slots.
+    /// @param slot The rejected slot name.
+    error UnknownPointerSlot(bytes32 slot);
+
+    /// @notice A value that must fit a packed `uint128` checkpoint field did not.
+    /// @param value The offending value.
+    error ValueTooLarge(uint256 value);
+
     // -------------------------------------------------------------------------------------------------------------
     // Reads — wiring
     // -------------------------------------------------------------------------------------------------------------
@@ -608,6 +627,17 @@ interface IAmpsVault {
     /// @return placed The raw amount placed.
     function deployBonded(uint16 constituentId) external returns (uint256 placed);
 
+    /// @notice Moves a retired constituent's unfilled bid inventory out of its pool and into idle claims, where it
+    ///         is valued in `A` and paid out by redemption. **Only registry**, from
+    ///         `PoolRegistry.withdrawRetiredBids` under the 7-day timelock. **Phase 3.**
+    /// @dev Bids are ladder positions and no ladder exists in Phase 2, so this reverts with {Phase3NotImplemented}
+    ///      after the caller and gate checks. It is declared now because the vault's bytecode is immutable and the
+    ///      registry's retirement path has to be written against the final ABI: the registry is the sole caller,
+    ///      and it records whatever amount this reports as moved.
+    /// @param constituentId The retired constituent.
+    /// @return amountMoved The counter-asset amount moved into claims, in raw units.
+    function withdrawRetiredBids(uint16 constituentId) external returns (uint256 amountMoved);
+
     // -------------------------------------------------------------------------------------------------------------
     // Mutative — governance
     // -------------------------------------------------------------------------------------------------------------
@@ -654,7 +684,22 @@ interface IAmpsVault {
     /// @param value The new value, inside `[SPOKE_SEED_BPS_MIN, SPOKE_SEED_BPS_MAX]`.
     function setSpokeSeedBps(uint16 value) external;
 
-    /// @notice Replaces a pointer-upgradeable policy. **Only timelock (7 d).** None of these can move a fund.
+    /// @notice Replaces a pointer-upgradeable policy **and carries the set-once protocol wiring**. **Only timelock
+    ///         (7 d).** None of these can move a fund.
+    ///
+    /// @dev This is the vault's single pointer setter, and it serves two populations of slot:
+    ///
+    ///        - **Set-once wiring**, written before {genesis} and refused for ever afterwards: `bytes32("registry")`,
+    ///          `bytes32("bonds")`, `bytes32("staking")` and `bytes32("bountyPot")`. Each of those contracts takes
+    ///          the vault in *its* constructor, so the vault cannot hold them as immutables; {genesis} sets the
+    ///          `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
+    ///        - **Pointer-upgradeable policies**, replaceable at any time under the same 7-day delay:
+    ///          `bytes32("oracleGate")`, `bytes32("feedRegistry")`, `bytes32("positionValuer")`,
+    ///          `bytes32("ladderPolicy")` and `bytes32("rolloutPolicy")`. `bytes32("marketReference")` sits between
+    ///          the two: set-once before genesis to the Phase 2 mock, and re-pointed to `AmpsHook` afterwards.
+    ///
+    ///      Any other slot name reverts with {UnknownPointerSlot}, and `address(0)` is refused for every slot.
+    ///
     /// @param slot The pointer name as a short string.
     /// @param newPointer The new address.
     function setPolicyPointer(bytes32 slot, address newPointer) external;

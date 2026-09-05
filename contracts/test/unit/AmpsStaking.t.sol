@@ -436,7 +436,7 @@ contract AmpsStakingTest is Test {
     }
 
     function test_notifyWithoutFundingReverts() public {
-        vm.expectRevert(abi.encodeWithSelector(AmpsStaking.RewardNotFunded.selector, 10e18, 0));
+        vm.expectRevert(abi.encodeWithSelector(IAmpsStaking.RewardNotFunded.selector, 10e18, 0));
         vm.prank(vaultAddr);
         staking.notifyReward(10e18);
     }
@@ -448,7 +448,7 @@ contract AmpsStakingTest is Test {
         // The vault forgets the transfer. Folding 200 AMPS into the 50 still streaming would claim 250 AMPS of
         // undistributed remainder against a 150 AMPS balance, which would make totalAssets() underflow for every
         // subsequent caller, so the notification is refused instead.
-        vm.expectRevert(abi.encodeWithSelector(AmpsStaking.RewardNotFunded.selector, 250e18, 150e18));
+        vm.expectRevert(abi.encodeWithSelector(IAmpsStaking.RewardNotFunded.selector, 250e18, 150e18));
         vm.prank(vaultAddr);
         staking.notifyReward(200e18);
     }
@@ -472,7 +472,7 @@ contract AmpsStakingTest is Test {
         _assertSolvent();
 
         uint256 required = staking.pendingRewards() + 150e18;
-        vm.expectRevert(abi.encodeWithSelector(AmpsStaking.RewardNotFunded.selector, required, 150e18));
+        vm.expectRevert(abi.encodeWithSelector(IAmpsStaking.RewardNotFunded.selector, required, 150e18));
         vm.prank(vaultAddr);
         staking.notifyReward(150e18);
 

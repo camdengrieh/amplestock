@@ -83,8 +83,36 @@ contract MockOracleGate is IOracleGate {
         Constants.H_SESSION_CLOSED_BPS_DEFAULT
     ];
 
+    /// @notice Layer F: the hub-vs-WETH reference tolerance the mock reports.
+    uint16 public refDivergenceBps = Constants.REF_DIVERGENCE_BPS_DEFAULT;
+
+    /// @inheritdoc IOracleGate
+    address public feedRegistry;
+
+    /// @inheritdoc IOracleGate
+    address public registry;
+
+    /// @inheritdoc IOracleGate
+    address public marketReference;
+
+    /// @inheritdoc IOracleGate
+    /// @dev The mock does no price arithmetic, so there is nothing to deploy; tests that need a real
+    ///      `GatePriceMath` use the real gate.
+    address public priceMath;
+
     mapping(uint16 constituentId => ConstituentState state) internal _constituents;
     mapping(PoolId poolId => PoolState state) internal _pools;
+    mapping(PoolId poolId => uint32 since) internal _divergedSince;
+    mapping(uint16 year => uint256[2] bitmap) internal _holidayBitmap;
+
+    uint32[] internal _dstStarts;
+    uint32[] internal _dstEnds;
+
+    /// @notice How many times {pokePool} has been called for a pool, so tests can assert layer E was re-evaluated.
+    mapping(PoolId poolId => uint256 count) public pokePoolCount;
+
+    /// @notice How many times {pokeConstituent} has been called for a constituent.
+    mapping(uint16 constituentId => uint256 count) public pokeConstituentCount;
 
     uint32 internal _watchdogBlock;
     uint32 internal _watchdogTimestamp;
@@ -186,6 +214,16 @@ contract MockOracleGate is IOracleGate {
         closedHours = hoursClosed;
     }
 
+    /// @notice Arms or clears the layer-E timer for a pool without going through {pokePool}.
+    function setDivergedSince(PoolId poolId, uint32 since) external {
+        _divergedSince[poolId] = since;
+    }
+
+    /// @notice Sets the address the mock reports as its `GatePriceMath`.
+    function setPriceMath(address value) external {
+        priceMath = value;
+    }
+
     /* --------------------------------------- IOracleGate --------------------------------------- */
 
     /// @inheritdoc IOracleGate
@@ -222,6 +260,44 @@ contract MockOracleGate is IOracleGate {
     function state(uint16 constituentId) external view returns (GateState gateState) {
         ConstituentState storage entry = _constituents[constituentId];
         gateState = entry.set ? entry.state : defaultState;
+    }
+
+    /// @inheritdoc IOracleGate
+    function stateByPool(PoolId poolId) external view returns (GateState gateState) {
+        PoolState storage entry = _pools[poolId];
+        gateState = entry.set ? entry.state : defaultState;
+    }
+
+    /// @inheritdoc IOracleGate
+    function divergedSince(PoolId poolId) external view returns (uint32 since) {
+        since = _divergedSince[poolId];
+    }
+
+    /// @inheritdoc IOracleGate
+    function holidayBitmap(uint16 year) external view returns (uint256[2] memory bitmap) {
+        bitmap = _holidayBitmap[year];
+    }
+
+    /// @inheritdoc IOracleGate
+    function dstTable() external view returns (uint32[] memory starts, uint32[] memory ends) {
+        return (_dstStarts, _dstEnds);
+    }
+
+    /// @inheritdoc IOracleGate
+    /// @dev The mock has no calendar: it reports standard time for every instant, and {sessionAt} is a stored
+    ///      value rather than a derivation, so the two never have to agree.
+    function utcOffsetAt(uint256) external pure returns (uint256 offsetSeconds) {
+        offsetSeconds = 5 * 3600;
+    }
+
+    /// @inheritdoc IOracleGate
+    /// @dev Reads the bitmap a test wrote through {setHolidayBitmap}; day-of-year is derived the cheap way, from
+    ///      the UTC day index, because nothing in the mock depends on the civil calendar.
+    function isHoliday(uint256 timestamp) external view returns (bool holiday) {
+        uint256 dayOfYear = (timestamp / 86_400) % 365;
+        uint16 year = uint16(1970 + timestamp / (365 days));
+        uint256[2] storage bitmap = _holidayBitmap[year];
+        holiday = (bitmap[dayOfYear >> 8] >> (dayOfYear & 255)) & 1 == 1;
     }
 
     /// @inheritdoc IOracleGate
@@ -353,6 +429,16 @@ contract MockOracleGate is IOracleGate {
         value = Constants.GUARDIAN_FREEZE_MAX_SECONDS;
     }
 
+    /// @inheritdoc IOracleGate
+    function REF_DIVERGENCE_BPS_MIN() external pure returns (uint16 value) {
+        value = Constants.REF_DIVERGENCE_BPS_MIN;
+    }
+
+    /// @inheritdoc IOracleGate
+    function REF_DIVERGENCE_BPS_MAX() external pure returns (uint16 value) {
+        value = Constants.REF_DIVERGENCE_BPS_MAX;
+    }
+
     /* ----------------------------------------- mutative ----------------------------------------- */
 
     /// @inheritdoc IOracleGate
@@ -361,6 +447,34 @@ contract MockOracleGate is IOracleGate {
         _watchdogTimestamp = uint32(block.timestamp);
         ++pokeCount;
         emit WatchdogStamped(_watchdogBlock, _watchdogTimestamp);
+    }
+
+    /// @inheritdoc IOracleGate
+    /// @dev Records the call and stamps layer A, exactly as {poke} does, so a path that pokes one pool is
+    ///      indistinguishable from one that pokes globally as far as the watchdog is concerned.
+    function pokePool(PoolId poolId) public {
+        _watchdogBlock = uint32(block.number);
+        _watchdogTimestamp = uint32(block.timestamp);
+        ++pokeCount;
+        ++pokePoolCount[poolId];
+        emit WatchdogStamped(_watchdogBlock, _watchdogTimestamp);
+    }
+
+    /// @inheritdoc IOracleGate
+    function pokePools(PoolId[] calldata poolIds) external {
+        for (uint256 i = 0; i < poolIds.length; ++i) {
+            pokePool(poolIds[i]);
+        }
+    }
+
+    /// @inheritdoc IOracleGate
+    function pokeConstituent(uint16 constituentId) external {
+        _watchdogBlock = uint32(block.number);
+        _watchdogTimestamp = uint32(block.timestamp);
+        ++pokeCount;
+        ++pokeConstituentCount[constituentId];
+        emit WatchdogStamped(_watchdogBlock, _watchdogTimestamp);
+        emit CorporateActionFreeze(constituentId, _constituents[constituentId].corporateFreeze, 0);
     }
 
     /// @inheritdoc IOracleGate
@@ -415,8 +529,33 @@ contract MockOracleGate is IOracleGate {
     }
 
     /// @inheritdoc IOracleGate
-    function setHolidayBitmap(uint16, uint256[2] calldata) external {}
+    function setRefDivergenceBps(uint16 value) external {
+        refDivergenceBps = value;
+    }
 
     /// @inheritdoc IOracleGate
-    function setDstTable(uint32[] calldata, uint32[] calldata) external {}
+    function setHolidayBitmap(uint16 year, uint256[2] calldata bitmap) external {
+        _holidayBitmap[year] = bitmap;
+    }
+
+    /// @inheritdoc IOracleGate
+    function setDstTable(uint32[] calldata starts, uint32[] calldata ends) external {
+        _dstStarts = starts;
+        _dstEnds = ends;
+    }
+
+    /// @inheritdoc IOracleGate
+    function setFeedRegistry(address value) external {
+        feedRegistry = value;
+    }
+
+    /// @inheritdoc IOracleGate
+    function setRegistry(address value) external {
+        registry = value;
+    }
+
+    /// @inheritdoc IOracleGate
+    function setMarketReference(address value) external {
+        marketReference = value;
+    }
 }

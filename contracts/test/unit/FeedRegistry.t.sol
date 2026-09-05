@@ -5,7 +5,7 @@ import {IFeedRegistry} from "../../src/interfaces/IFeedRegistry.sol";
 import {FeedRegistry} from "../../src/oracle/FeedRegistry.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {LengthMismatch, NotTimelock, OutOfBand, ZeroAddress} from "../../src/types/Errors.sol";
-import {FeedConfig, Session} from "../../src/types/Types.sol";
+import {FeedConfig, FeedStatus, Session} from "../../src/types/Types.sol";
 import {MockAggregator} from "../mocks/MockAggregator.sol";
 import {OracleGateFixture} from "./OracleGateFixture.sol";
 
@@ -113,7 +113,7 @@ contract FeedRegistryTest is OracleGateFixture {
         vm.prank(TIMELOCK);
         feeds.setStandardProxy(OTHER, true);
         vm.prank(TIMELOCK);
-        vm.expectRevert(abi.encodeWithSelector(FeedRegistry.FeedDead.selector, OTHER, OTHER));
+        vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedDead.selector, OTHER, OTHER));
         feeds.setFeed(OTHER, OTHER, _config(Constants.ONE_DAY));
     }
 
@@ -376,7 +376,7 @@ contract FeedRegistryTest is OracleGateFixture {
     ///         previously latched answer stands.
     function test_sanity_invalidAnswers() public {
         feed.setRoundData(9, -1, block.timestamp, block.timestamp);
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.live, "negative answer is not live");
         assertEq(status.answerUsd8, 180e8, "the latched answer stands");
         vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.InvalidAnswer.selector, TOKEN, int256(-1)));
@@ -417,7 +417,7 @@ contract FeedRegistryTest is OracleGateFixture {
     /// @notice An answer larger than `uint128` is out of bounds by construction, before any rescale can overflow.
     function test_sanity_absurdlyLargeAnswer() public {
         feed.setAnswer(type(int256).max);
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.live, "not live");
         assertEq(status.answerUsd8, 180e8, "the latched answer stands");
     }
@@ -448,7 +448,7 @@ contract FeedRegistryTest is OracleGateFixture {
         vm.prank(TIMELOCK);
         feeds.configureFeed(TOKEN, 300, 50, 1, type(uint128).max);
         feed.setRevert(true);
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.live, "not live");
         assertTrue(status.configured, "still configured");
         assertEq(status.answerUsd8, 180e8, "the latched answer stands");
@@ -457,7 +457,7 @@ contract FeedRegistryTest is OracleGateFixture {
         vm.warp(block.timestamp + 451);
         assertEq(uint8(feeds.sessionNow()), uint8(Session.REGULAR), "still the regular session");
         assertFalse(feeds.feedStatus(TOKEN).fresh, "until it ages out");
-        vm.expectRevert(abi.encodeWithSelector(FeedRegistry.FeedDead.selector, TOKEN, address(feed)));
+        vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedDead.selector, TOKEN, address(feed)));
         feeds.priceUsd8(TOKEN);
     }
 
@@ -465,7 +465,7 @@ contract FeedRegistryTest is OracleGateFixture {
     ///         code-size check is what turns that into "dead" instead of a decode revert.
     function test_dead_codelessAggregator() public {
         vm.etch(address(feed), "");
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.live, "codeless is dead");
         assertEq(status.answerUsd8, 180e8, "the latched answer stands");
     }
@@ -480,7 +480,7 @@ contract FeedRegistryTest is OracleGateFixture {
         vm.stopPrank();
 
         uint256 gasBefore = gasleft();
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(OTHER);
+        FeedStatus memory status = feeds.feedStatus(OTHER);
         uint256 spent = gasBefore - gasleft();
         assertFalse(status.live, "the burner is dead");
         assertEq(status.answerUsd8, 0, "and nothing was ever latched");
@@ -493,7 +493,7 @@ contract FeedRegistryTest is OracleGateFixture {
         NoDecimalsAggregator broken = new NoDecimalsAggregator();
         vm.startPrank(TIMELOCK);
         feeds.setStandardProxy(address(broken), true);
-        vm.expectRevert(abi.encodeWithSelector(FeedRegistry.FeedDead.selector, OTHER, address(broken)));
+        vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedDead.selector, OTHER, address(broken)));
         feeds.setFeed(OTHER, address(broken), _config(Constants.ONE_DAY));
         vm.stopPrank();
     }
@@ -545,10 +545,10 @@ contract FeedRegistryTest is OracleGateFixture {
         assertEq(feeds.FRESHNESS_MULTIPLIER_MIN(), Constants.FRESHNESS_MULTIPLIER_MIN, "multiplier min");
         assertEq(feeds.FRESHNESS_MULTIPLIER_MAX(), Constants.FRESHNESS_MULTIPLIER_MAX, "multiplier max");
         assertEq(feeds.ANSWER_JUMP_BPS(), Constants.ANSWER_JUMP_BPS, "jump threshold");
-        assertEq(feeds.CONFIRM_SECONDS_MIN(), Constants.GRACE_SECONDS_MIN, "confirm min");
-        assertEq(feeds.CONFIRM_SECONDS_MAX(), Constants.GRACE_SECONDS_MAX, "confirm max");
-        assertEq(feeds.HEARTBEAT_SECONDS_MIN(), Constants.GRACE_SECONDS_MIN, "heartbeat min");
-        assertEq(feeds.HEARTBEAT_SECONDS_MAX(), Constants.GRACE_SECONDS_MAX, "heartbeat max");
+        assertEq(feeds.CONFIRM_SECONDS_MIN(), Constants.ANSWER_CONFIRM_SECONDS_MIN, "confirm min");
+        assertEq(feeds.CONFIRM_SECONDS_MAX(), Constants.ANSWER_CONFIRM_SECONDS_MAX, "confirm max");
+        assertEq(feeds.HEARTBEAT_SECONDS_MIN(), Constants.FEED_HEARTBEAT_SECONDS_MIN, "heartbeat min");
+        assertEq(feeds.HEARTBEAT_SECONDS_MAX(), Constants.FEED_HEARTBEAT_SECONDS_MAX, "heartbeat max");
         assertEq(feeds.FEED_PROBE_GAS(), Constants.STOCK_TOKEN_PROBE_GAS, "probe gas");
         assertEq(feeds.SESSION_PROBE_GAS(), 4 * Constants.STOCK_TOKEN_PROBE_GAS, "session probe gas");
         assertEq(feeds.FEED_DECIMALS_MAX(), 18, "decimals ceiling");
@@ -557,7 +557,7 @@ contract FeedRegistryTest is OracleGateFixture {
     /// @notice A token with no feed at all reads as an all-zero status and reverts only where the interface says
     ///         it must.
     function test_dead_unconfiguredToken() public {
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(OTHER);
+        FeedStatus memory status = feeds.feedStatus(OTHER);
         assertFalse(status.configured, "not configured");
         assertEq(status.answerUsd8, 0, "no answer");
         assertFalse(status.fresh, "not fresh");
@@ -589,7 +589,7 @@ contract FeedRegistryTest is OracleGateFixture {
         (uint256 answer,, bool isFresh) = feeds.latestAnswer(OTHER);
         assertEq(answer, 0, "no usable answer");
         assertFalse(isFresh, "and not fresh");
-        vm.expectRevert(abi.encodeWithSelector(FeedRegistry.FeedDead.selector, OTHER, address(fresh_)));
+        vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedDead.selector, OTHER, address(fresh_)));
         feeds.priceUsd8(OTHER);
     }
 
@@ -607,7 +607,7 @@ contract FeedRegistryTest is OracleGateFixture {
         feeds.refresh(TOKEN);
         vm.warp(block.timestamp + 60);
         feed.setAnswer(240e8); // +21%, a jump
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertTrue(status.unconfirmed, "held back");
         assertEq(status.answerUsd8, 198e8, "the accepted answer stands");
         assertEq(status.updatedAt, uint32(MON_REGULAR + 60), "with its own timestamp, so it ages normally");
@@ -630,7 +630,7 @@ contract FeedRegistryTest is OracleGateFixture {
 
         vm.warp(block.timestamp + 60);
         feed.setAnswer(241e8); // a later round, within 10% of the pending level
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.unconfirmed, "confirmed");
         assertEq(status.answerUsd8, 241e8, "the new level is adopted");
 
@@ -666,7 +666,7 @@ contract FeedRegistryTest is OracleGateFixture {
         assertTrue(feeds.feedStatus(TOKEN).unconfirmed, "one second short");
 
         vm.warp(block.timestamp + 1);
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.unconfirmed, "adopted on elapse");
         assertEq(status.answerUsd8, 240e8, "the jump wins");
     }
@@ -676,7 +676,7 @@ contract FeedRegistryTest is OracleGateFixture {
     function test_jump_notArmedAcrossAHeartbeat() public {
         vm.warp(MON_REGULAR + Constants.ONE_DAY + 1);
         feed.setAnswer(400e8); // +122% but a day and a second later
-        FeedRegistry.FeedStatus memory status = feeds.feedStatus(TOKEN);
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
         assertFalse(status.unconfirmed, "not a single-round move");
         assertEq(status.answerUsd8, 400e8, "adopted directly");
     }
@@ -809,7 +809,7 @@ contract FeedRegistryTest is OracleGateFixture {
         feeds.configureFeed(TOKEN, Constants.ONE_DAY, 50, 50e8, 500e8);
         feed.setRoundData(7, rawAnswer, updatedAt, updatedAt);
 
-        FeedRegistry.FeedStatus memory status = feeds.feedStatusIn(TOKEN, session);
+        FeedStatus memory status = feeds.feedStatusIn(TOKEN, session);
         assertTrue(status.configured, "configured");
         if (status.answerUsd8 != 0) {
             assertGe(status.answerUsd8, 50e8, "never below the lower bound");
