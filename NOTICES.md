@@ -31,11 +31,30 @@ source file is imported, copied or vendored into this repository.
 ### Truncated geometric-mean oracle
 
 `TruncatedOracleLib` implements a geometric-mean TWAP whose per-block tick movement is clamped to a
-maximum, so a single-block price push cannot move the observation series by more than the cap. The
-idea is not ours: it follows Uniswap's `TruncGeoOracle` work and OpenZeppelin's `PanopticOracle`
-treatment of the same problem. Both were read as prior art and as a specification of the desired
-behaviour; the implementation here is written from scratch against our own tick accounting and
-observation cardinality, and neither project's source is imported or copied.
+maximum, so a single-block price push cannot move the observation series by more than the cap. Two
+separate lineages meet in that one file, and they have different licence consequences.
+
+**The truncation itself** follows Uniswap's `TruncGeoOracle` work and OpenZeppelin's
+`PanopticOracle` treatment of the same problem. Both were read as prior art and as a specification
+of the desired behaviour; the implementation here is written from scratch against our own tick
+accounting and observation cardinality, and neither project's source is imported or copied.
+
+**The structure it truncates** — a cumulative-tick accumulator, a fixed-size ring of observations,
+and a binary search over that ring to interpolate a reading at an arbitrary past timestamp — is the
+shape **Uniswap v3-core's `Oracle.sol`** established, and `consult`'s floor-toward-negative-infinity
+rounding matches Uniswap v3-periphery's `OracleLibrary.consult` so that the two cannot disagree
+about a mean by one tick.
+
+**Uniswap v3-core is licensed GPL-2.0-or-later**, and v3-periphery GPL-2.0-or-later as well. Neither
+is a dependency of this repository: they are not in `lib/`, not in `remappings.txt`, and not
+reachable from `contracts/src/**` by any import — which is precisely what
+[`scripts/licence-gate.py`](./scripts/licence-gate.py) fails the build over. They were read as a
+specification of the accumulator's semantics and then closed. `TruncatedOracleLib` is original MIT
+code with its own observation struct, its own per-*block* (not per-*swap*) truncation anchor, its
+own exact interpolation — it interpolates with the recorded tick rather than v3's average-slope
+formula, which removes a rounding step v3 has — and no `grow()`/cardinality-expansion path at all.
+The only thing carried across is the arithmetic contract: `int56` accumulators that wrap by design
+and `uint32` timestamps compared on the mod-2³² circle.
 
 ### Olympus v2 and Bond Protocol — bond mechanics
 
@@ -93,6 +112,16 @@ realistic local v4 environment without compiling BUSL source. It is never deploy
 network by this repository and is never reachable from `contracts/src/**`. Deployments target the
 PoolManager already live on Robinhood Chain
 (`0x8366a39cc670b4001a1121b8f6a443a643e40951`), deployed by Uniswap, not by us.
+
+## Agent-audit skills (tooling, not shipped code)
+
+`.claude/skills/{x-ray,solidity-auditor,fizz}` are vendored verbatim from
+[`pashov/skills`](https://github.com/pashov/skills) at commit `c577eb7799c349de0acb187ba00ca98e14e436fd`
+(MIT; the licence text is kept alongside as `.claude/skills/PASHOV-LICENSE`). They are Claude Code
+skills used for the Phase 6 agent audits (pre-audit x-ray, the multi-agent Solidity audit, and
+Echidna/Medusa suite generation). They are developer tooling: nothing under `.claude/` is imported by,
+compiled into or deployed with `contracts/src/**`, and the licence gate does not scan it. Audit
+reports produced with them are committed under `docs/audits/`.
 
 ## Reference data
 

@@ -105,6 +105,11 @@ interface IOracleGate {
     /// @return gateState The state.
     function state(uint16 constituentId) external view returns (GateState gateState);
 
+    /// @notice {state} addressed by pool rather than by constituent, so the hook and the quoter need no id lookup.
+    /// @param poolId The pool.
+    /// @return gateState The state.
+    function stateByPool(PoolId poolId) external view returns (GateState gateState);
+
     /// @notice The equity session right now, from the on-chain 24/5 ET calendar, the holiday bitmap and the DST
     ///         table.
     /// @return session The session.
@@ -128,9 +133,18 @@ interface IOracleGate {
     function isPlacementAllowed(PoolId poolId) external view returns (bool allowed, bool anchorAtNav);
 
     /// @notice Whether a bond on `constituentId` may proceed, and at what haircut.
+    ///
     /// @dev Only the corporate-action freeze, a guardian freeze and the divergence breaker close a market. A stale
     ///      feed or a closed session does **not**: the haircut widens instead, which is the 24/7 bond decision.
-    /// @param constituentId The constituent.
+    ///
+    /// @dev **`constituentId == 0` is the protocol-wide check `ENTRY`-class bond markets take**, not an error and
+    ///      not an unknown constituent. WETH and USDG are collateral without being index constituents, so there is
+    ///      no per-constituent state to consult: id 0 reads the guardian's protocol freeze and the session
+    ///      haircut, and nothing else. Layers C, D and E are skipped outright — no feed, no corporate action, no
+    ///      pool, therefore no divergence — so the only thing that can close an entry market is
+    ///      {freezeProtocol}. It must never revert with `UnknownConstituent`.
+    ///
+    /// @param constituentId The constituent, or 0 for the protocol-wide `ENTRY`-class check.
     /// @return allowed Whether the market may accept a bond.
     /// @return hSessionBps The haircut to apply to the collateral valuation, in bps.
     function isBondAllowed(uint16 constituentId) external view returns (bool allowed, uint16 hSessionBps);
@@ -145,15 +159,29 @@ interface IOracleGate {
     /// @return anchorAtNav Whether the caller must anchor at NAV.
     function checkPlacement(PoolId poolId) external view returns (bool anchorAtNav);
 
-    /// @notice Reverting form of {isBondAllowed}.
-    /// @param constituentId The constituent.
+    /// @notice Reverting form of {isBondAllowed}. `constituentId == 0` is the same protocol-wide `ENTRY`-class
+    ///         check described there, and is a valid input.
+    /// @param constituentId The constituent, or 0.
     /// @return hSessionBps The haircut to apply.
     function checkBond(uint16 constituentId) external view returns (uint16 hSessionBps);
 
-    /// @notice The layer-A watchdog's last stamp.
+    /// @notice The layer-A watchdog's last stamp, and whether it is tripped.
+    ///
+    /// @dev **The trip is two conditions, not one.** `tripped` is true exactly when
+    ///
+    ///      ```
+    ///      elapsed > graceSeconds   AND   blocksAdvanced < elapsed / gapSeconds
+    ///      ```
+    ///
+    ///      where `elapsed = block.timestamp - timestamp` and `blocksAdvanced = block.number - blockNumber`.
+    ///      Elapsed time alone is deliberately **not** a trip: on a healthy chain nobody may have called the gate
+    ///      for an hour, and a quiet hour is not an outage. Missing *blocks* across that hour are. This is the
+    ///      substitute for the Chainlink L2 sequencer uptime feed Robinhood Chain does not publish, which is why
+    ///      it measures the chain rather than the protocol's own call frequency.
+    ///
     /// @return blockNumber The stamped block.
     /// @return timestamp The stamped timestamp.
-    /// @return tripped Whether more than `graceSeconds` has elapsed since.
+    /// @return tripped Whether both conditions above hold right now.
     function watchdog() external view returns (uint32 blockNumber, uint32 timestamp, bool tripped);
 
     // -------------------------------------------------------------------------------------------------------------
@@ -194,6 +222,65 @@ interface IOracleGate {
     /// @return until The expiry timestamp.
     function constituentFreezeUntil(uint16 constituentId) external view returns (uint32 until);
 
+    /// @notice Layer F: how far the `AMPS/USDG` hub TWAP and `AMPS/WETH x ETH/USD` may disagree before
+    ///         `REF_DIVERGED`. 500 at launch.
+    /// @return value The tolerance in bps.
+    function refDivergenceBps() external view returns (uint16 value);
+
+    /// @notice Layer E: when the deviation first left the band for a pool, or 0 while it is inside it.
+    /// @dev Armed and cleared by the permissionless {pokePool}. The effective `DIVERGED` verdict re-checks the
+    ///      *current* deviation as well, so an armed timer nobody clears cannot hold a pool closed on its own.
+    /// @param poolId The pool.
+    /// @return since The arming timestamp.
+    function divergedSince(PoolId poolId) external view returns (uint32 since);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Reads — pointers
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The layer-C registry this gate reads answers and freshness from.
+    /// @return registryAddress The `IFeedRegistry` address.
+    function feedRegistry() external view returns (address registryAddress);
+
+    /// @notice The pool and constituent registry, for constituent -> token/feed/pool lookups.
+    /// @return registryAddress The `IPoolRegistry` address.
+    function registry() external view returns (address registryAddress);
+
+    /// @notice The tick source layers E and F read: a mock in Phase 2, `AmpsHook` in Phase 3.
+    /// @return referenceAddress The `IMarketReference` address.
+    function marketReference() external view returns (address referenceAddress);
+
+    /// @notice The gate's `PriceLib` boundary, deployed by the gate's own constructor.
+    /// @dev Immutable and pure, so there is nothing to govern and nothing to re-point. Every call into it is a
+    ///      bounded `try`: an AMPS price outside the v4 tick range is "no fair tick", never a revert out of
+    ///      {snapshot}.
+    /// @return priceMathAddress The `GatePriceMath` address.
+    function priceMath() external view returns (address priceMathAddress);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Reads — the layer-B calendar tables
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The holiday bitmap recorded for one calendar year.
+    /// @param year The calendar year.
+    /// @return bitmap The 512-bit map; bit `d - 1` set means day-of-year `d` is closed.
+    function holidayBitmap(uint16 year) external view returns (uint256[2] memory bitmap);
+
+    /// @notice The DST transition table, as parallel ascending arrays of UTC timestamps.
+    /// @return starts The window starts.
+    /// @return ends The window ends.
+    function dstTable() external view returns (uint32[] memory starts, uint32[] memory ends);
+
+    /// @notice The seconds ET is behind UTC at `timestamp`, from the governed DST table.
+    /// @param timestamp The instant to classify.
+    /// @return offsetSeconds 14,400 on daylight time, 18,000 on standard time.
+    function utcOffsetAt(uint256 timestamp) external view returns (uint256 offsetSeconds);
+
+    /// @notice Whether the local calendar day containing `timestamp` is marked closed in the holiday bitmap.
+    /// @param timestamp The instant to classify.
+    /// @return holiday Whether the day carries a set bit.
+    function isHoliday(uint256 timestamp) external view returns (bool holiday);
+
     // -------------------------------------------------------------------------------------------------------------
     // Hard bands
     // -------------------------------------------------------------------------------------------------------------
@@ -230,15 +317,42 @@ interface IOracleGate {
     /// @return value The bound.
     function GUARDIAN_FREEZE_MAX_SECONDS() external view returns (uint32 value);
 
+    /// @notice Hard floor of `refDivergenceBps`. 100.
+    /// @return value The bound.
+    function REF_DIVERGENCE_BPS_MIN() external view returns (uint16 value);
+
+    /// @notice Hard ceiling of `refDivergenceBps`. 2,000.
+    /// @return value The bound.
+    function REF_DIVERGENCE_BPS_MAX() external view returns (uint16 value);
+
     // -------------------------------------------------------------------------------------------------------------
     // Mutative
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Stamps the layer-A watchdog and re-evaluates the sustained-divergence timers. **Permissionless and
-    ///         unpaid** — anyone may call it, and the vault calls it from every state-changing entry point.
+    /// @notice Stamps the layer-A watchdog. **Permissionless and unpaid** — anyone may call it, and the vault
+    ///         calls it from every state-changing entry point.
     /// @dev Never reverts for a gate reason; a poke during a freeze is exactly what clears the freeze once its
-    ///      cause has gone.
+    ///      cause has gone. Re-evaluating the layer-E timer needs a pool argument, and iterating every pool inside
+    ///      an unpaid permissionless call is unbounded gas, so that half is {pokePool} and {pokePools}.
     function poke() external;
+
+    /// @notice Stamps layer A and re-evaluates the sustained-divergence timer for one pool. **Permissionless and
+    ///         unpaid.**
+    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation returns.
+    /// @param poolId The pool to re-evaluate.
+    function pokePool(PoolId poolId) external;
+
+    /// @notice {pokePool} for several pools in one transaction. **Permissionless and unpaid.**
+    /// @param poolIds The pools to re-evaluate.
+    function pokePools(PoolId[] calldata poolIds) external;
+
+    /// @notice Stamps layer A, re-evaluates one constituent's pool and records the layer-D observation.
+    ///         **Permissionless and unpaid.**
+    /// @dev The `CorporateActionFreeze` event is an *observation record*, not a state change: layer D holds no
+    ///      storage, so this is the only place an indexer can see both edges of a corporate-action freeze without
+    ///      polling.
+    /// @param constituentId The constituent to re-evaluate.
+    function pokeConstituent(uint16 constituentId) external;
 
     /// @notice Freezes one constituent until `until`. **Only guardian.** Disable-only: no bonds, no rollout, no
     ///         placements for that constituent. Swaps and redemption are unaffected.
@@ -278,6 +392,10 @@ interface IOracleGate {
     /// @param value The new value, at most `CORPORATE_ACTION_WINDOW_MAX`.
     function setCorporateActionWindow(uint32 value) external;
 
+    /// @notice Sets the layer-F tolerance. **Only timelock (48 h).**
+    /// @param value The new value, inside `[REF_DIVERGENCE_BPS_MIN, REF_DIVERGENCE_BPS_MAX]`.
+    function setRefDivergenceBps(uint16 value) external;
+
     /// @notice Sets one entry of the stale-feed haircut table. **Only timelock (48 h).**
     /// @param session The session.
     /// @param bps The haircut, at most `H_SESSION_BPS_MAX`.
@@ -292,4 +410,17 @@ interface IOracleGate {
     /// @param starts DST start timestamps, ascending.
     /// @param ends DST end timestamps, ascending and parallel to `starts`.
     function setDstTable(uint32[] calldata starts, uint32[] calldata ends) external;
+
+    /// @notice Re-points layer C. **Only timelock (7 d).**
+    /// @param value The new `IFeedRegistry`.
+    function setFeedRegistry(address value) external;
+
+    /// @notice Re-points the pool and constituent registry. **Only timelock (7 d).**
+    /// @param value The new `IPoolRegistry`.
+    function setRegistry(address value) external;
+
+    /// @notice Re-points the tick source layers E and F read. **Only timelock (7 d).**
+    /// @dev This is the pointer that moves from the Phase 2 mock to `AmpsHook` in Phase 3.
+    /// @param value The new `IMarketReference`.
+    function setMarketReference(address value) external;
 }

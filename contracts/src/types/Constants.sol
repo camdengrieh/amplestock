@@ -319,6 +319,26 @@ library Constants {
     /// @notice Layer C: a single-round move larger than this arms the two-confirmation rule. 10%.
     uint16 internal constant ANSWER_JUMP_BPS = 1000;
 
+    /// @notice Layer C: how long an unconfirmed jump is held before it is adopted without a second agreeing round.
+    ///         1 hour. A real 10% move must not be held back for ever by an aggregator that stops publishing.
+    uint32 internal constant ANSWER_CONFIRM_SECONDS_DEFAULT = 3600;
+
+    /// @notice Hard floor of the two-confirmation escape window. 5 minutes.
+    uint32 internal constant ANSWER_CONFIRM_SECONDS_MIN = 300;
+
+    /// @notice Hard ceiling of the two-confirmation escape window. 24 hours, the RDD heartbeat of every Robinhood
+    ///         Chain equity feed: holding a jump longer than one whole heartbeat is indistinguishable from a dead
+    ///         feed and is handled by the freshness bound instead.
+    uint32 internal constant ANSWER_CONFIRM_SECONDS_MAX = 86_400;
+
+    /// @notice Hard floor of a per-feed heartbeat. 60 s: the fastest publication cadence any Chainlink feed the
+    ///         protocol could adopt, and low enough that a future sub-minute feed needs no new bytecode.
+    uint32 internal constant FEED_HEARTBEAT_SECONDS_MIN = 60;
+
+    /// @notice Hard ceiling of a per-feed heartbeat. 86,400 s, exactly the RDD heartbeat of every Robinhood Chain
+    ///         equity feed.
+    uint32 internal constant FEED_HEARTBEAT_SECONDS_MAX = 86_400;
+
     /// @notice Layer E: the divergence breaker trips above this deviation. 5%.
     uint16 internal constant DIVERGENCE_BPS_DEFAULT = 500;
 
@@ -548,4 +568,33 @@ library Constants {
 
     /// @notice Multiple of the observed gas cost the bounty may never exceed.
     uint16 internal constant KEEPER_GAS_CAP_MULTIPLE = 3;
+
+    /// @notice Launch `dailyCeilingUsd18`: $25 a day, sized to the $5k launch book. At the launch tip and chip that
+    ///         is roughly two hundred paid jobs a day with headroom, and it is governed upward with TVL alongside
+    ///         the tip and the dust guard.
+    uint256 internal constant DAILY_CEILING_USD18_DEFAULT = 25e18;
+
+    /// @notice Hard ceiling of `tipUsd18`. $5 is a hundred times the launch tip and already far past the point
+    ///         where a flat tip is the dominant term for a $5k book.
+    uint256 internal constant TIP_USD18_MAX = 5e18;
+
+    /// @notice Hard ceiling of `chipBps`. 10% of realised work value; there is no floor beyond zero.
+    uint16 internal constant CHIP_BPS_MAX = 1000;
+
+    /// @notice Hard ceiling of `chostUsd18`. A dust guard above $1,000 of work value would silence every job the
+    ///         launch book can generate, which is a migration decision, not a parameter change.
+    uint256 internal constant CHOST_USD18_MAX = 1000e18;
+
+    /// @notice Hard floor of `gasCapMultiple`. Zero would mean no job is ever paid whatever the other parameters
+    ///         say, which is what a zero `dailyCeilingUsd18` is for.
+    uint16 internal constant GAS_CAP_MULTIPLE_MIN = 1;
+
+    /// @notice Hard ceiling of `gasCapMultiple`. Beyond 10x the observed gas cost the cap stops bounding a gas
+    ///         spike at all.
+    uint16 internal constant GAS_CAP_MULTIPLE_MAX = 10;
+
+    /// @notice Hard ceiling of `dailyCeilingUsd18`. $100k a day is four thousand times the launch ceiling; there is
+    ///         no floor, because setting the ceiling to zero is the governance path for pausing paid keeping
+    ///         without pausing the jobs themselves.
+    uint256 internal constant DAILY_CEILING_USD18_MAX = 100_000e18;
 }

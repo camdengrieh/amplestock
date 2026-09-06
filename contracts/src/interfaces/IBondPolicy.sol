@@ -48,8 +48,11 @@ pragma solidity 0.8.30;
 interface IBondPolicy {
     /// @notice Everything the pricing law is allowed to see. Assembled by `AmpsBonds` from its own state, the
     ///         vault checkpoint and the gate.
-    /// @param mX18 The spoke's 30-minute truncated TWAP, in AMPS wei per 1e18 raw units of collateral, rounded
-    ///        down. For an `ENTRY`-class market this is the entry pool's own TWAP.
+    /// @param mX18 The spoke's 30-minute truncated TWAP: **AMPS wei per 1e18 of `amountIn18`, i.e. per one whole
+    ///        collateral unit**, rounded down. It is quoted against the *normalised* deposit, never against the
+    ///        collateral's raw units, so a 6-decimal USDG and an 18-decimal Stock Token are the same number here
+    ///        and the shell's one decimal scaling happens before the policy sees anything. For an `ENTRY`-class
+    ///        market this is the entry pool's own TWAP.
     /// @param navPerShareX18 The vault's checkpointed NAV per share, USD per AMPS, 18 decimals.
     /// @param collateralPriceUsd18 The collateral's last Chainlink answer converted to 18-decimal USD. Never
     ///        multiplied by any `uiMultiplier()`.
@@ -81,7 +84,8 @@ interface IBondPolicy {
 
     /// @notice The priced result.
     /// @param ampsOut AMPS wei the bonder receives, before the capacity check, rounded down.
-    /// @param qX18 The applied price, AMPS wei per 1e18 of collateral, `min(qMarketX18, qFloorX18)`.
+    /// @param qX18 The applied price, in the same unit as `mX18` — AMPS wei per 1e18 of `amountIn18`, i.e. per one
+    ///        whole collateral unit — and equal to `min(qMarketX18, qFloorX18)`.
     /// @param qMarketX18 The market-derived price, `m / (1 - d)`.
     /// @param qFloorX18 The NAV-derived accretion floor.
     /// @param discountBps The clamped discount actually applied.

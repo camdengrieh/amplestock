@@ -341,6 +341,15 @@ contract MockPoolRegistry is IPoolRegistry {
     }
 
     /// @inheritdoc IPoolRegistry
+    /// @dev The base mock answers the **target** weight, exactly as the real `PoolRegistry` does in Phase 2, so a
+    ///      bond priced against this mock sees `deficit == 0`. `MockRegistryForBonds` overrides it with a settable
+    ///      realised weight (and a switch that makes it revert), which is how the bond suite drives the live
+    ///      deficit branch and the "registry cannot report a weight" branch.
+    function currentWeightBps(uint16 constituentId) external view virtual returns (uint16 weightBps) {
+        return _constituents[constituentId].targetWeightBps;
+    }
+
+    /// @inheritdoc IPoolRegistry
     function activeConstituentCount() external view returns (uint16 count) {
         return _activeCount;
     }

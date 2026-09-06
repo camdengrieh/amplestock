@@ -536,3 +536,31 @@ struct FeedConfig {
     uint128 minAnswerUsd8;
     uint128 maxAnswerUsd8;
 }
+
+/// @notice Everything `IFeedRegistry.feedStatus` reports about one feed, in the shape `AmpsQuoter` renders and a
+///         degraded dApp falls back to. Memory-only: nothing writes it to storage, so it carries no packing
+///         discipline and is laid out for readability instead.
+/// @dev The three answer fields are the *effective* answer, which is not always the aggregator's live round: while
+///      the two-confirmation rule holds a jump back, `answerUsd8` is the accepted answer and `unconfirmed` is true.
+///      `fresh` is `false` for an unconfigured token, and `live` says whether the aggregator answered this very
+///      call with a valid, in-bounds round — which is how a caller tells "dead feed" from "held-back jump".
+/// @param answerUsd8 The effective answer, 8 decimals; 0 when no usable answer exists at all.
+/// @param updatedAt The effective answer's publication timestamp.
+/// @param roundId The round the effective answer came from.
+/// @param age The effective answer's age in seconds.
+/// @param maxAgeSeconds The freshness bound in force; `type(uint32).max` when the session disables the check.
+/// @param fresh Whether the answer is within that bound.
+/// @param live Whether the aggregator answered this call with a valid, in-bounds round.
+/// @param unconfirmed Whether a jump above `Constants.ANSWER_JUMP_BPS` is being held back right now.
+/// @param configured Whether a feed is configured for the token at all.
+struct FeedStatus {
+    uint256 answerUsd8;
+    uint32 updatedAt;
+    uint80 roundId;
+    uint32 age;
+    uint32 maxAgeSeconds;
+    bool fresh;
+    bool live;
+    bool unconfirmed;
+    bool configured;
+}

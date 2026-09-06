@@ -41,21 +41,6 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
-/// @title IIndexWeightSource
-/// @notice The one registry view the bond shell needs and `IPoolRegistry` does not declare yet: the constituent's
-///         *realised* index weight, against which its target weight defines the deficit term.
-/// @dev Read through a bounded `staticcall` rather than a typed call, and treated as "unknown" on any failure, so
-///      a registry that does not implement it (Phase 2) simply prices every bond at `deficit == 0` — the
-///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued.
-///      Promoting this into `IPoolRegistry` is the one interface change `AmpsBonds` wants; the shell is written so
-///      that promotion needs no new bytecode.
-interface IIndexWeightSource {
-    /// @notice The constituent's current share of the index, in bps of the whole index.
-    /// @param constituentId The 1-based constituent id.
-    /// @return weightBps The realised weight in bps.
-    function currentWeightBps(uint16 constituentId) external view returns (uint16 weightBps);
-}
-
 /// @title AmpsBonds
 /// @notice Custody and vesting shell for the only post-genesis AMPS issuance path (Decision 9). Deposit a
 ///         registered collateral, receive AMPS at a discount to the spoke's own truncated TWAP but never below
@@ -379,18 +364,28 @@ contract AmpsBonds is IAmpsBonds {
         _rollEpoch(marketId, stored);
         _rollDay();
 
-        // 3. Price it: checkpoint, `m`, `P_i`, the policy, and the shell's own accretion floor.
+        // 3. Settle the collateral. The vault checkpoints *before* it settles, so the NAV read in step 4 is this
+        //    block's pre-deposit NAV: a bond never prices against a checkpoint an earlier bond, a redemption or a
+        //    feed move has already left below the live value (I27 against the live NAV, not a stale word). The
+        //    deposit is an interaction ahead of the effects in step 6; both contracts hold their transient locks
+        //    across it, and a revert anywhere below unwinds it.
+        uint256 settled = IAmpsVault(vault).depositBonded(marketId, stored.collateral, msg.sender, amountIn);
+        if (settled != amountIn) revert DepositMismatch(settled, amountIn);
+
+        // 4. Price it: the same-block checkpoint, `m`, `P_i`, the policy, and the shell's own accretion floor.
         _Priced memory priced = _price(stored, amountIn, haircutBps);
 
-        // 4. Capacity: per market per epoch, then globally per day. A clamp to zero closes the market until the
-        //    epoch rolls; a partial clamp is disclosed by {quote} and bounded by the caller's `minAmpsOut`.
+        // 5. Capacity: per market per epoch, then globally per day. A clamp to zero closes the market until the
+        //    epoch rolls; a partial clamp is disclosed by {quote} and bounded by the caller's `minAmpsOut`. The
+        //    clamp reduces the AMPS issued, never the collateral already settled: `minAmpsOut` is the bonder's
+        //    protection against handing over a whole deposit for a capped issue.
         (uint256 available,,) = _capacity(stored);
         if (available == 0) revert CapacityExceeded(priced.ampsOut, 0);
         ampsOut = priced.ampsOut > available ? available : priced.ampsOut;
         if (ampsOut == 0) revert ZeroAmount();
         if (ampsOut < minAmpsOut) revert SlippageExceeded(ampsOut, minAmpsOut);
 
-        // 5. Effects, before any interaction.
+        // 6. Effects, before the mint.
         uint128 issued = ampsOut.toUint128();
         stored.issuedThisEpoch += issued;
         stored.totalIssued += issued;
@@ -408,14 +403,14 @@ contract AmpsBonds is IAmpsBonds {
             })
         );
 
-        // 6. Interactions, the event and `sweepClean`.
-        _settle(marketId, stored.collateral, amountIn, ampsOut, positionId, priced);
+        // 7. The mint, the event and `sweepClean`.
+        _issue(marketId, stored.collateral, amountIn, ampsOut, positionId, priced);
     }
 
-    /// @dev Everything `bond` does after its effects are written: the collateral moves bonder -> PoolManager
-    ///      without ever resting here, the AMPS is minted to this contract and is in `totalSupply` from this
-    ///      instant (I30), and I12 is asserted against the market's own collateral.
-    function _settle(
+    /// @dev Everything `bond` does after its effects are written: the AMPS is minted to this contract and is in
+    ///      `totalSupply` from this instant (I30), and I12 is asserted against the market's own collateral, which
+    ///      moved bonder -> PoolManager in step 3 without ever resting here.
+    function _issue(
         uint16 marketId,
         address collateral,
         uint256 amountIn,
@@ -423,10 +418,7 @@ contract AmpsBonds is IAmpsBonds {
         uint256 positionId,
         _Priced memory priced
     ) internal {
-        address vaultAddress = vault;
-        uint256 settled = IAmpsVault(vaultAddress).depositBonded(marketId, collateral, msg.sender, amountIn);
-        if (settled != amountIn) revert DepositMismatch(settled, amountIn);
-        IAmpsVault(vaultAddress).mintVesting(address(this), ampsOut);
+        IAmpsVault(vault).mintVesting(address(this), ampsOut);
 
         emit Bond(
             msg.sender,
@@ -447,7 +439,9 @@ contract AmpsBonds is IAmpsBonds {
     /// @dev The reverting half of the pricing path: the checkpoint staleness bound, `m` from the spoke's own
     ///      30-minute truncated TWAP, `P_i` from the last Chainlink answer (staleness allowed on purpose), the
     ///      policy call, and the shell's independent accretion floor. The floor re-check is what makes the policy
-    ///      pointer safe: a hostile policy can refuse to price, never issue a dilutive bond.
+    ///      pointer safe: a hostile policy can refuse to price, never issue a dilutive bond. Inside {bond} the
+    ///      checkpoint is always this block's, written by `depositBonded` a moment earlier; the staleness bound
+    ///      is what {quote} enforces and what a vault that did not refresh would trip.
     function _price(BondMarket storage record, uint256 amountIn, uint16 haircutBps)
         internal
         view
@@ -950,7 +944,7 @@ contract AmpsBonds is IAmpsBonds {
 
     /// @dev `deficit = clamp((w_target - w_current) / w_target, 0, 1)`, rounded **down**: a smaller deficit widens
     ///      the discount less. Zero for `ENTRY`-class markets (they are not index constituents) and zero whenever
-    ///      the registry cannot report a realised weight — see {IIndexWeightSource}.
+    ///      the registry cannot report a realised weight — see {_tryCurrentWeightBps}.
     function _deficitX18(BondMarket storage record) internal view returns (uint64 deficitX18) {
         if (record.class != CollateralClass.CONSTITUENT || record.constituentId == 0) return 0;
 
@@ -969,21 +963,26 @@ contract AmpsBonds is IAmpsBonds {
         deficitX18 = uint64(FullMath.mulDiv(targetWeightBps - currentWeightBps, Constants.WAD, targetWeightBps));
     }
 
-    /// @dev The bounded probe behind {IIndexWeightSource}. Any failure — no such function, a revert, a short
-    ///      return, an out-of-range answer — reads as "unknown", never as a weight.
+    /// @dev The bounded probe behind `IPoolRegistry.currentWeightBps`. The call is typed — the registry declares
+    ///      the view — but it is still capped at `Constants.STOCK_TOKEN_PROBE_GAS` and still `try`/`catch`ed: any
+    ///      failure (a revert, a short or malformed return, a registry deployed before the view existed) reads as
+    ///      "unknown" and prices `deficit == 0`, never as a weight. A registry that cannot answer must never be
+    ///      able to close a bond market, which is why this is not a plain call.
     function _tryCurrentWeightBps(address registryAddress, uint16 constituentId)
         internal
         view
         returns (bool ok, uint16 weightBps)
     {
-        (bool success, bytes memory data) = registryAddress.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(
-            abi.encodeCall(IIndexWeightSource.currentWeightBps, (constituentId))
-        );
-        if (!success || data.length < 32) return (false, 0);
-
-        uint256 raw = abi.decode(data, (uint256));
-        if (raw > Constants.BPS) return (false, 0);
-        return (true, uint16(raw));
+        try IPoolRegistry(registryAddress).currentWeightBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}(
+            constituentId
+        ) returns (
+            uint16 raw
+        ) {
+            if (raw > Constants.BPS) return (false, 0);
+            return (true, raw);
+        } catch {
+            return (false, 0);
+        }
     }
 
     /// @dev `fill = clamp(issuedThisEpoch / capacity, 0, 1)`, rounded **up**: a larger fill narrows the discount

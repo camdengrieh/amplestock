@@ -59,8 +59,10 @@ slot 3   address creator                   [  0..159]
          bool    wiringFrozen              [200..207]   set by genesis(); set-once pointers refuse afterwards
          (free)                            [208..255]
 slot 4-7   address registry / bonds / staking / bountyPot        set-once, frozen by genesis()
-slot 8     address marketReference                               set-once (mock in Phase 2), re-pointed once to
-                                                                 AmpsHook under the 7-day timelock
+slot 8     address marketReference                               pointer-upgradeable (7 d) through setPolicyPointer,
+                                                                 exactly like slots 9-13: a mock in Phase 2, pointed
+                                                                 at AmpsHook in Phase 3, and re-pointable again after
+                                                                 that (it is not latched by genesis())
 slot 9-13  address oracleGate / feedRegistry / positionValuer /
            ladderPolicy / rolloutPolicy                          pointer-upgradeable (7 d); the last two are
                                                                  Phase 3, positionValuer is the zero-position stub
@@ -204,7 +206,9 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsVault` | `emergencyMigrate` | guardian, predicate-gated | none |
 | `AmpsBonds` | `bond` | **P** | — |
 | `AmpsBonds` | `claim`, `claimAll` | **P, U** (position owner) | — |
-| `AmpsBonds` | `addCollateral`, `removeCollateral`, `setPolicy` | timelock | 7 d |
+| `AmpsBonds` | `removeCollateral`, `setPolicy` | timelock | 7 d |
+| `AmpsBonds` | `addCollateral` | timelock, **or `PoolRegistry`** | 7 d |
+| `AmpsBonds` | `setMarketOpen` | timelock, **or `PoolRegistry`** | 48 h |
 | `AmpsBonds` | every other `set*` (the `h_session` table lives in `OracleGate`) | timelock | 48 h |
 | `AmpsBonds` | `setVault` | vault | — |
 | `AmpsStaking` | `deposit`/`mint`/`withdraw`/`redeem`, `accrue` | **P** | — |
@@ -212,7 +216,7 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsStaking` | `setRewardStreamSeconds` | timelock | 48 h |
 | `PoolRegistry` | every read | **P** | — |
 | `PoolRegistry` | `addConstituent`, `retire`, `reinstate`, `reconfigure`, `setIndexWeights`, `registerEntryPool`, `withdrawRetiredBids` | timelock | 7 d |
-| `OracleGate` | `poke` | **P** (unpaid) | — |
+| `OracleGate` | `poke`, `pokePool`, `pokePools`, `pokeConstituent` | **P** (unpaid) | — |
 | `OracleGate` | `freeze*` (disable-only, auto-expiring) / `unfreeze*` | guardian | none |
 | `OracleGate` | every `set*`, `unfreeze*` | timelock | 48 h |
 | `FeedRegistry` | `setFeed` / `configureFeed`, `setFreshnessMultiplier` | timelock | 7 d / 48 h |
@@ -225,6 +229,32 @@ slot 4   address vault                                   reassigned only by migr
 The guardian's entire power is: cancel a timelock operation, freeze one constituent or the protocol (disable-only,
 expiring within 7 days), and trigger `emergencyMigrate` when the on-chain denylist predicate holds. It can move no
 funds and can block neither `redeemProRata` nor `claim`.
+
+### 2.1 Why `PoolRegistry` is an accepted caller on `AmpsBonds`
+
+`AmpsBonds.addCollateral` and `setMarketOpen` accept two callers: the timelock, and the registry. The registry is not
+a second governance root — every one of its own mutators is timelock-only behind the 7-day delay — so the delay and
+the proposal review are identical either way. What the second caller buys is **atomicity**: `addConstituent` opens the
+new name's bond market inside its own operation, and `retireConstituent` closes it inside its own, so "a new
+constituent has a bond market" and "a retired constituent has no open bond market" (I37) hold at every block rather
+than only after a second proposal lands. The alternative leaves a window in which the index and the bond board
+disagree, and a window is exactly what an issuer halt exploits.
+
+The shell reaches the registry through its own set-once `registry` pointer, and the registry reaches the shell through
+`IAmpsVault.bonds()` — the vault is the single system of record for every protocol pointer, and §1.4 gives the
+registry no slot for a second one. `test/unit/RegistryBondsWiring.t.sol` is the one place both real contracts are
+deployed together, because every other suite mocks one side of that boundary and therefore answers the access-control
+question for itself.
+
+### 2.2 `checkBond(0)` and `isBondAllowed(0)`
+
+`constituentId == 0` is a **valid, protocol-wide bond check**, not an unknown constituent. WETH and USDG are bond
+collateral without being index constituents, so `AmpsBonds` hands the gate id 0 for every `ENTRY`-class market. On
+that path the gate resolves no pool (`poolIdOf(0)` is `bytes32(0)`), reads no feed, runs no corporate-action probe
+and measures no divergence: layers C, D and E have nothing to say about an id that names no token. What is left is
+the guardian's protocol-wide freeze and the session haircut table, which is exactly what an entry market should
+price. It must never revert with `UnknownConstituent` — the gate never looks id 0 up in the registry at all, so a
+hostile, mis-pointed or absent registry cannot close an entry market either.
 
 ## 3. Call graphs
 
@@ -241,17 +271,22 @@ genesis (once)
 bond
   bonder -> bonds.bond(marketId, amountIn, minAmpsOut, to)
     lock; gate.checkBond(constituentId) -> hSessionBps   (reverts only on CA freeze / guardian / DIVERGED)
-    _rollEpoch(marketId); vault.checkpointData() -> navPerShareX18 + staleness check
+    _rollEpoch(marketId); _rollDay()
+    vault.depositBonded(marketId, collateral, msg.sender, amountIn)      -- the deposit comes BEFORE the price
+        vault: lock; _requireBondsHealthy (7.1); _registerAsset(collateral)
+               _checkpoint()                        <- same-block, PRE-deposit NAV, under the bond gate policy
+               poolManager.unlock(SETTLE) -> transferFrom(bonder -> poolManager); settle -> ERC-6909 claim
+    vault.checkpointData() -> navPerShareX18 (this block's) + staleness check (always 0 here; it guards quote())
     marketReference.twapTick30m(spokePool) -> m
     feedRegistry.latestAnswer(collateral)  -> P_i (stale is allowed; it feeds q_floor with the haircut)
     policy.quote(input) -> ampsOut, q, discount;  require(q <= qFloor recomputed in the shell)
-    clamp ampsOut to per-epoch then global daily capacity
+    clamp ampsOut to per-epoch then global daily capacity   (the AMPS out is clamped; the deposit is not)
     require(ampsOut >= minAmpsOut)
-    vault.depositBonded(marketId, collateral, msg.sender, amountIn)
-        vault: lock; poolManager.unlock(SETTLE) -> transferFrom(bonder -> poolManager); settle -> ERC-6909 claim
-    vault.mintVesting(address(bonds), ampsOut)         -> Amps.mint; T rises immediately (I30)
     positions[to].push(VestingPosition{principal: ampsOut, start: now, vestSeconds, marketId})
+    vault.mintVesting(address(bonds), ampsOut)         -> Amps.mint; T rises immediately (I30)
     emit Bond; sweepClean assert
+    -- the deposit is an interaction ahead of the shell's effects; both locks are held across it and any revert
+       below it unwinds the settle, so the order buys the fresh NAV without a reentrancy surface
 
 claim  (structurally ungated)
   owner -> bonds.claim(positionId, to)
@@ -338,6 +373,13 @@ Three overrides are checked before `cand` is used at all, and each sets `pRef = 
 `GateState.WATCHDOG` (no observation or block for longer than `graceSeconds`); and observation coverage below
 `twapWindow` on a young pool, which additionally records `pMkt` as 0.
 
+The coverage branch is **not reachable through `checkpoint()`**: the same missing coverage makes the gate report
+`WATCHDOG` for the hub, and `checkpoint()` takes the management policy, so it reverts with `GateNotHealthy` before
+`_checkpoint` runs and the previous checkpoint (which already has `P_ref == NAV`) stands. It *is* reached through
+the bond path, because `depositBonded` checkpoints under the bond policy, which admits `WATCHDOG`: a bond on an
+unobserved hub writes `pMkt = 0`, `P_ref = navPerShareX18` and a fresh timestamp. `Phase2IntegrationTest.
+test_a_referenceFallsBackToNavWhenTheHubIsUnobserved` asserts all three halves.
+
 `premium = pRef / navPerShare - 1` is disclosure only. `P_mkt` is what the hook's fee wall, the bond `m` and the
 quoter read; `P_ref` is what NAV valuation and (Phase 3) placement anchors read. An attacker who moves one spoke
 moves neither: `P_mkt` comes from the hub, and both are truncated TWAPs.
@@ -361,14 +403,43 @@ Every direction favours the protocol, which is what makes I27 (`NAV/share after 
 rather than up-to-dust. `amountIn18` is the raw deposit normalised to 18 decimals, so USDG's 6 decimals are scaled
 up once, in the shell, before the policy sees anything.
 
+`w_current` is `IPoolRegistry.currentWeightBps(constituentId)`, read through a bounded `try` whose every failure —
+a revert, an out-of-range answer, a registry deployed before the view existed — prices `deficit == 0`. **Phase 2's
+registry answers the target weight**, so the deficit is exactly zero on every market: the realised weight is the
+vault's valuation of that spoke's position divided by the whole index, and Phase 2 ships `ZeroPositionValuer`, so
+there is no position to value and any other answer would be invented. Zero is also the protocol-favourable reading —
+a smaller deficit is a smaller discount and less AMPS issued for the same collateral — so an input that is unknowable
+in Phase 2 cannot dilute anyone. Phase 3 sources the numerator from the vault's valuation with no ABI change and no
+new bond bytecode. A registry that cannot answer must never be able to close a bond market, which is why the read is
+a bounded probe and not a plain call.
+
 `qFloor` is computed from the **last Chainlink answer**, never from the pool: that caps what TWAP manipulation can
 buy (the best a spoke-dumper can do is remove their own discount) and bounds weekend-gap exposure to `hSessionBps`
 (0 / 50 / 150 / 300 bp) on the bonded amount, which is why markets stay open 24/7 through stale feeds and closed
 sessions instead of shutting. Capacity is applied *after* pricing: `ampsOut` is clamped to
 `capBpsPerEpoch * T / BPS - issuedThisEpoch`, then to `dailyCapBps * T / BPS - dailyIssued`; a clamp to zero closes
-the market until the epoch rolls and does not revert the quote view. The shell recomputes `qFloor` itself and
-rejects any `q` above it with `AccretionFloorViolated`, so a hostile or buggy `BondPolicy` pointer can refuse to
-price but can never issue a dilutive bond.
+the market until the epoch rolls and does not revert the quote view. **The clamp reduces the AMPS issued, never the
+collateral**: the shell settles the whole `amountIn` and issues the capped `ampsOut`, so an over-capacity bond hands
+over its entire deposit for the capped issue unless `minAmpsOut` refuses it. `quote()` discloses the clamp and the
+dApp must always pass the quoted amount as `minAmpsOut`; the protocol side of an over-capacity bond is a large
+accretion, never a loss. The shell recomputes `qFloor` itself and rejects any `q` above it with
+`AccretionFloorViolated`, so a hostile or buggy `BondPolicy` pointer can refuse to price but can never issue a
+dilutive bond.
+
+**Which NAV the price reads.** `navPerShareX18` comes from `vault.checkpointData()`, and the shell settles the
+collateral *before* it prices (§3). `depositBonded` writes a checkpoint under the bond gate policy immediately before
+it settles, so the NAV a bond is priced against is always this block's pre-deposit NAV — never a value an earlier
+bond, a redemption or a feed move inside `CHECKPOINT_MAX_AGE` (1,800 s) has already left below the live one. This is
+what makes I27 exact against the *live* NAV under every gate state bonds are open in, including `DEGRADED` and
+`WATCHDOG`, where the management-gated `checkpoint()` refuses and no keeper could have refreshed it. Without it a
+second bond inside the window priced off the NAV its predecessor had already raised; with an over-capacity first
+bond (whole deposit in, capped AMPS out) the gap was several-fold and the second bond diluted every holder
+(`Phase2IntegrationTest.test_b_secondBondInTheSameBlockPricesAgainstTheLiveNav` is the regression). The
+`StaleCheckpoint` bound in `_price` is therefore what `quote()` enforces, and what a vault that did *not* refresh
+would trip; inside `bond()` the age is zero by construction. A `quote()` and the `bond()` that follows it can differ
+by exactly what changed NAV in between, in the protocol's favour. Cost: one checkpoint per bond (the fixture measures
+1,165,037 gas for a bond against 707,584 without it, with five constituents and the zero valuer; it scales with the
+asset list and, in Phase 3, with the positions the valuer decomposes), independent of placement.
 
 ## 7. The structurally ungated surface
 
@@ -383,14 +454,45 @@ Exactly two external state-changing functions are exempt from `_requireHealthy`:
 `guardian`, `standbyVault`, a freeze timestamp, a pause bool, `feedRegistry`, or any price. Both still take the
 transient reentrancy lock — a lock nobody else can hold, released in the same transaction, is not a gate.
 
+### 7.1 The vault has two gate policies, not one
+
+`AmpsVault` reads the gate through one helper with two policies, and the difference is load-bearing:
+
+| Policy | Taken by | Refuses | Passes |
+|---|---|---|---|
+| `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
+| either policy, gate pointer **reverts** | every gated selector | nothing | everything (fail-open, see below) |
+
+The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
+`h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
+than the design* rather than safer: it would shut every bond market every weekend. It mirrors `IOracleGate.checkBond`
+exactly, which makes the vault defence in depth behind the shell — a buggy or replaced `AmpsBonds` still cannot
+deposit or mint through a market the gate has closed — rather than a second, disagreeing gate.
+
+Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
+
+* **`emergencyMigrate` is not `_requireHealthy`-gated.** It is gated by the on-chain denylist predicate, which is
+  strictly narrower. The incident it exists for — an issuer denylisting the vault while pausing its oracle — is
+  precisely a state in which `_requireHealthy` refuses, so gating it would brick the evacuation path of an immutable
+  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`).
+* **A gate pointer that *reverts* is read as absent, not as a refusal.** The gate is the one pointer that can refuse
+  every governance call; if a broken one refused, nobody could call `setPolicyPointer` to replace it and a contract
+  holding no funds would have bricked the protocol. Failing open grants an attacker nothing they would not already
+  have with a `GREEN` gate.
+
 **How the I14 enumeration test verifies it** (`test/unit/GuardSymmetry.t.sol`):
 
-1. *Enumerate.* The test holds a `bytes4[] EXTERNAL_MUTATING` per contract plus an expected count; a CI step reads
-   `out-ifaces/<Contract>.sol/<Contract>.json` and compares the ABI's non-`view`/non-`pure` selectors against that
-   list, so adding a function without classifying it fails CI. (`ffi` is off and `fs_permissions` does not cover
-   `out-*`, so this comparison lives in the CI script, not in Solidity.)
+1. *Enumerate.* The test holds one classification entry per external mutating selector of `AmpsVault` (the
+   `_buildSelectorTable` list, three buckets: `MANAGEMENT`, `BONDS`, `EXEMPT`) and of `AmpsBonds` (the
+   `selector-gate:AmpsBonds` block, three buckets: gated, exempt, governed), plus an expected count for each. The CI
+   step `scripts/selector-gate.py` reads `out/<Contract>.sol/<Contract>.json`, lists the ABI's non-`view`/non-`pure`
+   selectors and fails on any name missing from those tables, so adding a function without deciding how it is
+   guarded cannot merge. (`ffi` is off and `fs_permissions` does not cover `out*`, so this comparison lives in the
+   CI script, not in Solidity.)
 2. *Assert refusal.* With the gate forced to each of `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG`,
-   every listed selector except the two exemptions must revert with `GateNotHealthy` or `ConstituentFrozen`.
+   every management-gated selector must revert with `GateNotHealthy` or `ConstituentFrozen`, and the two
+   bond-gated ones must refuse under `DIVERGED` and `SCHEDULED_FREEZE` and succeed under the other two.
 3. *Assert the exemptions succeed.* With every feed reverting, the watchdog tripped, the guardian freeze active and
    the timelock replaced by a contract that reverts on any call, `redeemProRata` and `claim` must succeed, and the
    redemption must pay exactly `(1 - redeemFeeBps/BPS) * shares / T` of every non-AMPS balance (I23).
@@ -429,3 +531,82 @@ transient reentrancy lock — a lock nobody else can hold, released in the same 
   short string, and reads its bound from `Constants`. Do not restate a bound as a literal.
 * Every external function asserts `sweepClean` at exit: the ERC-20 balance of every registered asset on the vault,
   the hook and `AmpsBonds` must be zero.
+
+## 9.1 Bootstrap ordering: the gate and the first pool are circular
+
+`AmpsVault.initializePool` and `genesis()` take `_requireHealthy`, and `OracleGate._referenceIntegrity` reports
+`WATCHDOG` whenever the hub pool is unregistered *or* its observation ring covers less than `twapWindow`. A freshly
+initialised hook pool has no observations at all, so with the gate already wired **no pool can be registered and
+`genesis()` cannot run**: both revert with `GateNotHealthy(WATCHDOG)` until the hub has thirty minutes of history it
+cannot acquire without existing. The Phase 2 integration fixture resolves it the only way the contracts allow, and
+the deploy runbook (`script/05_Registry`, `script/06_Genesis`) must use the same order:
+
+1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`) and the
+   pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave `oracleGate` unset**
+   (`_requireGate` returns when the pointer is zero);
+2. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate);
+3. wait until the hook's hub ring covers `twapWindow` — on Robinhood Chain that is thirty minutes of blocks after
+   the hub's first observation; on a test chain, seed the ring;
+4. point the vault at `OracleGate` through `setPolicyPointer`, confirm `gate.state(0) == GREEN`;
+5. run `genesis()`.
+
+Nothing is lost by the order: a gate that is absent is exactly as permissive as a gate that is `GREEN` (§7.1), the
+vault holds no assets before `genesis()`, and the `wiringFrozen` latch that `genesis()` sets does not cover the
+gate pointer, which stays governable for the life of the vault.
+
+## 10. How Phase 2 actually builds: libraries, lenses and per-path compilation
+
+Three facts about the build are not visible from the source alone and every deployment script depends on all three.
+
+### 10.1 `VaultNavLib` is a **linked** library, not an inlined one
+
+`AmpsVault` implements the whole of `IAmpsVault` and does not fit EIP-170 with the read side inlined: 45,818 B as
+one contract under the project-wide `optimizer_runs = 1_000_000`, and still 26,509 B at `runs = 1`. The read side —
+`A`, `P_mkt`, the reference overrides, the inventory disclosure and the migration predicate — therefore lives in
+`src/vault/VaultNavLib.sol`, which has `public`/`external` functions and is consequently a **deployed** library
+reached by `DELEGATECALL`, not an internal one folded into the caller.
+
+What that means in practice:
+
+* **Deploy scripts must deploy `VaultNavLib` first and link `AmpsVault` against it.** An unlinked `AmpsVault`
+  artefact carries `__$...$__` placeholders in its bytecode and cannot be deployed. `forge script` links
+  automatically from the artefact's link references; a raw `create` from bytecode does not, and will deploy a
+  contract whose every NAV read reverts.
+* **The library address is fixed at link time and is not governable.** There is no pointer to re-point and no
+  storage in the library, so it is part of `AmpsVault` for every governance and audit purpose: a change to
+  `VaultNavLib` is a change to the vault, and a vault migration.
+* **Splitting the reads out, not the writes, is deliberate.** `redeemProRata` stays entirely inside `AmpsVault` and
+  makes no `DELEGATECALL` at all, which is what keeps §7's structural argument true: the ungated path cannot reach
+  a gate, a feed or a price even through a library.
+
+### 10.2 Two contracts are compiled under per-path restrictions
+
+`foundry.toml` carries `[[profile.default.compilation_restrictions]]` entries for `src/vault/*` and `src/bonds/*`,
+both at `optimizer_runs = 200` with `via_ir = true`, while everything else stays on the project-wide legacy
+pipeline at `optimizer_runs = 1_000_000`.
+
+| Path | Why |
+|---|---|
+| `src/vault/*` | Even with the read side in `VaultNavLib`, the vault is 26,509 B at `runs = 1` on the legacy pipeline. The IR pipeline at 200 runs brings it to ~23.8 kB, inside EIP-170 with margin. |
+| `src/bonds/*` | `AmpsBonds` carries the whole bond call graph plus the collateral registry and twelve governed setters; at 1,000,000 runs solc inlines it past EIP-170. At 200 runs through IR it fits with room to spare. |
+
+The restriction is **per path, not per profile**, precisely so that nothing else moves: every other contract's
+codegen — and therefore every gas baseline in `test/gas/` — is byte-identical to what it was before either
+restriction was added. Widening the compiler profile globally instead would silently re-price every measurement in
+the gas suite, which is why an addition that pushes `AmpsVault` over the limit must move logic into `VaultNavLib`
+rather than relax the profile. The vault's remaining margin is small (roughly 0.8 kB) and should be treated as a
+budget.
+
+### 10.3 The read-only lens contracts
+
+Two contracts exist only to hold reads that would otherwise not fit inside EIP-170:
+
+* **`PoolRegistryLens`** — the active-constituent list, the index weight vector, and the cap/floor rule evaluated at
+  an arbitrary `n`. All of it is derived from `IPoolRegistry`'s getters.
+* **`AmpsBondsLens`** — position enumeration and the whole-board quote, both pure aggregations of `IAmpsBonds`'s
+  views.
+
+Neither holds storage, neither is referenced by any other contract, and neither is governed or upgradeable: they are
+stateless views over the contract they name, redeployable at will, and nothing on any protocol path reads them.
+`PoolRegistry.wiring()` returns its four immutables as one tuple for the same reason — four separate getters cost
+bytecode the registry does not have.

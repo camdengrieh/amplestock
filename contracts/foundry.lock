@@ -1,0 +1,14 @@
+{
+  "lib/forge-std": {
+    "rev": "452bdecf8772bf113532f67c5cf3accb71895cd0"
+  },
+  "lib/hookmate": {
+    "rev": "ef3e9845e0b2bc9cd5810644d7d337b00c47bc75"
+  },
+  "lib/openzeppelin-contracts": {
+    "rev": "bbf3600dc2fd09c7409c5e9d65e2faea36f35115"
+  },
+  "lib/uniswap-hooks": {
+    "rev": "2ae32be4906d300fc49b4384842ef6bc3e902d73"
+  }
+}

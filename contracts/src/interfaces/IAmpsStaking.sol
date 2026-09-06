@@ -43,6 +43,15 @@ interface IAmpsStaking is IERC4626 {
     /// @notice The reward notified was zero. Notifying nothing would silently restart the stream clock.
     error ZeroReward();
 
+    /// @notice {notifyReward} was called without the AMPS having been transferred in first, so honouring the
+    ///         notification would push `pendingRewards` above the contract's balance and make
+    ///         {IERC4626-totalAssets} underflow for every subsequent caller. Funding is push, not pull: the vault
+    ///         transfers and *then* notifies, in the same transaction, so a mis-sequenced vault fails loudly here
+    ///         instead of bricking the share price.
+    /// @param required The undistributed remainder the notification implies.
+    /// @param held The AMPS the contract actually holds.
+    error RewardNotFunded(uint256 required, uint256 held);
+
     // -------------------------------------------------------------------------------------------------------------
     // Reads (permissionless)
     // -------------------------------------------------------------------------------------------------------------
@@ -50,6 +59,13 @@ interface IAmpsStaking is IERC4626 {
     /// @notice The vault: the only address that may call {notifyReward}.
     /// @return vaultAddress The vault address.
     function vault() external view returns (address vaultAddress);
+
+    /// @notice The 48-hour timelock: the only address that may call {setRewardStreamSeconds}.
+    /// @dev Immutable in the implementation. Moving governance means migrating the vault, which hands the vault
+    ///      role on through {setVault} and redeploys this contract; there is no governance path that can point the
+    ///      parameter setter at a new owner.
+    /// @return timelockAddress The timelock address.
+    function timelock() external view returns (address timelockAddress);
 
     /// @notice AMPS wei notified but not yet released. Deliberately **not** part of {IERC4626-totalAssets}.
     /// @return amount The undistributed remainder.
@@ -70,6 +86,17 @@ interface IAmpsStaking is IERC4626 {
     /// @notice Total AMPS ever notified to this contract, for the dApp's realised-APR calculation.
     /// @return amount The cumulative total.
     function totalNotified() external view returns (uint256 amount);
+
+    /// @notice AMPS wei released into {IERC4626-totalAssets} since deployment: {totalNotified} less what is still
+    ///         pending.
+    /// @dev The dApp pairs it with {totalNotified} for the realised-APR panel, and the I36 tests assert
+    ///      `releasedRewards() <= totalNotified()` after every step.
+    /// @return amount The cumulative released total.
+    function releasedRewards() external view returns (uint256 amount);
+
+    /// @notice Seconds left in the current stream, zero when nothing is streaming.
+    /// @return secondsRemaining The remaining stream length.
+    function streamSecondsRemaining() external view returns (uint32 secondsRemaining);
 
     // -------------------------------------------------------------------------------------------------------------
     // Governed parameters and hard bands

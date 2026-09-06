@@ -48,6 +48,17 @@ interface IBountyPot {
     /// @param newValue The value after.
     event BountyParameterChanged(bytes32 indexed parameter, uint256 previousValue, uint256 newValue);
 
+    /// @notice Emitted at construction (`previousVault == address(0)`) and whenever the vault role is handed on
+    ///         during a migration.
+    /// @param previousVault The old vault.
+    /// @param newVault The new vault.
+    event VaultChanged(address indexed previousVault, address indexed newVault);
+
+    /// @notice The pot token reports more than 18 decimals, so 18-decimal USD amounts could not be scaled down to
+    ///         its raw units without a loss the accounting does not model. Thrown at construction only.
+    /// @param decimals The token's decimals.
+    error UnsupportedDecimals(uint8 decimals);
+
     // -------------------------------------------------------------------------------------------------------------
     // Reads (permissionless)
     // -------------------------------------------------------------------------------------------------------------
@@ -55,6 +66,12 @@ interface IBountyPot {
     /// @notice The pot's token: USDG on chain 4663, 6 decimals.
     /// @return tokenAddress The token address.
     function token() external view returns (address tokenAddress);
+
+    /// @notice The 48-hour timelock: the only address that may {sweep} or move a parameter.
+    /// @dev Immutable in the implementation, for the same reason as in `AmpsStaking`: there is no governance path
+    ///      that can re-point the parameter setters at a new owner, only a migration.
+    /// @return timelockAddress The timelock address.
+    function timelock() external view returns (address timelockAddress);
 
     /// @notice The pot's current balance, in the token's raw units.
     /// @return balanceRaw The balance.
@@ -87,6 +104,27 @@ interface IBountyPot {
     /// @notice Payments made in the trailing 24 hours, 18-decimal USD.
     /// @return value The rolling total.
     function spentLast24h() external view returns (uint256 value);
+
+    /// @notice What the daily ceiling still allows to be paid inside the open window, 18-decimal USD.
+    /// @dev `dailyCeilingUsd18 - spentLast24h()`, floored at zero. The keeper reads it to decide whether a job is
+    ///      worth submitting at all, and the dashboards render it as "budget left today".
+    /// @return value The remaining budget.
+    function budgetLeftUsd18() external view returns (uint256 value);
+
+    /// @notice The same figure as {budgetLeftUsd18}, in the token's raw units and floored to a whole unit.
+    /// @return valueRaw The remaining budget in raw token units.
+    function budgetLeftRaw() external view returns (uint256 valueRaw);
+
+    /// @notice When the open rolling window started, or zero before the first payment.
+    /// @dev The window is a rolling *reset*, not a trailing sum: it opens with the first payment that lands 24 h or
+    ///      more after the previous one opened. The indexer uses this to align its own accounting with the chain.
+    /// @return timestamp The window start.
+    function windowStart() external view returns (uint32 timestamp);
+
+    /// @notice The divisor from 18-decimal USD to the token's raw units, `10 ** (18 - token.decimals())`.
+    /// @dev Exposed so a keeper can reproduce {quote} off-chain exactly.
+    /// @return scale The divisor.
+    function usdScale() external view returns (uint256 scale);
 
     /// @notice What {pay} would pay for a hypothetical job, without paying it.
     /// @dev Never reverts. The keeper calls this before submitting so it can skip an unprofitable job.
@@ -142,4 +180,10 @@ interface IBountyPot {
     /// @notice Sets the rolling daily ceiling. **Only timelock (48 h).**
     /// @param value The new ceiling, 18-decimal USD.
     function setDailyCeilingUsd18(uint256 value) external;
+
+    /// @notice Hands the vault role on. **Only vault**, so a migration moves it atomically in the same transaction
+    ///         that moves the liquidity, exactly as `Amps.setVault`, `AmpsBonds.setVault` and
+    ///         `AmpsStaking.setVault` do.
+    /// @param newVault The new vault.
+    function setVault(address newVault) external;
 }

@@ -185,7 +185,7 @@ contract OracleGateTest is OracleGateFixture {
 
         // The fair tick of every pool is derived from the hub's implied AMPS price, so the fixture starts with
         // every pool exactly on its reference and each test moves one thing.
-        GatePriceMath math = gate.priceMath();
+        GatePriceMath math = GatePriceMath(gate.priceMath());
         uint256 ampsUsd18 = math.ampsPriceUsd18(HUB_TICK, 1e8, 6);
         fairTick = math.fairTick(ampsUsd18, 180e8, 18, TICK_SPACING);
         int24 wethTick = math.fairTick(ampsUsd18, 3000e8, 18, 1);
@@ -245,6 +245,113 @@ contract OracleGateTest is OracleGateFixture {
         assertEq(gate_.answerUsd8, 0, "no constituent answer");
         assertFalse(gate_.feedStale, "no feed to be stale");
         assertEq(gate_.poolTick, 0, "no pool");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // `constituentId == 0`: the protocol-wide bond check `ENTRY`-class markets take
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // WETH and USDG are bond collateral without being index constituents, so `AmpsBonds` hands the gate id 0 for
+    // those markets. That is a first-class input, not a degenerate one: it must answer the protocol freeze and the
+    // session haircut, consult no per-constituent state, and never revert with `UnknownConstituent`.
+
+    /// @notice Id 0 is a valid bond check: allowed, at the session haircut, on a green gate.
+    function test_bond_idZeroIsAValidProtocolWideCheck() public view {
+        (bool allowed, uint16 haircut) = gate.isBondAllowed(0);
+        assertTrue(allowed, "entry-class markets accept bonds");
+        assertEq(haircut, Constants.H_SESSION_REGULAR_BPS_DEFAULT, "at the session haircut");
+        assertEq(gate.checkBond(0), haircut, "checkBond agrees");
+    }
+
+    /// @notice The haircut id 0 reports is the session table, and it follows the calendar exactly as a
+    ///         constituent's does — that is the whole of what an entry-class market prices.
+    function test_bond_idZeroFollowsTheSessionHaircut() public {
+        assertEq(gate.checkBond(0), Constants.H_SESSION_REGULAR_BPS_DEFAULT, "regular");
+
+        vm.warp(MON_POST);
+        assertEq(gate.checkBond(0), Constants.H_SESSION_PRE_POST_BPS_DEFAULT, "pre/post");
+
+        vm.warp(MON_OVERNIGHT);
+        assertEq(gate.checkBond(0), Constants.H_SESSION_OVERNIGHT_BPS_DEFAULT, "overnight");
+
+        vm.warp(FRI_CLOSED);
+        assertEq(gate.checkBond(0), Constants.H_SESSION_CLOSED_BPS_DEFAULT, "closed");
+        (bool allowed,) = gate.isBondAllowed(0);
+        assertTrue(allowed, "a closed session widens the haircut, it does not close the market");
+    }
+
+    /// @notice No per-constituent state reaches the id-0 check. Freezing constituent 1, staling its feed and
+    ///         diverging its pool leave the entry-class answer untouched.
+    function test_bond_idZeroIgnoresEveryPerConstituentCondition() public {
+        // A guardian freeze on the constituent, which closes *its* market.
+        vm.prank(GUARDIAN);
+        gate.freezeConstituent(constituentId, uint32(block.timestamp + 1 days));
+
+        // A corporate action on the constituent, which also closes its market.
+        nvda.setOraclePaused(true);
+
+        // And its spoke diverged past the breaker, latched and sustained.
+        marketRef.setObservation(spokePool, fairTick + 5000, fairTick + 5000, 1800);
+        gate.pokePool(spokePool);
+        vm.warp(block.timestamp + gate.divergenceSustainSeconds() + 1);
+        vm.roll(block.number + 1000);
+
+        (bool allowed,) = gate.isBondAllowed(constituentId);
+        assertFalse(allowed, "the constituent's own market is shut");
+
+        (allowed,) = gate.isBondAllowed(0);
+        assertTrue(allowed, "the entry-class check is unmoved");
+        assertEq(gate.checkBond(0), gate.hSessionBps(gate.sessionNow()), "and still reports the session haircut");
+    }
+
+    /// @notice The one thing that closes an entry-class market is the guardian's protocol-wide freeze, and it
+    ///         expires by itself.
+    function test_bond_idZeroRefusesOnlyUnderAProtocolFreeze() public {
+        vm.prank(GUARDIAN);
+        gate.freezeProtocol(uint32(block.timestamp + 1 days));
+
+        (bool allowed,) = gate.isBondAllowed(0);
+        assertFalse(allowed, "the protocol freeze closes it");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IOracleGate.GateRefused.selector, GateState.SCHEDULED_FREEZE, PoolId.wrap(bytes32(0))
+            )
+        );
+        gate.checkBond(0);
+
+        vm.warp(block.timestamp + 2 days);
+        vm.roll(block.number + 100_000);
+        (allowed,) = gate.isBondAllowed(0);
+        assertTrue(allowed, "and it expires with no further action");
+    }
+
+    /// @notice Id 0 never reverts with `UnknownConstituent`, for any registry: a registry that reverts on every
+    ///         call, and no registry at all, both still answer the entry-class check.
+    function test_bond_idZeroNeverConsultsTheRegistry() public {
+        address hostile = address(new RevertingContract());
+        vm.prank(TIMELOCK);
+        gate.setRegistry(hostile);
+        (bool allowed, uint16 haircut) = gate.isBondAllowed(0);
+        assertTrue(allowed, "a hostile registry cannot close an entry market");
+        assertEq(gate.checkBond(0), haircut, "checkBond agrees");
+
+        OracleGate bare = new OracleGate(TIMELOCK, GUARDIAN, address(0), address(0), address(0));
+        (allowed, haircut) = bare.isBondAllowed(0);
+        assertTrue(allowed, "and neither can no registry at all");
+        assertEq(bare.checkBond(0), haircut, "checkBond agrees");
+    }
+
+    /// @notice A dead layer C degrades an entry market to the session haircut rather than closing it: there is no
+    ///         feed to read for id 0 in the first place, which is the 24/7 bond decision in its purest form.
+    function test_bond_idZeroSurvivesADeadFeedRegistry() public {
+        address hostile = address(new RevertingContract());
+        vm.prank(TIMELOCK);
+        gate.setFeedRegistry(hostile);
+
+        (bool allowed, uint16 haircut) = gate.isBondAllowed(0);
+        assertTrue(allowed, "still open");
+        assertEq(haircut, gate.hSessionBps(gate.sessionNow()), "still the session haircut");
+        assertEq(gate.checkBond(0), haircut, "checkBond agrees");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -601,7 +708,7 @@ contract OracleGateTest is OracleGateFixture {
     /// @notice When the hub and the WETH route disagree by more than the tolerance the reference falls back to
     ///         NAV: placements continue, anchored at NAV, and nothing else changes.
     function test_refDiverged() public {
-        GatePriceMath math = gate.priceMath();
+        GatePriceMath math = GatePriceMath(gate.priceMath());
         uint256 ampsUsd18 = math.ampsPriceUsd18(HUB_TICK, 1e8, 6);
         int24 wethTick = math.fairTick(ampsUsd18, 3000e8, 18, 1);
         marketRef.setObservation(wethPool, wethTick + 700, wethTick + 700, 1800);
@@ -619,7 +726,7 @@ contract OracleGateTest is OracleGateFixture {
 
     /// @notice A tolerance change moves the verdict, and the band is enforced.
     function test_refDiverged_toleranceIsGoverned() public {
-        GatePriceMath math = gate.priceMath();
+        GatePriceMath math = GatePriceMath(gate.priceMath());
         uint256 ampsUsd18 = math.ampsPriceUsd18(HUB_TICK, 1e8, 6);
         int24 wethTick = math.fairTick(ampsUsd18, 3000e8, 18, 1);
         marketRef.setObservation(wethPool, wethTick + 700, wethTick + 700, 1800);
@@ -998,7 +1105,7 @@ contract OracleGateTest is OracleGateFixture {
         vm.expectRevert(ZeroAddress.selector);
         this.deployGate(TIMELOCK, address(0));
         assertGt(this.deployGate(TIMELOCK, GUARDIAN).code.length, 0, "and accepts a real pair");
-        assertGt(address(gate.priceMath()).code.length, 0, "price math deployed");
+        assertGt(gate.priceMath().code.length, 0, "price math deployed");
     }
 
     // -------------------------------------------------------------------------------------------------------------

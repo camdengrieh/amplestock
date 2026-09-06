@@ -96,7 +96,7 @@ contract BountyPotTest is Test {
 
     function test_constructorRejectsMoreThanEighteenDecimals() public {
         MockUsdg odd = new MockUsdg("Odd", "ODD", 19);
-        vm.expectRevert(abi.encodeWithSelector(BountyPot.UnsupportedDecimals.selector, uint8(19)));
+        vm.expectRevert(abi.encodeWithSelector(IBountyPot.UnsupportedDecimals.selector, uint8(19)));
         new BountyPot(address(odd), vaultAddr, timelock);
     }
 
@@ -371,7 +371,7 @@ contract BountyPotTest is Test {
         pot.setVault(newVault);
 
         vm.expectEmit(true, true, false, false, address(pot));
-        emit BountyPot.VaultChanged(vaultAddr, newVault);
+        emit IBountyPot.VaultChanged(vaultAddr, newVault);
         vm.prank(vaultAddr);
         pot.setVault(newVault);
         assertEq(pot.vault(), newVault);
