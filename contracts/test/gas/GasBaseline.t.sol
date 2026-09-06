@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {AmpsHook} from "../../src/hook/AmpsHook.sol";
+import {Constants} from "../../src/types/Constants.sol";
+import {PoolClass, PoolConfig} from "../../src/types/Types.sol";
+import {HookStubFeePolicy} from "../mocks/HookStubFeePolicy.sol";
+import {MockOracleGate} from "../mocks/MockOracleGate.sol";
+import {MockPoolRegistry} from "../mocks/MockPoolRegistry.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
 import {StubAmpsHook} from "./StubAmpsHook.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -80,9 +87,52 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     ///      EVM under both behaviours.
     string internal constant FOUNDRY_VERSION = "1.8.1";
 
+    /// @dev `docs/phase3-state-model.md` §12.1 ruling G: `afterSwap <= 55,000` stands as an absolute ceiling;
+    ///      ruling 3's 22,000 `beforeSwap` ceiling is **superseded** by the hook's own recording, and is kept
+    ///      here only so the baseline can record which number was superseded.
+    uint256 internal constant CEILING_AFTER_SWAP = 55_000;
+    uint256 internal constant SUPERSEDED_CEILING_BEFORE_SWAP = 22_000;
+
+    /// @dev The Phase 1 stub numbers as first recorded. Ruling G calls them placeholders - `StubAmpsHook` has no
+    ///      policy call, no observation ring and one packed word - so they are the stub's own regression
+    ///      reference and nothing else; they are written into the baseline for the record.
+    uint256 internal constant PHASE1_ONE_HOP_BUY = 132_058;
+    uint256 internal constant PHASE1_ONE_HOP_SELL = 132_055;
+    uint256 internal constant PHASE1_TWO_HOP_ROTATION = 175_208;
+    uint256 internal constant PHASE1_BUY_THEN_SELL = 164_908;
+
+    /// @dev Recorded beside the numbers, because a re-baseline without a reason is just a raised limit.
+    string internal constant REBASELINE_REASON = "Phase 3 ruling G (docs/phase3-state-model.md 12.1). The Phase 1 stub numbers were placeholders: "
+        "StubAmpsHook has no IFeePolicy call, no observation ring, no gate cache and one packed word, so budgets "
+        "derived from them are not budgets for the production hook. Every number under .hook is the real "
+        "AmpsHook, measured cold with each measurement in its own call frame, and each is gated at its own "
+        "recording + 20%, which is this project's CI contract. afterSwap <= 55,000 stands as an absolute ceiling "
+        "and is asserted; ruling 3's 22,000 beforeSwap ceiling is superseded by the recording, because the "
+        "decomposition is structural rather than codegen (200 / 1,000 / 5,000 / 20,000 optimizer runs are within "
+        "~300 gas of each other): three cold packed words 6,300, the hook's slot 0 (sellFeeBps + the policy "
+        "pointer) 2,100, the cold IFeePolicy account 2,600, the policy's own arithmetic ~2,300, the cold hook "
+        "account 2,600, and ~9,000 of hook execution dominated by encoding the 20-field FeeInput. Section 1.7 had "
+        "assumed two extra cold SLOADs and a 4,000-gas policy call; shrinking FeeInput is a Phase 4/6 tuning "
+        "item. The phase1Budget* keys are the old stub + 20% figures, kept for the record and asserted nowhere.";
+
     struct Measurements {
         uint256 beforeSwap;
         uint256 afterSwap;
+        uint256 swapOneHopBuy;
+        uint256 swapOneHopSell;
+        uint256 swapTwoHopRotation;
+        uint256 swapBuyThenSell;
+    }
+
+    /// @dev The same shape, measured against the real `AmpsHook`. `beforeSwap` is split by path because the
+    ///      credited sell is the expensive one (a `TLOAD`, a `TSTORE` and the blend on top of the buy's work),
+    ///      and `afterSwap` is split by whether the swap happened to be the one that refreshed the gate cache -
+    ///      at most one swap per pool per `gateCacheSeconds` pays that, so the headline number is the other one.
+    struct HookMeasurements {
+        uint256 beforeSwapBuy;
+        uint256 beforeSwapCreditedSell;
+        uint256 afterSwap;
+        uint256 afterSwapWithGateRefresh;
         uint256 swapOneHopBuy;
         uint256 swapOneHopSell;
         uint256 swapTwoHopRotation;
@@ -96,6 +146,20 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
 
     PoolKey internal usdgKey;
     PoolKey internal stockKey;
+
+    /// @dev The production stack, measured beside the stub in the same fixture so the two sets of numbers are
+    ///      directly comparable: same tokens, same prices, same liquidity shape, same router, same tick spacing.
+    AmpsHook internal ampsHook;
+    MockPoolRegistry internal registry;
+    MockOracleGate internal gate;
+    HookStubFeePolicy internal policy;
+    MockStockToken internal stockReal;
+
+    PoolKey internal usdgKeyReal;
+    PoolKey internal stockKeyReal;
+
+    /// @dev The timelock the production hook answers to. Only used to point it at the fee policy.
+    address internal constant TIMELOCK = address(0x71E10C);
 
     function setUp() public {
         deployV4();
@@ -121,6 +185,116 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
 
         _seedPool(usdgKey, 1_000_000e18, 1_000_000e6, 500_000e18);
         _seedPool(stockKey, 1_000_000e18, 6000e18, 500_000e18);
+
+        _deployRealStack();
+    }
+
+    /// @dev The production hook and two pools of its own, seeded exactly like the stub's so the end-to-end
+    ///      numbers below are a like-for-like comparison against the Phase 1 baseline (§10 ruling 3).
+    function _deployRealStack() private {
+        registry = new MockPoolRegistry();
+        gate = new MockOracleGate();
+        policy = new HookStubFeePolicy();
+        registry.setVault(address(this));
+
+        stockReal = new MockStockToken("Mock Stock Token", "STK2");
+        stockReal.mint(address(this), 10_000_000e18);
+        _approveStack(address(stockReal));
+        vm.label(address(stockReal), "STOCK2");
+
+        bytes memory args = abi.encode(poolManager, AMPS_ADDRESS, address(this), address(registry), TIMELOCK);
+        (address mined, bytes32 salt) = HookMiner.find(address(this), HOOK_FLAGS, type(AmpsHook).creationCode, args);
+        ampsHook = new AmpsHook{salt: salt}(poolManager, AMPS_ADDRESS, address(this), address(registry), TIMELOCK);
+        require(address(ampsHook) == mined, "AmpsHook address mismatch");
+        vm.label(address(ampsHook), "AmpsHook");
+        registry.setHook(address(ampsHook));
+
+        vm.prank(TIMELOCK);
+        ampsHook.setFeePolicy(address(policy));
+        // The rail is a two-comparison check whatever its value, and this fixture is about gas, not refusals: a
+        // wide rail keeps a measurement from being lost to a legitimate `BeyondRail` half way through the run.
+        policy.setRailOverride(200_000);
+        // Likewise the dynamic component: the policy still computes every term (so the `staticcall` costs what it
+        // costs), but returns zero, which keeps the fee assertions below about the base fee and the rotation
+        // credit rather than about how much variance the measurement swaps happened to generate.
+        policy.setDynOverride(0);
+
+        usdgKeyReal = _realPoolKey(USDG_ADDRESS);
+        stockKeyReal = _realPoolKey(address(stockReal));
+
+        _registerRealPool(usdgKeyReal, USDG_ADDRESS, PoolClass.ENTRY, 6);
+        _registerRealPool(stockKeyReal, address(stockReal), PoolClass.SPOKE, 18);
+        registry.setHubPoolId(usdgKeyReal.toId());
+
+        poolManager.initialize(usdgKeyReal, _sqrtPriceX96(1e6, 1e18));
+        poolManager.initialize(stockKeyReal, _sqrtPriceX96(1, 180));
+
+        _seedPool(usdgKeyReal, 1_000_000e18, 1_000_000e6, 500_000e18);
+        _seedPool(stockKeyReal, 1_000_000e18, 6000e18, 500_000e18);
+
+        _fillObservationRing();
+    }
+
+    /// @dev Writes 70 observations at distinct timestamps into each pool's 64-slot ring, then widens the
+    ///      gate-cache interval. Both matter for a representative `afterSwap`: a ring slot that has never been
+    ///      written costs 20,000 gas and one that has costs 2,900, and production reaches the second state after
+    ///      64 seconds of trading; and the gate refresh is a once-per-`gateCacheSeconds` cost, not a per-swap one.
+    function _fillObservationRing() private {
+        uint256 ts = block.timestamp;
+        uint256 bn = block.number;
+        for (uint256 i; i < 70; ++i) {
+            ts += 1;
+            bn += 1;
+            vm.warp(ts);
+            vm.roll(bn);
+            _pokeAfterSwap(usdgKeyReal);
+            _pokeAfterSwap(stockKeyReal);
+        }
+
+        vm.prank(TIMELOCK);
+        ampsHook.setGateCacheSeconds(Constants.GATE_CACHE_MAX_AGE);
+
+        // One last poke at the current timestamp, so the cache is fresh and no measurement below is the swap
+        // that happens to refresh it.
+        _pokeAfterSwap(usdgKeyReal);
+        _pokeAfterSwap(stockKeyReal);
+    }
+
+    /// @dev `afterSwap` against a pool without moving it: same tick, zero delta.
+    function _pokeAfterSwap(PoolKey memory key) private {
+        SwapParams memory params = SwapParams({zeroForOne: true, amountSpecified: -1, sqrtPriceLimitX96: 0});
+        vm.prank(address(poolManager));
+        ampsHook.afterSwap(address(this), key, params, toBalanceDelta(0, 0), "");
+    }
+
+    function _registerRealPool(PoolKey memory key, address counter, PoolClass poolClass, uint8 counterDecimals)
+        private
+    {
+        if (poolClass != PoolClass.ENTRY) {
+            registry.addConstituentAndPool(counter, address(0xFEED), key.toId(), poolClass, TICK_SPACING, 1000);
+        }
+        registry.setPool(
+            key.toId(),
+            PoolConfig({
+                counter: counter,
+                poolClass: poolClass,
+                counterDecimals: counterDecimals,
+                tickSpacing: TICK_SPACING,
+                buyFeeBps: poolClass == PoolClass.ENTRY
+                    ? Constants.BUY_FEE_BPS_ENTRY_DEFAULT
+                    : Constants.BUY_FEE_BPS_SPOKE_DEFAULT,
+                constituentId: poolClass == PoolClass.ENTRY ? 0 : 1,
+                registered: true,
+                gridBaseTick: 0
+            })
+        );
+    }
+
+    /// @notice `IAmpsVault.oracleGate()`. The production hook reads the gate pointer off the vault, and in this
+    ///         fixture the test contract is the vault.
+    /// @return gateAddress The gate.
+    function oracleGate() external view returns (address gateAddress) {
+        return address(gate);
     }
 
     // ------------------------------------------------------------------ //
@@ -149,6 +323,8 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         (m.swapTwoHopRotation, hop1Fee, hop2Fee) = _measureTwoHopRotation();
         m.swapBuyThenSell = _measureBuyThenSell();
 
+        HookMeasurements memory hm = _measureRealHook();
+
         // The rotation credit really is applied: hop 2 of STOCK -> AMPS -> USDG is charged the 30 bp buy fee, while
         // an identical stand-alone sell into the same pool is charged the full 500 bp sell fee.
         assertEq(hop1Fee, EXPECTED_BUY_FEE_PIPS, "hop 1 must be charged the buy fee");
@@ -161,11 +337,12 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         assertApproxEqRel((rotatedOut * 1e18) / uncreditedOut, 1.049473684210526315e18, 0.01e18, "hop 2 fee saving");
 
         _printTable(m, hop1Fee, hop2Fee, loneSellFee, rotatedOut, uncreditedOut);
+        _printHookTable(hm);
 
         if (vm.envOr("WRITE_GAS_BASELINE", false)) {
-            _writeBaseline(m);
+            _writeBaseline(m, hm);
         } else {
-            _assertNoRegression(m);
+            _assertNoRegression(m, hm);
         }
     }
 
@@ -387,17 +564,270 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     }
 
     // ------------------------------------------------------------------ //
+    //                    the production hook (Phase 3)                   //
+    // ------------------------------------------------------------------ //
+
+    /// @dev Marks the production stack cold again. The test contract itself is deliberately **not** cooled: the
+    ///      stub measurements do not cool it either, and cooling it would charge the hook for this harness's own
+    ///      cold `SLOAD`s while the call arguments are being copied into memory.
+    function _coolReal() private {
+        vm.cool(address(poolManager));
+        vm.cool(address(ampsHook));
+        vm.cool(address(swapRouter));
+        vm.cool(address(permit2));
+        vm.cool(address(amps));
+        vm.cool(address(usdg));
+        vm.cool(address(stockReal));
+        vm.cool(address(gate));
+        vm.cool(address(policy));
+        vm.cool(address(registry));
+    }
+
+    /// @dev Every production-hook measurement, each in its own self-call.
+    ///
+    /// @dev **Why one frame per measurement.** A self-call is the closest thing a Foundry test has to a
+    ///      transaction: it starts with empty memory, so the quadratic `CALL` memory charge is the swap's own and
+    ///      not the harness's, and Foundry 1.8 clears EIP-1153 transient storage between the top-level calls a
+    ///      test makes, so a "lone sell" really is uncredited and a rotation's hop 2 really does spend the credit
+    ///      its own hop 1 created. Measuring all of them in one frame makes both false.
+    function _measureRealHook() private returns (HookMeasurements memory hm) {
+        // One representative swap of each shape first, so tick bitmaps, position slots and fee growth are as
+        // initialised here as they are on a live pool.
+        this.warmUpRealEntry();
+
+        (hm.beforeSwapBuy, hm.beforeSwapCreditedSell, hm.afterSwap, hm.afterSwapWithGateRefresh) =
+            this.isolationEntryReal();
+
+        // Leave both pools' gate caches fresh, so no end-to-end measurement below is the one that refreshes.
+        _pokeAfterSwap(usdgKeyReal);
+        _pokeAfterSwap(stockKeyReal);
+
+        vm.recordLogs();
+        _warpOneSecond();
+        hm.swapOneHopBuy = this.oneHopBuyEntryReal();
+        assertEq(
+            _swapFees(vm.getRecordedLogs())[0],
+            uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS,
+            "one-hop buy fee"
+        );
+
+        vm.recordLogs();
+        _warpOneSecond();
+        hm.swapOneHopSell = this.oneHopSellEntryReal();
+        assertEq(
+            _swapFees(vm.getRecordedLogs())[0],
+            uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            "a lone sell pays the full sell fee"
+        );
+
+        vm.recordLogs();
+        _warpOneSecond();
+        hm.swapTwoHopRotation = this.rotationEntryReal(STOCK_IN);
+        uint24[] memory fees = _swapFees(vm.getRecordedLogs());
+        assertEq(fees.length, 2, "two-hop must emit two Swap events");
+        assertEq(fees[0], uint24(Constants.BUY_FEE_BPS_SPOKE_DEFAULT) * Constants.PIPS_PER_BPS, "hop 1: spoke buy");
+        assertEq(fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "hop 2: credited");
+
+        vm.recordLogs();
+        _warpOneSecond();
+        hm.swapBuyThenSell = this.roundTripEntryReal();
+        fees = _swapFees(vm.getRecordedLogs());
+        assertEq(fees.length, 2, "round trip must emit two Swap events");
+        assertEq(fees[0], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "buy leg");
+        assertEq(fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "credited sell leg");
+    }
+
+    /// @notice Self-call entry point: one swap of each shape, so nothing below pays a first-touch cost a live
+    ///         pool would not pay.
+    function warmUpRealEntry() external {
+        require(msg.sender == address(this), "self-call only");
+        _buyRealUsdg(USDG_IN / 10);
+        _sellRealUsdg(AMPS_IN / 10);
+        _rotateRealStockToUsdg(STOCK_IN / 10);
+    }
+
+    /// @notice Self-call entry point: `beforeSwap` on both of its paths and `afterSwap` on both of its, called
+    ///         directly while impersonating the PoolManager, exactly as the stub measurements are.
+    /// @return beforeSwapBuy An uncredited buy: three cold packed words, one cold policy `staticcall`.
+    /// @return beforeSwapCreditedSell The credited exact-input sell: the same plus a `TLOAD`, a `TSTORE` and the
+    ///         blend.
+    /// @return afterSwap_ A buy with a cached gate view: the truncated observation, the EWMA and the credit.
+    /// @return afterSwapWithGateRefresh The same swap when it is also the one that refreshes the gate cache.
+    function isolationEntryReal()
+        external
+        returns (
+            uint256 beforeSwapBuy,
+            uint256 beforeSwapCreditedSell,
+            uint256 afterSwap_,
+            uint256 afterSwapWithGateRefresh
+        )
+    {
+        require(msg.sender == address(this), "self-call only");
+
+        SwapParams memory sell = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(AMPS_IN), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        SwapParams memory buy = SwapParams({
+            zeroForOne: false, amountSpecified: -int256(USDG_IN), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+        BalanceDelta buyDelta = toBalanceDelta(int128(int256(AMPS_IN)), -int128(int256(USDG_IN)));
+
+        // The key and the two addresses are hoisted into memory *before* any sample: they live in this test
+        // contract's storage, and a cold `SLOAD` of the harness's own state is not the hook's cost.
+        PoolKey memory key = usdgKeyReal;
+        AmpsHook hookLocal = ampsHook;
+        address routerLocal = address(swapRouter);
+
+        // Warm the account and the pool's three packed words the way a real transaction's first touch does.
+        vm.prank(address(poolManager));
+        hookLocal.beforeSwap(routerLocal, key, buy, "");
+
+        _coolReal();
+        vm.prank(address(poolManager));
+        uint256 start = gasleft();
+        hookLocal.beforeSwap(routerLocal, key, buy, "");
+        beforeSwapBuy = start - gasleft();
+
+        // A new second, so the observation ring appends rather than updating its head in place: that is what a
+        // production swap does, and the ring is fully populated by `_fillObservationRing`, so the slot is dirty.
+        _warpOneSecond();
+        _coolReal();
+        vm.prank(address(poolManager));
+        start = gasleft();
+        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, "");
+        afterSwap_ = start - gasleft();
+
+        // The other `afterSwap`: the one swap per pool per `gateCacheSeconds` that also refreshes the gate cache
+        // and probes `uiMultiplier()`. Recorded for the record, not gated against a ceiling.
+        vm.warp(block.timestamp + Constants.GATE_CACHE_MAX_AGE + 1);
+        _coolReal();
+        vm.prank(address(poolManager));
+        start = gasleft();
+        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, "");
+        afterSwapWithGateRefresh = start - gasleft();
+
+        // The credited sell comes last: it is the only measurement that leaves transient state behind.
+        uint256 creditBefore = ampsHook.rotationCredit();
+        _coolReal();
+        vm.prank(address(poolManager));
+        start = gasleft();
+        hookLocal.beforeSwap(routerLocal, key, sell, "");
+        beforeSwapCreditedSell = start - gasleft();
+        assertEq(ampsHook.rotationCredit(), creditBefore - AMPS_IN, "a credited sell consumes exactly amountIn");
+    }
+
+    /// @notice Self-call entry point: one exact-input buy through the router.
+    function oneHopBuyEntryReal() external returns (uint256 gasUsed) {
+        require(msg.sender == address(this), "self-call only");
+        _coolReal();
+        gasUsed = _buyRealUsdg(USDG_IN);
+    }
+
+    /// @notice Self-call entry point: one exact-input sell through the router, with no credit to spend.
+    function oneHopSellEntryReal() external returns (uint256 gasUsed) {
+        require(msg.sender == address(this), "self-call only");
+        assertEq(ampsHook.rotationCredit(), 0, "a lone sell starts with no credit");
+        _coolReal();
+        gasUsed = _sellRealUsdg(AMPS_IN);
+    }
+
+    /// @notice Self-call entry point: the two-hop rotation inside one transaction's transient storage.
+    function rotationEntryReal(uint256 amountIn) external returns (uint256 gasUsed) {
+        require(msg.sender == address(this), "self-call only");
+        _coolReal();
+        uint256 start = gasleft();
+        _rotateRealStockToUsdg(amountIn);
+        gasUsed = start - gasleft();
+        assertEq(ampsHook.rotationCredit(), 0, "hop 2 must consume the whole credit");
+    }
+
+    /// @notice Self-call entry point: the same-transaction buy-then-sell round trip.
+    function roundTripEntryReal() external returns (uint256 gasUsed) {
+        require(msg.sender == address(this), "self-call only");
+        _coolReal();
+        uint256 start = gasleft();
+        uint256 balanceBefore = amps.balanceOf(address(this));
+        swapRouter.swapExactTokensForTokens(USDG_IN, 0, false, usdgKeyReal, "", address(this), type(uint256).max);
+        uint256 ampsOut = amps.balanceOf(address(this)) - balanceBefore;
+        swapRouter.swapExactTokensForTokens(ampsOut, 0, true, usdgKeyReal, "", address(this), type(uint256).max);
+        gasUsed = start - gasleft();
+        assertEq(ampsHook.rotationCredit(), 0, "the round trip consumes the whole credit");
+    }
+
+    function _buyRealUsdg(uint256 amountIn) private returns (uint256 gasUsed) {
+        uint256 start = gasleft();
+        swapRouter.swapExactTokensForTokens(amountIn, 0, false, usdgKeyReal, "", address(this), type(uint256).max);
+        gasUsed = start - gasleft();
+    }
+
+    function _sellRealUsdg(uint256 amountIn) private returns (uint256 gasUsed) {
+        uint256 start = gasleft();
+        swapRouter.swapExactTokensForTokens(amountIn, 0, true, usdgKeyReal, "", address(this), type(uint256).max);
+        gasUsed = start - gasleft();
+    }
+
+    function _rotateRealStockToUsdg(uint256 amountIn) private {
+        PathKey[] memory path = new PathKey[](2);
+        path[0] = PathKey({
+            intermediateCurrency: Currency.wrap(AMPS_ADDRESS),
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(ampsHook)),
+            hookData: ""
+        });
+        path[1] = PathKey({
+            intermediateCurrency: Currency.wrap(USDG_ADDRESS),
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(ampsHook)),
+            hookData: ""
+        });
+        swapRouter.swapExactTokensForTokens(
+            amountIn, 0, Currency.wrap(address(stockReal)), path, address(this), type(uint256).max
+        );
+    }
+
+    /// @dev One second forward, so the next swap appends to the observation ring the way a live one does. Written
+    ///      through a local because solc treats `block.timestamp` as loop-invariant and hoists it past a `vm.warp`.
+    function _warpOneSecond() private {
+        uint256 ts = block.timestamp + 1;
+        vm.warp(ts);
+    }
+
+    // ------------------------------------------------------------------ //
     //                     baseline write / regression gate               //
     // ------------------------------------------------------------------ //
 
-    function _writeBaseline(Measurements memory m) private {
+    function _writeBaseline(Measurements memory m, HookMeasurements memory hm) private {
+        string memory hookObj = "amplestocks.gas.baseline.hook";
+        vm.serializeUint(hookObj, "beforeSwapBuy", hm.beforeSwapBuy);
+        vm.serializeUint(hookObj, "beforeSwapCreditedSell", hm.beforeSwapCreditedSell);
+        vm.serializeUint(hookObj, "afterSwap", hm.afterSwap);
+        vm.serializeUint(hookObj, "afterSwapWithGateRefresh", hm.afterSwapWithGateRefresh);
+        vm.serializeUint(hookObj, "swapOneHopBuy", hm.swapOneHopBuy);
+        vm.serializeUint(hookObj, "swapOneHopSell", hm.swapOneHopSell);
+        vm.serializeUint(hookObj, "swapTwoHopRotation", hm.swapTwoHopRotation);
+        vm.serializeUint(hookObj, "swapBuyThenSell", hm.swapBuyThenSell);
+        vm.serializeUint(hookObj, "ceilingAfterSwap", CEILING_AFTER_SWAP);
+        vm.serializeUint(hookObj, "ceilingBeforeSwapSuperseded", SUPERSEDED_CEILING_BEFORE_SWAP);
+        vm.serializeUint(hookObj, "phase1BudgetOneHopBuy", (PHASE1_ONE_HOP_BUY * 12) / 10);
+        vm.serializeUint(hookObj, "phase1BudgetOneHopSell", (PHASE1_ONE_HOP_SELL * 12) / 10);
+        vm.serializeUint(hookObj, "phase1BudgetTwoHopRotation", (PHASE1_TWO_HOP_ROTATION * 12) / 10);
+        vm.serializeUint(hookObj, "phase1BudgetBuyThenSell", (PHASE1_BUY_THEN_SELL * 12) / 10);
+        vm.serializeString(hookObj, "source", "test/gas/GasBaseline.t.sol (AmpsHook, flags 0x38C0)");
+        string memory hookJson = vm.serializeString(hookObj, "reason", REBASELINE_REASON);
+
+        // The stub's four end-to-end numbers stay at their Phase 1 recording: they are the budget ruling 3
+        // gates the production hook against, and a budget that is re-measured on every re-baseline is not one.
+        // `beforeSwap`/`afterSwap` are re-recorded, because ruling 3 re-baselines exactly those two.
         string memory obj = "amplestocks.gas.baseline";
         vm.serializeUint(obj, "beforeSwap", m.beforeSwap);
         vm.serializeUint(obj, "afterSwap", m.afterSwap);
-        vm.serializeUint(obj, "swapOneHopBuy", m.swapOneHopBuy);
-        vm.serializeUint(obj, "swapOneHopSell", m.swapOneHopSell);
-        vm.serializeUint(obj, "swapTwoHopRotation", m.swapTwoHopRotation);
-        vm.serializeUint(obj, "swapBuyThenSell", m.swapBuyThenSell);
+        vm.serializeUint(obj, "swapOneHopBuy", PHASE1_ONE_HOP_BUY);
+        vm.serializeUint(obj, "swapOneHopSell", PHASE1_ONE_HOP_SELL);
+        vm.serializeUint(obj, "swapTwoHopRotation", PHASE1_TWO_HOP_ROTATION);
+        vm.serializeUint(obj, "swapBuyThenSell", PHASE1_BUY_THEN_SELL);
+        vm.serializeString(obj, "hook", hookJson);
         vm.serializeString(obj, "foundry", FOUNDRY_VERSION);
         vm.serializeString(obj, "solc", "0.8.30");
         vm.serializeString(obj, "evm", "cancun");
@@ -408,25 +838,51 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         console.log("wrote %s", BASELINE_PATH);
     }
 
-    function _assertNoRegression(Measurements memory m) private view {
+    function _assertNoRegression(Measurements memory m, HookMeasurements memory hm) private view {
         if (!vm.exists(BASELINE_PATH)) {
             console.log("SKIP: %s not found; run with WRITE_GAS_BASELINE=true to create it", BASELINE_PATH);
             return;
         }
         string memory json = vm.readFile(BASELINE_PATH);
+
         string[6] memory keys =
             ["beforeSwap", "afterSwap", "swapOneHopBuy", "swapOneHopSell", "swapTwoHopRotation", "swapBuyThenSell"];
         uint256[6] memory measured =
             [m.beforeSwap, m.afterSwap, m.swapOneHopBuy, m.swapOneHopSell, m.swapTwoHopRotation, m.swapBuyThenSell];
         for (uint256 i; i < keys.length; ++i) {
-            string memory path = string.concat(".", keys[i]);
-            if (!vm.keyExistsJson(json, path)) {
-                console.log("SKIP: baseline has no key %s", keys[i]);
-                continue;
-            }
-            uint256 budget = (vm.parseJsonUint(json, path) * 12) / 10;
-            assertLe(measured[i], budget, string.concat("gas regression: ", keys[i]));
+            _assertWithin(json, string.concat(".", keys[i]), measured[i], keys[i]);
         }
+
+        // Every production-hook number against its own recording + 20%: that is the CI regression contract.
+        _assertWithin(json, ".hook.beforeSwapBuy", hm.beforeSwapBuy, "AmpsHook beforeSwapBuy");
+        _assertWithin(
+            json, ".hook.beforeSwapCreditedSell", hm.beforeSwapCreditedSell, "AmpsHook beforeSwapCreditedSell"
+        );
+        _assertWithin(json, ".hook.afterSwap", hm.afterSwap, "AmpsHook afterSwap");
+        _assertWithin(
+            json, ".hook.afterSwapWithGateRefresh", hm.afterSwapWithGateRefresh, "AmpsHook afterSwap (refresh)"
+        );
+        _assertWithin(json, ".hook.swapOneHopBuy", hm.swapOneHopBuy, "AmpsHook swapOneHopBuy");
+        _assertWithin(json, ".hook.swapOneHopSell", hm.swapOneHopSell, "AmpsHook swapOneHopSell");
+        _assertWithin(json, ".hook.swapTwoHopRotation", hm.swapTwoHopRotation, "AmpsHook swapTwoHopRotation");
+        _assertWithin(json, ".hook.swapBuyThenSell", hm.swapBuyThenSell, "AmpsHook swapBuyThenSell");
+
+        // Ruling G: the one absolute ceiling that survives. The stub-derived budgets do not: they are recorded
+        // in `gas/baseline.json` under `phase1Budget*` for the record and asserted nowhere, because a budget
+        // measured against a hook with no policy call, no observation ring and one packed word is not a budget
+        // for this one.
+        assertLe(hm.afterSwap, CEILING_AFTER_SWAP, "AmpsHook afterSwap ceiling (ruling G)");
+    }
+
+    /// @dev One measurement against one recorded number, at the CI gate's baseline x 1.2. A key the baseline
+    ///      does not carry logs and is skipped, so a new measurement can be added before it is recorded.
+    function _assertWithin(string memory json, string memory path, uint256 measured, string memory label) private view {
+        if (!vm.keyExistsJson(json, path)) {
+            console.log("SKIP: baseline has no key %s", path);
+            return;
+        }
+        uint256 budget = (vm.parseJsonUint(json, path) * 12) / 10;
+        assertLe(measured, budget, string.concat("gas regression: ", label));
     }
 
     function _printTable(
@@ -452,6 +908,21 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         console.log(_row("fee charged on a lone sell    (pips)", loneSellFee));
         console.log(_row("USDG out, rotated exit", rotatedOut));
         console.log(_row("USDG out, uncredited exit", uncreditedOut));
+    }
+
+    function _printHookTable(HookMeasurements memory hm) private pure {
+        console.log("+--------------------------------------------------+---------+");
+        console.log("| AmpsHook (production)                            |     gas |");
+        console.log("+--------------------------------------------------+---------+");
+        console.log(_row("beforeSwap  (uncredited buy)", hm.beforeSwapBuy));
+        console.log(_row("beforeSwap  (credited exact-in sell)", hm.beforeSwapCreditedSell));
+        console.log(_row("afterSwap   (buy, cached gate)", hm.afterSwap));
+        console.log(_row("afterSwap   (buy, gate refresh)", hm.afterSwapWithGateRefresh));
+        console.log(_row("swapOneHopBuy       USDG -> AMPS", hm.swapOneHopBuy));
+        console.log(_row("swapOneHopSell      AMPS -> USDG", hm.swapOneHopSell));
+        console.log(_row("swapTwoHopRotation  STOCK -> AMPS -> USDG", hm.swapTwoHopRotation));
+        console.log(_row("swapBuyThenSell     same-tx round trip", hm.swapBuyThenSell));
+        console.log("+--------------------------------------------------+---------+");
     }
 
     function _row(string memory label, uint256 value) private pure returns (string memory) {
@@ -483,6 +954,16 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
             fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
             tickSpacing: TICK_SPACING,
             hooks: IHooks(address(hook))
+        });
+    }
+
+    function _realPoolKey(address counterparty) private view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(AMPS_ADDRESS),
+            currency1: Currency.wrap(counterparty),
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(ampsHook))
         });
     }
 

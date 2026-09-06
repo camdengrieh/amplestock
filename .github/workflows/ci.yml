@@ -204,7 +204,7 @@ jobs:
           git diff --exit-code -- packages/config/launch.json
 
   # -------------------------------------------------------------------------------------------
-  # Hook address re-check (placeholder until the mined address is committed)
+  # Hook address re-check
   # -------------------------------------------------------------------------------------------
   hook-address:
     name: hook address re-check
@@ -219,12 +219,12 @@ jobs:
       - name: Does a mined hook address exist yet?
         id: probe
         run: |
-          if [ -f contracts/script/config/hook-address.json ]; then
+          if [ -f contracts/script/config/hook.json ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
-            echo "Found contracts/script/config/hook-address.json"
+            echo "Found contracts/script/config/hook.json"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "contracts/script/config/hook-address.json not present — nothing to re-check."
+            echo "contracts/script/config/hook.json not present — nothing to re-check."
           fi
 
       - name: Install Foundry
@@ -233,16 +233,19 @@ jobs:
         with:
           version: v1.8.1  # pinned: gas baselines and transient-storage semantics are toolchain-specific
 
-      # The hook's address encodes its permission flags (0x38C0), so the salt is only valid for
-      # one exact creation-code hash. Any change to AmpsHook or its constructor arguments
-      # invalidates it, and a stale salt would deploy a hook the PoolManager rejects. This
-      # re-mines from the committed salt and fails if the address moved.
+      # The hook's address encodes its permission flags (0x38C0), so the salt in script/config/hook.json
+      # is valid for exactly one creation-code hash. Any change to AmpsHook, to anything it
+      # imports, to the compiler or optimizer settings, or to its constructor arguments
+      # invalidates it, and a stale salt would deploy a hook the PoolManager rejects. The suite
+      # re-mines from the real `type(AmpsHook).creationCode`, re-derives the address from the
+      # committed salt and init-code hash, and fails if either moved. The fix is always the same:
+      # re-run `forge script script/04_MineHook.s.sol` and commit script/config/hook.json.
       - name: Re-check the mined hook address
         if: steps.probe.outputs.present == 'true'
         working-directory: contracts
         run: |
           echo "::group::committed hook address"
-          cat script/config/hook-address.json
+          cat script/config/hook.json
           echo "::endgroup::"
           forge test --isolate --match-path 'test/unit/HookAddress*.t.sol' -vv
 
