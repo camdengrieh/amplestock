@@ -177,7 +177,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: tickSpacing,
                 buyFeeBps: Constants.BUY_FEE_BPS_SPOKE_DEFAULT,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         emit ConstituentAdded(constituentId, token, poolId, targetWeightBps);
@@ -201,7 +202,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: tickSpacing,
                 buyFeeBps: buyFeeBps,
                 constituentId: 0,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
     }
@@ -440,7 +442,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: key.tickSpacing,
                 buyFeeBps: buyFeeBps,
                 constituentId: 0,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
     }
@@ -481,7 +484,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: params.tickSpacing,
                 buyFeeBps: params.buyFeeBps,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         emit ConstituentAdded(constituentId, params.token, poolId, params.targetWeightBps);

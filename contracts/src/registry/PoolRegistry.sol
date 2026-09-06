@@ -3,8 +3,10 @@ pragma solidity 0.8.30;
 
 import {IAggregatorV3} from "../interfaces/IAggregatorV3.sol";
 import {IAmpsBonds} from "../interfaces/IAmpsBonds.sol";
+import {IAmpsHook} from "../interfaces/IAmpsHook.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
+import {PoolStateLib} from "../lib/PoolStateLib.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
 import {
@@ -723,7 +725,11 @@ contract PoolRegistry is IPoolRegistry {
             tickSpacing: key.tickSpacing,
             buyFeeBps: buyFeeBps,
             constituentId: constituentId,
-            registered: true
+            registered: true,
+            // The grid origin is derived from the price the pool actually opens at, which {_openPool} computes a
+            // moment later; it is written there. It cannot be computed here, because the record has to exist
+            // *before* the vault opens the pool — `AmpsHook.beforeInitialize` reads it back mid-initialisation.
+            gridBaseTick: 0
         });
         _keys[poolId] = key;
         unchecked {
@@ -734,13 +740,56 @@ contract PoolRegistry is IPoolRegistry {
 
     /// @dev Prices the pool at `P_ref / P_counter` and opens it through the vault — pool creation has to come
     ///      through there because `AmpsHook.beforeInitialize` requires `sender == vault` — then asserts the vault
-    ///      opened the pool this registry recorded.
+    ///      opened the pool this registry recorded and mirrors the pool's canonical grid origin.
+    ///
+    ///      **The grid origin** (`docs/phase3-state-model.md` §3.2 and §10 ruling 14). Every vault position in the
+    ///      pool lies on the lattice `[gridBase + m*D, gridBase + (m+1)*D)`, and `gridBase` is the opening tick
+    ///      aligned **upward** to a whole tick spacing. The hook computes it in `afterInitialize`, which has
+    ///      already run by the time `initializePool` returns, and this reads that value back rather than
+    ///      re-deriving it from `sqrtPriceX96`. Two reasons, and the second is the one that matters: a second
+    ///      implementation of `getTickAtSqrtPrice` here would cost 2.8 kB of EIP-170 headroom at this contract's
+    ///      optimizer settings, and — far worse — two derivations can disagree, at which point the valuer
+    ///      enumerates a lattice the vault never placed on. "Mirrored" is meant literally: there is exactly one
+    ///      grid origin per pool and the hook owns it.
+    ///
+    ///      Before the hook exists (Phase 2, and any fixture that registers pools against a hookless address) the
+    ///      mirror is skipped and `gridBaseTick` stays 0, which is correct: without a hook there is no grid. The
+    ///      `extcodesize` guard is not decoration — a `staticcall` to an address with no code *succeeds* with
+    ///      empty returndata, and a decode failure after a successful call is not catchable by `catch`.
     function _openPool(PoolKey memory key, PoolId poolId, address feed, uint8 counterDecimals) private {
         uint160 sqrtPriceX96 =
             PriceLib.ampsPerCounterToSqrtPriceX96(_referencePriceUsd18(), _feedAnswerUsd8(feed), counterDecimals);
         PoolId opened = IAmpsVault(_vault).initializePool(key, sqrtPriceX96);
         if (PoolId.unwrap(opened) != PoolId.unwrap(poolId)) revert InvalidPoolKey("poolIdMismatch");
-        emit PoolOpened(poolId, feed, sqrtPriceX96);
+        if (_hook.code.length != 0) {
+            try IAmpsHook(_hook).gridBaseTick(poolId) returns (int24 gridBaseTick) {
+                _pools[poolId].gridBaseTick = gridBaseTick;
+            } catch {}
+        }
+        // The vault snaps the opening price down to the spacing-aligned tick so the grid origin sits exactly on it
+        // (Phase 3 §12 ruling C). Emit what the pool actually opened at, read back from the PoolManager, rather
+        // than the price this contract asked for, so the event and `slot0` can never disagree; a read that cannot
+        // be made (a mock vault, no PoolManager) falls back to the requested price.
+        uint160 openedAt = _openedPrice(poolId);
+        emit PoolOpened(poolId, feed, openedAt == 0 ? sqrtPriceX96 : openedAt);
+    }
+
+    /// @dev `slot0.sqrtPriceX96` of a pool the vault has just opened, through one bounded `extsload` so that a vault
+    ///      without a PoolManager (tests) or a manager that misbehaves can never make registration revert. Returns
+    ///      0 when the read cannot be made.
+    function _openedPrice(PoolId poolId) private view returns (uint160 sqrtPriceX96) {
+        address manager;
+        try IAmpsVault(_vault).poolManager() returns (address candidate) {
+            manager = candidate;
+        } catch {
+            return 0;
+        }
+        if (manager.code.length == 0) return 0;
+        (bool ok, bytes memory data) = manager.staticcall{gas: 30_000}(
+            abi.encodeWithSignature("extsload(bytes32)", PoolStateLib.poolStateSlot(poolId))
+        );
+        if (!ok || data.length != 32) return 0;
+        sqrtPriceX96 = uint160(uint256(abi.decode(data, (bytes32))));
     }
 
     /// @dev The reference price the initial pool price is anchored at. Before `genesis()` the vault has no

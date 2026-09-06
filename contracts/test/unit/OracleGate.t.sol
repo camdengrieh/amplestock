@@ -1211,7 +1211,8 @@ contract OracleGateTest is OracleGateFixture {
                 tickSpacing: TICK_SPACING,
                 buyFeeBps: 5,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         GateSnapshot memory gate_ = gate.snapshotByPool(spokePool);
@@ -1232,7 +1233,8 @@ contract OracleGateTest is OracleGateFixture {
                 tickSpacing: TICK_SPACING,
                 buyFeeBps: 5,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         GateSnapshot memory gate_ = gate.snapshotByPool(spokePool);

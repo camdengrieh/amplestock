@@ -452,6 +452,95 @@ library Constants {
     ///         `BEFORE_INITIALIZE | AFTER_INITIALIZE | BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP`.
     uint16 internal constant HOOK_FLAGS = 0x38C0;
 
+    /// @notice The mask `HOOK_FLAGS` is compared under: Uniswap v4's whole 14-bit permission field. Named here so
+    ///         the mining script, the deployment assertion and the permission test all read the same number.
+    /// @dev Equal to `Hooks.ALL_HOOK_MASK`. Restated rather than imported because `04_MineHook.s.sol` and the CI
+    ///      re-verification run against a compiled artefact, not against v4-core's source.
+    uint160 internal constant HOOK_ADDRESS_MASK = 0x3FFF;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Fee-law coefficients (Phase 3; `docs/phase3-state-model.md` §10 ruling 5)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // Ruling 5: `k_vol`, `k_dev`, `F_WALL_BPS` and `lambda` live in the **pointer-upgradeable** `FeePolicy`, with
+    // their hard bands here. The values below are what `FeePolicy` ships with — it reads them from this file rather
+    // than restating them as literals, exactly like every other governed number — and the `_MIN`/`_MAX` pairs are
+    // what a replacement policy may never step outside without new `AmpsHook` bytecode. They are Phase 0
+    // placeholders: the cadence and volatility sample recalibrates them, and recalibration is a pointer swap.
+
+    /// @notice `k_vol`: the coefficient on EWMA realised variance in `f_vol = k_vol x sigma^2`, 1e18 fixed point.
+    /// @dev Units, stated once: `AmpsHook` writes `FeeInput.varianceX18 = EWMA(d^2) x 1e18` with `d` the raw pool
+    ///      tick change of one swap (1 tick ~ 1 bp), lambda 0.98 per swap; `FeePolicy` computes
+    ///      `f_vol_bps = K_VOL_X18 x varianceX18 / 1e36`, capped at `F_VOL_CAP_BPS`. At 5e15 that is 1 bp at a
+    ///      per-swap sigma of ~14 ticks and the 100 bp cap at ~141 ticks (`5e15 x 141^2 x 1e18 / 1e36` ~ 99 bp),
+    ///      which is a violently volatile pool by construction. The field is `uint128` so that the cap is
+    ///      reachable (`141^2 x 1e18` ~ 2e22 does not fit 64 bits).
+    uint256 internal constant K_VOL_X18 = 5e15;
+
+    /// @notice Hard floor of `k_vol`. Below 1e14 the volatility term is structurally zero at any reachable
+    ///         variance, which is what setting the policy's cap to zero is for.
+    uint256 internal constant K_VOL_X18_MIN = 1e14;
+
+    /// @notice Hard ceiling of `k_vol`. Above 1e17 the 100 bp cap binds at a ~3-tick sigma and the term stops
+    ///         being a control at all.
+    uint256 internal constant K_VOL_X18_MAX = 1e17;
+
+    /// @notice `k_dev`: the coefficient on the squared deviation inside the inner band,
+    ///         `f_dev = K_DEV_BPS x dev^2 / 1e4` with `dev` in ticks.
+    /// @dev 25 puts `f_dev` at exactly 100 bp at the 200-tick Regular band edge, where the quadratic ramp to the
+    ///      wall takes over.
+    uint16 internal constant K_DEV_BPS = 25;
+
+    /// @notice Hard floor of `k_dev`. Zero would delete the deviation term; 1 is the smallest law that still bites.
+    uint16 internal constant K_DEV_BPS_MIN = 1;
+
+    /// @notice Hard ceiling of `k_dev`. At 100 the band edge already costs 400 bp, past `DYN_CAP_NORMAL_BPS`, so
+    ///         the clamp rather than the law would be setting the fee everywhere.
+    uint16 internal constant K_DEV_BPS_MAX = 100;
+
+    /// @notice `f_wall`: the fee the quadratic ramp reaches at the outer rail, in bps. 1,500.
+    /// @dev Between band and rail the law is `f_inner + (F_WALL_BPS - f_inner) x (dev - band)^2 / (rail - band)^2`.
+    ///      It is a wall, not a clamp: the fee climbs, the swap is still accepted, and only a deviation-increasing
+    ///      swap that *begins* beyond the rail is refused (I15, ruling 2).
+    uint16 internal constant F_WALL_BPS = 1500;
+
+    /// @notice Hard floor of `f_wall`. Below `FROZEN_FEE_FLOOR_BPS` the ramp would slope downward into the rail.
+    uint16 internal constant F_WALL_BPS_MIN = 100;
+
+    /// @notice Hard ceiling of `f_wall`, equal to `DYN_CAP_ESCALATION_BPS`: the wall may reach the escalation cap
+    ///         and never exceed it, so `base + dyn <= TOTAL_FEE_BPS_MAX` holds by construction (I16).
+    uint16 internal constant F_WALL_BPS_MAX = DYN_CAP_ESCALATION_BPS;
+
+    /// @notice `lambda`: the EWMA decay on realised variance, 1e18 fixed point. 0.98.
+    /// @dev `varianceX18 = (LAMBDA_X18 x varianceX18 + (1e18 - LAMBDA_X18) x d^2 x 1e18) / 1e18` on the raw tick
+    ///      delta `d`, saturating at `type(uint64).max`. A ~35-swap memory.
+    uint64 internal constant LAMBDA_X18 = 0.98e18;
+
+    /// @notice Hard floor of `lambda`. Below 0.5 the estimator is little more than the last observation squared.
+    uint64 internal constant LAMBDA_X18_MIN = 0.5e18;
+
+    /// @notice Hard ceiling of `lambda`. At 1e18 the estimator would never update again.
+    uint64 internal constant LAMBDA_X18_MAX = 0.999e18;
+
+    /// @notice How often `afterSwap` may refresh a pool's cached gate, band, rail and fair tick. 60 s.
+    /// @dev `beforeSwap` reads nothing outside the hook except the pure fee policy; everything external — the gate,
+    ///      the registry, the feeds, the hub TWAP and the `uiMultiplier()` probe — is pulled here, at most once per
+    ///      pool per this interval, and a refresh failure is a flag (`gateFlags` bit2) rather than a revert.
+    uint32 internal constant GATE_CACHE_SECONDS_DEFAULT = 60;
+
+    /// @notice How stale that cache may be before `beforeSwap` stops trusting it. 900 s.
+    /// @dev Past this, the fee is computed from the **most conservative** values for the pool's class — the widest
+    ///      band, `DYN_CAP_DEGRADED_BPS`, and `FROZEN_FEE_FLOOR_BPS` on the dynamic part. It still never reverts a
+    ///      swap (I15).
+    uint32 internal constant GATE_CACHE_MAX_AGE = 900;
+
+    /// @notice The EIP-1153 transient slot holding the same-transaction rotation credit, in AMPS wei.
+    /// @dev One slot, hard-coded, in the hook. Transient storage is zero at the start of every transaction by EVM
+    ///      rule, which is what makes invariant I26 — no credit ever crosses a transaction boundary — structural
+    ///      rather than enforced. Credited in `afterSwap` from the **realised** AMPS delta of a buy; consumed in
+    ///      `beforeSwap` by an exact-input sell, blended and rounded up.
+    bytes32 internal constant ROTATION_CREDIT_SLOT = keccak256("amplestocks.hook.ROTATION_CREDIT");
+
     // -------------------------------------------------------------------------------------------------------------
     // Ladder and rollout (48 h timelock; future placements only, never a reshape of existing positions)
     // -------------------------------------------------------------------------------------------------------------
@@ -511,6 +600,69 @@ library Constants {
 
     /// @notice Maximum `|slot0.tick - tickOf(P_mkt / P_i)|` accepted at the entry *and* exit of any placement.
     int24 internal constant PLACEMENT_DIVERGENCE_TICKS = 800;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The canonical doubling grid (Phase 3; `docs/phase3-state-model.md` §3.2 and §10 rulings 1 and 12)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // Every vault position in a pool lies on that pool's grid: cell `m` covers
+    // `[gridBaseTick + m*D, gridBaseTick + (m+1)*D)` with `D = LadderLib.doublingTicks(tickSpacing)`. That is what
+    // makes placements merge by cell instead of accumulating (one v4 position per range, since the salt is fixed),
+    // bounds `redeemProRata`'s work, and lets `LadderPositionValuer` enumerate the vault's positions by `extsload`
+    // without any getter on the vault. Invariant I39.
+
+    /// @notice Lowest grid cell index, inclusive. -8 doublings below the anchor: `1/256` of the opening price,
+    ///         which is four halvings below the deepest seed bid and leaves room for a bid ladder that has been
+    ///         walked all the way down.
+    int24 internal constant GRID_MIN_M = -8;
+
+    /// @notice Highest grid cell index, **exclusive**. +16 doublings above the anchor: 65,536x the opening price.
+    ///         A pool that runs past it needs a migration to place more asks, which is the documented cost of a
+    ///         bounded record count.
+    int24 internal constant GRID_MAX_M = 16;
+
+    /// @notice The number of cells in a pool's grid, and therefore the hard ceiling on the vault's
+    ///         `PlacementRecord` count per pool. 24.
+    uint8 internal constant GRID_CELLS = uint8(uint24(GRID_MAX_M - GRID_MIN_M));
+
+    /// @notice The vault-wide budget of **live** ladder cells (records with non-zero liquidity), summed over every
+    ///         pool. 512.
+    /// @dev This is what keeps `redeemProRata` executable in one transaction, which is the whole of the redemption
+    ///      floor's promise. Redemption removes `floor(L_p x shares / T)` from every live cell and the placement
+    ///      suite measures ~46k gas per live cell, so 512 cells is ~23.5M gas: inside Arbitrum's 32M per-transaction
+    ///      cap with a quarter in reserve for the idle-asset payouts and the burn. Every path that would open a
+    ///      *new* cell checks the budget first: `place` (timelock or registry) reverts with `CellBudgetExceeded`;
+    ///      the permissionless bountied paths (`compound`, `rollout`, `deployBonded`) merge into cells that already
+    ///      exist and leave the remainder idle rather than revert. At the launch shape (14 cells per pool: ten asks
+    ///      plus four bids) the budget admits ~36 pools, so a registry that grows toward `MAX_CONSTITUENTS` must
+    ///      either coarsen its ladders or raise this constant through a vault migration, and Phase 0 must confirm
+    ///      the chain's `MaxTxGasLimit` before either is decided.
+    uint32 internal constant MAX_LIVE_CELLS = 512;
+
+    /// @notice The `salt` every vault position at the PoolManager is opened with: `bytes32(0)`, everywhere, for
+    ///         ever (ruling 12).
+    /// @dev This is an invariant, not a convenience. A v4 position is keyed by `(owner, lower, upper, salt)`, so a
+    ///      second salt namespace would silently break merge-by-cell, the valuer's enumeration and the bounded
+    ///      record count all at once. No placement kind may ever open one.
+    bytes32 internal constant POSITION_SALT = bytes32(0);
+
+    /// @notice The factor `RolloutPolicy` applies to a spoke with no counter-asset depth yet. 0.5.
+    /// @dev A depthless spoke can still receive asks — that is how it gets a market at all — but it is preferred
+    ///      half as strongly as one that bonds or buys have already given stock-side depth.
+    uint256 internal constant DEPTHLESS_DISCOUNT_X18 = 0.5e18;
+
+    /// @notice Launch `deployThresholdUsd18`: `deployBonded` is a no-op below $100 of idle collateral.
+    /// @dev Ruling 15. Without a floor, `deployBonded` is a permissionless bountied call that can be made to fire
+    ///      on dust, which is a drain on `BountyPot` rather than a placement. Governed at 48 h inside the band
+    ///      below; the call is a **no-op**, never a revert, so an unpaid keeper call costs the caller gas alone.
+    uint256 internal constant DEPLOY_THRESHOLD_USD18_DEFAULT = 100e18;
+
+    /// @notice Hard floor of `deployThresholdUsd18`. $10: below this the bounty is worth more than the placement.
+    uint256 internal constant DEPLOY_THRESHOLD_USD18_MIN = 10e18;
+
+    /// @notice Hard ceiling of `deployThresholdUsd18`. $10,000: twice the whole launch book, so setting it here
+    ///         already means "bonded stock is never deployed", and anything larger is the same statement.
+    uint256 internal constant DEPLOY_THRESHOLD_USD18_MAX = 10_000e18;
 
     // -------------------------------------------------------------------------------------------------------------
     // Registry and index (7 d timelock)

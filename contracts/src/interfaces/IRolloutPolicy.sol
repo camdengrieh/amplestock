@@ -71,6 +71,13 @@ interface IRolloutPolicy {
     /// @return value The bound.
     function ENTRY_FLOOR_BPS_MAX() external view returns (uint16 value);
 
+    /// @notice The factor applied to a spoke with no counter-asset depth yet. 0.5e18.
+    /// @dev A depthless spoke can still receive asks — that is how it gets a market at all — but the schedule
+    ///      prefers a spoke that bonds or buys have already given stock-side depth, because asks placed against no
+    ///      bid side earn no fees at all until someone brings stock (§9 decision 13's stranded-fee case).
+    /// @return value The discount, 1e18 fixed point.
+    function DEPTHLESS_DISCOUNT_X18() external view returns (uint256 value);
+
     /// @notice Identifier of this schedule, for governance diffs and the dApp.
     /// @return id A short identifier, e.g. `bytes32("weighted-deficit-v1")`.
     function version() external pure returns (bytes32 id);

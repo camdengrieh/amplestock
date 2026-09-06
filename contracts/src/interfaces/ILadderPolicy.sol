@@ -79,6 +79,31 @@ interface ILadderPolicy {
     /// @return weightsX18 The weights, summing to exactly 1e18.
     function weights(uint64 tiltX18, uint8 buckets) external pure returns (uint256[] memory weightsX18);
 
+    /// @notice The bounds of one bucket, without proposing a whole ladder.
+    /// @dev The lattice, exposed. `docs/phase3-state-model.md` §3.2 makes the canonical doubling grid normative:
+    ///      the vault re-derives every proposed bucket's bounds itself and refuses anything off-grid (I39), the
+    ///      valuer enumerates the same lattice by `extsload`, and the dApp draws it. All three have to agree, so
+    ///      the arithmetic has exactly one public home.
+    /// @param anchorTick The tick the ladder is measured from.
+    /// @param tickSpacing The pool's tick spacing.
+    /// @param k The bucket index, 0 nearest the anchor.
+    /// @param above True for an ask bucket (above the anchor), false for a bid bucket (below it).
+    /// @return lowerTick Spacing-aligned lower bound.
+    /// @return upperTick Spacing-aligned upper bound.
+    function bucketBounds(int24 anchorTick, int24 tickSpacing, uint8 k, bool above)
+        external
+        pure
+        returns (int24 lowerTick, int24 upperTick);
+
+    /// @notice Splits an inventory across weights exactly: the returned amounts sum to `inventory`, with the
+    ///         flooring residue carried into the last element.
+    /// @dev Exposed for the invariant that asserts bucket `k` holds `tilt^k / SUM tilt^j` of the placement within
+    ///      rounding (I34), and so a keeper can size a placement off-chain before paying for one on-chain.
+    /// @param inventory The total to split.
+    /// @param weightsX18 The weights, as {weights} returns them.
+    /// @return amounts The per-bucket amounts, summing to exactly `inventory`.
+    function split(uint256 inventory, uint256[] calldata weightsX18) external pure returns (uint256[] memory amounts);
+
     /// @notice Hard floor of `ladderTilt`. 1e18: a flat ladder.
     /// @return value The bound.
     function LADDER_TILT_X18_MIN() external view returns (uint64 value);

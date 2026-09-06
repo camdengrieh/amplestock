@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {AmpsVaultFixture} from "../mocks/AmpsVaultFixture.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -193,7 +194,43 @@ contract VaultLayoutTest is AmpsVaultFixture {
             bytes32 cooldownKey = keccak256(abi.encode(pools[i], uint256(19)));
             assertEq(uint256(vm.load(address(vault), ladderKey)), 0, "slot 18: no placement records");
             assertEq(uint256(vm.load(address(vault), cooldownKey)), 0, "slot 19: no placement timestamps");
+
+            // The Phase 3 read surface over slot 18 agrees, and reports emptiness without reverting.
+            assertEq(vault.ladderLength(pools[i]), 0, "ladderLength reads the same empty array");
         }
+    }
+
+    /// @notice {IAmpsVault-ladderAt} is the generated getter over slot 18, and an out-of-range index reverts rather
+    ///         than returning a zeroed record — reading past the end must never look like an empty cell.
+    /// @dev The revert carries **no return data**: Solidity's generated getter for a dynamic array bounds-checks
+    ///      with a bare `revert()`, not with `Panic(0x32)` the way an in-contract `arr[i]` would. A consumer must
+    ///      therefore call {IAmpsVault-ladderLength} first rather than probing for a decodable error.
+    function test_slot18_ladderAtIsBoundsChecked() public {
+        (bool ok, bytes memory returndata) =
+            address(vault).staticcall(abi.encodeCall(IAmpsVault.ladderAt, (spokePool, 0)));
+        assertFalse(ok, "reading past the end reverts");
+        assertEq(returndata.length, 0, "and carries no data, so callers must read ladderLength first");
+    }
+
+    /// @notice Slot 20: `uint256 deployThresholdUsd18`. **Phase 3.**
+    /// @dev `docs/phase3-state-model.md` §10 ruling 15 adds the one governed parameter Phase 3 needs that section
+    ///      1.1 has no room for. It is **appended** rather than packed into slot 15's free upper 96 bits, on
+    ///      purpose: slots 0-19 are what the Phase 2 state model documents field by field and what a standby vault
+    ///      is written against, so the append-only rule is worth a whole word to keep literally true.
+    function test_slot20_deployThresholdIsAppendedNotPacked() public {
+        assertEq(
+            uint256(vm.load(address(vault), bytes32(uint256(20)))),
+            Constants.DEPLOY_THRESHOLD_USD18_DEFAULT,
+            "the launch threshold sits alone in slot 20"
+        );
+        assertEq(vault.deployThresholdUsd18(), Constants.DEPLOY_THRESHOLD_USD18_DEFAULT, "and the getter agrees");
+
+        // Slot 15's upper 96 bits stay free: nothing was squeezed in beside the rollout window.
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(15)))) >> 160, 0, "slot 15 [160..255] still free");
+
+        vm.prank(TIMELOCK);
+        vault.setDeployThresholdUsd18(4242e18);
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(20)))), 4242e18, "and the setter writes slot 20");
     }
 
     /// @notice The immutables carry no slot at all: they live in the bytecode, as section 1.1 says.
@@ -203,9 +240,9 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(vault.timelock(), TIMELOCK, "timelock");
         assertEq(vault.guardian(), GUARDIAN, "guardian");
 
-        // Slots 20 and beyond are unused: the layout ends at 19.
-        for (uint256 slot = 20; slot < 26; ++slot) {
-            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 19");
+        // Slots 21 and beyond are unused: the layout ends at 20.
+        for (uint256 slot = 21; slot < 26; ++slot) {
+            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 20");
         }
     }
 
