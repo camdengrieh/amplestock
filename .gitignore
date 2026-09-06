@@ -22,6 +22,9 @@ contracts/lcov.info
 # turbo
 .turbo/
 
+# ponder runtime state (PGlite, logs, generated views); `ponder-env.d.ts` IS committed
+.ponder/
+
 # env
 .env
 .env.*
@@ -47,8 +50,9 @@ venv/
 !.vscode/extensions.json
 *.log
 
-# wagmi CLI output (regenerate with `pnpm --filter @amplestocks/abis generate`)
-packages/abis/src/generated.ts
+# wagmi CLI output: `packages/abis/src/generated.ts` is DELIBERATELY COMMITTED (Phase 4). The indexer, the
+# dApp and the keeper consume it as ordinary TypeScript, so a checkout with no Foundry toolchain still
+# typechecks, builds and tests. Regenerate with `pnpm --filter @amplestocks/abis generate`.
 
 # licence gate report (CI artifact)
 licence-report.json

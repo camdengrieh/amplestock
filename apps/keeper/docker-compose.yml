@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: MIT
+#
+# A sketch, not a production deployment: the relayer, the keeper, Prometheus and Grafana wired together the way
+# `docs/keeper-runbook.md` describes them. Secrets are read from a `.env` next to this file (never committed);
+# the relayer's own signer configuration lives in `relayer/config/` and is the one thing this file does not
+# invent, because it is deployment-specific — see the runbook.
+#
+#     cd apps/keeper && docker compose up -d
+#
+# The keeper is stateless. Kill it, delete its container, run a second one on another host: every decision is a
+# function of chain state, so the only cost of an outage is time.
+
+name: amplestocks-keeper
+
+services:
+  # The transaction submitter. It owns the signer, the nonce and the gas policy; the keeper never holds a key.
+  relayer:
+    image: openzeppelin/openzeppelin-relayer:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./relayer/config:/app/config:ro
+      - relayer-data:/app/data
+    environment:
+      # Generated per deployment; see the runbook's "Relayer" section.
+      API_KEY: ${RELAYER_API_KEY:?set RELAYER_API_KEY in .env}
+      KEYSTORE_PASSPHRASE: ${RELAYER_KEYSTORE_PASSPHRASE:?set RELAYER_KEYSTORE_PASSPHRASE in .env}
+      REDIS_URL: redis://redis:6379
+      RUST_LOG: info
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  keeper:
+    build:
+      context: ../..
+      dockerfile: apps/keeper/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9464:9464"
+    environment:
+      AMPS_CHAIN_ID: ${AMPS_CHAIN_ID:-46630}
+      AMPS_RPC_URL: ${AMPS_RPC_URL:-}          # empty -> the @amplestocks/config default for the chain
+      AMPS_TOKEN_ADDRESS: ${AMPS_TOKEN_ADDRESS:?set AMPS_TOKEN_ADDRESS in .env}
+      AMPS_SENDER_ADDRESS: ${AMPS_SENDER_ADDRESS:?the relayer's signer address}
+      AMPS_SUBMITTER: relayer
+      AMPS_RELAYER_URL: http://relayer:8080
+      AMPS_RELAYER_ID: ${AMPS_RELAYER_ID:-amps-keeper}
+      AMPS_RELAYER_API_KEY: ${RELAYER_API_KEY}
+      AMPS_METRICS_PORT: "9464"
+      AMPS_LOG_LEVEL: ${AMPS_LOG_LEVEL:-info}
+      AMPS_SCAN_INTERVAL_SECONDS: ${AMPS_SCAN_INTERVAL_SECONDS:-15}
+      # Zero disables the bounty-versus-gas check. Set it once Phase 0 has resolved the ETH/USD feed on 4663.
+      AMPS_ETH_USD18: ${AMPS_ETH_USD18:-0}
+    depends_on:
+      relayer:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  relayer-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: MIT
+#
+# The alerts `docs/keeper-runbook.md` documents, one rule per operator action. Every one of them is a symptom
+# with a decision attached; nothing here pages for a state the protocol handles on its own (a closed market, a
+# pool on cooldown, a job below `chost`).
+
+groups:
+  - name: amps-keeper
+    rules:
+      - alert: KeeperDown
+        expr: up{job="amps-keeper"} == 0 or amps_keeper_up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The keeper is not running"
+          description: >-
+            Ladders are static, so trading, bonds and redemption are unaffected. Fee AMPS and bonded stock queue.
+            Restart, or let a second operator's instance take over — every job is permissionless.
+
+      - alert: KeeperScanStalled
+        expr: time() - amps_keeper_last_scan_timestamp_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No completed scan for five minutes"
+          description: "Check amps_keeper_scan_errors_total and the RPC endpoint."
+
+      - alert: KeeperGateNotGreen
+        expr: amps_keeper_gate_state != 0
+        for: 30m
+        labels: {severity: info}
+        annotations:
+          summary: "OracleGate has been non-GREEN for 30 minutes"
+          description: >-
+            1 DEGRADED (stale feed or closed session), 2 DIVERGED, 3 REF_DIVERGED, 4 SCHEDULED_FREEZE,
+            5 WATCHDOG. Expected overnight and at weekends. See the runbook's gate table.
+
+      - alert: KeeperWatchdogTripped
+        expr: amps_keeper_watchdog_tripped == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "The layer-A watchdog has been tripped for 15 minutes"
+          description: >-
+            `touch()` clears it in one transaction and the keeper sends it automatically. Fifteen minutes means
+            the keeper cannot send at all: check the relayer and the sender's ETH balance.
+
+      - alert: KeeperCheckpointStale
+        expr: amps_keeper_checkpoint_age_seconds > 1500
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The vault checkpoint is close to CHECKPOINT_MAX_AGE"
+          description: "AmpsBonds refuses to price above 1800 s. `checkpoint()` is unpaid and permissionless."
+
+      - alert: KeeperPotDepleted
+        expr: amps_keeper_pot_balance_raw == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "BountyPot is empty"
+          description: >-
+            Jobs degrade to unpaid, they do not stop. Fund the pot, or set AMPS_RUN_UNPAID=1 to keep compounding
+            out of the operator's own pocket.
+
+      - alert: KeeperDailyCeilingExhausted
+        expr: amps_keeper_pot_budget_left_usd == 0
+        for: 30m
+        labels: {severity: info}
+        annotations:
+          summary: "The pot's rolling 24 h ceiling is exhausted"
+          description: "Expected on a busy day. Governance raises dailyCeilingUsd18 through the 48 h timelock."
+
+      - alert: KeeperUnprofitable
+        expr: increase(amps_keeper_unprofitable_total[1h]) > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Jobs are being refused because the bounty does not cover gas"
+          description: >-
+            Compare amps_keeper_measured_gas_allowance_usd against amps_keeper_reported_gas_allowance_usd. The
+            vault reports a flat $1 allowance, so BountyPot's 3x cap cannot price a gas spike; raising `tip` is
+            the governance lever.
+
+      - alert: KeeperSubmitErrors
+        expr: increase(amps_keeper_submit_errors_total[15m]) > 3
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "The submitter is failing"
+          description: "Relayer health, API key, sender balance, RPC. The keeper retries every scan."
+
+      - alert: KeeperOnChainReverts
+        expr: increase(amps_keeper_failed_total[1h]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "A keeper transaction reverted on chain"
+          description: >-
+            Every job is simulated before it is sent, so an on-chain revert means state moved between the
+            simulation and the transaction — a race with another keeper, or a gate change. Investigate before
+            it repeats; it costs gas and pays nothing.
+
+      - alert: KeeperCellBudgetNearlyFull
+        expr: amps_keeper_live_cells / amps_keeper_live_cell_budget > 0.9
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "The vault-wide live-cell budget is above 90%"
+          description: >-
+            At the budget the bountied paths merge and idle rather than revert, and redemption gas approaches a
+            block. This is the §12 ruling E constraint on growing the constituent set; it needs coarser ladders
+            or a migration, not a keeper change.
