@@ -349,7 +349,8 @@ and no two records share an `m`.
 **Entry pools** (`AMPS/WETH`, `AMPS/USDG`), anchor $1.00 via
 `PriceLib.ampsPerCounterToSqrtPriceX96(1e18, counterPriceUsd8, counterDecimals)` then `sqrtPriceX96ToTick`:
 
-* **asks** 1,662.5 AMPS each, `ladderDoublings = 10`, `ladderTilt = 1.25`, `above = true`, cells `m = 0..9`.
+* **asks** 1,662.5 AMPS each, `ladderDoublings = 10`, `ladderTilt = 1.25`, `above = true`, cells `m = 0..9`
+  (or `m = 1..10` for a pool whose fair tick has crossed its origin by the time it is placed: §12.2 ruling L).
   `sum 1.25^k (k=0..9) = 33.2529`, so `w_0 = 3.007%` (50.0 AMPS over $1-$2) up to `w_9 = 1.25^9 / 33.2529 =
   22.406%` (372.5 AMPS over $512-$1,024; an earlier draft wrote 28.008% / 465.7 AMPS, which is `1.25^10 / 33.2529`,
   one power too many — `LadderLib` and `unit/LadderLib.t.sol` pin the correct vector). A one-sided range order
@@ -980,4 +981,10 @@ Gas of the placement paths at the worst reachable state in the fixture: `place` 
 | I | **Hook deviations accepted:** `gateAttemptedAt` in DYNAMIC's free bits [200..231] (rate-limits refresh attempts; `gateRefreshedAt` is the last *successful* refresh); `beforeSwap` reads four cold words (the three packed words plus slot 0 for `sellFeeBps` and the policy pointer); the corporate-action detector runs before the gate refresh and `caArmed` is cleared when the multiplier is stable, the oracle un-paused and no `effectiveAt` is inside the window (unreadable probes leave it up); `IAmpsHook.quoteFee`'s second argument is `zeroForOne` (true = sell); price-improving swaps skip `f_dev` only (the dividend-capture direction is deviation-decreasing by construction); `TOTAL_FEE_BPS_MAX` is a clamp, not a revert (I15 outranks an unreachable revert); `PoolNotRegistered(PoolId)` replaces §1.3's `UnknownPool`; `setGateCacheSeconds` is on the hook but not on `IAmpsHook`; every hot-path external read is a hand-decoded `staticcall` with clamped enums and ticks, because `try`/`catch` cannot survive a decode failure after a successful call. `src/hook/*` compiles under the same per-path IR/200-runs restriction as the vault and bonds (20,757 B; 28,014 B on the legacy pipeline). |
 | J | **`PoolRegistry.PoolOpened` emits the price the pool actually opened at**, read back from the PoolManager through `PoolStateLib` after `initializePool`, because the vault snaps the requested price down to the grid origin (ruling C) and an event that disagreed with `slot0` by up to one spacing would mislead the indexer. |
 | K | **Cached-versus-effective hook words.** `poolState()` words 13/14/15 are the cached band, rail and cap; when the cache is older than `GATE_CACHE_MAX_AGE` the effective values are the conservative substitutes (band 1,500, the class rail, the DEGRADED cap) that `innerBandTicks()`, `outerRailTicks()` and `quoteFee()` use. Readers wanting the charged fee use `quoteFee`. |
+
+### 12.2 Genesis placement order (orchestrator ruling, 2026-09-06)
+
+| # | Ruling |
+|---|---|
+| L | **A genesis ask ladder may start one cell above the origin, and that is I32 working.** Every ask placement is valued at the reference price by `LadderPositionValuer`, so NAV/share and `P_ref` tick up by a few bp as the 32 ladders are placed in sequence (measured: $0.999999… → $1.000204 after all 32). `VaultPlacementLib._cells` anchors a ladder at `ceilDiv(fairTick(P_ref) − gridBase, D)`, which is 1 for any pool whose exact fair tick sits within ~2 ticks below a spacing boundary (~3% of pools at the launch vector). The ladder is still ten contiguous one-cell asks and the bids still sit at `m = -1..-4`; `11_GenesisPlacement.assertLayout` asserts exactly that shape ("anchored at the origin or one cell above it"), and no contract changes. Placing the entry pools first and the spokes in one batch keeps the drift to two basis points. |
 

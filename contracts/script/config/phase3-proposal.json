@@ -1,0 +1,9 @@
+{
+  "$comment": "Written by script/09_Phase3Wire.s.sol in proposal mode: the seven Phase 3 timelock calls, plus the TimelockController scheduleBatch/executeBatch calldata for the proposer Safe. Empty until the script has run.",
+  "chainId": 0,
+  "salt": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "delaySeconds": 604800,
+  "calls": [],
+  "scheduleBatch": "0x",
+  "executeBatch": "0x"
+}

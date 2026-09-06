@@ -54,7 +54,27 @@ test/utils/V4TestBase.sol     local v4 stack from hookmate artifacts
 test/mocks/                   MockStockToken (uiMultiplier, denylist, pause, reentrancy), MockAggregator, MockNavSource
 test/{unit,fuzz,gas}/         suites; gas/baseline.json is the CI regression reference
 script/                       deployment and mining scripts; script/config holds mined salts and addresses
+test/script/                  fork-free dry run of the deployment scripts against a local PoolManager
 ```
+
+## Deployment
+
+`docs/deploy-runbook.md` is the runbook: the library-linking flags, the bootstrap order the contracts force, and
+what is still placeholder config pending Phase 0.
+
+`AmpsVault` reaches four **deployed** libraries by `DELEGATECALL`, so an unlinked artefact carries `__$...$__`
+placeholders and cannot be deployed. Every command that builds, deploys, measures or verifies the vault takes all
+four flags, which `script/02_Libraries.s.sol` prints and records in `script/config/libraries.json`:
+
+```
+--libraries src/vault/VaultNavLib.sol:VaultNavLib:0x...
+--libraries src/vault/VaultRedeemLib.sol:VaultRedeemLib:0x...
+--libraries src/vault/VaultPlacementLib.sol:VaultPlacementLib:0x...
+--libraries src/vault/VaultRolloutLib.sol:VaultRolloutLib:0x...
+```
+
+They are deliberately **not** in `foundry.toml`'s `libraries` key: that would pin one chain's addresses into every
+build, `forge test` included, where Foundry deploys its own copies at its own addresses.
 
 Later phases add `src/vault/AmpsVault.sol`, `src/hook/AmpsHook.sol`, `src/bonds/AmpsBonds.sol`,
 `src/staking/AmpsStaking.sol`, `src/policy/*`, `src/oracle/*`, `src/registry/PoolRegistry.sol`,
