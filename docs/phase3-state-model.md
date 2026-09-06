@@ -349,11 +349,14 @@ and no two records share an `m`.
 **Entry pools** (`AMPS/WETH`, `AMPS/USDG`), anchor $1.00 via
 `PriceLib.ampsPerCounterToSqrtPriceX96(1e18, counterPriceUsd8, counterDecimals)` then `sqrtPriceX96ToTick`:
 
-* **asks** 1,662.5 AMPS each, `ladderDoublings = 10`, `ladderTilt = 1.25`, `above = true`, cells `m = 0..9`.
-  `sum 1.25^k (k=0..9) = 33.2529`, so `w_0 = 3.007%` (50.0 AMPS over $1-$2) up to `w_9 = 28.008%` (465.7 AMPS
-  over $512-$1,024). A one-sided range order raises `sqrt(P_lo * P_hi)` per AMPS, so bucket 0 raises ~$70.7 per
-  pool, ~$141 across both — the plan's "about $140 of buying doubles the price from $1", which confirms the shape.
-  Bucket 9 raises ~$337k per pool, ~$674k across both (decision 9).
+* **asks** 1,662.5 AMPS each, `ladderDoublings = 10`, `ladderTilt = 1.25`, `above = true`, cells `m = 0..9`
+  (or `m = 1..10` for a pool whose fair tick has crossed its origin by the time it is placed: §12.2 ruling L).
+  `sum 1.25^k (k=0..9) = 33.2529`, so `w_0 = 3.007%` (50.0 AMPS over $1-$2) up to `w_9 = 1.25^9 / 33.2529 =
+  22.406%` (372.5 AMPS over $512-$1,024; an earlier draft wrote 28.008% / 465.7 AMPS, which is `1.25^10 / 33.2529`,
+  one power too many — `LadderLib` and `unit/LadderLib.t.sol` pin the correct vector). A one-sided range order
+  raises `sqrt(P_lo * P_hi)` per AMPS, so bucket 0 raises ~$70.7 per pool, ~$141 across both — the plan's "about
+  $140 of buying doubles the price from $1", which confirms the shape. Bucket 9 raises ~$270k per pool, ~$539k
+  across both, which is the plan's "$540k" (decision 9).
 * **seed bids** $2,500 of counter each, `seedHalvings = 4`, `above = false`, cells `m = -4..-1`. `LadderLib`
   applies the weight vector reversed for bids, so the cell adjacent to $1 is largest: 33.87% / 27.10% / 21.68% /
   17.34% => $846.72 / $677.38 / $541.90 / $433.60.
@@ -740,10 +743,11 @@ property functions need no storage access. Run it over `src/hook/**`, `src/polic
 8. **"Keep the counter side in place" is impossible for a partially re-crossed cell** — a single-sided `amount1`
    position must lie entirely below the tick. *Proposal:* re-place it at `[lower, alignDown(currentTick)]`, still
    inside the cell and still on the grid (3.5).
-9. **The plan's "top bucket raises about $540k" does not reconcile.** Bucket 9 holds 465.7 AMPS over $512-$1,024
-   and raises `465.7 * sqrt(512*1024)` = ~$337k per entry pool, ~$674k across both; bucket 0 raises ~$141 across
-   both, which *does* match "$140 doubles the price". *Proposal:* publish the derived table in the dApp and
-   correct the plan's figure. No code depends on it.
+9. **The plan's "top bucket raises about $540k" reconciles once the weight is computed correctly.** Bucket 9
+   holds 372.5 AMPS over $512-$1,024 (`1.25^9 / 33.2529 = 22.406%`; the first draft of this section used one
+   power too many and wrote 465.7 AMPS) and raises `372.5 * sqrt(512*1024)` = ~$270k per entry pool, ~$539k
+   across both; bucket 0 raises ~$141 across both, which matches "$140 doubles the price". *Proposal:* publish
+   the derived table in the dApp. No code depends on it.
 10. **The corporate-action flag has no path from hook to gate** — the Phase 2 `OracleGate` reads the token
     directly and holds a mock market reference. *Proposal:* redeploy `OracleGate` in Phase 3 (a swap already
     required for the market-reference move) so `_corporateAction` also consults
@@ -777,10 +781,228 @@ property functions need no storage access. Run it over `src/hook/**`, `src/polic
 | 6 | **Accepted.** Redemption's position removal lives in a minimal linked `VaultRedeemLib`; the I14 proof (`vm.accesses` + selector enumeration) covers the vault and every linked library. |
 | 7 | **Accepted.** Grid-bounded loop, worst-case single-block gas test, never gated. |
 | 8 | **Accepted.** Re-place the counter side at `[lower, alignDown(tick)]`. |
-| 9 | **Plan corrected.** The plan's "$540k" is the top bucket of the whole 3,325-AMPS entry tranche; per pool it is roughly half. The per-bucket derivation in §3.3 is normative. |
+| 9 | **Reconciled.** The plan's "$540k" is the top bucket across both entry pools (~$270k each) once `w_9 = 1.25^9 / Σ` is used; §3.3's first draft had one power too many. The per-bucket derivation in §3.3 (as corrected) is normative and `LadderLib` pins it. |
 | 10 | **Accepted.** `OracleGate` is redeployed in Phase 3 (pointer-upgradeable, nothing deployed yet) to read `IAmpsHook.poolState` for the corporate-action flag, keeping its own token probes as the fallback. |
 | 11 | **Accepted.** `place` is timelock-or-registry; `compound`, `rollout`, `deployBonded` are the permissionless bountied paths. |
 | 12 | **Accepted.** `salt = bytes32(0)` everywhere, asserted as an invariant. |
 | 13 | **Accepted.** Stranded out-of-range fees are measured and disclosed, not engineered around. |
 | 14 | **Accepted.** `gridBase` in the hook CONFIG word, mirrored in `PoolConfig.gridBaseTick`. |
 | 15 | **Accepted.** `DEPLOY_THRESHOLD_USD18 = 100e18`, 48-hour governed. |
+
+---
+
+## 11. Declarations as landed
+
+Everything §10's rulings require now exists in `contracts/src/types/{Types,Constants,Errors}.sol` and
+`contracts/src/interfaces/*.sol`, so the hook, policy, placement, valuer and quoter agents build against final
+declarations without touching a shared file. This section is the inventory: what was added, who consumes it, and
+every place a name or a shape was chosen rather than quoted.
+
+### 11.1 `types/Types.sol`
+
+| Declaration | Shape | Consumed by |
+|---|---|---|
+| `PoolConfig.gridBaseTick` | `int24`, **appended** — it starts slot +1 of the struct; every existing field keeps its slot and bit range | `PoolRegistry` (writes it), `LadderPositionValuer` (§4), `VaultPlacementLib` (§3.2), `AmpsQuoter` |
+| `HookPoolState` + `counterDecimals`, `gridBaseTick`, `lastTick`, `fairTick`, `session`, `gateFlags`, `fVolBps`, `gateRefreshedAt` | eight appended fields; the struct is now documented as the **memory view** `poolState()` assembles, not a storage layout | `AmpsHook.poolState`, `OracleGate` (ruling 10), `AmpsQuoter` |
+| `GridCell` | `{uint8 index; int24 lowerTick; int24 upperTick; uint128 liquidity; bool above;}` | `VaultPlacementLib` — it is the `Cell[]` of §3.9's `ACTION_BURNBACK`; also the grid arithmetic's shared vocabulary |
+| `PlaceParams` | `{PoolKey key; PoolClass poolClass; bool above; uint256 amount; int24 anchorTick; int24 currentTick; int24 gridBaseTick; uint8 buckets; uint64 tiltX18; bytes32 reason;}` | `AmpsVault` → `VaultPlacementLib` (§3.1's signature) |
+| `Placed` | `{uint256 amountPlaced; uint128 liquidityAdded; uint8 cells; int24 lowestTick; int24 highestTick;}` | `VaultPlacementLib` → `AmpsVault` |
+
+`Types.sol` gains one import, MIT v4-core `PoolKey`, for `PlaceParams.key`.
+
+**Already present, not duplicated.** `ILadderPolicy.LadderRequest` / `LadderBucket`, `IFeePolicy.FeeInput` /
+`FeeQuote`, `IRolloutPolicy.RolloutRequest` / `RolloutDecision` and `Types.PlacementRecord` were declared in
+Phase 2 and are unchanged. There is no `FeeOutput` and no `RolloutMove`: the doc's names are `FeeQuote` and
+`RolloutDecision`, and both already exist.
+
+### 11.2 `types/Constants.sol`
+
+| Constant | Value | Consumed by |
+|---|---|---|
+| `HOOK_ADDRESS_MASK` | `0x3FFF` | `04_MineHook.s.sol`, the deployment assertion, `unit/AmpsHook.t.sol` |
+| `K_VOL_X18`, `K_VOL_X18_MIN`, `K_VOL_X18_MAX` | `5e15`, `1e14`, `1e17` | `FeePolicy` |
+| `K_DEV_BPS`, `K_DEV_BPS_MIN`, `K_DEV_BPS_MAX` | `25`, `1`, `100` | `FeePolicy` |
+| `F_WALL_BPS`, `F_WALL_BPS_MIN`, `F_WALL_BPS_MAX` | `1500`, `100`, `DYN_CAP_ESCALATION_BPS` | `FeePolicy` |
+| `LAMBDA_X18`, `LAMBDA_X18_MIN`, `LAMBDA_X18_MAX` | `0.98e18`, `0.5e18`, `0.999e18` | `AmpsHook.afterSwap` (the EWMA), `FeePolicy` |
+| `GATE_CACHE_SECONDS_DEFAULT`, `GATE_CACHE_MAX_AGE` | `60`, `900` | `AmpsHook` (§1.5 step 6, §1.4 step 6) |
+| `ROTATION_CREDIT_SLOT` | `keccak256("amplestocks.hook.ROTATION_CREDIT")` | `AmpsHook`, `unit/RotationCredit.t.sol` |
+| `GRID_MIN_M`, `GRID_MAX_M`, `GRID_CELLS` | `-8`, `16`, `24` | `VaultPlacementLib`, `LadderPositionValuer`, `AmpsVault`, `Phase3.invariant` (I39) |
+| `POSITION_SALT` | `bytes32(0)` | every placement and every enumeration (ruling 12) |
+| `DEPTHLESS_DISCOUNT_X18` | `0.5e18` | `RolloutPolicy` |
+| `DEPLOY_THRESHOLD_USD18_DEFAULT`, `_MIN`, `_MAX` | `100e18`, `10e18`, `10_000e18` | `AmpsVault.deployBonded` and its 48-hour setter (ruling 15) |
+
+Ruling 5 places `k_vol`, `k_dev`, `f_wall` and `lambda` in the pointer-upgradeable `FeePolicy` "with bands in
+`Constants`". Both the launch value and the band live here, because §5 also requires each policy to read its
+numbers from `Constants` rather than restate them as literals — a policy needs somewhere to read the value *from*,
+not only somewhere to be checked against.
+
+Two things deliberately **not** added, to avoid a second home for one number:
+
+* **the observation ring size.** It already exists as `TruncatedOracleLib.MAX_CARDINALITY = 64`, beside the ring it
+  describes and beside `TWAP_WINDOW = 1800`. Restating it in `Constants` would create two values that can drift.
+* **the `beforeSwap <= 22,000` / `afterSwap <= 55,000` gas ceilings of ruling 3.** §1.7 homes them in
+  `gas/baseline.json` "beside the Phase 1 stub numbers", which is where the gas suite reads its ceilings from.
+
+### 11.3 `types/Errors.sol`
+
+| Error | Thrown by |
+|---|---|
+| `BeyondRail(bytes32 poolId, int24 devTicks, int24 outerRailTicks)` | `AmpsHook.beforeSwap` (start-of-swap tick) and `AmpsHook.afterSwap` (post-swap tick), per ruling 2 |
+| `PlacementCooldown(bytes32 poolId, uint32 readyAt)` | `AmpsVault` / `VaultPlacementLib`, gauntlet step 6 |
+| `PlacementDiverged(bytes32 poolId, int24 poolTick, int24 fairTick, int24 maxTicks)` | gauntlet step 3, at entry and at exit |
+| `WrongSide(bytes32 poolId, bool above, int24 bucketTick, int24 boundTick)` | gauntlet step 4 (I9) |
+| `OffGrid(bytes32 poolId, int24 lowerTick, int24 gridBaseTick, int24 cellWidth)` | gauntlet step 5 (I39) |
+| `InsufficientInventory(uint256 requested, uint256 available)` | gauntlet step 5 |
+| `RolloutLimitExceeded(bytes32 limit, uint256 requested, uint256 available)` | `rollout`'s own re-check of all three limits (I32) |
+
+Only `BeyondRail` is named by §10; the other six are the gauntlet's revert sites, named here rather than left to
+the placement agent so that the invariant handler and the attack tests can decode them.
+
+**`IAmpsHook.BeyondOuterRail` is superseded, not removed.** A declared error selector is ABI and this interface
+never removes a member, so it stays with a NatSpec note saying that `Errors.BeyondRail` is what the hook throws.
+Nothing throws `BeyondOuterRail`. This is the one place where the Phase 2 declaration and ruling 2 disagree, and
+the ruling wins.
+
+### 11.4 Interfaces
+
+| Interface | Added |
+|---|---|
+| `IAmpsHook` | events `RebalanceNeeded`, `GateCacheRefreshed`, `HookParameterChanged`, `FeePolicyChanged`; error `PoolKeyMismatch(bytes32 field)`; views `timelock()`, `gateCacheSeconds()`, `gridBaseTick(PoolId)` |
+| `IFeePolicy` | `captureDecay(uint16,uint32)`; bound getters `FROZEN_FEE_FLOOR_BPS()`, `K_VOL_X18()`, `K_DEV_BPS()`, `F_WALL_BPS()`, `LAMBDA_X18()` |
+| `ILadderPolicy` | `bucketBounds(int24,int24,uint8,bool)`, `split(uint256,uint256[])` — both named in §5 |
+| `IRolloutPolicy` | `DEPTHLESS_DISCOUNT_X18()` |
+| `IPositionValuer` | no members; the §4 normative rules (grid enumeration, uncollected fees excluded) are now in its NatSpec |
+| `IMarketReference` | nothing — it was already complete against §1.6 |
+| `IAmpsQuoter` (**new file**) | `PoolQuote` exactly as §6 gives it, plus `quotePool`, `quoteAll`, `quoteRotation`, `bondQuote`, `vault()`, `registry()`, `hook()`, `bonds()`, `version()` |
+| `IAmpsVault` | `ladderLength(PoolId)`, `ladderAt(PoolId,uint256)`, `deployThresholdUsd18()`, `setDeployThresholdUsd18(uint256)`, `DEPLOY_THRESHOLD_USD18_MIN()`, `DEPLOY_THRESHOLD_USD18_MAX()` |
+
+`IAmpsVault` grows from 91 to 97 declared functions. The header of this document froze it at 91; rulings 1 and 15
+override that, and the growth is five `view`/`pure` getters plus one governed setter. Only the setter is a
+mutating selector, so it is the only one the I14 enumeration and `scripts/selector-gate.py` see.
+
+**`captureDecay` resolves a contradiction rather than adding a feature.** §5 writes
+`f_div = surgeDecay(captureFeeBps, captureElapsed)`, but §1.5 and `Constants.DIVIDEND_CAPTURE_HALF_LIFE` both put
+the capture fee's half-life at 300 s while the surge's is 60 s. Reusing `surgeDecay` would decay the capture fee
+five times too fast and would leave `DIVIDEND_CAPTURE_HALF_LIFE` with no consumer at all. `captureDecay` is the
+same shape on the other half-life.
+
+### 11.5 Implementations, kept minimal
+
+* **`AmpsVault`** — slot **20**, `uint256 _deployThresholdUsd18`, initialised to
+  `DEPLOY_THRESHOLD_USD18_DEFAULT`; `setDeployThresholdUsd18` through the existing `_band` helper (same
+  `OutOfBand`, same `VaultParameterChanged`, same `locked` + `onlyTimelock` + management gate as every other
+  setter); the two band getters; `ladderLength`. Slot 18's value type changes from the vault-local
+  `PlacementRecordStorage` to `Types.PlacementRecord` — the same ten fields in the same order, so the layout is
+  bit-identical — and the mapping is declared `public` under the name `ladderAt`, which *is* the implementation of
+  `IAmpsVault.ladderAt`. `place`, `compound`, `rollout`, `deployBonded` and `withdrawRetiredBids` remain
+  `Phase3NotImplemented`.
+* **`PoolRegistry`** — `_openPool` mirrors `gridBaseTick` from the hook after the vault has opened the pool,
+  guarded by `extcodesize` and `try`/`catch`.
+* **`VaultNavLib`** — unchanged in substance.
+
+**Where the vault's headroom went.** `AmpsVault` is **24,505 B**, 71 B under EIP-170, against 23,774 B before this
+slice. Three decisions fell out of that 802-byte budget and are worth recording because they are visible in the
+ABI:
+
+1. `ladderAt` returns the record's fields **flattened** rather than a `Types.PlacementRecord` struct. Solidity's
+   generated getter for the `public` mapping is 234 B smaller than the hand-written struct-returning form, which
+   is a fifth of the whole budget. It also reverts with **empty return data** on an out-of-range index rather than
+   `Panic(0x32)`, so a consumer reads `ladderLength` first.
+2. There is **no by-cell getter and no `lastPlacementAt` getter**. Ruling 1 names exactly `ladderAt` and
+   `ladderLength`; a cell lookup is `ladderLength` plus at most `GRID_CELLS` reads of `bucketIndex`, which is the
+   same work the vault would have done. Both were written, measured (184 B and 130 B) and removed.
+3. Moving these getters into `VaultNavLib` was tried and is **worse**: the `DELEGATECALL` plus the ABI round trip
+   for a ten-field struct costs 168 B *more* than the inline form. Recorded so nobody tries it twice.
+
+`VaultRedeemLib` (ruling 6) is what reopens this headroom, and it belongs to the placement slice. Until it lands,
+anything added to `AmpsVault` has 71 bytes to fit in.
+
+**Why the registry mirrors the grid origin instead of deriving it.** §9.14 says `gridBaseTick` is "written by
+`initializePool`", and the tick that `initializePool` hands the hook is the PoolManager's own. Re-deriving it in
+`PoolRegistry` from `sqrtPriceX96` means a second call site for `TickMath.getTickAtSqrtPrice`, which costs
+**2,822 B** at the registry's 1,000,000-run optimizer settings — it does not fit — and, much worse, gives the
+system two derivations of one number that can disagree. A disagreement would point `LadderPositionValuer` at
+ranges the vault never placed on. So the hook owns the value and the registry reads it back through the
+`gridBaseTick(PoolId)` getter added to `IAmpsHook`. Consequences the hook agent must honour:
+
+* `AmpsHook.afterInitialize` must have written its CONFIG word, `gridBaseTick` included, before it returns. It
+  does — §1.3 already specifies exactly that — and `_openPool` reads it on the next line.
+* `AmpsHook.gridBaseTick(poolId)` must not revert for a pool it has just initialised. If it does, registration
+  still succeeds and the origin stays 0; `unit/PoolRegistry.t.sol` pins that.
+* Before the hook exists, `gridBaseTick` is 0 for every pool, which is correct: without a hook there is no grid.
+  The `extcodesize` guard is load-bearing, because a `staticcall` to an address with no code *succeeds* with empty
+  return data and a decode failure after a successful call is not catchable by `catch`.
+
+### 11.6 Names chosen, not quoted
+
+The document fixes most of these; where it does not, this is what was chosen and why.
+
+| Name | Status |
+|---|---|
+| `PlaceParams`, `Placed` | names from the task and §3.1's signature; **fields chosen** — exactly what §3.3 and §3.8 need, so the library never calls back out mid-placement |
+| `GridCell` | chosen. §3.9 calls the payload `Cell[]`; `Cell` is too generic for a file-level type |
+| `PlacementCooldown`, `PlacementDiverged`, `WrongSide`, `OffGrid`, `InsufficientInventory`, `RolloutLimitExceeded` | chosen. §3.8 names the checks, not the reverts |
+| `BeyondRail`'s parameters | chosen as `(bytes32 poolId, int24 devTicks, int24 outerRailTicks)`, following §1.4's `RailBreached(dev, rail)` and adding the pool. `bytes32` rather than `PoolId` so contracts that do not import v4-core's types can still decode it |
+| `captureDecay` | chosen; see §11.4 |
+| `GateCacheRefreshed`, `HookParameterChanged`, `FeePolicyChanged`, `PoolKeyMismatch`, `gateCacheSeconds`, `gridBaseTick` | chosen. `RebalanceNeeded` is the plan's own name |
+| `K_VOL_X18`, `K_DEV_BPS`, `F_WALL_BPS`, `LAMBDA_X18` | §9.5's names, kept bare so the formulas in §1.4 and §1.5 read literally; the `_MIN`/`_MAX` bands beside them are chosen |
+| `bondQuote` | chosen. §6 calls it `bondQ(marketId)`; `bondQuote` matches `quotePool`/`quoteAll`/`quoteRotation` and returns the discount, the capacity and the `degraded` bitfield alongside `q` |
+| `HookPoolState`'s three extra fields beyond ruling 4 | chosen. Ruling 4 names `lastTick`, `fairTick`, `gateFlags`, `fVolBps`, `gateRefreshedAt`; `counterDecimals`, `gridBaseTick` and `session` are in §1.2's CONFIG and DYNAMIC words and a memory *view* of those words that omitted them would be an incomplete view |
+
+**One field §1.2 asks for that `FeeInput` cannot carry.** §1.2 says `beforeSwap` needs no `k_vol` multiply because
+`afterSwap` pre-computes `fVolBps`. `IFeePolicy.FeeInput` is a Phase 2 declaration and carries `varianceX18`, not
+`fVolBps`, and §9 does not propose changing it — so `FeePolicy` computes `f_vol = min(K_VOL_X18 * varianceX18 /
+1e36, F_VOL_CAP_BPS)` from the full-precision variance. The hook still does no multiply; the pure policy does.
+`HookPoolState.fVolBps` remains the cached value `beforeSwap` falls back to when the gate cache is older than
+`GATE_CACHE_MAX_AGE`, and what `AmpsQuoter` reads.
+
+## 12. Placement path as landed (orchestrator rulings, 2026-09-06)
+
+The placement slice landed with five deliberate deviations from §3 and §10; each is accepted or amended here, and
+this section wins over the earlier text where they differ.
+
+| # | Ruling |
+|---|---|
+| A | **Four linked libraries, not three.** `VaultPlacementLib` with `rollout`/`deployBonded`/`withdrawRetiredBids` inlined is 30,237 B, so those three live in `src/vault/VaultRolloutLib.sol` and route every placement back through `VaultPlacementLib.place`. Deploy scripts link `VaultNavLib`, `VaultPlacementLib`, `VaultRedeemLib`, `VaultRolloutLib`; `script/config/libraries.json` records four addresses. The libraries read the vault's parameter word and pointer set by slot (a `DELEGATECALL` shares storage); §1.1's layout is pinned by `VaultLayout.t.sol`, and `_poolKeys` lives at `keccak256("amplestocks.vault.poolKeys")` so the numbered layout still ends at slot 20. |
+| B | **Ruling 8 superseded.** The counter side of a burnt-back cell is *not* re-placed at `[lower, alignDown(tick)]` (a fraction of a cell is invisible to the valuer, so R1 would revert the `compound` that created it). It is held as an ERC-6909 claim and re-enters the ladder in step 7 of the same `compound` as a proper grid bid below the tick. |
+| C | **Genesis price is grid-aligned.** §3.3's seed bids at cells `-4..-1` require the opening price to sit exactly on the grid origin: `initializePool` uses `TickMath.getSqrtPriceAtTick(gridBaseTick)` with `gridBaseTick` the spacing-aligned tick nearest the intended price (the launch price is therefore the aligned price nearest $1.00, within one tick spacing). Sidedness is checked in exact v4 terms — an ask needs `sqrtPriceX96 <= getSqrtPriceAtTick(lowerTick)`, a bid needs `sqrtPriceX96 >= getSqrtPriceAtTick(upperTick)` — so at the aligned opening price cell 0 holds pure AMPS and cell -1 pure counter, and the seed bids land at `-1..-4` as specified. |
+| D | **The vault consumes `ILadderPolicy.weights`, not `propose`**, because the grid already fixes every bucket bound; a policy that reverts or answers badly falls back to `LadderLib`. The ladder is clipped to the grid rather than reverting `OffGrid` when a pool has run most of the way up. |
+| E | **A vault-wide live-cell budget bounds redemption gas.** `redeemProRata` costs ~46k gas per live cell (measured: 2.20M for 48 cells over four pools). At the launch shape (14 cells per pool) 32 pools are ~20.5M and every grid cell occupied (24 x 32) is ~35M, which does not fit a 32M transaction. `Constants.MAX_LIVE_CELLS = 512` (~23.5M) is enforced at every new-cell opening: `place` reverts `CellBudgetExceeded`; `compound`/`rollout`/`deployBonded` merge into existing cells and leave the remainder idle. `IAmpsVault.liveCells()` exposes the count. Consequence for Decision 19: at 14 cells per pool the budget admits ~36 pools, so growing toward `MAX_CONSTITUENTS = 64` needs coarser ladders or a migration with a larger budget, and Phase 0 must read the chain's `MaxTxGasLimit`. **This narrows a user decision and is raised to the user.** |
+| F | **Redemption burns the AMPS claim slice too.** `inventoryBurned` covers the vault's AMPS ERC-20 balance and its AMPS ERC-6909 claim (a merge-add can leave a small claim); the claim is taken inside the redemption `unlock` and burned with the rest. |
+
+Gas of the placement paths at the worst reachable state in the fixture: `place` 2.2–3.0M, `compound` 1.0–3.3M, `rollout` 1.1–2.9M, `deployBonded` 1.5–2.4M, `emergencyMigrate` with a full ladder unwind ~2.1M for four pools (~16M for 32). The bounty for v1 reports a flat `$1` gas allowance (`BountyPot._quote` caps at `gasCostUsd18 x gasCapMultiple`, so `0` would pay nothing); the Phase 4 keeper reports measured gas.
+
+### 12.1 Hook, fee calibration and gas as landed (orchestrator rulings, 2026-09-06)
+
+| # | Ruling |
+|---|---|
+| G | **Gas re-baselined against the real hook; ruling 3's 22,000 `beforeSwap` ceiling is superseded.** Measured cold, each in its own frame: `beforeSwap` buy 25,116 / credited sell 28,863, `afterSwap` 39,744 (59,308 with a gate refresh), one-hop buy 153,260, one-hop sell 145,325, two-hop rotation 244,359, buy-then-sell 224,037. The decomposition (three cold hook words + slot 0, a cold `IFeePolicy` account and its ~2.3k of maths, ~9k of hook execution dominated by encoding the 20-field `FeeInput`) is recorded in `gas/baseline.json`; §1.7 had assumed two extra SLOADs and a 4k policy call. The stub numbers were placeholders with no policy call, so the multi-swap budgets derived from them (stub + 20%) are replaced by the hook's own recordings + 20%; `afterSwap <= 55,000` stands. Shrinking `FeeInput` is a Phase 4/6 tuning item, not a gate. |
+| H | **`f_vol` recalibrated.** `AmpsHook` writes `FeeInput.varianceX18 = EWMA(d^2) x 1e18`, `d` the raw tick change of one swap, lambda 0.98 per swap. The field is now `uint128` (a `uint64` saturated at 18.45 ticks^2, which made the term structurally zero at `K_VOL_X18 = 5e15`); the hook keeps its packed 64-bit store but must scale it so the X18 value it hands the policy reaches the cap. With `K_VOL_X18 = 5e15`, `f_vol_bps = k x varianceX18 / 1e36` is 1 bp at a per-swap sigma of ~14 ticks and the 100 bp cap at ~141 ticks. Phase 0 recalibrates from the cadence sample. |
+| I | **Hook deviations accepted:** `gateAttemptedAt` in DYNAMIC's free bits [200..231] (rate-limits refresh attempts; `gateRefreshedAt` is the last *successful* refresh); `beforeSwap` reads four cold words (the three packed words plus slot 0 for `sellFeeBps` and the policy pointer); the corporate-action detector runs before the gate refresh and `caArmed` is cleared when the multiplier is stable, the oracle un-paused and no `effectiveAt` is inside the window (unreadable probes leave it up); `IAmpsHook.quoteFee`'s second argument is `zeroForOne` (true = sell); price-improving swaps skip `f_dev` only (the dividend-capture direction is deviation-decreasing by construction); `TOTAL_FEE_BPS_MAX` is a clamp, not a revert (I15 outranks an unreachable revert); `PoolNotRegistered(PoolId)` replaces §1.3's `UnknownPool`; `setGateCacheSeconds` is on the hook but not on `IAmpsHook`; every hot-path external read is a hand-decoded `staticcall` with clamped enums and ticks, because `try`/`catch` cannot survive a decode failure after a successful call. `src/hook/*` compiles under the same per-path IR/200-runs restriction as the vault and bonds (20,757 B; 28,014 B on the legacy pipeline). |
+| J | **`PoolRegistry.PoolOpened` emits the price the pool actually opened at**, read back from the PoolManager through `PoolStateLib` after `initializePool`, because the vault snaps the requested price down to the grid origin (ruling C) and an event that disagreed with `slot0` by up to one spacing would mislead the indexer. |
+| K | **Cached-versus-effective hook words.** `poolState()` words 13/14/15 are the cached band, rail and cap; when the cache is older than `GATE_CACHE_MAX_AGE` the effective values are the conservative substitutes (band 1,500, the class rail, the DEGRADED cap) that `innerBandTicks()`, `outerRailTicks()` and `quoteFee()` use. Readers wanting the charged fee use `quoteFee`. |
+
+### 12.2 Genesis placement order (orchestrator ruling, 2026-09-06)
+
+| # | Ruling |
+|---|---|
+| L | **A genesis ask ladder may start one cell above the origin, and that is I32 working.** Every ask placement is valued at the reference price by `LadderPositionValuer`, so NAV/share and `P_ref` tick up by a few bp as the 32 ladders are placed in sequence (measured: $0.999999… → $1.000204 after all 32). `VaultPlacementLib._cells` anchors a ladder at `ceilDiv(fairTick(P_ref) − gridBase, D)`, which is 1 for any pool whose exact fair tick sits within ~2 ticks below a spacing boundary (~3% of pools at the launch vector). The ladder is still ten contiguous one-cell asks and the bids still sit at `m = -1..-4`; `11_GenesisPlacement.assertLayout` asserts exactly that shape ("anchored at the origin or one cell above it"), and no contract changes. Placing the entry pools first and the spokes in one batch keeps the drift to two basis points. |
+
+### 12.3 Measured against the wired system (orchestrator notes, 2026-09-06)
+
+The full Phase 3 fixture (real hook, real policies, real valuer, four linked libraries, live v4 pools) corrects
+several numbers and wordings above; where they differ, this section wins.
+
+| # | Note |
+|---|---|
+| M | **Redemption gas per live cell is ~43k at the launch shape**, not ~46k: 14,156,742 gas for 328 live cells over 32 pools (43,160/cell), so `MAX_LIVE_CELLS = 512` projects to 22.1M, inside the 24M budget. The four-pool average (47.5k) is dominated by the fixed part and must not be extrapolated. |
+| N | **Two-hop rotation through real ladders costs ~977k gas**, about 4x ruling G's 244k, because each hop crosses several initialised ticks; `gas/baseline.json`'s end-to-end numbers are flat-liquidity figures and are gated as such. |
+| O | **The quadratic wall to `F_WALL_BPS = 1500` is unreachable while the gate is `NORMAL`**: `beforeSwap`'s clamp to `base + dynCapBps` caps the dynamic part at 300 bp, which the ramp reaches at ~346 ticks of deviation, well inside the rail. The wall shows only once the cap is escalated (`DEGRADED` 1,000, `BAND_ESCALATION` 2,000). This is the intended precedence (the cap is the gate's lever), recorded so nobody expects 1,500 bp under a green gate. |
+| P | **A "+30% in ten minutes" hub pump is a sequence, not an event**: it is achievable (+2,662 ticks in 555 s) only as ~185 small buys riding the rail, because `fairTick` is the pool's own truncated TWAP and lags; any single swap or a schedule coarser than ~3 s is refused `BeyondRail`. |
+| Q | **`AmpsBonds.bond` keeps the whole deposit when it clamps to capacity** (Phase 2 §6): with `minAmpsOut == 0` a bonder hands over the full collateral for the capped issue. The dApp must always pass the quoted amount as `minAmpsOut`, and every fixture that bonds must size the deposit to capacity. |
+| R | **`PoolRegistry.setIndexWeights` requires the vector to sum to exactly `BPS`**; an even 30-name split cannot, so the launch scripts register every name at 500 bp and assign the residue explicitly when the real vector is set. |
+| S | **Test hazard.** solc hoists `TIMESTAMP`/`NUMBER` as loop-invariant, so `vm.roll(block.number + 1)` inside a warping loop rolls once and silently freezes `TruncatedOracleLib`'s per-block truncation anchor. Fixtures advance the clock through `vm.getBlockTimestamp()`/`vm.getBlockNumber()` (`Phase3Fixture.advance()`). |
+| T | **I11's ghost is checked ex market moves**: `A` decomposes positions at the previous checkpoint's reference (I7) and every placement checkpoints on exit, so previews before and after a placement are computed at different references; the handler compares them only when `P_ref` came out where it went in, and `checkpoint()` is classified as a market move. |
+| U | **Open finding, raised to the user (economic, no stated invariant broken):** because `redeemProRata` burns the released ladder inventory as well as the redeemer's shares (I23), every redemption lifts NAV/share for whoever redeems next, including the same redeemer's next slice: 300 AMPS redeemed in one shot returns 148.50 USDG, in 60 slices 152.76 (+2.9%), monotone in the split count. The effect scales with inventory's share of supply (95% at genesis) and shrinks as inventory sells. Candidate fixes: return released inventory AMPS to idle inventory instead of burning it (redemption becomes split-neutral apart from the 1% fee, at the cost of Decision 14's accretion-on-exit), or defer the burn to a rate-limited stream. Decision pending; the current behaviour stands until the user rules. |
+| V | **Fixed.** `TruncatedOracleLib.MAX_CARDINALITY = 64` with one observation per distinct second lost TWAP coverage on any pool trading in more than 63 distinct seconds inside the window (70 writes 3 s apart left 189 s of coverage), which turned the hub into `WATCHDOG` under ordinary trading. The library now advances an exact head accumulator on every write and commits a ring slot only every `MIN_INSERT_INTERVAL = ceil(7200 / 63) = 115 s`, so a full ring spans 7,245 s (the widest governable window) and coverage is bounded below for every governed `twapWindow`; consults interpolate between exact endpoints with an error at most ~0.4% of the I25 budget; zero new storage (the three head fields fill the existing scalar slot); `afterSwap` fell from 39,815 to 31,755 gas, and the hook was re-mined (`script/config/hook.json`). |
+

@@ -1553,6 +1553,72 @@ contract PoolRegistryTest is PoolRegistryFixture {
         (uint16 id,) = _addWith(second);
         assertEq(registry.constituent(id).feed, address(longLength), "accepted");
     }
+
+    /* ------------------------------------- the canonical grid origin ------------------------------------- */
+    //
+    // `docs/phase3-state-model.md` §3.2 and §10 ruling 14. `PoolConfig.gridBaseTick` is the origin of the lattice
+    // every vault position lies on, and the registry's copy is the one `LadderPositionValuer` enumerates. The hook
+    // owns the value — it computes it in `afterInitialize` from the tick the PoolManager reports — and the registry
+    // mirrors it. These three tests pin the mirror, its absence and its failure mode, because a wrong grid origin
+    // would silently point the valuer at ranges the vault never placed on.
+
+    /// @notice With a hook deployed, the registry mirrors whatever grid origin the hook reports, for both pool
+    ///         classes.
+    function test_gridBaseTick_isMirroredFromTheHook() public {
+        vm.etch(HOOK, address(new GridBaseHook(6930)).code);
+
+        _registerEntryPools();
+        assertEq(registry.poolConfig(_entryKey(address(usdg)).toId()).gridBaseTick, 6930, "entry pool mirrors the hook");
+
+        (, PoolId spokeId) = _add(19);
+        assertEq(registry.poolConfig(spokeId).gridBaseTick, 6930, "spoke mirrors the hook");
+    }
+
+    /// @notice Without a hook there is no grid, and the registry says so by leaving the origin at zero rather than
+    ///         inventing one.
+    /// @dev The `extcodesize` guard in `_openPool` is load-bearing: a `staticcall` to an address with no code
+    ///      *succeeds* with empty return data, and a decode failure after a successful call is not catchable by
+    ///      `catch`. Without the guard this registration would revert.
+    function test_gridBaseTick_isZeroWhileNoHookIsDeployed() public {
+        assertEq(HOOK.code.length, 0, "the fixture's hook is an address, not a contract");
+
+        vm.prank(TIMELOCK);
+        registry.registerEntryPool(_entryKey(address(usdg)), 6, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, address(usdgFeed));
+        assertEq(registry.poolConfig(_entryKey(address(usdg)).toId()).gridBaseTick, 0, "no hook, no grid");
+    }
+
+    /// @notice A hook that reverts on the mirror read cannot block a registration: the origin stays zero and the
+    ///         7-day proposal still lands.
+    function test_gridBaseTick_hookRevertDoesNotBlockRegistration() public {
+        vm.etch(HOOK, address(new RevertingGridHook()).code);
+
+        vm.prank(TIMELOCK);
+        registry.registerEntryPool(_entryKey(address(usdg)), 6, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, address(usdgFeed));
+        assertTrue(registry.isRegistered(_entryKey(address(usdg)).toId()), "registered anyway");
+        assertEq(registry.poolConfig(_entryKey(address(usdg)).toId()).gridBaseTick, 0, "and the origin stays zero");
+    }
+}
+
+/// @notice A stand-in hook that reports one grid origin for every pool.
+contract GridBaseHook {
+    int24 private immutable _tick;
+
+    constructor(int24 tick) {
+        _tick = tick;
+    }
+
+    function gridBaseTick(PoolId) external view returns (int24) {
+        return _tick;
+    }
+}
+
+/// @notice A stand-in hook whose grid-origin read reverts.
+contract RevertingGridHook {
+    error Nope();
+
+    function gridBaseTick(PoolId) external pure returns (int24) {
+        revert Nope();
+    }
 }
 
 /// @notice An aggregator whose `description()` returns arbitrary bytes, well formed or not.

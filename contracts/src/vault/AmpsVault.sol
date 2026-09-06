@@ -26,8 +26,11 @@ import {
     ZeroAddress,
     ZeroAmount
 } from "../types/Errors.sol";
-import {Checkpoint, GateState} from "../types/Types.sol";
+import {Checkpoint, GateState, PlacementRecord} from "../types/Types.sol";
 import {VaultNavLib} from "./VaultNavLib.sol";
+import {VaultPlacementLib} from "./VaultPlacementLib.sol";
+import {VaultRedeemLib} from "./VaultRedeemLib.sol";
+import {VaultRolloutLib} from "./VaultRolloutLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -87,25 +90,35 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev `keccak256("amplestocks.vault.REENTRANCY_LOCK")`. Taken by every external function, {redeemProRata}
-    ///      included.
-    uint256 private constant REENTRANCY_LOCK = 0x3abe6f13db6cb23388862b0e36259666a9a7cd452a11ef9de4aed253478c843c;
+    ///      included. Declared once, in {VaultRedeemLib}, for the reason {UNLOCK_ACTION} gives.
+    uint256 private constant REENTRANCY_LOCK = VaultRedeemLib.REENTRANCY_LOCK;
 
-    /// @dev `keccak256("amplestocks.vault.UNLOCK_ACTION")`. The discriminator the sole `IUnlockCallback` dispatches
-    ///      on; zero outside an unlock this contract started.
-    uint256 private constant UNLOCK_ACTION = 0x291441d399a16c9ae9ccf88b6ae5184884515a8004caafbe978b06287b215855;
+    /// @dev `keccak256("amplestocks.vault.UNLOCK_ACTION")`. The discriminator the sole `IUnlockCallback`
+    ///      dispatches on; zero outside an unlock this contract started. **Read from {VaultRedeemLib} rather than
+    ///      restated here**: the three linked libraries set it before their own `unlock` calls, and a second copy
+    ///      of the number is a second thing that can drift.
+    uint256 private constant UNLOCK_ACTION = VaultRedeemLib.UNLOCK_ACTION;
 
-    /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`. NAV/share captured at entry for the R1 post-condition.
-    ///      Phase 2 uses it for the relaxed migration bleed bound; Phase 3 uses it for placements and compounds.
-    uint256 private constant NAV_BEFORE = 0x6f2a9a8b4cb99f4e46ead1f9b636e99fbe475b6e810215ed22b447ae90ae3975;
+    /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`. NAV/share captured at entry for the R1 post-condition,
+    ///      used by the relaxed migration bleed bound. Declared once, in {VaultRedeemLib}.
+    uint256 private constant NAV_BEFORE = VaultRedeemLib.NAV_BEFORE;
 
-    /// @dev Unlock action: pull an ERC-20 from a payer straight into the PoolManager and mint the claim.
-    uint256 private constant ACTION_SETTLE = 1;
-
-    /// @dev Unlock action: burn claims and `take` the ERC-20 out to a redeemer.
-    uint256 private constant ACTION_PAYOUT = 2;
-
-    /// @dev Unlock action: move the vault's own idle ERC-20 balances into ERC-6909 claims (I12).
-    uint256 private constant ACTION_ABSORB = 3;
+    /// @dev The unlock action set lives in {VaultRedeemLib}, which is the one library both the placement path and
+    ///      the ungated redemption path may reference, so the discriminators have exactly one home. `ACTION_SETTLE`
+    ///      = 1, `ACTION_PAYOUT` = 2, `ACTION_ABSORB` = 3 are Phase 2's; `ACTION_PLACE` = 4, `ACTION_COMPOUND` = 5,
+    ///      `ACTION_BURNBACK` = 6, `ACTION_UNWIND` = 7 and `ACTION_HARVEST` = 8 are the Phase 3 set of §3.9.
+    ///
+    /// @dev slot `keccak256("amplestocks.vault.poolKeys")` — the vault's own list of every `PoolKey` it has
+    ///      opened, appended by {initializePool}.
+    ///
+    ///      **Why a hashed slot and not slot 21.** `redeemProRata` needs a `PoolKey` per pool to remove liquidity,
+    ///      and reading one from `PoolRegistry` would put a registry `SLOAD` on the one structurally ungated path
+    ///      in the protocol (Phase 2 §7, and `test/unit/GuardSymmetry.t.sol` proves the absence at the storage
+    ///      level). The vault therefore keeps its own copy — exactly as it already keeps its own asset list, and
+    ///      for exactly the same reason. Hashing the slot rather than appending to the sequential layout keeps
+    ///      section 1.1's "the layout ends at slot 20" literally true, which is what a standby vault is written
+    ///      against.
+    bytes32 private constant POOL_KEYS_SLOT = keccak256("amplestocks.vault.poolKeys");
 
     // -------------------------------------------------------------------------------------------------------------
     // Storage — the layout of section 1.1, slot for slot
@@ -201,41 +214,25 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev slot 17 — 1-based index into {_assets}; 0 means "not an asset".
     mapping(address token => uint256 index) private _assetIndex;
 
-    /// @dev slot 18 — placed ladder buckets per pool. Phase 3.
-    mapping(PoolId poolId => PlacementRecordStorage[] buckets) private _ladder;
+    /// @dev slot 18 — placed ladder buckets per pool. Phase 3. Two slots per record, exactly as section 1.1 gives
+    ///      it: `Types.PlacementRecord` is the layout itself rather than a struct this contract mirrors, so there
+    ///      is no second declaration to keep in step and no storage-to-memory conversion written by hand.
+    ///
+    ///      **`public`, and that is the implementation of {IAmpsVault-ladderAt}** (ruling 1). Solidity's generated
+    ///      getter returns the record's fields flattened, which is 234 bytes smaller than the hand-written
+    ///      `PlacementRecord memory` form and 234 bytes is a fifth of this contract's entire EIP-170 headroom.
+    ///      The mapping is still only ever *written* by the placement path.
+    mapping(PoolId poolId => PlacementRecord[] buckets) public ladderAt;
 
     /// @dev slot 19 — last placement timestamp per pool, for the 60-second cooldown. Phase 3.
     mapping(PoolId poolId => uint32 at) private _lastPlacementAt;
 
-    /// @dev The Phase 3 ladder record, declared here so that slot 18 has the width section 1.1 gives it (two slots
-    ///      per bucket). Mirrors `Types.PlacementRecord`; nothing in Phase 2 writes it.
-    struct PlacementRecordStorage {
-        int24 lowerTick;
-        int24 upperTick;
-        uint128 liquidity;
-        uint8 bucketIndex;
-        uint8 buckets;
-        bool above;
-        uint32 placedAt;
-        uint128 amount;
-        uint64 tiltX18;
-        int24 anchorTick;
-    }
-
-    /// @notice The result of {_redemption}: what {previewRedeem} shows and what {redeemProRata} pays, computed
-    ///         once by one function so that the preview can never drift from the payout.
-    /// @param tokens The non-AMPS assets paid, in registration order.
-    /// @param amounts The net amount of each, after `redeemFeeBps`.
-    /// @param fromClaims The part of each payout taken out of the vault's ERC-6909 claims.
-    /// @param fromIdle The part of each payout taken out of an idle ERC-20 balance.
-    /// @param inventoryBurned AMPS wei released from the vault's own inventory and burned.
-    struct Redemption {
-        address[] tokens;
-        uint256[] amounts;
-        uint256[] fromClaims;
-        uint256[] fromIdle;
-        uint256 inventoryBurned;
-    }
+    /// @dev slot 20 — the idle-collateral floor {deployBonded} refuses to fire below, in 18-decimal USD. Phase 3,
+    ///      `docs/phase3-state-model.md` §10 ruling 15. Appended rather than packed into slot 15's free upper 96
+    ///      bits so that section 1.1's documented layout for slots 0-19 stays literally true; the parameter is read
+    ///      once per `deployBonded` and never on a swap, a bond or a redemption, so a dedicated word costs nothing
+    ///      that matters.
+    uint256 private _deployThresholdUsd18;
 
     // -------------------------------------------------------------------------------------------------------------
     // Immutables (bytecode, no slot)
@@ -280,6 +277,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _spokeSeedBps = Constants.SPOKE_SEED_BPS_DEFAULT;
         _rolloutBpsPerDay = Constants.ROLLOUT_BPS_PER_DAY_DEFAULT;
         _entryFloorBps = Constants.ENTRY_FLOOR_BPS_DEFAULT;
+        _deployThresholdUsd18 = Constants.DEPLOY_THRESHOLD_USD18_DEFAULT;
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -289,16 +287,17 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev The EIP-1153 transient lock. Taken by every external entry point including {redeemProRata}: nobody else
     ///      can hold it and it is released in the same transaction, so it is a lock and not a gate (section 7).
     modifier locked() {
+        uint256 lockSlot = REENTRANCY_LOCK;
         assembly ("memory-safe") {
-            if tload(REENTRANCY_LOCK) {
+            if tload(lockSlot) {
                 mstore(0x00, 0xab143c06) // Reentrancy()
                 revert(0x1c, 0x04)
             }
-            tstore(REENTRANCY_LOCK, 1)
+            tstore(lockSlot, 1)
         }
         _;
         assembly ("memory-safe") {
-            tstore(REENTRANCY_LOCK, 0)
+            tstore(lockSlot, 0)
         }
     }
 
@@ -469,7 +468,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     function previewNavPerShareX18() external view returns (uint256 value) {
-        return _navPerShare(VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true));
+        return _previewNav();
     }
 
     /// @inheritdoc IAmpsVault
@@ -478,12 +477,20 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev Includes the position term from Phase 3: what a pro-rata unwind would free out of the ladder, priced
+    ///      exactly as v4 itself would free it, so the preview and the payout agree to the wei.
     function previewRedeem(uint256 shares)
         external
         view
         returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned)
     {
-        Redemption memory result = _redemption(shares, IAmps(_AMPS).totalSupply());
+        uint256 supply = IAmps(_AMPS).totalSupply();
+        (uint256[] memory released, uint256 releasedAmps) = VaultRedeemLib.previewUnwind(
+            ladderAt, _poolKeys(), _assetIndex, _assets.length, _POOL_MANAGER, shares, supply
+        );
+        VaultRedeemLib.Redemption memory result = VaultRedeemLib.redemption(
+            _assets, _POOL_MANAGER, _AMPS, shares, supply, _redeemFeeBps, released, new uint256[](0), releasedAmps, 0
+        );
         return (result.tokens, result.amounts, result.inventoryBurned);
     }
 
@@ -576,6 +583,28 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function entryFloorBps() external view returns (uint16 value) {
         return _entryFloorBps;
+    }
+
+    /// @inheritdoc IAmpsVault
+    function deployThresholdUsd18() external view returns (uint256 value) {
+        return _deployThresholdUsd18;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Reads — the ladder (Phase 3, `view`-only)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IAmpsVault
+    function ladderLength(PoolId poolId) external view returns (uint256 length) {
+        return ladderAt[poolId].length;
+    }
+
+    /// @inheritdoc IAmpsVault
+    /// @dev `docs/phase3-state-model.md` §12 ruling E. The count lives at a hashed slot in {VaultRedeemLib} and is
+    ///      maintained by all four libraries on every open, merge, unwind and removal; it is what bounds the gas
+    ///      of {redeemProRata}, which is the one path that must never be gated to make it fit.
+    function liveCells() external view returns (uint32 count) {
+        return VaultRedeemLib.liveCellCount();
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -683,6 +712,16 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    function DEPLOY_THRESHOLD_USD18_MIN() external pure returns (uint256 value) {
+        return Constants.DEPLOY_THRESHOLD_USD18_MIN;
+    }
+
+    /// @inheritdoc IAmpsVault
+    function DEPLOY_THRESHOLD_USD18_MAX() external pure returns (uint256 value) {
+        return Constants.DEPLOY_THRESHOLD_USD18_MAX;
+    }
+
+    /// @inheritdoc IAmpsVault
     function SPOKE_SEED_BPS_MAX() external pure returns (uint16 value) {
         return Constants.SPOKE_SEED_BPS_MAX;
     }
@@ -727,14 +766,32 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // `T` is read once, before the burn, so a redemption cannot inflate its own share.
         uint256 supply = IAmps(_AMPS).totalSupply();
 
-        Redemption memory result = _redemption(shares, supply);
-        tokens = result.tokens;
-        amounts = result.amounts;
-
         // Effects before interactions: the redeemer's shares are gone before a single asset moves.
         IAmps(_AMPS).burn(msg.sender, shares);
 
-        _setUnlockAction(ACTION_PAYOUT);
+        // Phase 3: remove exactly `floor(L x shares / T)` from every record in every pool the vault has opened
+        // (I23, §3.10). The counter principal lands in claims, the AMPS principal as an idle balance to burn, and
+        // the fees the removal realised stay with the protocol.
+        uint256[] memory released;
+        uint256[] memory added;
+        uint256 releasedAmps;
+        uint256 addedAmps;
+        if (_poolKeys().length != 0) {
+            _setUnlockAction(VaultRedeemLib.ACTION_UNWIND);
+            (released, added, releasedAmps, addedAmps) = abi.decode(
+                IPoolManager(_POOL_MANAGER).unlock(abi.encode(_AMPS, shares, supply)),
+                (uint256[], uint256[], uint256, uint256)
+            );
+            _setUnlockAction(0);
+        }
+
+        VaultRedeemLib.Redemption memory result = VaultRedeemLib.redemption(
+            _assets, _POOL_MANAGER, _AMPS, shares, supply, _redeemFeeBps, released, added, releasedAmps, addedAmps
+        );
+        tokens = result.tokens;
+        amounts = result.amounts;
+
+        _setUnlockAction(VaultRedeemLib.ACTION_PAYOUT);
         IPoolManager(_POOL_MANAGER).unlock(abi.encode(tokens, result.fromClaims, result.fromIdle, to));
         _setUnlockAction(0);
 
@@ -801,7 +858,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // the checkpoint runs under that policy rather than behind the management gate of {checkpoint}.
         _checkpoint();
 
-        _setUnlockAction(ACTION_SETTLE);
+        _setUnlockAction(VaultRedeemLib.ACTION_SETTLE);
         bytes memory result = IPoolManager(_POOL_MANAGER).unlock(abi.encode(collateral, from, amount));
         _setUnlockAction(0);
         settled = abi.decode(result, (uint256));
@@ -856,7 +913,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
             if (token == address(0) || token == _AMPS) revert ZeroAddress();
             if (amount == 0) revert ZeroAmount();
             _registerAsset(token);
-            _setUnlockAction(ACTION_SETTLE);
+            _setUnlockAction(VaultRedeemLib.ACTION_SETTLE);
             IPoolManager(_POOL_MANAGER).unlock(abi.encode(token, msg.sender, amount));
             _setUnlockAction(0);
         }
@@ -876,8 +933,17 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _requireHealthy();
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
 
-        IPoolManager(_POOL_MANAGER).initialize(key, sqrtPriceX96);
+        // §12 ruling C: every pool opens exactly on a spacing-aligned tick, which is what makes it open on its
+        // own grid origin and what puts the genesis asks at cells 0..9 and the seed bids at -1..-4. The snap is at
+        // most half a tick spacing, so the launch price is the aligned price nearest the intended one.
+        IPoolManager(_POOL_MANAGER)
+            .initialize(key, VaultPlacementLib.alignedOpeningPrice(sqrtPriceX96, key.tickSpacing));
         poolId = key.toId();
+
+        // The vault's own pool list, so that `redeemProRata` can reach every position it owns without ever
+        // consulting the registry. A second `initializePool` over the same key cannot get here: v4's own
+        // `initialize` reverts on an already-initialised pool.
+        _poolKeys().push(key);
 
         // The counter asset joins the NAV sum and the redemption enumeration the moment its pool exists, so that
         // `redeemProRata` never has to consult the registry.
@@ -887,56 +953,59 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev **Phase 3.** Declared so the ABI is final; reverts with {Phase3NotImplemented} after the gate check, so
-    ///      the guard-symmetry enumeration still sees the same refusal every other mutating selector gives. The
-    ///      stubs still take the transient lock, so the "every external function is locked" discipline reads true
-    ///      end to end; the compiler's one `Unreachable code` note on the shared release is the price of that.
+    /// @dev **Timelock or registry** (`docs/phase3-state-model.md` §10 ruling 11): governance places the genesis
+    ///      ladders and any hand-directed placement, and `PoolRegistry.addConstituent` places a new spoke's
+    ///      `spokeSeedBps` seed ask. `compound`, `rollout` and `deployBonded` are the permissionless bountied
+    ///      paths. The whole gauntlet of §3.8 runs here and in {VaultPlacementLib}: the transient lock and the
+    ///      management gate above, the pool gate, cooldown, divergence at entry and exit, sidedness, grid
+    ///      membership and the inventory bound inside, and R1 plus `sweepClean` in {_afterPlacement}.
     function place(PoolId poolId, bool above, uint256 amount) external locked returns (uint256 placed) {
+        if (msg.sender != _TIMELOCK && msg.sender != _registry) revert NotTimelock(msg.sender);
         _requireHealthy();
-        poolId;
-        above;
-        amount;
-        placed;
-        _phase3();
+        uint256 navBefore = _previewNav();
+        placed = VaultPlacementLib.place(
+            ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, above, amount, bytes32("place"), true
+        );
+        _afterPlacement(navBefore);
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev **Phase 3.** See {place}.
+    /// @dev Permissionless and bountied. See {VaultPlacementLib-compound} for the step-by-step of §3.6.
     function compound(PoolId poolId) external locked returns (uint256 ampsFees, uint256 burned) {
         _requireHealthy();
-        poolId;
-        ampsFees;
-        burned;
-        _phase3();
+        uint256 navBefore = _previewNav();
+        (ampsFees, burned) = VaultPlacementLib.compound(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId);
+        _afterPlacement(navBefore);
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev **Phase 3.** See {place}.
+    /// @dev Permissionless and bountied. `amountAmps == 0` from the schedule is a no-op, not a revert.
     function rollout(uint16 constituentId) external locked returns (uint256 moved) {
         _requireHealthy();
-        constituentId;
-        moved;
-        _phase3();
+        uint256 navBefore = _previewNav();
+        moved = VaultRolloutLib.rollout(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
+        _afterPlacement(navBefore);
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev **Phase 3.** See {place}.
+    /// @dev Permissionless and bountied, and a no-op below `deployThresholdUsd18` of idle collateral so it cannot
+    ///      be used to drain the bounty pot a wei at a time (§10 ruling 15).
     function deployBonded(uint16 constituentId) external locked returns (uint256 placed) {
         _requireHealthy();
-        constituentId;
-        placed;
-        _phase3();
+        uint256 navBefore = _previewNav();
+        placed = VaultRolloutLib.deployBonded(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
+        _afterPlacement(navBefore);
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev **Phase 3.** See {place}. The caller check comes before the gate check here because the registry is
-    ///      the only legitimate caller and a wrong caller is not a gate refusal.
+    /// @dev **Only registry**, and the caller check comes before the gate check because the registry is the only
+    ///      legitimate caller and a wrong caller is not a gate refusal.
     function withdrawRetiredBids(uint16 constituentId) external locked returns (uint256 amountMoved) {
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
         _requireHealthy();
-        constituentId;
-        amountMoved;
-        _phase3();
+        uint256 navBefore = _previewNav();
+        amountMoved = VaultRolloutLib.withdrawRetiredBids(ladderAt, _lastPlacementAt, _POOL_MANAGER, constituentId);
+        _afterPlacement(navBefore);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1052,6 +1121,17 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    function setDeployThresholdUsd18(uint256 value) external locked onlyTimelock {
+        _deployThresholdUsd18 = _band(
+            bytes32("deployThresholdUsd18"),
+            value,
+            Constants.DEPLOY_THRESHOLD_USD18_MIN,
+            Constants.DEPLOY_THRESHOLD_USD18_MAX,
+            _deployThresholdUsd18
+        );
+    }
+
+    /// @inheritdoc IAmpsVault
     /// @dev The single pointer setter. Five slots are **set-once** and refuse once {genesis} has frozen the wiring
     ///      (`registry`, `bonds`, `staking`, `bountyPot`); `marketReference` is set-once before genesis and may be
     ///      re-pointed afterwards exactly once more, to `AmpsHook`, under the 7-day timelock. The remaining slots
@@ -1059,46 +1139,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function setPolicyPointer(bytes32 slot, address newPointer) external locked onlyTimelock {
         _requireHealthy();
         if (newPointer == address(0)) revert ZeroAddress();
-
-        address previous;
-        if (slot == bytes32("registry")) {
-            _requireWiringOpen();
-            previous = _registry;
-            _registry = newPointer;
-        } else if (slot == bytes32("bonds")) {
-            _requireWiringOpen();
-            previous = _bonds;
-            _bonds = newPointer;
-        } else if (slot == bytes32("staking")) {
-            _requireWiringOpen();
-            previous = _staking;
-            _staking = newPointer;
-        } else if (slot == bytes32("bountyPot")) {
-            _requireWiringOpen();
-            previous = _bountyPot;
-            _bountyPot = newPointer;
-        } else if (slot == bytes32("marketReference")) {
-            previous = _marketReference;
-            _marketReference = newPointer;
-        } else if (slot == bytes32("oracleGate")) {
-            previous = _oracleGate;
-            _oracleGate = newPointer;
-        } else if (slot == bytes32("feedRegistry")) {
-            previous = _feedRegistry;
-            _feedRegistry = newPointer;
-        } else if (slot == bytes32("positionValuer")) {
-            previous = _positionValuer;
-            _positionValuer = newPointer;
-        } else if (slot == bytes32("ladderPolicy")) {
-            previous = _ladderPolicy;
-            _ladderPolicy = newPointer;
-        } else if (slot == bytes32("rolloutPolicy")) {
-            previous = _rolloutPolicy;
-            _rolloutPolicy = newPointer;
-        } else {
-            revert UnknownPointerSlot(slot);
-        }
-
+        address previous = VaultNavLib.setPointer(slot, newPointer, _wiringFrozen);
         emit PolicyPointerChanged(slot, previous, newPointer);
     }
 
@@ -1135,26 +1176,24 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (!VaultNavLib.migrationPredicate(_registry, address(this))) revert MigrationPredicateNotMet();
 
         uint256 navBefore = _navPerShareX18;
+        uint256 navSlot = NAV_BEFORE;
         assembly ("memory-safe") {
-            tstore(NAV_BEFORE, navBefore)
+            tstore(navSlot, navBefore)
         }
 
         IPoolManager pm = IPoolManager(_POOL_MANAGER);
 
-        // Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the evacuation.
-        uint256 length = _assets.length;
-        for (uint256 i; i < length; ++i) {
-            address token = _assets[i];
-            uint256 claim = pm.balanceOf(address(this), Currency.wrap(token).toId());
-            if (claim != 0) pm.transfer(standby, Currency.wrap(token).toId(), claim);
-            uint256 idle = IERC20(token).balanceOf(address(this));
-            if (idle != 0) IERC20(token).safeTransfer(standby, idle);
+        // Phase 3: unwind the ladder first. Liquidity left in v4 positions owned by a denylisted vault would be
+        // unreachable by the standby, and the removal itself cannot be blocked — the hook carries no
+        // `BEFORE_REMOVE_LIQUIDITY` bit (I18) and the released counter never leaves the PoolManager.
+        if (_poolKeys().length != 0) {
+            _setUnlockAction(VaultRedeemLib.ACTION_UNWIND);
+            pm.unlock(abi.encode(_AMPS, uint256(1), uint256(1)));
+            _setUnlockAction(0);
         }
 
-        uint256 ampsClaim = pm.balanceOf(address(this), Currency.wrap(_AMPS).toId());
-        if (ampsClaim != 0) pm.transfer(standby, Currency.wrap(_AMPS).toId(), ampsClaim);
-        uint256 ampsIdle = IERC20(_AMPS).balanceOf(address(this));
-        if (ampsIdle != 0) IERC20(_AMPS).safeTransfer(standby, ampsIdle);
+        // Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the evacuation.
+        VaultNavLib.evacuate(_assets, _POOL_MANAGER, _AMPS, standby);
 
         // The four `onlyVault` role handovers, in the same transaction. Nobody else can perform any of them.
         IAmps(_AMPS).setVault(standby);
@@ -1173,7 +1212,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         } catch {}
 
         assembly ("memory-safe") {
-            tstore(NAV_BEFORE, 0)
+            tstore(navSlot, 0)
         }
         emit Migrated(standby, navBefore, navAfter);
         _assertSweepZero();
@@ -1190,110 +1229,33 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function unlockCallback(bytes calldata data) external returns (bytes memory result) {
         if (msg.sender != _POOL_MANAGER) revert NotPoolManager(msg.sender);
 
+        uint256 slot = UNLOCK_ACTION;
         uint256 action;
         assembly ("memory-safe") {
-            action := tload(UNLOCK_ACTION)
+            action := tload(slot)
         }
 
-        if (action == ACTION_SETTLE) {
-            (address token, address from, uint256 amount) = abi.decode(data, (address, address, uint256));
-            return abi.encode(_settleFrom(token, from, amount));
+        // The ladder's four actions (§3.9) go to the placement library; the four that move an asset — settle,
+        // pay out, absorb and the pro-rata unwind — go to the redemption library, which is the one the ungated
+        // path may reach. Both bodies live outside this contract because it has no EIP-170 headroom left.
+        if (
+            action == VaultRedeemLib.ACTION_PLACE || action == VaultRedeemLib.ACTION_COMPOUND
+                || action == VaultRedeemLib.ACTION_BURNBACK || action == VaultRedeemLib.ACTION_HARVEST
+        ) {
+            return VaultPlacementLib.unlockAction(ladderAt, _POOL_MANAGER, action, data);
         }
-        if (action == ACTION_PAYOUT) {
-            (address[] memory tokens, uint256[] memory fromClaims, uint256[] memory fromIdle, address to) =
-                abi.decode(data, (address[], uint256[], uint256[], address));
-            _payOut(tokens, fromClaims, fromIdle, to);
-            return "";
-        }
-        if (action == ACTION_ABSORB) {
-            (address[] memory tokens, uint256[] memory amounts) = abi.decode(data, (address[], uint256[]));
-            uint256 length = tokens.length;
-            for (uint256 i; i < length; ++i) {
-                _settleFrom(tokens[i], address(this), amounts[i]);
-            }
-            return "";
-        }
-        revert UnknownUnlockAction();
+        return
+            VaultRedeemLib.unlockAction(ladderAt, _poolKeys(), _assetIndex, _assets.length, _POOL_MANAGER, action, data);
     }
 
     // -------------------------------------------------------------------------------------------------------------
     // Internals — custody
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev `sync -> transferFrom -> settle -> mint`: the collateral goes straight from the payer into the
-    ///      PoolManager and comes back as an ERC-6909 claim owned by the vault, so the vault's own ERC-20 balance
-    ///      is untouched and `sweepClean` (I12) holds at function exit.
-    /// @param token The asset to settle.
-    /// @param from The payer. `address(this)` when absorbing an idle balance the vault already holds.
-    /// @param amount The raw amount to move.
-    /// @return settled The amount the PoolManager actually credited.
-    function _settleFrom(address token, address from, uint256 amount) private returns (uint256 settled) {
-        IPoolManager pm = IPoolManager(_POOL_MANAGER);
-        Currency currency = Currency.wrap(token);
-
-        pm.sync(currency);
-        if (from == address(this)) {
-            IERC20(token).safeTransfer(address(pm), amount);
-        } else {
-            IERC20(token).safeTransferFrom(from, address(pm), amount);
-        }
-        settled = pm.settle();
-        if (settled != 0) pm.mint(address(this), currency.toId(), settled);
-    }
-
-    /// @dev Burns the claim slice and `take`s it out as ERC-20, then pays the remainder from any idle balance.
-    ///      Claims first, idle second, exactly as section 3 specifies.
-    function _payOut(address[] memory tokens, uint256[] memory fromClaims, uint256[] memory fromIdle, address to)
-        private
-    {
-        IPoolManager pm = IPoolManager(_POOL_MANAGER);
-        uint256 length = tokens.length;
-        for (uint256 i; i < length; ++i) {
-            uint256 claimPart = fromClaims[i];
-            if (claimPart != 0) {
-                Currency currency = Currency.wrap(tokens[i]);
-                pm.burn(address(this), currency.toId(), claimPart);
-                pm.take(currency, to, claimPart);
-            }
-            uint256 idlePart = fromIdle[i];
-            if (idlePart != 0) IERC20(tokens[i]).safeTransfer(to, idlePart);
-        }
-    }
-
-    /// @dev I12. Any ERC-20 balance the vault is left holding — a donation, a rounding remainder — is absorbed into
-    ///      ERC-6909 claims (where it becomes backing for every holder) and the zero balance is then asserted. The
-    ///      absorb step is what stops a 1-wei donation from bricking an assert-only implementation.
+    /// @dev I12, in {VaultRedeemLib}: any ERC-20 balance the vault is left holding is absorbed into ERC-6909
+    ///      claims and the zero balance is then asserted.
     function _sweepClean() private {
-        uint256 length = _assets.length;
-        address[] memory dirty = new address[](length);
-        uint256[] memory amounts = new uint256[](length);
-        uint256 count;
-        for (uint256 i; i < length; ++i) {
-            address token = _assets[i];
-            uint256 balance = IERC20(token).balanceOf(address(this));
-            if (balance != 0) {
-                dirty[count] = token;
-                amounts[count] = balance;
-                unchecked {
-                    ++count;
-                }
-            }
-        }
-        if (count == 0) return;
-
-        assembly ("memory-safe") {
-            mstore(dirty, count)
-            mstore(amounts, count)
-        }
-
-        _setUnlockAction(ACTION_ABSORB);
-        IPoolManager(_POOL_MANAGER).unlock(abi.encode(dirty, amounts));
-        _setUnlockAction(0);
-
-        for (uint256 i; i < count; ++i) {
-            uint256 balance = IERC20(dirty[i]).balanceOf(address(this));
-            if (balance != 0) revert SweepDirty(dirty[i], balance);
-        }
+        VaultRedeemLib.sweepClean(_assets, _POOL_MANAGER);
     }
 
     /// @dev The assertion half of {_sweepClean}, without the absorb step: used by {emergencyMigrate}, which has
@@ -1308,46 +1270,32 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @dev Writes the transient unlock discriminator.
     function _setUnlockAction(uint256 action) private {
+        uint256 slot = UNLOCK_ACTION;
         assembly ("memory-safe") {
-            tstore(UNLOCK_ACTION, action)
+            tstore(slot, action)
         }
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // Internals — redemption arithmetic
+    // Internals — the ladder's own storage
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev The whole of I23 in one place, shared by {previewRedeem} and {redeemProRata} so the preview cannot
-    ///      drift from the payout. Reads balances only: no oracle, no gate, no registry, no price.
-    /// @param shares The AMPS wei being redeemed.
-    /// @param supply `T`, read before the burn.
-    /// @return result The token list, the net amounts
-    ///         `floor(floor(b x shares / T) x (BPS - redeemFeeBps) / BPS)`, the claim/idle split of each payout and
-    ///         `floor(inventory x shares / T)` of the vault's own AMPS, burned so `T` falls by more than `shares`.
-    function _redemption(uint256 shares, uint256 supply) private view returns (Redemption memory result) {
-        uint256 length = _assets.length;
-        result.tokens = new address[](length);
-        result.amounts = new uint256[](length);
-        result.fromClaims = new uint256[](length);
-        result.fromIdle = new uint256[](length);
-        if (supply == 0) return result;
-
-        uint256 keepBps = Constants.BPS - _redeemFeeBps;
-
-        for (uint256 i; i < length; ++i) {
-            address token = _assets[i];
-            result.tokens[i] = token;
-            uint256 claimBalance = IPoolManager(_POOL_MANAGER).balanceOf(address(this), Currency.wrap(token).toId());
-            uint256 balance = claimBalance + IERC20(token).balanceOf(address(this));
-            uint256 net = FullMath.mulDiv(FullMath.mulDiv(balance, shares, supply), keepBps, Constants.BPS);
-            if (net == 0) continue;
-            result.amounts[i] = net;
-            uint256 claimPart = net > claimBalance ? claimBalance : net;
-            result.fromClaims[i] = claimPart;
-            result.fromIdle[i] = net - claimPart;
+    /// @dev The vault's `PoolKey` list, at {POOL_KEYS_SLOT}. See that constant for why it is not slot 21.
+    function _poolKeys() private pure returns (PoolKey[] storage keys) {
+        bytes32 slot = POOL_KEYS_SLOT;
+        assembly ("memory-safe") {
+            keys.slot := slot
         }
+    }
 
-        result.inventoryBurned = FullMath.mulDiv(IERC20(_AMPS).balanceOf(address(this)), shares, supply);
+    /// @dev The R1 post-condition and the exit sweep, shared by all five Phase 3 entry points. `_checkpoint()`
+    ///      recomputes `A` at the *previous* reference price, so `navBefore` and `navAfter` are measured on the
+    ///      same basis and a placement is judged on what it moved, never on what the market did (I11).
+    function _afterPlacement(uint256 navBefore) private {
+        uint256 navAfter = _checkpoint().navPerShareX18;
+        uint256 floor = FullMath.mulDiv(navBefore, Constants.BPS - Constants.PLACEMENT_BLEED_BPS_MAX, Constants.BPS);
+        if (navAfter < floor) revert NavBleedExceeded(navBefore, navAfter, Constants.PLACEMENT_BLEED_BPS_MAX);
+        _sweepClean();
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1384,6 +1332,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         return FullMath.mulDiv(assetsUsd18 + 1, Constants.WAD, supply + Constants.VIRTUAL_SHARES);
     }
 
+    /// @dev NAV/share recomputed from live balances, positions included: what {previewNavPerShareX18} returns and
+    ///      what every Phase 3 entry point captures as `navBefore` for R1.
+    function _previewNav() private view returns (uint256) {
+        return _navPerShare(VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true));
+    }
+
     /// @dev Recomputes `A`, NAV/share, `P_mkt` and `P_ref` and writes the two checkpoint words (section 5).
     function _checkpoint() private returns (Checkpoint memory snapshot) {
         VaultNavLib.Sources memory src = _sources();
@@ -1393,41 +1347,15 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         uint256 nav = _navPerShare(assetsUsd18);
 
         (uint256 pMkt, bool usable) = VaultNavLib.marketPrice(src);
-        bool overridden = !usable || VaultNavLib.referenceOverridden(src, pMkt);
-
-        uint256 pRef;
-        bool rateLimited;
-        bool navFloored;
-        if (overridden) {
-            pRef = nav;
-            navFloored = true;
-        } else {
-            uint256 pRefPrev = _pRefX18;
-            uint256 candidate;
-            if (pMkt <= pRefPrev) {
-                // Down is immediate and unlimited.
-                candidate = pMkt;
-            } else {
-                uint32 last = _checkpointTimestamp;
-                uint256 elapsed = last == 0 ? 0 : block.timestamp - last;
-                uint256 cap = pRefPrev
-                    + FullMath.mulDiv(
-                        pRefPrev, uint256(_refUpRateBps) * elapsed, uint256(Constants.ONE_HOUR) * Constants.BPS
-                    );
-                if (pMkt > cap) {
-                    candidate = cap;
-                    rateLimited = true;
-                } else {
-                    candidate = pMkt;
-                }
-            }
-            if (nav > candidate) {
-                pRef = nav;
-                navFloored = true;
-            } else {
-                pRef = candidate;
-            }
-        }
+        uint32 last = _checkpointTimestamp;
+        (uint256 pRef, bool rateLimited, bool navFloored) = VaultNavLib.referencePrice(
+            nav,
+            pMkt,
+            !usable || VaultNavLib.referenceOverridden(src, pMkt),
+            _pRefX18,
+            last == 0 ? 0 : block.timestamp - last,
+            _refUpRateBps
+        );
 
         _navPerShareX18 = _toUint128(nav);
         _pRefX18 = _toUint128(pRef);
@@ -1546,12 +1474,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (value < min || value > max) revert OutOfBand(name, value, min, max);
         emit VaultParameterChanged(name, previous, value);
         return value;
-    }
-
-    /// @dev The single revert site of the four Phase 3 entry points. A function rather than an inline `revert` so
-    ///      that the shared `locked` modifier's release is not statically unreachable.
-    function _phase3() private pure {
-        revert Phase3NotImplemented();
     }
 
     /// @dev Narrows to the packed width the checkpoint words use.

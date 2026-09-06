@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: MIT */
+@import 'tailwindcss';
+
+/*
+ * One dark palette, no theme switcher. The app is a read-out of a set of contracts; the fewer
+ * moving parts between a number and the person reading it, the better.
+ *
+ * Fonts are system stacks on purpose: `next/font/google` fetches at build time and the production
+ * build has to succeed with no network.
+ */
+@theme {
+  --color-background: oklch(0.16 0.012 260);
+  --color-foreground: oklch(0.95 0.005 260);
+  --color-card: oklch(0.2 0.014 260);
+  --color-card-foreground: oklch(0.95 0.005 260);
+  --color-muted: oklch(0.27 0.014 260);
+  --color-muted-foreground: oklch(0.7 0.012 260);
+  --color-primary: oklch(0.72 0.16 155);
+  --color-primary-foreground: oklch(0.15 0.02 155);
+  --color-secondary: oklch(0.3 0.02 260);
+  --color-secondary-foreground: oklch(0.95 0.005 260);
+  --color-destructive: oklch(0.55 0.2 25);
+  --color-border: oklch(0.32 0.014 260);
+  --color-ring: oklch(0.72 0.16 155);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+html,
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+* {
+  border-color: var(--color-border);
+}

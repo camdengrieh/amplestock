@@ -14,7 +14,10 @@ via_ir = false
 ffi = false
 fs_permissions = [
   { access = "read-write", path = "./gas" },
-  { access = "read", path = "./script/config" },
+  # `script/04_MineHook.s.sol` records the mined hook address, its salt and the init-code hash it is bound to in
+  # `script/config/hook.json`, which `test/unit/HookAddress.t.sol` re-checks in CI. Writing is therefore part of
+  # the script's job; every other consumer of this directory only reads.
+  { access = "read-write", path = "./script/config" },
 ]
 gas_reports = ["AmpsHook", "AmpsVault", "AmpsBonds", "AmpsStaking", "Amps"]
 fuzz = { runs = 512, max_test_rejects = 200_000 }
@@ -65,5 +68,17 @@ via_ir = true
 # IR pipeline it fits with room to spare, and nothing else in `src/` changes.
 [[profile.default.compilation_restrictions]]
 paths = "src/bonds/*"
+optimizer_runs = 200
+via_ir = true
+
+# `AmpsHook` implements the whole of `IAmpsHook` and `IMarketReference` on top of the two swap callbacks, the
+# three packed words, the observation ring and the bounded external probes; at the project-wide 1,000,000
+# optimizer runs solc inlines it to 28,014 B, well past EIP-170. Compiled on its own through the IR pipeline at
+# 200 runs it is 20,757 B, which leaves 3,819 B of EIP-170 headroom -- exactly the treatment `src/vault/*` and
+# `src/bonds/*` get, and it reuses their compiler profile. Higher runs buy nothing worth having: 1,000 runs is
+# 22,448 B and 5,000 runs 23,955 B, and all three are within ~300 gas per swap of each other, because the hook's
+# cost is dominated by cold storage and the `IFeePolicy` staticcall rather than by codegen.
+[[profile.default.compilation_restrictions]]
+paths = "src/hook/*"
 optimizer_runs = 200
 via_ir = true

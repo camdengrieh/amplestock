@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsHook} from "../interfaces/IAmpsHook.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../interfaces/IMarketReference.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
@@ -41,8 +42,12 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///        disabled when Closed, plus positivity, per-ticker bounds and the two-confirmation rule.
 ///      - **D, corporate actions.** Four bounded `staticcall`s into the Stock Token — `oraclePaused()`,
 ///        `effectiveAt()`, `newUIMultiplier()`, `uiMultiplier()` — each capped at
-///        `Constants.STOCK_TOKEN_PROBE_GAS`. A pause, or a pending `effectiveAt` within
-///        `+/- corporateActionWindow` of now, is `SCHEDULED_FREEZE` for that constituent.
+///        `Constants.STOCK_TOKEN_PROBE_GAS`, **ORed with the hook's own multiplier-step detector**
+///        (`IAmpsHook.poolState(poolId).gateFlags` bit 3, `docs/phase3-state-model.md` §10 ruling 10). A pause, a
+///        pending `effectiveAt` within `+/- corporateActionWindow` of now, or an armed hook flag is
+///        `SCHEDULED_FREEZE` for that constituent and for nothing else. The hook read is bounded and its failure
+///        is silent: a market reference that is absent, is not a hook or reverts leaves layer D exactly as Phase 2
+///        left it, which is why the token probes are still the primary source rather than a legacy path.
 ///      - **E, divergence.** `|poolTick - fairTick| > divergenceBps` sustained for `divergenceSustainSeconds`
 ///        latches `DIVERGED` for that one pool. `fairTick` is derived from the hub TWAP, the counter asset's
 ///        Chainlink answer and the registry's pool config; the hook never writes here.
@@ -98,6 +103,17 @@ contract OracleGate is IOracleGate {
 
     /// @notice Gas forwarded to every bounded probe into a Stock Token or a market-reference source.
     uint256 public constant PROBE_GAS = Constants.STOCK_TOKEN_PROBE_GAS;
+
+    /// @notice Bit 3 of `HookPoolState.gateFlags`: the hook's own corporate-action arm (`caArmed`), set by its
+    ///         `uiMultiplier()` step detector when a step exceeds `Constants.DIVIDEND_STEP_BPS_MAX`.
+    uint256 public constant HOOK_GATE_FLAG_CA_ARMED = 0x08;
+
+    /// @dev Words in an ABI-encoded `HookPoolState`: 25 static fields, one word each. A hook that appends fields
+    ///      still answers with at least this many, and every field this contract reads keeps its index.
+    uint256 private constant HOOK_POOL_STATE_WORDS = 25;
+
+    /// @dev Index of `gateFlags` inside that encoding.
+    uint256 private constant HOOK_POOL_STATE_GATE_FLAGS_WORD = 22;
 
     // -------------------------------------------------------------------------------------------------------------
     // Storage (slot layout per `docs/phase2-state-model.md` §1.5)
@@ -583,7 +599,7 @@ contract OracleGate is IOracleGate {
         PoolId poolId = _poolOf(constituentId);
         _updateDivergence(poolId);
         ConstituentConfig memory config = _constituent(constituentId);
-        (bool frozen, uint32 effectiveAt) = _corporateAction(config);
+        (bool frozen, uint32 effectiveAt) = _corporateAction(config, poolId);
         emit CorporateActionFreeze(constituentId, frozen, effectiveAt);
     }
 
@@ -879,7 +895,7 @@ contract OracleGate is IOracleGate {
             gate.answerUsd8 = answerUsd8 > type(uint64).max ? type(uint64).max : uint64(answerUsd8);
             gate.answerUpdatedAt = answerUpdatedAt;
             gate.feedStale = !fresh;
-            (gate.corporateFreeze,) = _corporateAction(config);
+            (gate.corporateFreeze,) = _corporateAction(config, poolId);
         }
 
         uint16 deviationBps;
@@ -978,12 +994,24 @@ contract OracleGate is IOracleGate {
         }
     }
 
-    /// @dev Layer D: four bounded probes into the Stock Token, plus the registry's forced-freeze override. A probe
-    ///      that fails is *unknown*, never a revert; an unknown `oraclePaused()` is read as not-paused, but an
-    ///      unknown multiplier pair alongside a pending `effectiveAt` is read as a change in flight, because the
-    ///      only thing an `effectiveAt` is ever set for is a change.
-    function _corporateAction(ConstituentConfig memory config) internal view returns (bool frozen, uint32 effectiveAt) {
+    /// @dev Layer D: the hook's own multiplier-step detector, four bounded probes into the Stock Token, and the
+    ///      registry's forced-freeze override, ORed. A probe that fails is *unknown*, never a revert; an unknown
+    ///      `oraclePaused()` is read as not-paused, but an unknown multiplier pair alongside a pending
+    ///      `effectiveAt` is read as a change in flight, because the only thing an `effectiveAt` is ever set for
+    ///      is a change.
+    /// @dev **Ruling 10.** The hook watches `uiMultiplier()` on every gate-cache refresh and arms
+    ///      {HOOK_GATE_FLAG_CA_ARMED} on a step larger than `Constants.DIVIDEND_STEP_BPS_MAX`, which is a signal
+    ///      this contract cannot see for itself: the gate is only called when somebody calls it, while the hook is
+    ///      called on every swap. Reading it here gives layer D a detector with the pool's own cadence. The token
+    ///      probes stay exactly as they were and are the fallback whenever the hook is absent, is not a hook, or
+    ///      cannot answer.
+    function _corporateAction(ConstituentConfig memory config, PoolId poolId)
+        internal
+        view
+        returns (bool frozen, uint32 effectiveAt)
+    {
         if (config.caFreezeOverride) frozen = true;
+        if (!frozen && _hookCorporateArmed(poolId)) frozen = true;
         address token = config.token;
         if (token == address(0) || token.code.length == 0) return (frozen, 0);
 
@@ -1166,6 +1194,17 @@ contract OracleGate is IOracleGate {
 
     /// @dev The pool's mean truncated tick over the canonical window, refusing to shorten the window: an
     ///      uncovered ring is "no reference", which is what layer F reports as missing coverage.
+    // BUG: this and the other typed `try` reads in this file (`_feedAnswer`, `_constituent`, `_poolConfig`,
+    // `_poolOf`, `_constituentOfPool`, `_hubPoolId`, `_wethPoolId`, `_lastTruncatedTick` and the two
+    // `GatePriceMath` calls) survive a callee that *reverts*, but not one that returns malformed data. Solidity
+    // decodes a successful call's returndata in the caller's frame and a decode failure — too few bytes, or a
+    // word that does not fit the declared type — raises a `Panic` that `try`/`catch` cannot catch, so a market
+    // reference, registry or feed registry answering five bytes, no bytes, or `0xff...ff` for a `uint32` makes
+    // `snapshot`, `state`, `isBondAllowed`, `checkBond`, `isPlacementAllowed` and `dynCapBps` revert instead of
+    // degrade. Reachable only through the three timelocked pointers, never through user input, and never through
+    // `redeemProRata`, which reads none of this. Ruling 10's own read (`_hookCorporateArmed`) unpacks its words by
+    // hand precisely so that it cannot add another instance; the pre-existing ones are left as they are and are
+    // reported rather than fixed in this slice. `test/unit/OracleGateHookState.t.sol` pins the boundary.
     function _twapTick(PoolId poolId) internal view returns (bool ok, int24 meanTick) {
         address ref = _marketReference;
         if (ref == address(0) || ref.code.length == 0) return (false, 0);
@@ -1185,6 +1224,36 @@ contract OracleGate is IOracleGate {
         } catch {
             return (false, 0);
         }
+    }
+
+    /// @dev Ruling 10's read: bit 3 (`caArmed`) of `IAmpsHook.poolState(poolId).gateFlags`, through one bounded
+    ///      `staticcall` whose result is unpacked by hand rather than ABI-decoded.
+    ///
+    ///      Hand-unpacking is not fussiness. `HookPoolState` carries two enums and a `bool`, and a market reference
+    ///      that is not the hook — a Phase 2 mock, a mis-pointed address, a hostile contract — can answer with an
+    ///      out-of-range ordinal, which Solidity's decoder answers with a `Panic` that `try`/`catch` does **not**
+    ///      catch. That would turn a fallback into a revert on `snapshot`, `state` and `isBondAllowed`, which is
+    ///      the opposite of what a fallback is for. Reading two words out of the returndata cannot fail that way.
+    ///
+    ///      Bit 3 and not bit 1: bit 1 (`corporateFreeze`) is the hook's *cache of this contract's own verdict*,
+    ///      refreshed at most once per `Constants.GATE_CACHE_SECONDS_DEFAULT`. Reading it back would close a loop —
+    ///      gate freezes, hook caches the freeze, gate reads its own freeze — and latch `SCHEDULED_FREEZE` for that
+    ///      constituent forever. Bit 3 is the hook's own observation of the token and has no such feedback path.
+    function _hookCorporateArmed(PoolId poolId) internal view returns (bool armed) {
+        address ref = _marketReference;
+        if (PoolId.unwrap(poolId) == bytes32(0) || ref == address(0) || ref.code.length == 0) return false;
+
+        (bool success, bytes memory data) =
+            ref.staticcall{gas: PROBE_GAS * 4}(abi.encodeWithSelector(IAmpsHook.poolState.selector, poolId));
+        if (!success || data.length < HOOK_POOL_STATE_WORDS * 32) return false;
+
+        uint256 initialized;
+        uint256 gateFlags;
+        assembly ("memory-safe") {
+            initialized := mload(add(data, 0x20))
+            gateFlags := mload(add(data, add(0x20, mul(HOOK_POOL_STATE_GATE_FLAGS_WORD, 0x20))))
+        }
+        return initialized != 0 && gateFlags & HOOK_GATE_FLAG_CA_ARMED != 0;
     }
 
     /// @dev The pool's current truncated tick, or "unknown".
