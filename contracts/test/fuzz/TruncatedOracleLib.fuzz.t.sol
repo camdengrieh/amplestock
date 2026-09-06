@@ -16,6 +16,11 @@ import {Test} from "forge-std/Test.sol";
 ///      ~100 ms blocks against whole-second timestamps, so several blocks routinely share one timestamp and a
 ///      manipulator gets several capped moves inside one second - which is exactly why the bound is stated in blocks
 ///      and not in seconds.
+///
+/// @dev **Ring insertion is rate-limited; the accumulator is not.** Every write advances the head exactly, and a ring
+///      slot is committed at most once per `MIN_INSERT_INTERVAL` seconds (see the library note). The properties below
+///      are therefore stated against the head - which is exact - and against the committed slots' spacing, rather
+///      than against "one observation per second", which the ring deliberately no longer holds.
 contract TruncatedOracleLibFuzzTest is Test {
     /// @dev Number of adversarial writes per run.
     uint256 internal constant STEPS = 24;
@@ -36,6 +41,8 @@ contract TruncatedOracleLibFuzzTest is Test {
     /// @param blocksInWindow Blocks the window spans: the block live when it opened, plus every new block since.
     /// @param lowest         Lowest truncated tick recorded during the attack.
     /// @param highest        Highest truncated tick recorded during the attack.
+    /// @param live           The truncated tick currently in force.
+    /// @param cumulative     Ghost of the exact accumulator: the integral of the truncated tick series since `T0`.
     struct Run {
         uint32 time;
         uint32 blockNumber;
@@ -44,6 +51,8 @@ contract TruncatedOracleLibFuzzTest is Test {
         uint256 blocksInWindow;
         int24 lowest;
         int24 highest;
+        int24 live;
+        int256 cumulative;
     }
 
     TruncatedOracleHarness internal oracle;
@@ -87,6 +96,8 @@ contract TruncatedOracleLibFuzzTest is Test {
 
         // I25. The `+ 1` is the floor in `consult`: the true time-weighted mean is inside `cap * blocksInWindow` of
         // `meanBefore`, and rounding toward negative infinity can move the reported value down by less than a tick.
+        // The rate limit does not widen this: every tick the reported mean averages was recorded either inside the
+        // window or inside the quiet baseline that precedes it, where the tick was `tick0 == meanBefore` throughout.
         assertLe(
             _abs(int256(oracle.consult(r.time, window)) - int256(meanBefore)),
             budget + 1,
@@ -108,7 +119,7 @@ contract TruncatedOracleLibFuzzTest is Test {
         if (elapsed == 0) return;
 
         // Any window that opens at or after the attack began is bounded by the same budget: every truncated tick it
-        // averages was recorded inside the attack.
+        // averages was recorded inside the attack, or inside the quiet baseline at `tick0`.
         uint32 window = uint32(bound(seedWindow, 1, elapsed));
         assertLe(
             _abs(int256(oracle.consult(r.time, window)) - int256(tick0)),
@@ -118,7 +129,8 @@ contract TruncatedOracleLibFuzzTest is Test {
     }
 
     /// @notice The per-write half of I25, isolated: the recorded tick never leaves the current block's allowance
-    ///         band, however many swaps share the block and however far the raw tick jumps.
+    ///         band, however many swaps share the block and however far the raw tick jumps. Unaffected by the ring's
+    ///         insertion rate limit, which is exactly the point of the fix.
     function testFuzz_truncatedTickNeverMovesMoreThanCapPerBlock(int24 seedTick, int24 seedCap, uint256 entropy)
         public
     {
@@ -147,20 +159,46 @@ contract TruncatedOracleLibFuzzTest is Test {
     // structural invariants
     // ---------------------------------------------------------------------------------------------------------
 
-    /// @notice The accumulator is exactly the integral of the recorded tick series: for every retained pair of
-    ///         neighbours, `dCumulative == truncatedTick * dt`. Direction consistency follows - the accumulator rises
-    ///         over an interval iff the tick in force there was positive.
-    function testFuzz_tickCumulativeIsTheIntegralOfTheTickSeries(int24 seedTick, int24 seedCap, uint256 entropy)
-        public
-    {
+    /// @notice The head accumulator is *exactly* the integral of the recorded tick series, on every write and
+    ///         whatever the cadence. This is the property the rate limit had to preserve: the ring stops taking a
+    ///         slot per second, the accumulator does not stop being exact.
+    function testFuzz_theHeadAccumulatorIsTheExactIntegralOfTheTickSeries(
+        int24 seedTick,
+        int24 seedCap,
+        uint256 entropy
+    ) public {
         Run memory r = _baseline(_boundTick(seedTick), _boundCap(seedCap), entropy);
+        assertEq(int256(oracle.headCumulative()), r.cumulative, "exact after the baseline");
+
         _attack(r);
+
+        assertEq(int256(oracle.headCumulative()), r.cumulative, "exact after the attack");
+        assertEq(oracle.headTimestamp(), r.time, "the head clock is the last write that moved it");
+        assertEq(oracle.lastTruncatedTick(), r.live, "and the tick in force is the last one recorded");
+    }
+
+    /// @notice The committed slots are a strictly increasing, rate-limited sub-sequence of the head's history: each
+    ///         carries the exact accumulator at its own timestamp, and consecutive slots are at least
+    ///         `MIN_INSERT_INTERVAL` seconds apart, which is what bounds coverage below.
+    function testFuzz_committedSlotsAreRateLimitedAndOrdered(int24 seedCap, uint256 entropy, uint8 writes) public {
+        int24 cap = _boundCap(seedCap);
+        uint256 count = bound(writes, 1, 120);
+
+        oracle.initialize(T0, 0);
+        uint32 time = T0;
+        uint32 blockNumber = 1;
+
+        for (uint256 i = 0; i < count; ++i) {
+            // A coarser cadence than `_step`, so runs regularly cross the insertion interval.
+            uint256 word = uint256(keccak256(abi.encode(entropy, i, "coarse")));
+            blockNumber += uint32(word % 11) + 1;
+            time += uint32(word % (2 * uint256(TruncatedOracleLib.MIN_INSERT_INTERVAL)));
+            oracle.write(time, blockNumber, int24(uint24(word >> 32)), cap);
+        }
 
         uint16 index = oracle.index();
         uint16 cardinality = oracle.cardinality();
-        // The baseline alone contributes 41 observations; the attack adds one per distinct timestamp, so the ring is
-        // often - but not always - full, and often wrapped. The walk below covers both cases.
-        assertGe(cardinality, BASELINE_BLOCKS + 1, "the baseline is retained");
+        assertGe(cardinality, 1, "the seed is always retained");
         assertLe(cardinality, TruncatedOracleLib.MAX_CARDINALITY, "cardinality never exceeds the ring");
 
         for (uint16 k = 0; k + 1 < cardinality; ++k) {
@@ -168,23 +206,29 @@ contract TruncatedOracleLibFuzzTest is Test {
             TruncatedOracleLib.Observation memory b = oracle.observationAt((index + 2 + k) % cardinality);
 
             assertTrue(a.initialized && b.initialized, "retained slots are populated");
-            assertGt(b.blockTimestamp, a.blockTimestamp, "strictly increasing: one observation per timestamp");
-
-            int256 dt = int256(uint256(b.blockTimestamp - a.blockTimestamp));
-            assertEq(
-                int256(b.tickCumulative) - int256(a.tickCumulative),
-                int256(a.truncatedTick) * dt,
-                "cumulative delta equals the tick in force times the elapsed time"
+            assertGt(b.blockTimestamp, a.blockTimestamp, "strictly increasing");
+            assertGe(
+                b.blockTimestamp - a.blockTimestamp,
+                TruncatedOracleLib.MIN_INSERT_INTERVAL,
+                "and at least one insertion interval apart"
             );
 
-            if (a.truncatedTick > 0) assertGt(b.tickCumulative, a.tickCumulative, "rises while the tick is positive");
-            else if (a.truncatedTick < 0) assertLt(b.tickCumulative, a.tickCumulative, "falls while negative");
-            else assertEq(b.tickCumulative, a.tickCumulative, "flat at tick zero");
+            // The accumulator between two committed slots is the integral of ticks that really were in force, so it
+            // is bracketed by the extremes of the valid tick range times the elapsed time.
+            int256 dt = int256(uint256(b.blockTimestamp - a.blockTimestamp));
+            int256 delta = int256(b.tickCumulative) - int256(a.tickCumulative);
+            assertLe(delta, int256(TickMath.MAX_TICK) * dt, "bracketed above");
+            assertGe(delta, int256(TickMath.MIN_TICK) * dt, "bracketed below");
         }
+
+        // The newest committed slot is a snapshot of the head at the moment it was taken, never newer than it.
+        assertLe(oracle.newestCommittedObservation().blockTimestamp, oracle.headTimestamp(), "commit <= head");
+        assertEq(oracle.lastCommitTimestamp(), oracle.newestCommittedObservation().blockTimestamp, "commit clock");
     }
 
     /// @notice The TWAP over any covered window is bracketed by the extremes of the recorded tick series, which is
-    ///         what turns the per-block cap on the series into a bound on the mean.
+    ///         what turns the per-block cap on the series into a bound on the mean. Linear interpolation between two
+    ///         exact endpoints keeps this true: the value it substitutes is that interval's own average tick.
     function testFuzz_twapLiesBetweenTheExtremesOfTheRecordedSeries(int24 seedTick, int24 seedCap, uint256 entropy)
         public
     {
@@ -266,6 +310,41 @@ contract TruncatedOracleLibFuzzTest is Test {
         oracle.consult(time, covered + 1);
     }
 
+    /// @notice The liveness property the rate limit buys, under any cadence: coverage is the whole elapsed time
+    ///         until the ring wraps, and never less than a full ring's span afterwards - so it is never destroyed by
+    ///         trading, only ever bought by it.
+    function testFuzz_coverageIsNeverLostByTrading(int24 seedCap, uint256 entropy, uint16 writes) public {
+        int24 cap = _boundCap(seedCap);
+        uint256 count = bound(writes, 1, 400);
+        uint256 fullRing =
+            uint256(TruncatedOracleLib.MAX_CARDINALITY - 1) * uint256(TruncatedOracleLib.MIN_INSERT_INTERVAL);
+
+        oracle.initialize(T0, 0);
+        uint32 time = T0;
+        uint32 blockNumber = 1;
+
+        for (uint256 i = 0; i < count; ++i) {
+            uint256 word = uint256(keccak256(abi.encode(entropy, i, "coverage")));
+            blockNumber += uint32(word % 11) + 1;
+            // 0 to 3 insertion intervals per step: sometimes several writes share one interval, sometimes a step
+            // jumps several intervals at once.
+            time += uint32(word % (3 * uint256(TruncatedOracleLib.MIN_INSERT_INTERVAL) + 1));
+            oracle.write(time, blockNumber, int24(uint24(word >> 32)), cap);
+
+            uint256 elapsed = time - T0;
+            uint256 floorCoverage = elapsed < fullRing ? elapsed : fullRing;
+            assertGe(uint256(oracle.observationCoverage(time)), floorCoverage, "coverage is never lost by trading");
+        }
+
+        // And once two hours have gone by, the widest governable window is always answerable.
+        if (time - T0 >= TruncatedOracleLib.MAX_TWAP_WINDOW) {
+            assertGe(
+                oracle.observationCoverage(time), TruncatedOracleLib.MAX_TWAP_WINDOW, "the widest window is covered"
+            );
+            oracle.consult(time, TruncatedOracleLib.MAX_TWAP_WINDOW);
+        }
+    }
+
     /// @notice `observe` and `consult` are the same computation: the mean is the accumulator delta over the window.
     function testFuzz_observeAgreesWithConsult(int24 seedCap, uint256 entropy, uint32 seedWindow) public {
         Run memory r = _baseline(0, _boundCap(seedCap), entropy);
@@ -303,26 +382,31 @@ contract TruncatedOracleLibFuzzTest is Test {
             // The block live when the window opens still holds its own unspent allowance, so it counts.
             blocksInWindow: 1,
             lowest: tick0,
-            highest: tick0
+            highest: tick0,
+            live: tick0,
+            cumulative: 0
         });
         oracle.initialize(r.time, tick0);
         for (uint32 i = 0; i < BASELINE_BLOCKS; ++i) {
             ++r.blockNumber;
             ++r.time;
-            oracle.write(r.time, r.blockNumber, tick0, cap);
+            r.cumulative += int256(r.live);
+            r.live = oracle.write(r.time, r.blockNumber, tick0, cap);
         }
     }
 
-    /// @dev `STEPS` adversarial writes, updating the run's clock, block counter and observed extremes.
+    /// @dev `STEPS` adversarial writes, updating the run's clock, block counter, ghost accumulator and extremes.
     function _attack(Run memory r) private {
         for (uint256 i = 0; i < STEPS; ++i) {
             (uint32 blocksElapsed, uint32 secondsElapsed, int24 rawTick) = _step(r.entropy, i);
             r.blockNumber += blocksElapsed;
             r.time += secondsElapsed;
             r.blocksInWindow += blocksElapsed;
+            r.cumulative += int256(r.live) * int256(uint256(secondsElapsed));
 
             int24 anchor = _anchorFor(r.blockNumber);
             int24 truncated = oracle.write(r.time, r.blockNumber, rawTick, r.cap);
+            r.live = truncated;
 
             assertLe(_abs(int256(truncated) - int256(anchor)), int256(r.cap), "per-block cap");
             if (truncated < r.lowest) r.lowest = truncated;

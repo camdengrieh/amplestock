@@ -113,7 +113,16 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         "pointer) 2,100, the cold IFeePolicy account 2,600, the policy's own arithmetic ~2,300, the cold hook "
         "account 2,600, and ~9,000 of hook execution dominated by encoding the 20-field FeeInput. Section 1.7 had "
         "assumed two extra cold SLOADs and a 4,000-gas policy call; shrinking FeeInput is a Phase 4/6 tuning "
-        "item. The phase1Budget* keys are the old stub + 20% figures, kept for the record and asserted nowhere.";
+        "item. The phase1Budget* keys are the old stub + 20% figures, kept for the record and asserted nowhere. "
+        "RE-RECORDED for 12.3 ruling V (the truncated ring's insertion rate limit). Only one measurement rose past "
+        "its old recording + 20%: .hook.afterSwapWithGateRefresh, 59,401 -> 74,858. That is not the ring getting "
+        "dearer, it is the ring finally having coverage: an entry pool's fairTick is its own 30-minute TWAP "
+        "(1.5 step 6) and is computed only when observationCoverage >= TWAP_WINDOW, which under the old "
+        "one-slot-per-second ring an actively traded pool never reached, so the branch was never taken and the "
+        "recording never paid for it. The per-swap numbers all fell, because `write` no longer reads the ring and "
+        "touches one packed slot instead of two: .hook.afterSwap 39,815 -> 31,755 (-20%), .hook.swapOneHopBuy "
+        "153,953 -> 145,877, .hook.swapOneHopSell 148,806 -> 140,746, .hook.swapTwoHopRotation 248,533 -> 232,397, "
+        ".hook.swapBuyThenSell 228,211 -> 219,401. beforeSwap is untouched on both paths.";
 
     struct Measurements {
         uint256 beforeSwap;

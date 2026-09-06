@@ -104,6 +104,47 @@ contract AmpsHookObservationsTest is HookTestFixture {
         assertLt(_currentTick(usdgId), before - int24(uint24(cap)), "the raw price ran further than the cap");
     }
 
+    /// @notice The liveness half of the ring (§12.3 ruling V). An hour of trading in *every single second* - which
+    ///         on a 100 ms chain is ordinary, not adversarial - must never take the 30-minute read away: ring
+    ///         insertion is rate-limited, so coverage is bought with elapsed time and can only grow.
+    function test_theThirtyMinuteReadSurvivesTradingEverySecond() public {
+        uint256 ts = block.timestamp;
+        uint256 bn = block.number;
+
+        // First, buy the window with quiet blocks so the read is armed at all.
+        for (uint256 i; i < 40; ++i) {
+            ts += 60;
+            bn += 1;
+            vm.warp(ts);
+            vm.roll(bn);
+            _pokeAfterSwap(usdgKey, true);
+        }
+        assertGe(hook.observationCoverage(usdgId), 1800, "the ring covers the window");
+        uint32 covered = hook.observationCoverage(usdgId);
+
+        // Then write in every second for an hour, with a real swap every other minute so the tick genuinely moves
+        // under the writes rather than sitting still.
+        for (uint256 i; i < 3600; ++i) {
+            ts += 1;
+            bn += 1;
+            vm.warp(ts);
+            vm.roll(bn);
+            if (i % 120 == 0) _buyRaw(usdgKey, 20_000e6);
+            else if (i % 120 == 60) _sellRaw(usdgKey, 20_000e18);
+            else _pokeAfterSwap(usdgKey, i % 2 == 0);
+
+            uint32 nowCovered = hook.observationCoverage(usdgId);
+            // Coverage grows until the ring wraps, and a wrapped ring still spans 63 insertion intervals.
+            assertTrue(nowCovered >= covered || nowCovered >= 63 * 115, "coverage is never spent by trading");
+            assertGe(nowCovered, 1800, "and never falls under the window");
+            covered = nowCovered;
+            hook.twapTick30m(usdgId); // the read that used to revert `WindowNotCovered` after ~63 swaps
+        }
+
+        assertEq(covered, hook.observationCoverage(usdgId), "coverage settled");
+        assertEq(hook.twapTick(usdgId, 1800), hook.twapTick30m(usdgId), "and the windowed read agrees with it");
+    }
+
     function test_twapReadsRevertOnlyWhenTheWindowIsNotCovered() public {
         uint32 coverage = hook.observationCoverage(usdgId);
         assertLt(coverage, 1800, "the ring does not reach back a window yet");
