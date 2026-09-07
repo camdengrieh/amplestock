@@ -156,8 +156,8 @@ unconditionally "AMPS in", i.e. a sell. v4's `Swap` carries the *swapper's* delt
 paying currency0 (`amount0 < 0`) is exactly that sell. Nothing infers direction from the sender, the
 router or the tick move.
 
-**Base fee.** `base = sell ? sellFeeBps : pool.buyFeeBps`. `sellFeeBps` is hook-wide and is tracked
-from `HookParameterChanged("sellFeeBps", 0, …)`; `buyFeeBps` is per pool, carried by
+**Base fee.** `base = sell ? ampsFeeBps : pool.buyFeeBps`. `ampsFeeBps` is hook-wide and is tracked
+from `HookParameterChanged("ampsFeeBps", 0, …)`; `buyFeeBps` is per pool, carried by
 `PoolRegistered` itself and moved by `HookParameterChanged("buyFeeBps", poolId, …)` or
 `ConstituentReconfigured(id, "buyFeeBps", …)`. Neither is ever read from the chain.
 
@@ -165,7 +165,7 @@ from `HookParameterChanged("sellFeeBps", 0, …)`; `buyFeeBps` is per pool, carr
 
 ```
 c    = min(credit, amountIn)
-base = buyFeeBps + ceil((sellFeeBps - buyFeeBps) * (amountIn - c) / amountIn)
+base = buyFeeBps + ceil((ampsFeeBps - buyFeeBps) * (amountIn - c) / amountIn)
 ```
 
 The hook computes that itself in `beforeSwap` and emits
@@ -173,7 +173,7 @@ The hook computes that itself in `beforeSwap` and emits
 and emits, so the hook's log always has the smaller log index in the same transaction: the indexer
 parks the credit keyed `(txHash, poolId)` and the `Swap` handler consumes it, taking `blendedFeeBps`
 as the base and `consumed` as the credited amount. The formula above is only ever evaluated in a
-test. Exact-output sells consume no credit and pay `sellFeeBps` in full; a credit on a buy is
+test. Exact-output sells consume no credit and pay `ampsFeeBps` in full; a credit on a buy is
 ignored, because only AMPS-in swaps consume one.
 
 **Dynamic part.** v4's `Swap.fee` is the total actually charged after the hook's override, so

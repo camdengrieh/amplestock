@@ -35,7 +35,7 @@ export function poolQuote(overrides: Partial<PoolQuote> = {}): PoolQuote {
     innerBandTicks: 200,
     outerRailTicks: 2_000,
     buyFeeBps: 30,
-    sellFeeBps: 500,
+    ampsFeeBps: 500,
     buyFeePips: 3_000,
     sellFeePips: 50_000,
     dynBps: 0,

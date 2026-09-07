@@ -81,7 +81,7 @@ export function pool(overrides: Partial<PoolSnapshot> = {}): PoolSnapshot {
     corporateFreeze: false,
     pRefX18: WAD,
     navPerShareX18: WAD,
-    sellFeeBps: 500,
+    ampsFeeBps: 500,
     ...overrides,
   }
 }

@@ -11,7 +11,7 @@
  * Three things happen on a `Swap`:
  *
  * 1. **The fee is decomposed** per `src/lib/fee.ts` — direction from the sign of `amount0`, base
- *    from `sellFeeBps`/`buyFeeBps` or from the `RotationCreditConsumed` the hook emitted earlier in
+ *    from `ampsFeeBps`/`buyFeeBps` or from the `RotationCreditConsumed` the hook emitted earlier in
  *    the same transaction, dynamic as the residual against what v4 actually charged.
  * 2. **The pool's ladder is re-decomposed** at the new price. A v4 position converts in place as
  *    the price crosses it (§3.4), so each cell's split into AMPS-still-there and counter-raised
@@ -32,8 +32,8 @@ import {amountsForLiquidity, clampInt, priceX18FromSqrt, to18} from '../lib/math
 import {STATE, getState, updateFlywheelDay, updateSummary, type Db} from '../lib/store'
 import {jsonRecord} from '../lib/json'
 
-/** `sellFeeBps` at launch (`Constants.SELL_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
-const SELL_FEE_BPS_DEFAULT = 500
+/** `ampsFeeBps` at launch (`Constants.AMPS_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
+const AMPS_FEE_BPS_DEFAULT = 500
 
 /**
  * Scratch the `Placement` handler consumes. Only the liquidity is carried now: the cell count and
@@ -177,7 +177,7 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
   const pool = await context.db.find(schema.pool, {id})
   if (pool === null) return
 
-  const sellFeeBps = clampInt((await getState(context.db, STATE.sellFeeBps)) ?? BigInt(SELL_FEE_BPS_DEFAULT))
+  const ampsFeeBps = clampInt((await getState(context.db, STATE.ampsFeeBps)) ?? BigInt(AMPS_FEE_BPS_DEFAULT))
   const pRefX18 = (await getState(context.db, STATE.pRefX18)) ?? 0n
 
   const ck = creditKey(event.transaction.hash, event.args.id)
@@ -192,7 +192,7 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
     amount0: event.args.amount0,
     amount1: event.args.amount1,
     feePips: Number(event.args.fee),
-    sellFeeBps,
+    ampsFeeBps,
     buyFeeBps: pool.buyFeeBps,
     credit,
   })

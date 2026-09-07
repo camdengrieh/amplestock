@@ -105,7 +105,7 @@ interface IAmpsHook is IMarketReference {
 
     /// @notice Emitted by every governed hook setter, so the indexer and the governance drill can follow a
     ///         parameter without decoding calldata. Mirrors `IAmpsVault.VaultParameterChanged`.
-    /// @param parameter The parameter name as a short string, e.g. `bytes32("sellFeeBps")`.
+    /// @param parameter The parameter name as a short string, e.g. `bytes32("ampsFeeBps")`.
     /// @param poolId The pool the change applies to, or `bytes32(0)` for a protocol-wide parameter.
     /// @param previousValue The value before.
     /// @param newValue The value after.
@@ -179,7 +179,7 @@ interface IAmpsHook is IMarketReference {
     /// @return policyAddress The `IFeePolicy` address.
     function feePolicy() external view returns (address policyAddress);
 
-    /// @notice The governance timelock: the only caller of {setSellFeeBps}, {setBuyFeeBps},
+    /// @notice The governance timelock: the only caller of {setAmpsFeeBps}, {setBuyFeeBps},
     ///         {setMaxTickMovePerBlock} and {setFeePolicy}.
     /// @return timelockAddress The timelock address.
     function timelock() external view returns (address timelockAddress);
@@ -266,7 +266,7 @@ interface IAmpsHook is IMarketReference {
 
     /// @notice The protocol-wide sell fee charged on every AMPS-in swap in all 32 pools. 500 bp at launch.
     /// @return value The parameter.
-    function sellFeeBps() external view returns (uint16 value);
+    function ampsFeeBps() external view returns (uint16 value);
 
     /// @notice A pool's base buy fee.
     /// @param poolId The pool.
@@ -277,13 +277,13 @@ interface IAmpsHook is IMarketReference {
     // Hard bands
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Hard floor of `sellFeeBps`, in bps. 100.
+    /// @notice Hard floor of `ampsFeeBps`, in bps. 100.
     /// @return value The bound.
-    function SELL_FEE_BPS_MIN() external view returns (uint16 value);
+    function AMPS_FEE_BPS_MIN() external view returns (uint16 value);
 
-    /// @notice Hard ceiling of `sellFeeBps`, in bps. 600.
+    /// @notice Hard ceiling of `ampsFeeBps`, in bps. 600.
     /// @return value The bound.
-    function SELL_FEE_BPS_MAX() external view returns (uint16 value);
+    function AMPS_FEE_BPS_MAX() external view returns (uint16 value);
 
     /// @notice The largest total fee the hook can ever return, in bps. 2,600, far below `MAX_LP_FEE` (I16).
     /// @return value The bound.
@@ -319,8 +319,8 @@ interface IAmpsHook is IMarketReference {
     function armSurge(PoolId poolId, uint16 surgeBps, bytes32 reason) external;
 
     /// @notice Sets the protocol-wide sell fee. **Only timelock (48 h).**
-    /// @param value The new fee, inside `[SELL_FEE_BPS_MIN, SELL_FEE_BPS_MAX]`.
-    function setSellFeeBps(uint16 value) external;
+    /// @param value The new fee, inside `[AMPS_FEE_BPS_MIN, AMPS_FEE_BPS_MAX]`.
+    function setAmpsFeeBps(uint16 value) external;
 
     /// @notice Sets a pool's buy fee. **Only timelock (48 h).**
     /// @param poolId The pool.

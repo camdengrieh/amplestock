@@ -37,8 +37,8 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(pips, uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "entry buy pips");
 
         (pips, base,,) = hook.quoteFee(usdgId, true, true, 1e18);
-        assertEq(base, Constants.SELL_FEE_BPS_DEFAULT, "entry sell base");
-        assertEq(pips, uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry sell pips");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "entry sell base");
+        assertEq(pips, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry sell pips");
 
         (, base,,) = hook.quoteFee(wethId, false, true, 1e18);
         assertEq(base, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "the WETH route is an entry pool too");
@@ -48,7 +48,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(base, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "spoke buy base");
 
         (, base,,) = hook.quoteFee(stockId, true, true, 1e18);
-        assertEq(base, Constants.SELL_FEE_BPS_DEFAULT, "the sell fee is protocol-wide");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the sell fee is protocol-wide");
     }
 
     function test_theHighVolatilitySpokeBucketIsTenBasisPoints() public {
@@ -60,12 +60,12 @@ contract AmpsHookFeeTest is HookTestFixture {
 
     function test_theGovernedSellFeeMovesEveryPool() public {
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(100);
+        hook.setAmpsFeeBps(100);
         (, uint16 base,,) = hook.quoteFee(stockId, true, true, 1e18);
         assertEq(base, 100, "floor of the band");
 
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(600);
+        hook.setAmpsFeeBps(600);
         (, base,,) = hook.quoteFee(usdgId, true, true, 1e18);
         assertEq(base, 600, "ceiling of the band");
     }
@@ -84,7 +84,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         _sell(usdgKey, 100e18);
         assertEq(
             _lastSwapFee(vm.getRecordedLogs()),
-            uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
             "a lone sell pays 500 bp"
         );
     }
@@ -385,7 +385,7 @@ contract AmpsHookFeeTest is HookTestFixture {
             amountIn: 1e18,
             rotationCredit: 0,
             poolClass: PoolClass.ENTRY,
-            sellFeeBps: Constants.SELL_FEE_BPS_DEFAULT,
+            ampsFeeBps: Constants.AMPS_FEE_BPS_DEFAULT,
             buyFeeBps: Constants.BUY_FEE_BPS_ENTRY_DEFAULT,
             devTicks: 0,
             innerBandTicks: Constants.INNER_BAND_REGULAR_TICKS,
@@ -413,7 +413,7 @@ contract AmpsHookFeeTest is HookTestFixture {
     function test_theQuoteFeeContract() public {
         // 1. `amountIn == 0` gives the un-blended base, in both directions.
         (uint24 pips, uint16 base, uint16 dyn, bool refuse) = hook.quoteFee(usdgId, true, true, 0);
-        assertEq(base, hook.sellFeeBps(), "a sell quotes sellFeeBps");
+        assertEq(base, hook.ampsFeeBps(), "a sell quotes ampsFeeBps");
         (, base,,) = hook.quoteFee(usdgId, false, true, 0);
         assertEq(base, hook.buyFeeBps(usdgId), "a buy quotes the pool's buyFeeBps");
 
@@ -462,9 +462,9 @@ contract AmpsHookFeeTest is HookTestFixture {
 
         (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, sell, exactInput, amountIn);
 
-        uint16 sellFee = hook.sellFeeBps();
-        assertGe(sellFee, Constants.SELL_FEE_BPS_MIN, "sellFeeBps floor");
-        assertLe(sellFee, Constants.SELL_FEE_BPS_MAX, "sellFeeBps ceiling");
+        uint16 sellFee = hook.ampsFeeBps();
+        assertGe(sellFee, Constants.AMPS_FEE_BPS_MIN, "ampsFeeBps floor");
+        assertLe(sellFee, Constants.AMPS_FEE_BPS_MAX, "ampsFeeBps ceiling");
 
         if (sell) {
             // Either the full sell fee or a blend between the buy fee and it; with no credit in a fresh

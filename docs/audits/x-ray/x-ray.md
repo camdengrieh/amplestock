@@ -51,7 +51,7 @@ The core trick: AMPS is never minted to defend a price and never priced by the v
 Router.swap(key, params)
 └─ PoolManager.swap()
    ├─ AmpsHook.beforeSwap()                       ← reads the pool's packed CONFIG/DYNAMIC/ARMED words, no gate call
-   │  ├─ base = zeroForOne ? sellFeeBps : buyFeeBps[class]
+   │  ├─ base = zeroForOne ? ampsFeeBps : buyFeeBps[class]
    │  ├─ credit = tload(ROTATION_CREDIT); blend base over min(amountIn, credit)   *transient, same tx only*
    │  ├─ FeePolicy.quoteFee() (bounded staticcall) → dyn = f_vol + f_dev + f_session + surge + capture, clamped
    │  └─ deviation-increasing and beyond outerRail? → revert BeyondRail   *the only swap revert*

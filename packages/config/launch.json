@@ -386,8 +386,8 @@
       ]
     },
     "fees": {
-      "sellFeeBps": 500,
-      "sellFeeBpsBand": {
+      "ampsFeeBps": 500,
+      "ampsFeeBpsBand": {
         "min": 100,
         "max": 600
       },

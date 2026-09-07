@@ -9,21 +9,21 @@ const WAD = 10n ** 18n
 
 describe('compareRotation', () => {
   it('prices hop 2 at the destination pool’s buy fee when the credit covers it', () => {
-    const c = compareRotation({hop1BuyFeeBps: 5, hop2BuyFeeBps: 5, sellFeeBps: 500, ampsFromHop1: WAD})
+    const c = compareRotation({hop1BuyFeeBps: 5, hop2BuyFeeBps: 5, ampsFeeBps: 500, ampsFromHop1: WAD})
     expect(c.hop2BaseBpsRotated).toBe(5)
     expect(c.hop2BaseBpsSeparate).toBe(500)
     expect(c.savedPips).toBe(bpsToPips(495))
   })
 
   it('never claims a saving larger than the sell fee itself', () => {
-    const c = compareRotation({hop1BuyFeeBps: 30, hop2BuyFeeBps: 30, sellFeeBps: 100, ampsFromHop1: WAD})
+    const c = compareRotation({hop1BuyFeeBps: 30, hop2BuyFeeBps: 30, ampsFeeBps: 100, ampsFromHop1: WAD})
     expect(c.savedPips).toBe(bpsToPips(70))
     expect(c.savedPips).toBeLessThanOrEqual(bpsToPips(100))
   })
 })
 
 describe('RotationComparisonPanel', () => {
-  const comparison = compareRotation({hop1BuyFeeBps: 5, hop2BuyFeeBps: 5, sellFeeBps: 500, ampsFromHop1: WAD})
+  const comparison = compareRotation({hop1BuyFeeBps: 5, hop2BuyFeeBps: 5, ampsFeeBps: 500, ampsFromHop1: WAD})
 
   it('puts the credited and uncredited second hop side by side', () => {
     render(<RotationComparisonPanel comparison={comparison} outSymbol="AAPL" degraded={0} />)

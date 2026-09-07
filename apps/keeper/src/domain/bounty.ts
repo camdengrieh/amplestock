@@ -195,21 +195,21 @@ export interface AmpsFeeSplit {
  * `VaultPlacementLib._split`, in the order the contract applies it.
  *
  * `creatorBps` is `AmpsVault.creatorBpsAt(now)` — 100 bp at genesis decaying linearly to exactly zero at
- * `genesis + 30 days` — and the creator slice is `min(creatorBps, sellFeeBps) / sellFeeBps` of the AMPS-side
- * fees, so it is a share of the sell fee rather than a share of volume. A zero `sellFeeBps` cannot happen (the
+ * `genesis + 30 days` — and the creator slice is `min(creatorBps, ampsFeeBps) / ampsFeeBps` of the AMPS-side
+ * fees, so it is a share of the sell fee rather than a share of volume. A zero `ampsFeeBps` cannot happen (the
  * hard band floor is 100 bp) but is handled anyway: no sell fee, no creator slice.
  */
 export function splitAmpsFees(
   ampsFees: bigint,
   creatorBps: number,
-  sellFeeBps: number,
+  ampsFeeBps: number,
   stakerBps: number,
   burnBps: number,
 ): AmpsFeeSplit {
   if (ampsFees === 0n) return {creatorCut: 0n, stakerCut: 0n, burnCut: 0n, relaid: 0n}
 
-  const creatorNumerator = BigInt(Math.min(creatorBps, sellFeeBps))
-  const creatorCut = sellFeeBps === 0 ? 0n : (ampsFees * creatorNumerator) / BigInt(sellFeeBps)
+  const creatorNumerator = BigInt(Math.min(creatorBps, ampsFeeBps))
+  const creatorCut = ampsFeeBps === 0 ? 0n : (ampsFees * creatorNumerator) / BigInt(ampsFeeBps)
   const afterCreator = ampsFees - creatorCut
   const stakerCut = (afterCreator * BigInt(stakerBps)) / BPS
   const afterStaker = afterCreator - stakerCut

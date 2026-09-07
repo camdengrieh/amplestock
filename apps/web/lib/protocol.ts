@@ -77,8 +77,8 @@ export const F_WALL_BPS = 1_500
 export const K_DEV_BPS = 25
 
 /** Launch defaults. Governed; the live value is read from the hook through `AmpsQuoter`. */
-export const SELL_FEE_BPS_DEFAULT = 500
-export const SELL_FEE_BPS_BAND = {min: 100, max: 600} as const
+export const AMPS_FEE_BPS_DEFAULT = 500
+export const AMPS_FEE_BPS_BAND = {min: 100, max: 600} as const
 export const BUY_FEE_BPS_ENTRY_DEFAULT = 30
 export const BUY_FEE_BPS_ENTRY_BAND = {min: 5, max: 100} as const
 export const BUY_FEE_BPS_SPOKE_DEFAULT = 5

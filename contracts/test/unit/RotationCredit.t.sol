@@ -126,7 +126,7 @@ contract RotationCreditTest is HookTestFixture {
         assertEq(fillerCredit, 0, "and the filler holds none of it");
         assertEq(
             fillerFee,
-            (uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS) | LPFeeLibrary.OVERRIDE_FEE_FLAG,
+            (uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS) | LPFeeLibrary.OVERRIDE_FEE_FLAG,
             "so the filler's own exit pays the sell fee in full"
         );
         assertEq(
@@ -199,7 +199,7 @@ contract RotationCreditTest is HookTestFixture {
 
         uint256 uncredited = amountIn - creditBefore;
         uint256 expected = uint256(Constants.BUY_FEE_BPS_ENTRY_DEFAULT)
-            + _ceilDiv((Constants.SELL_FEE_BPS_DEFAULT - Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * uncredited, amountIn);
+            + _ceilDiv((Constants.AMPS_FEE_BPS_DEFAULT - Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * uncredited, amountIn);
         assertEq(fees[1], uint24(expected) * Constants.PIPS_PER_BPS, "blended, rounded up");
         assertEq(creditAfter, 0, "the whole credit was consumed");
         // A sell of exactly twice the credit is half credited: 30 + ceil(470/2) = 265 bp.
@@ -259,7 +259,7 @@ contract RotationCreditTest is HookTestFixture {
         (uint256 creditBefore, uint256 creditAfter) = this.exactOutputSellEntry();
 
         uint24[] memory fees = _swapFees(vm.getRecordedLogs());
-        assertEq(fees[fees.length - 1], uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "full");
+        assertEq(fees[fees.length - 1], uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "full");
         assertEq(creditAfter, creditBefore, "and the credit is untouched");
         assertGt(creditBefore, 0, "there really was a credit to spend");
     }
@@ -281,7 +281,7 @@ contract RotationCreditTest is HookTestFixture {
 
         assertEq(credit, 1, "one wei in, one wei of credit");
         // 30 + ceil(470 * (amountIn - 1) / amountIn) = 500 for any amountIn > 470.
-        assertEq(fee, uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "still the full sell fee");
+        assertEq(fee, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "still the full sell fee");
     }
 
     /// @notice Self-call entry point: credit exactly one wei from a realised delta, then sell 1,000 AMPS.
@@ -311,7 +311,7 @@ contract RotationCreditTest is HookTestFixture {
         _sell(usdgKey, ampsOut);
         assertEq(
             _lastSwapFee(vm.getRecordedLogs()),
-            uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
             "the sell pays in full in the next transaction"
         );
     }

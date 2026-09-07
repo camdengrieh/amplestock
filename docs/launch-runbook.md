@@ -193,7 +193,7 @@ them, so every proposal description states its class and every signer checks it.
 
 | Delay | Actions |
 |---|---|
-| 48 h | `sellFeeBps` [100, 600], buy fees, `redeemFeeBps` ≤ 500, `burnBps` ≤ 2500, `stakerBps` ≤ 5000, `rewardStreamSeconds` [1 h, 7 d], `refUpRateBps` [100, 5000]/h, TWAP window, `maxTickMovePerBlock`, `GRACE`/`GAP_SECONDS`, freshness multipliers, calendar tables, ladder tilt/doublings, rollout, every bond variable and per-market open/close, keeper `tip`/`chost`/caps, `BountyPot` funding |
+| 48 h | `ampsFeeBps` [100, 600], buy fees, `redeemFeeBps` ≤ 500, `burnBps` ≤ 2500, `stakerBps` ≤ 5000, `rewardStreamSeconds` [1 h, 7 d], `refUpRateBps` [100, 5000]/h, TWAP window, `maxTickMovePerBlock`, `GRACE`/`GAP_SECONDS`, freshness multipliers, calendar tables, ladder tilt/doublings, rollout, every bond variable and per-market open/close, keeper `tip`/`chost`/caps, `BountyPot` funding |
 | 7 d | constituent add / retire / reinstate / reconfigure, index weights, bond collateral add / remove, and every policy pointer (`LadderPolicy`, `FeePolicy`, `RolloutPolicy`, `BondPolicy`, `OracleGate`, `FeedRegistry`) |
 | 14 d | standby vault registration (`AmpsVault.setStandbyVault`) |
 | none | guardian freezes and `emergencyMigrate` |

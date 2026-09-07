@@ -26,34 +26,34 @@ export function mulDivRoundingUp(a: bigint, b: bigint, d: bigint): bigint {
  *
  * ```
  * c    = min(credit, amountIn)
- * base = buyFeeBps + ceilDiv((sellFeeBps - buyFeeBps) * (amountIn - c), amountIn)
+ * base = buyFeeBps + ceilDiv((ampsFeeBps - buyFeeBps) * (amountIn - c), amountIn)
  * ```
  *
  * Rounded **up**, so a credit never rounds a fee down in the swapper's favour. Three consequences
  * the UI states plainly rather than burying:
  *
  * - a fully credited sell pays the *buy* fee of the pool it sells into, not zero;
- * - an uncredited sell pays `sellFeeBps`;
- * - an **exact-output** sell consumes no credit at all and pays `sellFeeBps` in full, which is why
+ * - an uncredited sell pays `ampsFeeBps`;
+ * - an **exact-output** sell consumes no credit at all and pays `ampsFeeBps` in full, which is why
  *   the router always builds hop 2 as `SWAP_EXACT_IN`.
  *
  * The credit lives in EIP-1153 transient storage: it exists only inside the transaction that
  * created it and can never be carried across transactions.
  */
-export function blendedSellFeeBps(params: {
-  sellFeeBps: number
+export function blendedAmpsFeeBps(params: {
+  ampsFeeBps: number
   buyFeeBps: number
   amountIn: bigint
   credit: bigint
 }): number {
-  const {sellFeeBps, buyFeeBps, amountIn, credit} = params
-  if (sellFeeBps < buyFeeBps) {
-    throw new Error('blendedSellFeeBps: sellFeeBps < buyFeeBps is unreachable on chain (bands [100,600] vs [1,100])')
+  const {ampsFeeBps, buyFeeBps, amountIn, credit} = params
+  if (ampsFeeBps < buyFeeBps) {
+    throw new Error('blendedAmpsFeeBps: ampsFeeBps < buyFeeBps is unreachable on chain (bands [100,600] vs [1,100])')
   }
-  if (amountIn <= 0n) return sellFeeBps
+  if (amountIn <= 0n) return ampsFeeBps
   const c = credit < amountIn ? credit : amountIn
-  if (c <= 0n) return sellFeeBps
-  const delta = BigInt(sellFeeBps - buyFeeBps)
+  if (c <= 0n) return ampsFeeBps
+  const delta = BigInt(ampsFeeBps - buyFeeBps)
   const blended = BigInt(buyFeeBps) + mulDivRoundingUp(delta, amountIn - c, amountIn)
   return Number(blended)
 }
@@ -121,7 +121,7 @@ export function feeAmount(amount: bigint, feePips: number): bigint {
 export function rotationFeePips(params: {
   hop1BuyFeeBps: number
   hop2BuyFeeBps: number
-  sellFeeBps: number
+  ampsFeeBps: number
   /** AMPS out of hop 1 — the credit hop 2 will consume. */
   ampsFromHop1: bigint
   /** AMPS into hop 2. Equal to `ampsFromHop1` for a pure rotation. */
@@ -132,8 +132,8 @@ export function rotationFeePips(params: {
   hop2DynCapBps?: number
 }): {hop1FeePips: number; hop2FeePips: number; hop2BaseBps: number; creditUsed: bigint} {
   const creditUsed = creditConsumed(params.ampsIntoHop2, params.ampsFromHop1)
-  const hop2BaseBps = blendedSellFeeBps({
-    sellFeeBps: params.sellFeeBps,
+  const hop2BaseBps = blendedAmpsFeeBps({
+    ampsFeeBps: params.ampsFeeBps,
     buyFeeBps: params.hop2BuyFeeBps,
     amountIn: params.ampsIntoHop2,
     credit: params.ampsFromHop1,

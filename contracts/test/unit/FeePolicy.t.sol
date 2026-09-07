@@ -152,7 +152,7 @@ contract FeePolicyTest is Test {
 
     /* --------------------------------------------- the fee table --------------------------------------------- */
 
-    /// @dev The launch table with nothing armed: a buy pays its pool's buy fee and a sell pays `sellFeeBps`,
+    /// @dev The launch table with nothing armed: a buy pays its pool's buy fee and a sell pays `ampsFeeBps`,
     ///      with no dynamic component at all.
     function test_feeTableAtRest() public view {
         // entry pool buy / sell
@@ -255,7 +255,7 @@ contract FeePolicyTest is Test {
     ///      `TOTAL_FEE_BPS_MAX` and a long way below `MAX_LP_FEE`.
     function test_theLargestPossibleFeeIsTotalFeeBpsMax() public view {
         IFeePolicy.FeeInput memory input = _sell();
-        input.sellFeeBps = Constants.SELL_FEE_BPS_MAX;
+        input.ampsFeeBps = Constants.AMPS_FEE_BPS_MAX;
         input.deviationIncreasing = true;
         input.devTicks = type(int24).max;
         input.dynCapBps = Constants.DYN_CAP_ESCALATION_BPS;
@@ -273,7 +273,7 @@ contract FeePolicyTest is Test {
     ///      off the dynamic part first and then off the base, so the returned decomposition stays exact.
     function test_anOutOfBandBaseIsClampedIntoTheCeiling() public view {
         IFeePolicy.FeeInput memory input = _sell();
-        input.sellFeeBps = type(uint16).max;
+        input.ampsFeeBps = type(uint16).max;
         IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
         assertEq(quote.baseBps, Constants.TOTAL_FEE_BPS_MAX, "the base absorbs the ceiling");
         assertEq(quote.dynBps, 0, "and the dynamic part is gone");
@@ -621,7 +621,7 @@ contract FeePolicyTest is Test {
             amountIn: 0,
             rotationCredit: 0,
             poolClass: PoolClass.ENTRY,
-            sellFeeBps: SELL,
+            ampsFeeBps: SELL,
             buyFeeBps: BUY_ENTRY,
             devTicks: 0,
             innerBandTicks: Constants.INNER_BAND_REGULAR_TICKS,

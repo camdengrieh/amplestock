@@ -36,7 +36,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         uint256 honest = this.honestExitEntry(10e18);
 
         assertLe(credit, 2, "a 1-wei buy realises a wei or two of AMPS and no more");
-        assertEq(baseBps, hook.sellFeeBps(), "and the exit still pays the sell fee in full");
+        assertEq(baseBps, hook.ampsFeeBps(), "and the exit still pays the sell fee in full");
         assertLe(gamed, honest, "the gamed exit is never better than the honest one");
     }
 
@@ -50,7 +50,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         vm.revertToState(snapshot);
         uint256 honest = this.honestExitEntry(ampsToExit);
 
-        assertLt(blendedBase, hook.sellFeeBps(), "the credit really did blend the base fee down");
+        assertLt(blendedBase, hook.ampsFeeBps(), "the credit really did blend the base fee down");
         assertGt(blendedBase, registry.poolConfig(hubPool).buyFeeBps, "but only partly: this is not a rotation");
         assertLe(gamedNet, int256(honest), "and the netted proceeds never beat the honest exit");
     }
@@ -61,7 +61,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) = this.exactOutputEntry();
         assertGt(creditBefore, 0, "there was a credit to spend");
         assertEq(creditAfter, creditBefore, "and the exact-output sell spent none of it");
-        assertEq(baseBps, hook.sellFeeBps(), "paying the sell fee in full");
+        assertEq(baseBps, hook.ampsFeeBps(), "paying the sell fee in full");
     }
 
     /// @notice Shape 4 — across transactions. `ROTATION_CREDIT` is one EIP-1153 slot, so the EVM itself zeroes it
@@ -73,7 +73,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         assertEq(hook.rotationCredit(address(swapRouter)), 0, "and left nothing behind");
 
         (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, bought);
-        assertEq(baseBps, hook.sellFeeBps(), "so the next transaction's exit pays the sell fee in full");
+        assertEq(baseBps, hook.ampsFeeBps(), "so the next transaction's exit pays the sell fee in full");
     }
 
     // -------------------------------------------------------------------------------------------------------------

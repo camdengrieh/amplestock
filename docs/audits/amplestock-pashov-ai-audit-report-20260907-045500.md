@@ -140,15 +140,15 @@ The buyback predicate `liquidity != 0 && upperTick <= highWater && pool.tick < u
 `VaultPlacementLib._split` · Confidence: 85 · [agents: 5]
 
 **Description**
-`creatorPaid = ampsFees × creatorBps / sellFeeBps` assumes fees were collected at exactly `sellFeeBps`, but the hook charges `base + dyn`, so the creator is over-paid by `(base + dyn) / base` (+20 % every weekend under the 100 bp degraded floor, +60 % inside the surge `compound` itself arms, 5× at the escalation cap) out of the staker, burn and re-ladder slices, and because `SELL_FEE_BPS_MIN == CREATOR_FEE_BPS == 100` an in-band `setSellFeeBps(100)` makes the ratio exactly 1 and routes 100 % of accrued AMPS-side fees to the creator.
+`creatorPaid = ampsFees × creatorBps / ampsFeeBps` assumes fees were collected at exactly `ampsFeeBps`, but the hook charges `base + dyn`, so the creator is over-paid by `(base + dyn) / base` (+20 % every weekend under the 100 bp degraded floor, +60 % inside the surge `compound` itself arms, 5× at the escalation cap) out of the staker, burn and re-ladder slices, and because `AMPS_FEE_BPS_MIN == CREATOR_FEE_BPS == 100` an in-band `setAmpsFeeBps(100)` makes the ratio exactly 1 and routes 100 % of accrued AMPS-side fees to the creator.
 
 **Fix (Option A — cap the divisor)**
 
 ```diff
--        uint256 sellFeeBps = _sellFeeBps(ctx);
-+        uint256 sellFeeBps = _sellFeeBps(ctx);
+-        uint256 ampsFeeBps = _ampsFeeBps(ctx);
++        uint256 ampsFeeBps = _ampsFeeBps(ctx);
 +        // The slice is defined against the launch base rate: a fee cut can never enlarge it (ratio <= 1/5).
-+        if (sellFeeBps < Constants.SELL_FEE_BPS_DEFAULT) sellFeeBps = Constants.SELL_FEE_BPS_DEFAULT;
++        if (ampsFeeBps < Constants.AMPS_FEE_BPS_DEFAULT) ampsFeeBps = Constants.AMPS_FEE_BPS_DEFAULT;
 ```
 
 **Fix (Option B — track volume)**

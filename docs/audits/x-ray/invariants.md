@@ -134,7 +134,7 @@ Per-call preconditions. Heading IDs below (`G-N`) are anchor targets from x-ray.
 `if (msg.sender != timelock) revert NotTimelock(msg.sender);` · `src/hook/AmpsHook.sol:1250` · Every hook setter is the timelock's; the guardian can only freeze through the gate.
 
 #### G-42
-`if (value < Constants.SELL_FEE_BPS_MIN || value > Constants.SELL_FEE_BPS_MAX) revert OutOfBand("sellFeeBps", ...)` · `src/hook/AmpsHook.sol:1175` · The sell fee stays inside [100, 600] bp (doc I16).
+`if (value < Constants.AMPS_FEE_BPS_MIN || value > Constants.AMPS_FEE_BPS_MAX) revert OutOfBand("ampsFeeBps", ...)` · `src/hook/AmpsHook.sol:1175` · The sell fee stays inside [100, 600] bp (doc I16).
 
 #### G-43
 `if (s.cardinality != 0) revert AlreadyInitialized();` · `src/lib/TruncatedOracleLib.sol:213` · A pool's observation ring is seeded exactly once, at initialisation.
@@ -309,7 +309,7 @@ Each block is classified by shape: `Conservation` · `Bound` · `Ratio` · `Stat
 
 `Conservation` · On-chain: **Yes**
 
-> `creatorPaid + stakerPaid + burnCut + relaid == ampsFees` at every compound; `creatorPaid <= ampsFees * creatorBps(t) / sellFeeBps` with `creatorBps` clamped to `sellFeeBps` and zero from genesis + 30 days.
+> `creatorPaid + stakerPaid + burnCut + relaid == ampsFees` at every compound; `creatorPaid <= ampsFees * creatorBps(t) / ampsFeeBps` with `creatorBps` clamped to `ampsFeeBps` and zero from genesis + 30 days.
 
 **Derivation** — Δ-pair `VaultPlacementLib.sol:931-957` (`_split`): each slice is subtracted from the running remainder and `relaid` is the residue (956); `creatorBps` clamp at 933 and decay in `_creatorBps` (1044-1051).
 

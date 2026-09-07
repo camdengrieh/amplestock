@@ -7,7 +7,7 @@ import {formatBps} from '@/lib/format'
 
 const rows: ParameterRow[] = [
   {name: 'redeemFeeBps', live: 100, format: formatBps, band: {min: 0, max: 500}, delay: '48 h', note: 'Kept by the vault.'},
-  {name: 'sellFeeBps', format: formatBps, band: {min: 100, max: 600}, delay: '48 h', note: 'Read live from the hook.'},
+  {name: 'ampsFeeBps', format: formatBps, band: {min: 100, max: 600}, delay: '48 h', note: 'Read live from the hook.'},
 ]
 
 describe('ParameterTable', () => {
@@ -21,7 +21,7 @@ describe('ParameterTable', () => {
 
   it('renders an unread value as unavailable rather than as zero', () => {
     render(<ParameterTable rows={rows} />)
-    const row = screen.getByTestId('param-sellFeeBps')
+    const row = screen.getByTestId('param-ampsFeeBps')
     expect(row.querySelector('[data-unavailable="true"]')).not.toBeNull()
   })
 })

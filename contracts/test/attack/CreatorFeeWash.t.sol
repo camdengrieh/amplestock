@@ -9,7 +9,7 @@ import {console} from "forge-std/console.sol";
 /// @notice The plan's named attack **creator-fee wash trading**: "every round trip pays the sell fee to earn back
 ///         at most 1 point of it".
 ///
-///         The creator earns `min(creatorBps(t), sellFeeBps) / sellFeeBps` of the AMPS-side fees a `compound`
+///         The creator earns `min(creatorBps(t), ampsFeeBps) / ampsFeeBps` of the AMPS-side fees a `compound`
 ///         collects - one point of five at launch, decaying to zero over thirty days. Washing volume to farm it is
 ///         a 5-for-1 loss before slippage: the wash pays the whole sell fee and the creator gets a fifth of the
 ///         AMPS-side slice of it back, and only after a keeper compounds.
@@ -53,9 +53,9 @@ contract CreatorFeeWashTest is Phase3Fixture {
         assertGt(ampsFees, 0, "the wash generated AMPS-side fees");
         assertLt(paidUsd18, costUsd18, "and the creator got back far less than the washing cost");
         assertLe(
-            paid * uint256(hook.sellFeeBps()),
+            paid * uint256(hook.ampsFeeBps()),
             ampsFees * uint256(vault.creatorBpsAt(block.timestamp)) + ampsFees,
-            "I31: the payout is at most creatorBps / sellFeeBps of the AMPS-side fees"
+            "I31: the payout is at most creatorBps / ampsFeeBps of the AMPS-side fees"
         );
         assertLe(paid * 5, ampsFees + 5, "one point of a five-point sell fee, and no more");
     }

@@ -17,10 +17,10 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 /// @dev **The law**, exactly `docs/phase3-state-model.md` §1.4 steps 3-7:
 ///
 ///      ```
-///      base = zeroForOne ? sellFeeBps : buyFeeBps
+///      base = zeroForOne ? ampsFeeBps : buyFeeBps
 ///      if (zeroForOne && exactInput && amountIn != 0):                       // the rotation blend
 ///          c    = min(amountIn, rotationCredit)
-///          base = buyFeeBps + ceilDiv((sellFeeBps - buyFeeBps) * (amountIn - c), amountIn)
+///          base = buyFeeBps + ceilDiv((ampsFeeBps - buyFeeBps) * (amountIn - c), amountIn)
 ///      f_vol     = min(K_VOL_X18 * varianceX18 / 1e36, F_VOL_CAP_BPS)
 ///      f_dev     = 0                                                          price-improving swaps
 ///                = K_DEV_BPS * dev^2 / BPS                                    dev <= innerBand
@@ -35,7 +35,7 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 ///
 ///      The blend rounds **up**, so a rotation credit never rounds a fee down in the swapper's favour, and
 ///      `creditConsumed` comes back so the hook decrements its transient slot by exactly the amount that was
-///      credited (I26). Exact-output sells consume no credit and pay `sellFeeBps` in full.
+///      credited (I26). Exact-output sells consume no credit and pay `ampsFeeBps` in full.
 ///
 /// @dev **A wall, not a clamp, and never a gate.** Only a *deviation-increasing* swap that starts beyond the outer
 ///      rail comes back with `refuse == true`, and even that is returned rather than thrown so `AmpsQuoter` can
@@ -305,12 +305,12 @@ contract FeePolicy is IFeePolicy {
     ///      The blend is written as a delta rather than as `ceilDiv(buy*c + sell*(in-c), in)` because the naive
     ///      form overflows for `amountIn > 2**256 / 600`; both delta forms carry the 512-bit intermediate through
     ///      `FullMath` and neither can underflow, because the branch is chosen on the sign of `sell - buy`. In
-    ///      production `sellFeeBps >= buyFeeBps` always (bands `[100, 600]` against `[1, 100]`) and only the first
+    ///      production `ampsFeeBps >= buyFeeBps` always (bands `[100, 600]` against `[1, 100]`) and only the first
     ///      branch is reachable; the second exists so a mis-parameterised hook cannot make this function revert.
     function _baseBps(IFeePolicy.FeeInput calldata input) private pure returns (uint256 base, uint256 creditConsumed) {
         if (!input.zeroForOne) return (uint256(input.buyFeeBps), 0);
 
-        base = uint256(input.sellFeeBps);
+        base = uint256(input.ampsFeeBps);
         if (!input.exactInput || input.amountIn == 0 || input.rotationCredit == 0) return (base, 0);
 
         uint256 amountIn = input.amountIn;

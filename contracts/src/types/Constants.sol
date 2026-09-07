@@ -81,14 +81,14 @@ library Constants {
     // Fees (48 h timelock)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Launch `sellFeeBps`: 5% on every AMPS-in swap in all 32 pools, less any rotation credit.
-    uint16 internal constant SELL_FEE_BPS_DEFAULT = 500;
+    /// @notice Launch `ampsFeeBps`: 5% on every AMPS-in swap in all 32 pools, less any rotation credit.
+    uint16 internal constant AMPS_FEE_BPS_DEFAULT = 500;
 
-    /// @notice Hard floor of `sellFeeBps`. 1%.
-    uint16 internal constant SELL_FEE_BPS_MIN = 100;
+    /// @notice Hard floor of `ampsFeeBps`. 1%.
+    uint16 internal constant AMPS_FEE_BPS_MIN = 100;
 
-    /// @notice Hard ceiling of `sellFeeBps`. 6%.
-    uint16 internal constant SELL_FEE_BPS_MAX = 600;
+    /// @notice Hard ceiling of `ampsFeeBps`. 6%.
+    uint16 internal constant AMPS_FEE_BPS_MAX = 600;
 
     /// @notice Launch buy fee in the two entry pools (`AMPS/WETH`, `AMPS/USDG`). 30 bp.
     uint16 internal constant BUY_FEE_BPS_ENTRY_DEFAULT = 30;
@@ -112,7 +112,7 @@ library Constants {
     uint16 internal constant BUY_FEE_BPS_SPOKE_MAX = 50;
 
     /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 1%, paid to the remaining holders.
-    uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 100;
+    uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 250;
 
     /// @notice Hard ceiling of `redeemFeeBps`. 5%. There is no floor: governance may set it to zero.
     uint16 internal constant REDEEM_FEE_BPS_MAX = 500;
@@ -129,7 +129,7 @@ library Constants {
     /// @notice Hard ceiling of `stakerBps`. 50%.
     uint16 internal constant STAKER_BPS_MAX = 5000;
 
-    /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `sellFeeBps`, never added on top.
+    /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `ampsFeeBps`, never added on top.
     /// @dev The whole schedule is immutable. There is no setter, no band and no governance path that can extend,
     ///      restart or enlarge it; only the current `creator` may reassign the destination address.
     uint16 internal constant CREATOR_FEE_BPS = 100;
@@ -467,9 +467,9 @@ library Constants {
     /// @notice Entry-pool outer rail, in ticks: +/-22% per window, so price discovery is never reverted inside it.
     int24 internal constant OUTER_RAIL_ENTRY_TICKS = 2000;
 
-    /// @notice The highest total fee the hook can ever return, in bps: `SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS`.
+    /// @notice The highest total fee the hook can ever return, in bps: `AMPS_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS`.
     ///         26% is far below `MAX_LP_FEE`, which is what invariant I16 asserts.
-    uint16 internal constant TOTAL_FEE_BPS_MAX = SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS;
+    uint16 internal constant TOTAL_FEE_BPS_MAX = AMPS_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS;
 
     /// @notice The mined hook address must satisfy `address & 0x3FFF == HOOK_FLAGS`:
     ///         `BEFORE_INITIALIZE | AFTER_INITIALIZE | BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP`.

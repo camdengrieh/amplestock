@@ -16,16 +16,16 @@ import {GateState, PoolClass, Session} from "../types/Types.sol";
 ///
 ///      ```
 ///      dir  = zeroForOne ? SELL : BUY                       // AMPS is currency0 in all 32 pools
-///      base = dir == BUY ? buyFeeBps[poolClass] : sellFeeBps
+///      base = dir == BUY ? buyFeeBps[poolClass] : ampsFeeBps
 ///      if dir == SELL && exactInput:                        // blended by the same-transaction rotation credit
 ///          c    = min(amountIn, rotationCredit)
-///          base = ceilDiv(buyFeeBps x c + sellFeeBps x (amountIn - c), amountIn)
+///          base = ceilDiv(buyFeeBps x c + ampsFeeBps x (amountIn - c), amountIn)
 ///      dyn  = f_vol + f_dev + f_div + f_session + surge     // f_dev only on deviation-INCREASING swaps
 ///      fee  = clamp(base + dyn, F_MIN_BPS, base + dynCapBps)
 ///      ```
 ///
 ///      `base` is rounded **up** on the blend, so a rotation credit never rounds a fee down in the swapper's
-///      favour. Exact-output sells pay `sellFeeBps` in full: the credit applies only to exact-input sells, which is
+///      favour. Exact-output sells pay `ampsFeeBps` in full: the credit applies only to exact-input sells, which is
 ///      why the dApp always builds hop 2 of a rotation as `SWAP_EXACT_IN`.
 ///
 /// @dev **Two things this law may never do**, both asserted by the invariant suite:
@@ -47,7 +47,7 @@ interface IFeePolicy {
     /// @param amountIn The input amount, in the input currency's raw units. Zero when unknown (exact output).
     /// @param rotationCredit The live same-transaction rotation credit, in AMPS wei.
     /// @param poolClass The pool's fee bucket.
-    /// @param sellFeeBps The governed protocol-wide sell fee.
+    /// @param ampsFeeBps The governed protocol-wide sell fee.
     /// @param buyFeeBps The pool's governed buy fee.
     /// @param devTicks `|poolTick - fairTick|` after the swap, in ticks.
     /// @param innerBandTicks The inner band half-width in force.
@@ -69,7 +69,7 @@ interface IFeePolicy {
         uint256 amountIn;
         uint256 rotationCredit;
         PoolClass poolClass;
-        uint16 sellFeeBps;
+        uint16 ampsFeeBps;
         uint16 buyFeeBps;
         int24 devTicks;
         int24 innerBandTicks;

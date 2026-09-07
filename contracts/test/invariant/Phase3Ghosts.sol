@@ -314,7 +314,7 @@ contract Phase3Ghosts {
     // Internals
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev I16 on one quote: the total is `base + dyn`, `sellFeeBps` is inside its band, and neither side
+    /// @dev I16 on one quote: the total is `base + dyn`, `ampsFeeBps` is inside its band, and neither side
     ///      exceeds the protocol ceiling.
     ///
     ///      The cap is deliberately *not* compared against `quote.dynCapBps`: §12.1 ruling K says the word the
@@ -324,7 +324,7 @@ contract Phase3Ghosts {
     function _checkFee(IAmpsQuoter.PoolQuote memory quote) private {
         if (quote.degraded != 0) return;
         uint256 ceiling = uint256(HOOK.TOTAL_FEE_BPS_MAX()) * Constants.PIPS_PER_BPS;
-        if (quote.sellFeeBps < 100 || quote.sellFeeBps > 600) feeEverMalformed = true;
+        if (quote.ampsFeeBps < 100 || quote.ampsFeeBps > 600) feeEverMalformed = true;
         if (uint256(quote.buyFeePips) > ceiling) feeEverMalformed = true;
         if (uint256(quote.sellFeePips) > ceiling) feeEverMalformed = true;
     }

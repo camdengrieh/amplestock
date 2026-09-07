@@ -56,7 +56,7 @@ interface IAmpsQuoter {
     /// @param innerBandTicks The inner band half-width in force, by session and class.
     /// @param outerRailTicks The outer rail half-width in force.
     /// @param buyFeeBps The pool's base buy fee.
-    /// @param sellFeeBps The protocol-wide base sell fee.
+    /// @param ampsFeeBps The protocol-wide base sell fee.
     /// @param buyFeePips The **total** fee a buy would pay right now, in pips, base plus the clamped dynamic part.
     /// @param sellFeePips The total fee an uncredited sell would pay right now, in pips. A sell inside a rotation
     ///        pays less; use {quoteRotation} for that.
@@ -97,7 +97,7 @@ interface IAmpsQuoter {
         int24 innerBandTicks;
         int24 outerRailTicks;
         uint16 buyFeeBps;
-        uint16 sellFeeBps;
+        uint16 ampsFeeBps;
         uint24 buyFeePips;
         uint24 sellFeePips;
         uint16 dynBps;
@@ -141,11 +141,11 @@ interface IAmpsQuoter {
     ///      ```
     ///      hop 1: a buy in `hop1`, paying buyFeeBps[hop1]; the AMPS it yields is the credit
     ///      hop 2: an exact-input sell in `hop2`, base fee
-    ///             = buyFeeBps[hop2] + ceilDiv((sellFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
+    ///             = buyFeeBps[hop2] + ceilDiv((ampsFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
     ///      ```
     ///
     ///      That is the hook's own delta form, rounded up the same way, so the quote is exact rather than
-    ///      approximate. Exact-**output** sells consume no credit and pay `sellFeeBps` in full, which is why the
+    ///      approximate. Exact-**output** sells consume no credit and pay `ampsFeeBps` in full, which is why the
     ///      dApp always builds hop 2 as `SWAP_EXACT_IN`.
     /// @param hop1 The pool bought through.
     /// @param hop2 The pool sold through.

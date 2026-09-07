@@ -53,7 +53,7 @@ contract QuoterHookStub is IAmpsHook {
     address public feePolicy;
     address public timelock;
     uint32 public gateCacheSeconds = Constants.GATE_CACHE_SECONDS_DEFAULT;
-    uint16 public sellFeeBps = Constants.SELL_FEE_BPS_DEFAULT;
+    uint16 public ampsFeeBps = Constants.AMPS_FEE_BPS_DEFAULT;
     uint32 internal _twapWindow = Constants.TWAP_WINDOW_DEFAULT;
 
     mapping(PoolId poolId => HookPoolState state) internal _state;
@@ -144,7 +144,7 @@ contract QuoterHookStub is IAmpsHook {
         _fees[poolId][true] =
             FeeAnswer({feePips: uint24(sellFee) * Constants.PIPS_PER_BPS, baseBps: sellFee, dynBps: 0, refuse: false});
         _state[poolId].buyFeeBps = buyFee;
-        sellFeeBps = sellFee;
+        ampsFeeBps = sellFee;
     }
 
     /// @notice Sets the refusal flag of one direction.
@@ -277,13 +277,13 @@ contract QuoterHookStub is IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function SELL_FEE_BPS_MIN() external pure returns (uint16 value) {
-        return Constants.SELL_FEE_BPS_MIN;
+    function AMPS_FEE_BPS_MIN() external pure returns (uint16 value) {
+        return Constants.AMPS_FEE_BPS_MIN;
     }
 
     /// @inheritdoc IAmpsHook
-    function SELL_FEE_BPS_MAX() external pure returns (uint16 value) {
-        return Constants.SELL_FEE_BPS_MAX;
+    function AMPS_FEE_BPS_MAX() external pure returns (uint16 value) {
+        return Constants.AMPS_FEE_BPS_MAX;
     }
 
     /// @inheritdoc IAmpsHook
@@ -310,8 +310,8 @@ contract QuoterHookStub is IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function setSellFeeBps(uint16 value) external {
-        sellFeeBps = value;
+    function setAmpsFeeBps(uint16 value) external {
+        ampsFeeBps = value;
     }
 
     /// @inheritdoc IAmpsHook

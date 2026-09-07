@@ -210,12 +210,12 @@ contract Phase3InvariantTest is Phase3Fixture {
     }
 
     /// @notice I16: every fee decomposes as `base + dyn` with `base` the pool's own buy fee or the protocol sell
-    ///         fee, `sellFeeBps` inside `[100, 600]`, `dyn` inside the state's cap, and the total under
+    ///         fee, `ampsFeeBps` inside `[100, 600]`, `dyn` inside the state's cap, and the total under
     ///         `TOTAL_FEE_BPS_MAX`.
     function invariant_I16_everyFeeDecomposes() public view {
         assertFalse(ghosts.feeEverMalformed(), "every fee decomposed inside its bands");
-        assertGe(hook.sellFeeBps(), 100, "sellFeeBps floor");
-        assertLe(hook.sellFeeBps(), 600, "sellFeeBps ceiling");
+        assertGe(hook.ampsFeeBps(), 100, "ampsFeeBps floor");
+        assertLe(hook.ampsFeeBps(), 600, "ampsFeeBps ceiling");
     }
 
     /// @notice I18: the deployed hook carries no `BEFORE_REMOVE_LIQUIDITY` bit, so a removal cannot be blocked -
@@ -256,13 +256,13 @@ contract Phase3InvariantTest is Phase3Fixture {
     // The flywheel
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice I31: the creator was never paid more than `creatorBps(t) / sellFeeBps` of the AMPS-side fees, and
+    /// @notice I31: the creator was never paid more than `creatorBps(t) / ampsFeeBps` of the AMPS-side fees, and
     ///         the schedule is monotone non-increasing and zero after thirty days.
     function invariant_I31_creatorPayoutIsBounded() public view {
         assertLe(
-            ghosts.creatorPaid() * uint256(hook.sellFeeBps()),
-            ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.sellFeeBps()),
-            "creatorPaid <= ampsFees * creatorBps / sellFeeBps, summed"
+            ghosts.creatorPaid() * uint256(hook.ampsFeeBps()),
+            ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.ampsFeeBps()),
+            "creatorPaid <= ampsFees * creatorBps / ampsFeeBps, summed"
         );
         assertEq(
             vault.creatorBpsAt(uint256(vault.genesisTimestamp()) + Constants.CREATOR_DECAY_SECONDS),
@@ -383,7 +383,7 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I16.
     /// @return ok Whether every fee decomposed inside its bands.
     function medusa_feesAlwaysDecompose() public view returns (bool ok) {
-        return !ghosts.feeEverMalformed() && hook.sellFeeBps() >= 100 && hook.sellFeeBps() <= 600;
+        return !ghosts.feeEverMalformed() && hook.ampsFeeBps() >= 100 && hook.ampsFeeBps() <= 600;
     }
 
     /// @notice I18.
@@ -401,8 +401,8 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I31.
     /// @return ok Whether the creator payout stayed inside its share of the AMPS-side fees.
     function medusa_creatorPayoutIsBounded() public view returns (bool ok) {
-        return ghosts.creatorPaid() * uint256(hook.sellFeeBps())
-            <= ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.sellFeeBps());
+        return ghosts.creatorPaid() * uint256(hook.ampsFeeBps())
+            <= ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.ampsFeeBps());
     }
 
     /// @notice I32.

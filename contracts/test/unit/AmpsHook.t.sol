@@ -356,28 +356,28 @@ contract AmpsHookTest is HookTestFixture {
     // -----------------------------------------------------------------------------------------------------------
 
     function test_sellFeeIsTimelockOnlyAndBanded() public {
-        assertEq(hook.sellFeeBps(), Constants.SELL_FEE_BPS_DEFAULT, "launch value");
-        assertEq(hook.SELL_FEE_BPS_MIN(), 100, "hard floor");
-        assertEq(hook.SELL_FEE_BPS_MAX(), 600, "hard ceiling");
+        assertEq(hook.ampsFeeBps(), Constants.AMPS_FEE_BPS_DEFAULT, "launch value");
+        assertEq(hook.AMPS_FEE_BPS_MIN(), 100, "hard floor");
+        assertEq(hook.AMPS_FEE_BPS_MAX(), 600, "hard ceiling");
 
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, address(this)));
-        hook.setSellFeeBps(300);
+        hook.setAmpsFeeBps(300);
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(99), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(99), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(99);
+        hook.setAmpsFeeBps(99);
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(601), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(601), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(601);
+        hook.setAmpsFeeBps(601);
 
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(600);
-        assertEq(hook.sellFeeBps(), 600, "set");
+        hook.setAmpsFeeBps(600);
+        assertEq(hook.ampsFeeBps(), 600, "set");
     }
 
     function test_buyFeeBandsFollowThePoolClass() public {

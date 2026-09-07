@@ -193,7 +193,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice §3.6 step 5, in order and to the wei, on fees earned by real swaps through the real hook:
-    ///         `creatorCut = ampsFees * min(creatorBps(t), sellFeeBps) / sellFeeBps`, then `stakerBps` of the
+    ///         `creatorCut = ampsFees * min(creatorBps(t), ampsFeeBps) / ampsFeeBps`, then `stakerBps` of the
     ///         remainder, then exactly `burnBps` of what is left, then the rest re-laddered.
     function test_compoundPaysCreatorThenStakerThenBurnsBurnBps() public {
         _tradeForAmpsFees();
@@ -206,9 +206,9 @@ contract Phase3FlywheelTest is Phase3Fixture {
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
         assertGt(ampsFees, 0, "the sells really paid a fee in AMPS");
 
-        uint256 sellFeeBps = hook.sellFeeBps();
+        uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
-        uint256 creatorCut = ampsFees * creatorBps / sellFeeBps;
+        uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
         uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
         uint256 burnCut = (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
         uint256 relaid = ampsFees - creatorCut - stakerCut - burnCut;
@@ -283,7 +283,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice A one-transaction `stock -> AMPS -> stock` rotation pays the **buy** fee on both hops: hop 2's base
-    ///         is `buyFeeBps[hop2]`, not `sellFeeBps`, because the credit hop 1 created covers the whole sell.
+    ///         is `buyFeeBps[hop2]`, not `ampsFeeBps`, because the credit hop 1 created covers the whole sell.
     function test_rotationCredit_stockToAmpsToStockPaysBuyPlusBuy() public {
         deepenSpokes(600e18);
         seedSpokeBids(1);
@@ -298,7 +298,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
     function test_rotationCredit_buyThenLargerSellPaysSellOnTheExcessOnly() public {
         (uint16 baseBlended, uint256 creditUsed, uint256 amountIn) = this.buyThenLargerSellEntry();
         uint16 buyFee = registry.poolConfig(hubPool).buyFeeBps;
-        uint16 sellFee = hook.sellFeeBps();
+        uint16 sellFee = hook.ampsFeeBps();
 
         uint256 expected =
             uint256(buyFee) + (uint256(sellFee - buyFee) * (amountIn - creditUsed) + amountIn - 1) / amountIn;
@@ -307,13 +307,13 @@ contract Phase3FlywheelTest is Phase3Fixture {
         assertLt(baseBlended, sellFee, "and strictly below the sell fee");
     }
 
-    /// @notice An exact-**output** sell consumes no credit and pays `sellFeeBps` in full, even with a credit
+    /// @notice An exact-**output** sell consumes no credit and pays `ampsFeeBps` in full, even with a credit
     ///         sitting in the same transaction.
     function test_rotationCredit_exactOutputSellPaysTheFullSellFee() public {
         (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) = this.exactOutputSellEntry();
         assertGt(creditBefore, 0, "there was a credit to spend");
         assertEq(creditAfter, creditBefore, "an exact-output sell spends none of it");
-        assertEq(baseBps, hook.sellFeeBps(), "and pays the sell fee in full");
+        assertEq(baseBps, hook.ampsFeeBps(), "and pays the sell fee in full");
     }
 
     /// @notice I26's structural half: the credit is transient, so a buy in one transaction leaves nothing behind
@@ -322,7 +322,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
         buyAmps(hubPool, ALICE, 1e6);
         assertEq(hook.rotationCredit(address(swapRouter)), 0, "the credit is zero at every transaction boundary");
         (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18);
-        assertEq(baseBps, hook.sellFeeBps(), "so the next transaction's sell pays the sell fee in full");
+        assertEq(baseBps, hook.ampsFeeBps(), "so the next transaction's sell pays the sell fee in full");
     }
 
     /// @notice A 1-wei buy unlocks 1 wei of credit and not a basis point more: the blend is computed on the
@@ -330,7 +330,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
     function test_rotationCredit_oneWeiBuyUnlocksOneWei() public {
         (uint256 credit, uint16 baseBps) = this.dustBuyEntry();
         assertLe(credit, 2, "a 1-wei buy yields at most a wei or two of AMPS");
-        assertEq(baseBps, hook.sellFeeBps(), "and a 1 AMPS sell still pays the full sell fee");
+        assertEq(baseBps, hook.ampsFeeBps(), "and a 1 AMPS sell still pays the full sell fee");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -402,29 +402,29 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // Fee band, quoter, and `afterSwap`
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice I16's hard half: `sellFeeBps` is enforced in-contract inside `[100, 600]`, by the hook itself.
+    /// @notice I16's hard half: `ampsFeeBps` is enforced in-contract inside `[100, 600]`, by the hook itself.
     function test_i16_sellFeeBandIsEnforcedInContract() public {
-        assertEq(hook.SELL_FEE_BPS_MIN(), 100, "the floor is a hundred basis points");
-        assertEq(hook.SELL_FEE_BPS_MAX(), 600, "and the ceiling six hundred");
+        assertEq(hook.AMPS_FEE_BPS_MIN(), 100, "the floor is a hundred basis points");
+        assertEq(hook.AMPS_FEE_BPS_MAX(), 600, "and the ceiling six hundred");
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(99), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(99), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(99);
+        hook.setAmpsFeeBps(99);
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(601), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(601), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(601);
+        hook.setAmpsFeeBps(601);
 
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(600);
-        assertEq(hook.sellFeeBps(), 600, "the ceiling itself is accepted");
+        hook.setAmpsFeeBps(600);
+        assertEq(hook.ampsFeeBps(), 600, "the ceiling itself is accepted");
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(100);
-        assertEq(hook.sellFeeBps(), 100, "and so is the floor");
+        hook.setAmpsFeeBps(100);
+        assertEq(hook.ampsFeeBps(), 100, "and so is the floor");
     }
 
     /// @notice `AmpsQuoter.quotePool` reports exactly the fee the pool then charges, on both directions, in every
@@ -544,7 +544,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
         vm.recordLogs();
         sellAmps(hubPool, ALICE, sellIn);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        assertGe(uint256(lastSwapFee(logs)) / 100, uint256(hook.sellFeeBps()), "the sell paid at least the sell fee");
+        assertGe(uint256(lastSwapFee(logs)) / 100, uint256(hook.ampsFeeBps()), "the sell paid at least the sell fee");
 
         // 7. Redeem pro-rata and get exactly `(1 - redeemFeeBps) * shares / T` of every non-AMPS balance.
         uint256 redeemShares = amps.balanceOf(ALICE);

@@ -251,7 +251,7 @@ contract HubPumpTest is Phase3Fixture {
                 assertEq(uint256(buyPips), uint256(buyBase + buyDyn) * Constants.PIPS_PER_BPS, "buy fee decomposes");
                 assertEq(uint256(sellPips), uint256(sellBase + sellDyn) * Constants.PIPS_PER_BPS, "sell decomposes");
                 assertEq(uint256(buyBase), uint256(registry.poolConfig(ids[i]).buyFeeBps), "buy base is the buy fee");
-                assertEq(uint256(sellBase), uint256(hook.sellFeeBps()), "sell base is the sell fee");
+                assertEq(uint256(sellBase), uint256(hook.ampsFeeBps()), "sell base is the sell fee");
                 assertLe(uint256(buyBase + buyDyn), uint256(hook.TOTAL_FEE_BPS_MAX()), "and both stay under the cap");
                 assertLe(uint256(sellBase + sellDyn), uint256(hook.TOTAL_FEE_BPS_MAX()), "on both sides");
 

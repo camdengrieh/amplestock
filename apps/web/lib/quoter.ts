@@ -74,7 +74,7 @@ export interface PoolQuote {
   innerBandTicks: number
   outerRailTicks: number
   buyFeeBps: number
-  sellFeeBps: number
+  ampsFeeBps: number
   buyFeePips: number
   sellFeePips: number
   dynBps: number

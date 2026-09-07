@@ -140,7 +140,7 @@ test('every start value sits inside its hard band', () => {
   const inBand = (v: number, b: {min: number; max: number}, what: string): void => {
     assert.ok(v >= b.min && v <= b.max, `${what}: ${v} outside [${b.min}, ${b.max}]`)
   }
-  inBand(p.fees.sellFeeBps, p.fees.sellFeeBpsBand, 'sellFeeBps')
+  inBand(p.fees.ampsFeeBps, p.fees.ampsFeeBpsBand, 'ampsFeeBps')
   inBand(p.fees.buyFeeBpsEntry, p.fees.buyFeeBpsEntryBand, 'buyFeeBpsEntry')
   inBand(p.fees.buyFeeBpsSpoke, p.fees.buyFeeBpsSpokeBand, 'buyFeeBpsSpoke')
   inBand(p.fees.buyFeeBpsSpokeHighVol, p.fees.buyFeeBpsSpokeBand, 'buyFeeBpsSpokeHighVol')

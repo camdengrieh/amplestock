@@ -32,7 +32,7 @@ contract FeePolicyFuzzTest is Test {
         bool deviationIncreasing;
         uint256 amountIn;
         uint256 rotationCredit;
-        uint16 sellFeeBps;
+        uint16 ampsFeeBps;
         uint16 buyFeeBps;
         int24 devTicks;
         int24 band;
@@ -135,7 +135,7 @@ contract FeePolicyFuzzTest is Test {
     /// @dev The blended base always lies between the two fees it blends, and the credit consumed is exactly
     ///      `min(amountIn, rotationCredit)` on an exact-input sell and nothing anywhere else (I26).
     function testFuzz_theRotationBlendIsBoundedAndAccountsExactly(Swap memory swap) public view {
-        swap.sellFeeBps = uint16(bound(swap.sellFeeBps, Constants.SELL_FEE_BPS_MIN, Constants.SELL_FEE_BPS_MAX));
+        swap.ampsFeeBps = uint16(bound(swap.ampsFeeBps, Constants.AMPS_FEE_BPS_MIN, Constants.AMPS_FEE_BPS_MAX));
         swap.buyFeeBps = uint16(bound(swap.buyFeeBps, 1, 100));
         IFeePolicy.FeeInput memory input = _input(swap);
         input.dynCapBps = Constants.DYN_CAP_NORMAL_BPS;
@@ -146,10 +146,10 @@ contract FeePolicyFuzzTest is Test {
             uint256 expected = input.rotationCredit < input.amountIn ? input.rotationCredit : input.amountIn;
             assertEq(quote.creditConsumed, expected, "credit consumed is min(amountIn, rotationCredit)");
             assertGe(quote.baseBps, input.buyFeeBps, "the blend never falls below the buy fee");
-            assertLe(quote.baseBps, input.sellFeeBps, "and never rises above the sell fee");
+            assertLe(quote.baseBps, input.ampsFeeBps, "and never rises above the sell fee");
         } else {
             assertEq(quote.creditConsumed, 0, "only exact-input sells consume credit");
-            assertEq(quote.baseBps, input.zeroForOne ? input.sellFeeBps : input.buyFeeBps, "an unblended base");
+            assertEq(quote.baseBps, input.zeroForOne ? input.ampsFeeBps : input.buyFeeBps, "an unblended base");
         }
     }
 
@@ -332,7 +332,7 @@ contract FeePolicyFuzzTest is Test {
             amountIn: 0,
             rotationCredit: 0,
             poolClass: PoolClass.SPOKE,
-            sellFeeBps: 500,
+            ampsFeeBps: 500,
             buyFeeBps: 5,
             devTicks: 0,
             innerBandTicks: Constants.INNER_BAND_REGULAR_TICKS,
@@ -357,7 +357,7 @@ contract FeePolicyFuzzTest is Test {
         input.deviationIncreasing = swap.deviationIncreasing;
         input.amountIn = bound(swap.amountIn, 0, type(uint128).max);
         input.rotationCredit = bound(swap.rotationCredit, 0, type(uint128).max);
-        input.sellFeeBps = swap.sellFeeBps;
+        input.ampsFeeBps = swap.ampsFeeBps;
         input.buyFeeBps = swap.buyFeeBps;
         input.devTicks = int24(bound(int256(swap.devTicks), 0, MAX_DEV));
         input.innerBandTicks = int24(bound(int256(swap.band), 0, Constants.INNER_BAND_MAX_TICKS));

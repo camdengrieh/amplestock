@@ -38,7 +38,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///
 ///      | bit | source | what is zeroed when it is set |
 ///      |-----|--------|-------------------------------|
-///      | 0   | `AmpsHook` | `fairTick`, bands, `buyFeeBps`/`sellFeeBps`, both fee legs, `refuseBuy`/`refuseSell` |
+///      | 0   | `AmpsHook` | `fairTick`, bands, `buyFeeBps`/`ampsFeeBps`, both fee legs, `refuseBuy`/`refuseSell` |
 ///      | 1   | `OracleGate` | `gateState`, `session`, `feedStale`, `corporateFreeze` |
 ///      | 2   | `FeedRegistry` | the counter-asset answer behind `pMktX18` |
 ///      | 3   | vault checkpoint | `navPerShareX18`, `pRefX18`, `premiumX18`, `checkpointAge` |
@@ -51,7 +51,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      unaffected by the addition. `degraded != 0` still means "do not trade on this field".
 ///
 /// @dev **What is exact and what is not.** The fee arithmetic is exact: it is the hook's own `quoteFee` plus, for
-///      hop 2 of a rotation, the same `ceilDiv` blend on the same `sellFeeBps - buyFeeBps` delta, so a rotation
+///      hop 2 of a rotation, the same `ceilDiv` blend on the same `ampsFeeBps - buyFeeBps` delta, so a rotation
 ///      quote matches the fee the hook will actually charge rather than approximating it. The `amountOut` of
 ///      {quoteExactIn} and {quoteRotation} is a full tick walk over the PoolManager's published state and matches a
 ///      real swap to the wei, up to two documented limits: it is bounded at {MAX_SWAP_STEPS} tick words, and it is
@@ -61,7 +61,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      transient storage keyed by the swap's `sender`, and is therefore zero in every fresh `eth_call` and zero
 ///      for this contract at any time; consulting it would understate hop 2's credit by exactly the amount that
 ///      matters. {quoteRotation} models the credit the caller's own hop 1 will create, and
-///      takes the sell base from `IAmpsHook.sellFeeBps()` rather than from `quoteFee`'s `baseBps`, so a quoter
+///      takes the sell base from `IAmpsHook.ampsFeeBps()` rather than from `quoteFee`'s `baseBps`, so a quoter
 ///      called from inside a transaction that already holds a credit cannot double-count it.
 contract AmpsQuoter is IAmpsQuoter {
     // -------------------------------------------------------------------------------------------------------------
@@ -330,7 +330,7 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @inheritdoc IAmpsQuoter
     /// @dev Hop 1 is a buy in `hop1` at `buyFeeBps[hop1]` plus its dynamic part; the AMPS it yields is both hop 2's
     ///      input and hop 2's credit, so the blend below always resolves to `buyFeeBps[hop2]` for a pure rotation
-    ///      and degrades continuously toward `sellFeeBps` as the caller sells more than it just bought. The general
+    ///      and degrades continuously toward `ampsFeeBps` as the caller sells more than it just bought. The general
     ///      case — selling more than the hop before it bought — is {quoteSellWithCredit}.
     /// @dev `amountOut` is **zero** whenever the route would not execute: either hop refused for beginning beyond
     ///      its outer rail, a pool unreadable, or a tick walk that did not finish. The fees are still reported in
@@ -365,7 +365,7 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @notice Prices an exact-input **sell** that carries a same-transaction rotation credit, which is the shape
     ///         the dApp builds whenever a user sells more AMPS than the hop before it bought.
     /// @dev The general case of hop 2 of {quoteRotation}: `credit >= ampsIn` reproduces a pure rotation and prices
-    ///      the whole sell at `buyFeeBps`, `credit == 0` prices it at `sellFeeBps`, and everything between is the
+    ///      the whole sell at `buyFeeBps`, `credit == 0` prices it at `ampsFeeBps`, and everything between is the
     ///      hook's `ceilDiv` blend on the uncredited excess. The credit is an argument rather than a read, because
     ///      the hook holds it in transient storage where an `eth_call` always sees zero.
     /// @param poolId The pool sold through.
@@ -576,7 +576,7 @@ contract AmpsQuoter is IAmpsQuoter {
         quote.buyFeePips = buyPips;
         quote.sellFeePips = sellPips;
         quote.buyFeeBps = buyBase;
-        quote.sellFeeBps = sellBase;
+        quote.ampsFeeBps = sellBase;
         quote.dynBps = buyDyn > sellDyn ? buyDyn : sellDyn;
         quote.refuseBuy = refuseBuy_;
         quote.refuseSell = refuseSell_;
@@ -727,7 +727,7 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @dev Hop 2 of a rotation, in the hook's own delta form:
     ///
     ///      ```
-    ///      base = buyFeeBps[hop2] + ceilDiv((sellFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
+    ///      base = buyFeeBps[hop2] + ceilDiv((ampsFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
     ///      fee  = clamp(base + dyn, F_MIN_BPS, base + dynCapBps)
     ///      ```
     ///
@@ -741,18 +741,18 @@ contract AmpsQuoter is IAmpsQuoter {
         view
         returns (uint24 feePips)
     {
-        (bool okSell, uint256 sellFeeBps) =
-            _uintReadChecked(_hook, abi.encodeWithSelector(IAmpsHook.sellFeeBps.selector));
+        (bool okSell, uint256 ampsFeeBps) =
+            _uintReadChecked(_hook, abi.encodeWithSelector(IAmpsHook.ampsFeeBps.selector));
         (bool okBuy, uint256 buyFeeBps) =
             _uintReadChecked(_hook, abi.encodeWithSelector(IAmpsHook.buyFeeBps.selector, poolId));
         if (!okSell || !okBuy) return 0;
-        sellFeeBps = uint16(sellFeeBps);
+        ampsFeeBps = uint16(ampsFeeBps);
         buyFeeBps = uint16(buyFeeBps);
 
-        uint256 base = sellFeeBps;
-        if (ampsIn != 0 && credit != 0 && sellFeeBps > buyFeeBps) {
+        uint256 base = ampsFeeBps;
+        if (ampsIn != 0 && credit != 0 && ampsFeeBps > buyFeeBps) {
             uint256 consumed = credit < ampsIn ? credit : ampsIn;
-            base = buyFeeBps + FullMath.mulDivRoundingUp(sellFeeBps - buyFeeBps, ampsIn - consumed, ampsIn);
+            base = buyFeeBps + FullMath.mulDivRoundingUp(ampsFeeBps - buyFeeBps, ampsIn - consumed, ampsIn);
         }
 
         uint256 total = base + dynBps;

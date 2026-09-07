@@ -234,7 +234,7 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     expect(Number(buy.feeBps)).toBe(Number(buy.baseFeeBps) + Number(buy.dynamicFeeBps))
     expect(BigInt(buy.feeAmps as string)).toBe(0n)
 
-    // The sell pays `sellFeeBps` = 500 as its base, in AMPS.
+    // The sell pays `ampsFeeBps` = 500 as its base, in AMPS.
     expect(sell.baseFeeBps).toBe(500)
     expect(BigInt(sell.feeAmps as string)).toBeGreaterThan(0n)
     expect(BigInt(sell.ampsAmount as string)).toBeGreaterThan(0n)

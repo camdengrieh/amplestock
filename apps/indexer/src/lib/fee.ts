@@ -11,10 +11,10 @@
  * **Base fee.**
  *
  * ```
- * base = sell ? sellFeeBps : poolConfig.buyFeeBps
+ * base = sell ? ampsFeeBps : poolConfig.buyFeeBps
  * ```
  *
- * with `sellFeeBps` a hook-wide parameter (`HookParameterChanged("sellFeeBps", 0, …)`) and
+ * with `ampsFeeBps` a hook-wide parameter (`HookParameterChanged("ampsFeeBps", 0, …)`) and
  * `buyFeeBps` per pool (set at registration, moved by `HookParameterChanged("buyFeeBps", poolId, …)`
  * or `ConstituentReconfigured(id, "buyFeeBps", …)`).
  *
@@ -23,7 +23,7 @@
  *
  * ```
  * c    = min(credit, amountIn)
- * base = buyFeeBps + ceil((sellFeeBps - buyFeeBps) * (amountIn - c) / amountIn)
+ * base = buyFeeBps + ceil((ampsFeeBps - buyFeeBps) * (amountIn - c) / amountIn)
  * ```
  *
  * The hook computes that itself and emits `RotationCreditConsumed(poolId, consumed, blendedFeeBps)`
@@ -48,8 +48,8 @@ export interface SwapFeeInput {
   amount1: bigint
   /** `Swap.fee`, in hundredths of a basis point. */
   feePips: number
-  /** The hook's `sellFeeBps` in force at this block. */
-  sellFeeBps: number
+  /** The hook's `ampsFeeBps` in force at this block. */
+  ampsFeeBps: number
   /** The pool's `buyFeeBps` in force at this block. */
   buyFeeBps: number
   /** From a `RotationCreditConsumed` in the same transaction, for this pool. */
@@ -86,15 +86,15 @@ export function isSell(amount0: bigint, amount1: bigint): boolean {
 
 /** The blend §1.4 applies when a rotation credit covers part of an exact-input sell. */
 export function blendedBaseBps(
-  sellFeeBps: number,
+  ampsFeeBps: number,
   buyFeeBps: number,
   amountIn: bigint,
   consumed: bigint,
 ): number {
-  if (amountIn === 0n || consumed === 0n) return sellFeeBps
-  if (sellFeeBps <= buyFeeBps) return buyFeeBps
+  if (amountIn === 0n || consumed === 0n) return ampsFeeBps
+  if (ampsFeeBps <= buyFeeBps) return buyFeeBps
   const c = consumed < amountIn ? consumed : amountIn
-  const spread = BigInt(sellFeeBps - buyFeeBps)
+  const spread = BigInt(ampsFeeBps - buyFeeBps)
   return buyFeeBps + Number(mulDivUp(spread, amountIn - c, amountIn))
 }
 
@@ -108,7 +108,7 @@ export function decodeSwapFee(input: SwapFeeInput): SwapFee {
   const baseFeeBps = credited
     ? input.credit!.blendedFeeBps
     : sell
-      ? input.sellFeeBps
+      ? input.ampsFeeBps
       : input.buyFeeBps
 
   const dynamicFeeBps = Math.max(0, feeBps - baseFeeBps)

@@ -327,7 +327,7 @@ export function measureWorkValueUsd18(
       const split = splitAmpsFees(
         ampsFees,
         snapshot.vault.creatorBps,
-        pool?.sellFeeBps ?? 500,
+        pool?.ampsFeeBps ?? 500,
         snapshot.vault.stakerBps,
         snapshot.vault.burnBps,
       )

@@ -437,8 +437,8 @@ export const launchParameters = {
   },
   fees: {
     /** Charged on every AMPS-in swap in all 32 pools unless covered by the rotation credit. */
-    sellFeeBps: 500,
-    sellFeeBpsBand: {min: 100, max: 600},
+    ampsFeeBps: 500,
+    ampsFeeBpsBand: {min: 100, max: 600},
     /** Buy fees: entry pools / spokes / high-sigma spokes. */
     buyFeeBpsEntry: 30,
     buyFeeBpsSpoke: 5,

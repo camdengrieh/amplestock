@@ -15,7 +15,7 @@ import {console} from "forge-std/console.sol";
 ///         The attacker buys AMPS in the hub to mark the price up, then sells the AMPS into a spoke's bid ladder
 ///         hoping the spoke will pay the *marked* price. It cannot: a bid is a v4 range position at the ticks it
 ///         was placed at, and nothing in the protocol re-prices or moves one upward (I29). The dump walks down
-///         those static bids, pays `sellFeeBps` the whole way, and hands the vault AMPS that the next `compound`
+///         those static bids, pays `ampsFeeBps` the whole way, and hands the vault AMPS that the next `compound`
 ///         burns (I33).
 contract HubPumpThenDumpTest is Phase3Fixture {
     address internal constant ATTACKER = address(0xA77ACC);

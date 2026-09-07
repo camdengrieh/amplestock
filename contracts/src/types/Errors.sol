@@ -77,7 +77,7 @@ error LengthMismatch();
 error IndexOutOfRange(uint256 index, uint256 length);
 
 /// @notice A governed parameter was set outside its hard band. Every setter in the protocol throws exactly this.
-/// @param parameter The parameter name, as a short string (`bytes32("sellFeeBps")`), so the revert is readable
+/// @param parameter The parameter name, as a short string (`bytes32("ampsFeeBps")`), so the revert is readable
 ///                  without an ABI and the governance drill can assert on which parameter failed.
 /// @param value The rejected value.
 /// @param min The inclusive lower bound from `Constants`.

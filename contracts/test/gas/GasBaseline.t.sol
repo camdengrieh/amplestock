@@ -109,7 +109,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         "recording + 20%, which is this project's CI contract. afterSwap <= 55,000 stands as an absolute ceiling "
         "and is asserted; ruling 3's 22,000 beforeSwap ceiling is superseded by the recording, because the "
         "decomposition is structural rather than codegen (200 / 1,000 / 5,000 / 20,000 optimizer runs are within "
-        "~300 gas of each other): three cold packed words 6,300, the hook's slot 0 (sellFeeBps + the policy "
+        "~300 gas of each other): three cold packed words 6,300, the hook's slot 0 (ampsFeeBps + the policy "
         "pointer) 2,100, the cold IFeePolicy account 2,600, the policy's own arithmetic ~2,300, the cold hook "
         "account 2,600, and ~9,000 of hook execution dominated by encoding the 20-field FeeInput. Section 1.7 had "
         "assumed two extra cold SLOADs and a 4,000-gas policy call; shrinking FeeInput is a Phase 4/6 tuning "
@@ -625,7 +625,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         hm.swapOneHopSell = this.oneHopSellEntryReal();
         assertEq(
             _swapFees(vm.getRecordedLogs())[0],
-            uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
             "a lone sell pays the full sell fee"
         );
 

@@ -220,7 +220,7 @@ export class ChainReader {
     topology: Topology,
     poolId: `0x${string}`,
     vault: VaultSnapshot,
-    sellFeeBps: number,
+    ampsFeeBps: number,
   ): Promise<PoolSnapshot | null> {
     const registry = {address: topology.registry, abi: poolRegistryAbi} as const
     const config = (await this.client.readContract({
@@ -296,7 +296,7 @@ export class ChainReader {
       corporateFreeze: gateSnapshot.corporateFreeze,
       pRefX18: vault.pRefX18,
       navPerShareX18: vault.navPerShareX18,
-      sellFeeBps,
+      ampsFeeBps,
     }
   }
 
@@ -353,7 +353,7 @@ export class ChainReader {
     const now = Number(block.timestamp)
 
     const gate = {address: topology.oracleGate, abi: oracleGateAbi} as const
-    const [vault, pot, globalState, freezeUntil, watchdog, sellFeeBps] = await Promise.all([
+    const [vault, pot, globalState, freezeUntil, watchdog, ampsFeeBps] = await Promise.all([
       this.vaultSnapshot(topology, now),
       this.potSnapshot(topology),
       topology.oracleGate === ZERO
@@ -365,14 +365,14 @@ export class ChainReader {
       topology.oracleGate === ZERO
         ? Promise.resolve([0, 0, false] as const)
         : (this.client.readContract({...gate, functionName: 'watchdog'}) as Promise<readonly [number, number, boolean]>),
-      this.client.readContract({address: topology.hook, abi: ampsHookAbi, functionName: 'sellFeeBps'}).catch(() => 500) as Promise<number>,
+      this.client.readContract({address: topology.hook, abi: ampsHookAbi, functionName: 'ampsFeeBps'}).catch(() => 500) as Promise<number>,
     ])
 
     const ids = await this.poolIds(topology)
     const pools = (
       await Promise.all(
         ids.map((poolId) =>
-          this.poolSnapshot(topology, poolId, vault, Number(sellFeeBps)).catch((error: unknown) => {
+          this.poolSnapshot(topology, poolId, vault, Number(ampsFeeBps)).catch((error: unknown) => {
             this.logger.warn('pool read failed', {poolId, error})
             return null
           }),

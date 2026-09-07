@@ -224,7 +224,7 @@ slot 4   address vault                                   reassigned only by migr
 | `BountyPot` | `pay` | vault | — |
 | `BountyPot` | `sweep`, every `set*` | timelock | 48 h |
 | `AmpsHook` | `resetHighWater`, `armSurge` | vault | — |
-| `AmpsHook` | `setSellFeeBps`, `setBuyFeeBps`, `setMaxTickMovePerBlock` / `setFeePolicy` | timelock | 48 h / 7 d |
+| `AmpsHook` | `setAmpsFeeBps`, `setBuyFeeBps`, `setMaxTickMovePerBlock` / `setFeePolicy` | timelock | 48 h / 7 d |
 
 The guardian's entire power is: cancel a timelock operation, freeze one constituent or the protocol (disable-only,
 expiring within 7 days), and trigger `emergencyMigrate` when the on-chain denylist predicate holds. It can move no

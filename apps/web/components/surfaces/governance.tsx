@@ -214,9 +214,9 @@ export function GovernanceSurface() {
       note: 'Share of AMPS-side fees streamed to xAMPS.',
     },
     {
-      name: 'sellFeeBps',
+      name: 'ampsFeeBps',
       format: formatBps,
-      band: launchParameters.fees.sellFeeBpsBand,
+      band: launchParameters.fees.ampsFeeBpsBand,
       delay: '48 h',
       note: 'Charged on every AMPS-in swap unless a rotation credit covers it. Read live from the hook per pool.',
     },

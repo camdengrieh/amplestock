@@ -1054,7 +1054,7 @@ describe('swaps', () => {
       'AmpsHook:HookParameterChanged',
       makeEvent({
         args: {
-          parameter: `0x${Buffer.from('sellFeeBps', 'utf8').toString('hex').padEnd(64, '0')}`,
+          parameter: `0x${Buffer.from('ampsFeeBps', 'utf8').toString('hex').padEnd(64, '0')}`,
           poolId: `0x${'00'.repeat(32)}`,
           previousValue: 500n,
           newValue: 300n,

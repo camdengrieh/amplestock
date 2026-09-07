@@ -415,7 +415,7 @@ contract AmpsQuoterTest is QuoterFixture {
         assertEq(quote.dynCapBps, Constants.DYN_CAP_NORMAL_BPS, "cap");
 
         assertEq(quote.buyFeeBps, BUY_FEE_BPS, "buy base");
-        assertEq(quote.sellFeeBps, SELL_FEE_BPS, "sell base");
+        assertEq(quote.ampsFeeBps, SELL_FEE_BPS, "sell base");
         assertEq(quote.buyFeePips, BUY_FEE_PIPS, "buy pips");
         assertEq(quote.sellFeePips, SELL_FEE_PIPS, "sell pips");
         assertEq(quote.dynBps, 0, "no dynamic part at rest");

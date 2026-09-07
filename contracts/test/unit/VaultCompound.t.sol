@@ -32,7 +32,7 @@ contract VaultCompoundTest is PlacementFixture {
 
     /// @notice The whole of §3.6 step 5, in order and to the wei:
     ///         ```
-    ///         creatorCut = ampsFees x min(creatorBps(t), sellFeeBps) / sellFeeBps
+    ///         creatorCut = ampsFees x min(creatorBps(t), ampsFeeBps) / ampsFeeBps
     ///         stakerCut  = (ampsFees - creatorCut) x stakerBps / BPS
     ///         burnCut    = (ampsFees - creatorCut - stakerCut) x burnBps / BPS
     ///         relaid     = ampsFees - creatorCut - stakerCut - burnCut
@@ -52,9 +52,9 @@ contract VaultCompoundTest is PlacementFixture {
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
         assertGt(ampsFees, 0, "the sell really paid a fee in AMPS");
 
-        uint256 sellFeeBps = hook.sellFeeBps();
+        uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
-        uint256 creatorCut = ampsFees * creatorBps / sellFeeBps;
+        uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
         uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
         uint256 burnCut = (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
         uint256 relaid = ampsFees - creatorCut - stakerCut - burnCut;
@@ -70,7 +70,7 @@ contract VaultCompoundTest is PlacementFixture {
         assertSweepClean("compound");
     }
 
-    /// @notice The creator slice is `1 / sellFeeBps` of the AMPS-side fees at genesis: one point of a five-point
+    /// @notice The creator slice is `1 / ampsFeeBps` of the AMPS-side fees at genesis: one point of a five-point
     ///         sell fee, exactly as Decision 13 describes it.
     function test_split_creatorIsOnePointOfTheSellFeeAtGenesis() public {
         _tradeForAmpsFees();
@@ -86,7 +86,7 @@ contract VaultCompoundTest is PlacementFixture {
 
         assertEq(
             amps.balanceOf(CREATOR) - creatorBefore,
-            ampsFees * creatorBps / hook.sellFeeBps(),
+            ampsFees * creatorBps / hook.ampsFeeBps(),
             "one point of five, less the schedule's first few minutes"
         );
     }
@@ -753,11 +753,11 @@ contract VaultCompoundTest is PlacementFixture {
     // §3.6 step 5 — the creator slice cannot be enlarged by cutting the sell fee
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice **The finding this closes.** `creatorCut = ampsFees x creatorBps / sellFeeBps` reads the collected
-    ///         fee as "`sellFeeBps` of what crossed the pool". `SELL_FEE_BPS_MIN` and `CREATOR_FEE_BPS` are both
-    ///         100, so an entirely in-band `setSellFeeBps(100)` made that ratio **one** and routed every wei of
+    /// @notice **The finding this closes.** `creatorCut = ampsFees x creatorBps / ampsFeeBps` reads the collected
+    ///         fee as "`ampsFeeBps` of what crossed the pool". `AMPS_FEE_BPS_MIN` and `CREATOR_FEE_BPS` are both
+    ///         100, so an entirely in-band `setAmpsFeeBps(100)` made that ratio **one** and routed every wei of
     ///         the AMPS-side fees to the creator — no staker stream, no burn, no re-ladder. Flooring the divisor
-    ///         at `SELL_FEE_BPS_DEFAULT` caps the slice at one fifth of the AMPS-side fees however low the live
+    ///         at `AMPS_FEE_BPS_DEFAULT` caps the slice at one fifth of the AMPS-side fees however low the live
     ///         fee goes.
     function test_theCreatorSliceIsCappedWhenTheSellFeeIsCutToItsFloor() public {
         _tradeForAmpsFees();
@@ -765,8 +765,8 @@ contract VaultCompoundTest is PlacementFixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         // The whole attack: cut the base fee to its floor immediately before the permissionless call.
-        hook.setSellFeeBps(Constants.SELL_FEE_BPS_MIN);
-        assertEq(uint256(hook.sellFeeBps()), uint256(Constants.CREATOR_FEE_BPS), "the ratio the bug turned into 1");
+        hook.setAmpsFeeBps(Constants.AMPS_FEE_BPS_MIN);
+        assertEq(uint256(hook.ampsFeeBps()), uint256(Constants.CREATOR_FEE_BPS), "the ratio the bug turned into 1");
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
         uint256 stakingBefore = amps.balanceOf(address(staking));
@@ -777,7 +777,7 @@ contract VaultCompoundTest is PlacementFixture {
         assertGt(ampsFees, 0, "there were fees to split");
 
         uint256 creatorPaid = amps.balanceOf(CREATOR) - creatorBefore;
-        assertLe(creatorPaid, ampsFees / 5, "never more than CREATOR_FEE_BPS / SELL_FEE_BPS_DEFAULT of the fees");
+        assertLe(creatorPaid, ampsFees / 5, "never more than CREATOR_FEE_BPS / AMPS_FEE_BPS_DEFAULT of the fees");
         assertGt(amps.balanceOf(address(staking)) - stakingBefore, 0, "the stakers were still paid");
         assertGt(burned, 0, "the burn still happened");
         assertGt(_lastCompoundRelaid(), 0, "and something was still re-laddered");
@@ -875,7 +875,7 @@ contract VaultCompoundTest is PlacementFixture {
 
     /// @dev The burn the fee split alone accounts for, so a test can tell it apart from a buyback.
     function _expectedBurnCut(uint256 ampsFees) private view returns (uint256) {
-        uint256 creatorCut = ampsFees * vault.creatorBpsAt(block.timestamp) / hook.sellFeeBps();
+        uint256 creatorCut = ampsFees * vault.creatorBpsAt(block.timestamp) / hook.ampsFeeBps();
         uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
         return (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
     }

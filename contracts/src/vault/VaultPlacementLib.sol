@@ -1039,31 +1039,31 @@ library VaultPlacementLib {
     ///      re-laddered. The creator slice is the only transfer of protocol-held AMPS to a non-pool address (I31)
     ///      and is zero for good from `genesis + CREATOR_DECAY_SECONDS`.
     ///
-    /// @dev **What the divisor is, and why it has a floor.** `creatorCut = ampsFees x creatorBps / sellFeeBps`
-    ///      reads the collected fee as "`sellFeeBps` of the AMPS that crossed the pool" and hands the creator the
+    /// @dev **What the divisor is, and why it has a floor.** `creatorCut = ampsFees x creatorBps / ampsFeeBps`
+    ///      reads the collected fee as "`ampsFeeBps` of the AMPS that crossed the pool" and hands the creator the
     ///      `creatorBps` points of it that are theirs. Neither half of that reading is exactly true, and the two
     ///      errors point in opposite directions:
     ///
-    ///        * The hook charges **base + dynamic**, so `ampsFees` was collected at more than `sellFeeBps` and the
+    ///        * The hook charges **base + dynamic**, so `ampsFees` was collected at more than `ampsFeeBps` and the
     ///          quotient over-states the creator's points. The over-statement is bounded by
-    ///          `(base + dynCap) / base` — 1.6x under GREEN at the launch base (`SELL_FEE_BPS_DEFAULT` 500 and
+    ///          `(base + dynCap) / base` — 1.6x under GREEN at the launch base (`AMPS_FEE_BPS_DEFAULT` 500 and
     ///          `DYN_CAP_NORMAL_BPS` 300), i.e. at most 160 bp of the AMPS-side fees at the genesis
     ///          `CREATOR_FEE_BPS` rather than 100 — and it decays to nothing with the schedule.
-    ///        * Governance may cut the base fee, and *that* is what the floor is for. `SELL_FEE_BPS_MIN` and
-    ///          `CREATOR_FEE_BPS` are both 100, so an entirely in-band `setSellFeeBps(100)` made the ratio
-    ///          `creatorBps / sellFeeBps` equal to one and routed **every wei** of the AMPS-side fees to the
+    ///        * Governance may cut the base fee, and *that* is what the floor is for. `AMPS_FEE_BPS_MIN` and
+    ///          `CREATOR_FEE_BPS` are both 100, so an entirely in-band `setAmpsFeeBps(100)` made the ratio
+    ///          `creatorBps / ampsFeeBps` equal to one and routed **every wei** of the AMPS-side fees to the
     ///          creator, leaving the stakers, the burn and the ladder nothing. Flooring the divisor at
-    ///          `SELL_FEE_BPS_DEFAULT` decouples the slice from the live fee entirely: a fee cut can never enlarge
-    ///          it past `CREATOR_FEE_BPS / SELL_FEE_BPS_DEFAULT` — one fifth of the AMPS-side fees — however low
+    ///          `AMPS_FEE_BPS_DEFAULT` decouples the slice from the live fee entirely: a fee cut can never enlarge
+    ///          it past `CREATOR_FEE_BPS / AMPS_FEE_BPS_DEFAULT` — one fifth of the AMPS-side fees — however low
     ///          the base goes, and a fee *rise* still shrinks it, which is the direction that costs no one.
     function _split(Ctx memory ctx, address amps, uint256 ampsFees) private returns (Split memory split) {
-        uint256 sellFeeBps = _sellFeeBps(ctx);
-        if (sellFeeBps < Constants.SELL_FEE_BPS_DEFAULT) sellFeeBps = Constants.SELL_FEE_BPS_DEFAULT;
+        uint256 ampsFeeBps = _ampsFeeBps(ctx);
+        if (ampsFeeBps < Constants.AMPS_FEE_BPS_DEFAULT) ampsFeeBps = Constants.AMPS_FEE_BPS_DEFAULT;
         uint256 creatorBps = _creatorBps(ctx);
-        if (creatorBps > sellFeeBps) creatorBps = sellFeeBps;
+        if (creatorBps > ampsFeeBps) creatorBps = ampsFeeBps;
 
         if (creatorBps != 0 && ctx.creator != address(0)) {
-            split.creatorPaid = FullMath.mulDiv(ampsFees, creatorBps, sellFeeBps);
+            split.creatorPaid = FullMath.mulDiv(ampsFees, creatorBps, ampsFeeBps);
             if (split.creatorPaid != 0) IERC20(amps).safeTransfer(ctx.creator, split.creatorPaid);
         }
 
@@ -1206,16 +1206,16 @@ library VaultPlacementLib {
 
     /// @dev The live sell fee, from the hook. The launch value stands in when the hook cannot answer, so the
     ///      creator's share of the fees is never divided by zero. {_split}, its only caller, floors it at
-    ///      `SELL_FEE_BPS_DEFAULT` before dividing — see there for why.
-    function _sellFeeBps(Ctx memory ctx) private view returns (uint256 bps) {
+    ///      `AMPS_FEE_BPS_DEFAULT` before dividing — see there for why.
+    function _ampsFeeBps(Ctx memory ctx) private view returns (uint256 bps) {
         if (ctx.marketReference != address(0)) {
-            try IAmpsHook(ctx.marketReference).sellFeeBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}() returns (
+            try IAmpsHook(ctx.marketReference).ampsFeeBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}() returns (
                 uint16 value
             ) {
                 if (value != 0) return value;
             } catch {}
         }
-        return Constants.SELL_FEE_BPS_DEFAULT;
+        return Constants.AMPS_FEE_BPS_DEFAULT;
     }
 
     /// @dev `creatorBps(t) = CREATOR_FEE_BPS x max(0, 1 - (t - genesis) / CREATOR_DECAY_SECONDS)`: the immutable

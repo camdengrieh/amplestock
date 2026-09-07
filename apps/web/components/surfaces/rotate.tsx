@@ -21,7 +21,7 @@ import {activeChainId} from '@/lib/chains'
 import {addressOf} from '@/lib/contracts'
 import {NOTES} from '@/lib/copy'
 import {explorerTxUrl, referenceBook} from '@/lib/deployment'
-import {blendedSellFeeBps, bpsToPips, pipsToPercent} from '@/lib/fees'
+import {blendedAmpsFeeBps, bpsToPips, pipsToPercent} from '@/lib/fees'
 import {formatAmount, parseAmount} from '@/lib/format'
 import {deadlineFromNow, encodeRotation, minOutFromSlippage, poolKeyFromQuote, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
 
@@ -50,11 +50,11 @@ export interface RotationComparison {
 export function compareRotation(params: {
   hop1BuyFeeBps: number
   hop2BuyFeeBps: number
-  sellFeeBps: number
+  ampsFeeBps: number
   ampsFromHop1: bigint
 }): RotationComparison {
-  const rotatedBase = blendedSellFeeBps({
-    sellFeeBps: params.sellFeeBps,
+  const rotatedBase = blendedAmpsFeeBps({
+    ampsFeeBps: params.ampsFeeBps,
     buyFeeBps: params.hop2BuyFeeBps,
     amountIn: params.ampsFromHop1,
     credit: params.ampsFromHop1,
@@ -62,11 +62,11 @@ export function compareRotation(params: {
   return {
     hop1FeePips: bpsToPips(params.hop1BuyFeeBps),
     rotatedHop2FeePips: bpsToPips(rotatedBase),
-    separateHop2FeePips: bpsToPips(params.sellFeeBps),
+    separateHop2FeePips: bpsToPips(params.ampsFeeBps),
     hop2BaseBpsRotated: rotatedBase,
-    hop2BaseBpsSeparate: params.sellFeeBps,
+    hop2BaseBpsSeparate: params.ampsFeeBps,
     creditUsed: params.ampsFromHop1,
-    savedPips: bpsToPips(params.sellFeeBps - rotatedBase),
+    savedPips: bpsToPips(params.ampsFeeBps - rotatedBase),
   }
 }
 
@@ -103,7 +103,7 @@ export function RotateSurface() {
     return compareRotation({
       hop1BuyFeeBps: from.quote.buyFeeBps,
       hop2BuyFeeBps: to.quote.buyFeeBps,
-      sellFeeBps: to.quote.sellFeeBps,
+      ampsFeeBps: to.quote.ampsFeeBps,
       ampsFromHop1: credit,
     })
   }, [from, to, rotation.rotation, amount])

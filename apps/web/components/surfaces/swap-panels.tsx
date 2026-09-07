@@ -126,7 +126,7 @@ export function SwapQuoteView({
           </FieldRow>
           <FieldRow label="Base fee" hint={blendedBaseBps !== undefined ? 'After the rotation-credit blend' : 'Before the dynamic component'}>
             <Value unavailable={!avail.fees}>
-              {avail.fees ? formatBps(blendedBaseBps ?? (side === 'buy' ? quote.buyFeeBps : quote.sellFeeBps)) : null}
+              {avail.fees ? formatBps(blendedBaseBps ?? (side === 'buy' ? quote.buyFeeBps : quote.ampsFeeBps)) : null}
             </Value>
           </FieldRow>
           <FieldRow label="Dynamic component" hint="Volatility, deviation, divergence, session and surge, capped by gate state">

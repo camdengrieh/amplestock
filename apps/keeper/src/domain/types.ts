@@ -112,7 +112,7 @@ export interface PoolSnapshot {
   readonly corporateFreeze: boolean
   readonly pRefX18: bigint
   readonly navPerShareX18: bigint
-  readonly sellFeeBps: number
+  readonly ampsFeeBps: number
 }
 
 /** What one constituent looks like: the rollout and bonded-deployment targets. */

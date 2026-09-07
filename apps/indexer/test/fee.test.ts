@@ -27,12 +27,12 @@ describe('direction', () => {
 })
 
 describe('base fee', () => {
-  it('charges sellFeeBps on an uncredited sell', () => {
+  it('charges ampsFeeBps on an uncredited sell', () => {
     const fee = decodeSwapFee({
       amount0: -100n * WAD,
       amount1: 95n * 10n ** 6n,
       feePips: 50_000, // 500 bp
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
     })
     expect(fee.sell).toBe(true)
@@ -46,7 +46,7 @@ describe('base fee', () => {
       amount0: 100n * WAD,
       amount1: -95n * 10n ** 6n,
       feePips: 3_000, // 30 bp
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
     })
     expect(fee.sell).toBe(false)
@@ -61,7 +61,7 @@ describe('base fee', () => {
       amount0: -100n * WAD,
       amount1: 95n * 10n ** 6n,
       feePips: 3_000,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
       credit: {consumed: 100n * WAD, blendedFeeBps: 30},
     })
@@ -76,7 +76,7 @@ describe('base fee', () => {
       amount0: 100n * WAD,
       amount1: -95n * 10n ** 6n,
       feePips: 3_000,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
       credit: {consumed: 10n * WAD, blendedFeeBps: 30},
     })
@@ -114,7 +114,7 @@ describe('dynamic component', () => {
       amount0: -100n * WAD,
       amount1: 95n * 10n ** 6n,
       feePips: 62_500, // 625 bp: 500 base + 125 dynamic
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
     })
     expect(fee.feeBps).toBe(625)
@@ -127,7 +127,7 @@ describe('dynamic component', () => {
       amount0: -100n * WAD,
       amount1: 95n * 10n ** 6n,
       feePips: 10_000, // 100 bp charged
-      sellFeeBps: 500, // stale base
+      ampsFeeBps: 500, // stale base
       buyFeeBps: 30,
     })
     expect(fee.dynamicFeeBps).toBe(0)
@@ -140,7 +140,7 @@ describe('fee amount', () => {
       amount0: -100n * WAD,
       amount1: 95n * 10n ** 6n,
       feePips: 50_000,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
     })
     // 100 AMPS x 5% = 5 AMPS.
@@ -153,7 +153,7 @@ describe('fee amount', () => {
       amount0: 100n * WAD,
       amount1: -1_000n * 10n ** 6n,
       feePips: 3_000,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       buyFeeBps: 30,
     })
     expect(fee.feeAmps).toBe(0n)

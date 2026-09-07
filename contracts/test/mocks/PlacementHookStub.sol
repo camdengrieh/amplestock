@@ -56,7 +56,7 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     address public immutable vault;
 
     /// @notice The live sell fee, in bps. `VaultPlacementLib` divides the creator's share by this.
-    uint16 public sellFeeBps = 500;
+    uint16 public ampsFeeBps = 500;
 
     /// @dev Per-pool state.
     mapping(PoolId => Obs) internal _obs;
@@ -210,8 +210,8 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     }
 
     /// @notice Sets the live sell fee the creator slice is measured against.
-    function setSellFeeBps(uint16 value) external {
-        sellFeeBps = value;
+    function setAmpsFeeBps(uint16 value) external {
+        ampsFeeBps = value;
     }
 
     /// @notice Sets a pool's buy fee, in bps.
@@ -302,7 +302,7 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     {
         Obs storage o = _obs[key.toId()];
         if (!o.observed) revert PoolNotInitializedHere();
-        uint24 pips = params.zeroForOne ? uint24(sellFeeBps) * 100 : uint24(o.buyFeeBps) * 100;
+        uint24 pips = params.zeroForOne ? uint24(ampsFeeBps) * 100 : uint24(o.buyFeeBps) * 100;
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, pips | LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 

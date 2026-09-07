@@ -38,7 +38,7 @@ Forbidden and CI-gated: `StateLibrary`, `TransientStateLibrary`, `Position.sol`,
 immutable  amps (Currency)   registry   timelock        poolManager (from BaseHook)
 storage    address vault    — set in the constructor; reassigned only by setVault (msg.sender == vault), the
                              migration handover (audit fix 12)
-slot 0     uint16 _sellFeeBps | address _feePolicy | uint16 _gateCacheSeconds
+slot 0     uint16 _ampsFeeBps | address _feePolicy | uint16 _gateCacheSeconds
 mapping(PoolId => uint256) _cfg    CONFIG word   — written at afterInitialize, then only by governance
 mapping(PoolId => uint256) _dyn    DYNAMIC word  — written by afterSwap
 mapping(PoolId => uint256) _arm    ARMED word    — written by afterSwap and by armSurge
@@ -104,20 +104,20 @@ There is no `beforeRemoveLiquidity` bit, so removals can never be blocked (I18).
    in". `exactInput = p.amountSpecified < 0`; `amountIn = exactInput ? uint256(-p.amountSpecified) : 0`.
 3. **Base fee and rotation credit.**
    ```
-   base = sell ? sellFeeBps : cfg.buyFeeBps
+   base = sell ? ampsFeeBps : cfg.buyFeeBps
    if (sell && exactInput && amountIn != 0) {
        slot = keccak256(abi.encode(ROTATION_CREDIT_SLOT, sender))
        credit = tload(slot);  c = credit < amountIn ? credit : amountIn
        if (c != 0) {
            tstore(slot, credit - c)
-           // sellFeeBps >= buyFeeBps always (bands [100,600] vs [1,100]), so the delta form cannot underflow
+           // ampsFeeBps >= buyFeeBps always (bands [100,600] vs [1,100]), so the delta form cannot underflow
            base = cfg.buyFeeBps
-                + FullMath.mulDivRoundingUp(sellFeeBps - cfg.buyFeeBps, amountIn - c, amountIn)
+                + FullMath.mulDivRoundingUp(ampsFeeBps - cfg.buyFeeBps, amountIn - c, amountIn)
        }
    }
    ```
    Rounded **up**, so a credit never rounds a fee down in the swapper's favour. Exact-output sells consume no
-   credit and pay `sellFeeBps` in full; the dApp always builds hop 2 as `SWAP_EXACT_IN`. Note that the naive
+   credit and pay `ampsFeeBps` in full; the dApp always builds hop 2 as `SWAP_EXACT_IN`. Note that the naive
    `(buy*c + sell*(in-c) + in-1)/in` used by `StubAmpsHook` overflows for `amountIn > 2^256/600`; `mulDivRoundingUp`
    carries the 512-bit intermediate and does not.
 4. **Deviation, measured pre-swap.** `dev = abs(dyn.lastTick - dyn.fairTick)`;
@@ -190,7 +190,7 @@ resetHighWater(poolId)             onlyVault  returns the mark it armed: _obs[po
                                               min(lastTruncatedTick, rawTick) — floored at the raw post-swap tick
                                               (re-audit finding 10, see §3.5)
 armSurge(poolId, bps, reason)      onlyVault  require(bps <= SURGE_MAX_BPS); writes _arm; forces a gate refresh
-setSellFeeBps / setBuyFeeBps / setMaxTickMovePerBlock  onlyTimelock 48 h, `_band`-checked against Constants
+setAmpsFeeBps / setBuyFeeBps / setMaxTickMovePerBlock  onlyTimelock 48 h, `_band`-checked against Constants
 setFeePolicy                                          onlyTimelock 7 d
 ```
 
@@ -448,7 +448,7 @@ Permissionless, paid from `BountyPot`.
 5. **AMPS-side split**, in order, on `ampsFees`:
    ```
    creatorBps(t) = CREATOR_FEE_BPS * max(0, 1 - (t - genesis)/CREATOR_DECAY_SECONDS)     100 bp -> 0 over 30 d
-   divisor       = max(sellFeeBps, SELL_FEE_BPS_DEFAULT)                                  -- a fee cut never enlarges the slice
+   divisor       = max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT)                                  -- a fee cut never enlarges the slice
    creatorCut    = ampsFees * min(creatorBps(t), divisor) / divisor                      -> transfer to `creator`
    stakerCut     = (ampsFees - creatorCut) * stakerBps / BPS                             -> AmpsStaking.notifyReward
    burnCut       = (ampsFees - creatorCut - stakerCut) * burnBps / BPS                   -> Amps.burn
@@ -645,7 +645,7 @@ struct PoolQuote {
     PoolId  poolId;    PoolClass poolClass;   address counter;
     uint256 pMktX18;   uint256 pRefX18;       uint256 navPerShareX18;  int256 premiumX18;
     int24   poolTick;  int24 fairTick;        int24 innerBandTicks;    int24 outerRailTicks;
-    uint16  buyFeeBps; uint16 sellFeeBps;     uint24 buyFeePips;       uint24 sellFeePips;
+    uint16  buyFeeBps; uint16 ampsFeeBps;     uint24 buyFeePips;       uint24 sellFeePips;
     uint16  dynBps;    uint16 dynCapBps;      bool   refuseSell;       bool refuseBuy;
     uint256 bondQX18;  uint16 bondDiscountBps;uint256 bondCapacityLeft;bool bondOpen;
     uint8   gateState; uint8 session;         bool   feedStale;        bool corporateFreeze;
@@ -664,7 +664,7 @@ and are `false` when bit0 is set — fail open for display, never for execution.
 **Rotation-credit-aware two-hop quote.** `quoteRotation(PoolId hop1, PoolId hop2, uint256 amountIn) -> (uint256
 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed)`: hop 1 is a buy in `hop1` paying
 `buyFeeBps[hop1]`; the AMPS it yields is the credit; hop 2 is an exact-input sell in `hop2` whose base is
-`buyFeeBps[hop2] + ceilDiv((sellFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)` — the same delta form as
+`buyFeeBps[hop2] + ceilDiv((ampsFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)` — the same delta form as
 the hook, so the quote is exact rather than approximate. `IAmpsHook.rotationCredit(sender)` is deliberately **not**
 consulted: it is transient, keyed by the swap `sender`, and always zero when read from a fresh transaction, so the quoter simulates the credit
 the caller's own hop 1 will create. `bondQ(marketId)` mirrors `AmpsBonds`' `min(qMarket, qFloor)` with the same
@@ -739,13 +739,13 @@ use **four**: `AMPS/USDG` as the hub, `AMPS/WETH`, one `SPOKE`, one `SPOKE_HIGH_
   **I18** no `BEFORE_REMOVE_LIQUIDITY` bit; a removal succeeds in every gate state.
 * **I15** `swapEverReverted` is set only by `RailBreached` on a deviation-increasing swap — never for a gate
   reason, never inside the rail. **I16** every fee decomposes as `base + dyn`, `base in {buyFee, blended,
-  sellFee}`, `sellFeeBps in [100, 600]`, `dyn <= dynCap_state`, total `<= MAX_LP_FEE`. **I19** band monotone in
+  sellFee}`, `ampsFeeBps in [100, 600]`, `dyn <= dynCap_state`, total `<= MAX_LP_FEE`. **I19** band monotone in
   closedness and untouched by the breaker.
 * **I26** `rotationCredit(sender) <= sum(AMPS received by that sender this tx)`, zero at every transaction boundary;
   one sender's buy never discounts another sender's sell (audit fix 17).
 * **I29** every bid traces to the seed, a filled ask cell at its own prices, or a bonded ladder; none placed above
   the tick or moved up. **I35** positions shrink only through redemption, rollout, the buyback burn, migration.
-* **I31** `creatorPaid <= ampsFees * creatorBps(t) / sellFeeBps` per compound, `creatorBps` monotone
+* **I31** `creatorPaid <= ampsFees * creatorBps(t) / ampsFeeBps` per compound, `creatorBps` monotone
   non-increasing and 0 after 30 days, and no other transfer of protocol AMPS to a non-pool address.
   **I32** `rolloutMoved` per rolling 24 h within budget, entry inventory never below `entryFloorBps`, no
   rolled-out ask below `P_ref`. **I33** AMPS in a high-water-crossed cell is burned at the next compound and never
@@ -1035,7 +1035,7 @@ Gas of the placement paths at the worst reachable state in the fixture: `place` 
 |---|---|
 | G | **Gas re-baselined against the real hook; ruling 3's 22,000 `beforeSwap` ceiling is superseded.** Measured cold, each in its own frame: `beforeSwap` buy 25,116 / credited sell 28,863, `afterSwap` 39,744 (59,308 with a gate refresh), one-hop buy 153,260, one-hop sell 145,325, two-hop rotation 244,359, buy-then-sell 224,037. The decomposition (three cold hook words + slot 0, a cold `IFeePolicy` account and its ~2.3k of maths, ~9k of hook execution dominated by encoding the 20-field `FeeInput`) is recorded in `gas/baseline.json`; §1.7 had assumed two extra SLOADs and a 4k policy call. The stub numbers were placeholders with no policy call, so the multi-swap budgets derived from them (stub + 20%) are replaced by the hook's own recordings + 20%; `afterSwap <= 55,000` stands. Shrinking `FeeInput` is a Phase 4/6 tuning item, not a gate. |
 | H | **`f_vol` recalibrated.** `AmpsHook` writes `FeeInput.varianceX18 = EWMA(d^2) x 1e18`, `d` the raw tick change of one swap, lambda 0.98 per swap. The field is now `uint128` (a `uint64` saturated at 18.45 ticks^2, which made the term structurally zero at `K_VOL_X18 = 5e15`); the hook keeps its packed 64-bit store but must scale it so the X18 value it hands the policy reaches the cap. With `K_VOL_X18 = 5e15`, `f_vol_bps = k x varianceX18 / 1e36` is 1 bp at a per-swap sigma of ~14 ticks and the 100 bp cap at ~141 ticks. Phase 0 recalibrates from the cadence sample. |
-| I | **Hook deviations accepted:** `gateAttemptedAt` in DYNAMIC's free bits [200..231] (rate-limits refresh attempts; `gateRefreshedAt` is the last *successful* refresh); `beforeSwap` reads four cold words (the three packed words plus slot 0 for `sellFeeBps` and the policy pointer); the corporate-action detector runs before the gate refresh and `caArmed` is cleared when the multiplier is stable, the oracle un-paused and no `effectiveAt` is inside the window (unreadable probes leave it up); `IAmpsHook.quoteFee`'s second argument is `zeroForOne` (true = sell); price-improving swaps skip `f_dev` only (the dividend-capture direction is deviation-decreasing by construction); `TOTAL_FEE_BPS_MAX` is a clamp, not a revert (I15 outranks an unreachable revert); `PoolNotRegistered(PoolId)` replaces §1.3's `UnknownPool`; `setGateCacheSeconds` is on the hook but not on `IAmpsHook`; every hot-path external read is a hand-decoded `staticcall` with clamped enums and ticks, because `try`/`catch` cannot survive a decode failure after a successful call. `src/hook/*` compiles under the same per-path IR/200-runs restriction as the vault and bonds (20,757 B; 28,014 B on the legacy pipeline). |
+| I | **Hook deviations accepted:** `gateAttemptedAt` in DYNAMIC's free bits [200..231] (rate-limits refresh attempts; `gateRefreshedAt` is the last *successful* refresh); `beforeSwap` reads four cold words (the three packed words plus slot 0 for `ampsFeeBps` and the policy pointer); the corporate-action detector runs before the gate refresh and `caArmed` is cleared when the multiplier is stable, the oracle un-paused and no `effectiveAt` is inside the window (unreadable probes leave it up); `IAmpsHook.quoteFee`'s second argument is `zeroForOne` (true = sell); price-improving swaps skip `f_dev` only (the dividend-capture direction is deviation-decreasing by construction); `TOTAL_FEE_BPS_MAX` is a clamp, not a revert (I15 outranks an unreachable revert); `PoolNotRegistered(PoolId)` replaces §1.3's `UnknownPool`; `setGateCacheSeconds` is on the hook but not on `IAmpsHook`; every hot-path external read is a hand-decoded `staticcall` with clamped enums and ticks, because `try`/`catch` cannot survive a decode failure after a successful call. `src/hook/*` compiles under the same per-path IR/200-runs restriction as the vault and bonds (20,757 B; 28,014 B on the legacy pipeline). |
 | J | **`PoolRegistry.PoolOpened` emits the price the pool actually opened at**, read back from the PoolManager through `PoolStateLib` after `initializePool`, because the vault snaps the requested price down to the grid origin (ruling C) and an event that disagreed with `slot0` by up to one spacing would mislead the indexer. |
 | K | **Cached-versus-effective hook words.** `poolState()` words 13/14/15 are the cached band, rail and cap; when the cache is older than `GATE_CACHE_MAX_AGE` the effective values are the conservative substitutes (band 1,500, the class rail, the DEGRADED cap) that `innerBandTicks()`, `outerRailTicks()` and `quoteFee()` use. Readers wanting the charged fee use `quoteFee`. |
 
@@ -1089,7 +1089,7 @@ The twelve-agent `solidity-auditor` review of `89e451d` (`docs/audits/amplestock
 | AD | **Redemption pays a refusing token as a claim.** `_payOut` tries `take`; a token that refuses the transfer leaves the redeemer an ERC-6909 claim (`pm.transfer`) they take once the issuer relents, and an unmovable idle wei is simply not paid. The floor is therefore unblockable by any single issuer (finding 2); §7's "no reference to a gate or a price" still holds — the calls are into the tokens themselves, bounded and best-effort. |
 | AE | **The buyback burn selects only fully round-tripped cells** (`upperTick <= highWater && tick <= lowerTick`), straddled cells are left alone, and every ask placement resets the mark (§3.5; findings 4 and the stale-mark lead). Decision 16's "AMPS bought back is burned" now means "burned once the cell is pure AMPS again"; partially bought-back inventory re-sells on the way up. |
 | AF | **A zero-work `compound` is inert**: no surge, no mark reset, no cooldown (§3.6 step 8; finding 5). |
-| AG | **The creator divisor is floored at `SELL_FEE_BPS_DEFAULT`** so the slice is at most one fifth of AMPS-side fees whatever `sellFeeBps` is set to; the dynamic-fee over-statement (≤ 1.6x under GREEN) is accepted and documented rather than tracked per swap, which would cost an SSTORE on every sell (finding 6). |
+| AG | **The creator divisor is floored at `AMPS_FEE_BPS_DEFAULT`** so the slice is at most one fifth of AMPS-side fees whatever `ampsFeeBps` is set to; the dynamic-fee over-statement (≤ 1.6x under GREEN) is accepted and documented rather than tracked per swap, which would cost an SSTORE on every sell (finding 6). |
 | AH | **`checkpoint()`/`touch()` refuse before genesis** and `navPerShare` is 0 at zero supply, so the reference can never be written as `1e15` before the first pool opens (finding 7). |
 | AI | **`compound` re-ladders at the reference anchor** like every other ask placement (I32; finding 16). |
 | AJ | **`deployBonded` refuses a constituent that is not `ACTIVE`** (finding 10); `rollout` charges the window and pays the bounty on what was placed, leaving an unplaced remainder idle and reported by the `Rollout` event; `spokeHasDepth` is derived from the spoke's own bid records. |

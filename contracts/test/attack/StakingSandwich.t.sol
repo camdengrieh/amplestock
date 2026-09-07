@@ -68,7 +68,7 @@ contract StakingSandwichTest is Phase3Fixture {
 
         vm.prank(KEEPER);
         (uint256 ampsFees,) = vault.compound(hubPool);
-        uint256 stakerSlice = (ampsFees - ampsFees * vault.creatorBpsAt(block.timestamp) / hook.sellFeeBps())
+        uint256 stakerSlice = (ampsFees - ampsFees * vault.creatorBpsAt(block.timestamp) / hook.ampsFeeBps())
             * vault.stakerBps() / Constants.BPS;
 
         warpBy(1 hours);

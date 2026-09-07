@@ -152,7 +152,7 @@ ponder.on('AmpsHook:MultiplierStepDetected', async ({event, context}) => {
 })
 
 /**
- * `sellFeeBps` is hook-wide (`poolId == 0`); `buyFeeBps` is per pool. Both are the base fee the
+ * `ampsFeeBps` is hook-wide (`poolId == 0`); `buyFeeBps` is per pool. Both are the base fee the
  * swap decoder needs, so both are mirrored out of the parameter table into the place the decoder
  * reads: `indexerState` for the former, the `pool` row for the latter.
  */
@@ -167,8 +167,8 @@ ponder.on('AmpsHook:HookParameterChanged', async ({event, context}) => {
     poolId: scoped ? id : undefined,
   })
 
-  if (name === 'sellFeeBps') {
-    await setState(context.db, STATE.sellFeeBps, event.args.newValue, event.block.number)
+  if (name === 'ampsFeeBps') {
+    await setState(context.db, STATE.ampsFeeBps, event.args.newValue, event.block.number)
   } else if (name === 'buyFeeBps' && scoped) {
     const pool = await context.db.find(schema.pool, {id})
     if (pool !== null) {

@@ -97,7 +97,7 @@ contract HookStubFeePolicy {
         if (dyn > input.dynCapBps) dyn = input.dynCapBps;
 
         quote.dynBps = uint16(dyn);
-        quote.baseBps = input.zeroForOne ? input.sellFeeBps : input.buyFeeBps;
+        quote.baseBps = input.zeroForOne ? input.ampsFeeBps : input.buyFeeBps;
         quote.refuse = input.deviationIncreasing && input.devTicks > input.outerRailTicks;
         quote.feePips = uint24(uint256(quote.baseBps) + dyn) * Constants.PIPS_PER_BPS;
     }

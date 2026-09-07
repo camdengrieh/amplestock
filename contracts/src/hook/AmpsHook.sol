@@ -158,7 +158,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Slot 0, packed: the protocol-wide sell fee, the fee-policy pointer and the gate-cache interval.
-    uint16 private _sellFee;
+    uint16 private _ampsFee;
     address private _policy;
     uint32 private _gateCache;
 
@@ -242,7 +242,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
         vault = vault_;
         registry = registry_;
         timelock = timelock_;
-        _sellFee = Constants.SELL_FEE_BPS_DEFAULT;
+        _ampsFee = Constants.AMPS_FEE_BPS_DEFAULT;
         _gateCache = Constants.GATE_CACHE_SECONDS_DEFAULT;
     }
 
@@ -514,7 +514,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
         HookStateLib.Armed memory a,
         SwapCtx memory ctx
     ) private view returns (Quote memory q) {
-        uint16 sellFee = _sellFee;
+        uint16 sellFee = _ampsFee;
 
         // Step 3: the base fee, and the rotation blend on an exact-input sell.
         q.baseBps = ctx.sell ? sellFee : c.buyFeeBps;
@@ -574,7 +574,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
             amountIn: ctx.amountIn,
             rotationCredit: ctx.credit,
             poolClass: c.poolClass,
-            sellFeeBps: _sellFee,
+            ampsFeeBps: _ampsFee,
             buyFeeBps: c.buyFeeBps,
             devTicks: devTicks,
             innerBandTicks: e.bandTicks,
@@ -1235,8 +1235,8 @@ contract AmpsHook is BaseHook, IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function sellFeeBps() external view returns (uint16 value) {
-        value = _sellFee;
+    function ampsFeeBps() external view returns (uint16 value) {
+        value = _ampsFee;
     }
 
     /// @inheritdoc IAmpsHook
@@ -1245,13 +1245,13 @@ contract AmpsHook is BaseHook, IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function SELL_FEE_BPS_MIN() external pure returns (uint16 value) {
-        value = Constants.SELL_FEE_BPS_MIN;
+    function AMPS_FEE_BPS_MIN() external pure returns (uint16 value) {
+        value = Constants.AMPS_FEE_BPS_MIN;
     }
 
     /// @inheritdoc IAmpsHook
-    function SELL_FEE_BPS_MAX() external pure returns (uint16 value) {
-        value = Constants.SELL_FEE_BPS_MAX;
+    function AMPS_FEE_BPS_MAX() external pure returns (uint16 value) {
+        value = Constants.AMPS_FEE_BPS_MAX;
     }
 
     /// @inheritdoc IAmpsHook
@@ -1327,14 +1327,14 @@ contract AmpsHook is BaseHook, IAmpsHook {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc IAmpsHook
-    function setSellFeeBps(uint16 value) external {
+    function setAmpsFeeBps(uint16 value) external {
         _onlyTimelock();
-        if (value < Constants.SELL_FEE_BPS_MIN || value > Constants.SELL_FEE_BPS_MAX) {
-            revert OutOfBand("sellFeeBps", value, Constants.SELL_FEE_BPS_MIN, Constants.SELL_FEE_BPS_MAX);
+        if (value < Constants.AMPS_FEE_BPS_MIN || value > Constants.AMPS_FEE_BPS_MAX) {
+            revert OutOfBand("ampsFeeBps", value, Constants.AMPS_FEE_BPS_MIN, Constants.AMPS_FEE_BPS_MAX);
         }
-        uint16 previous = _sellFee;
-        _sellFee = value;
-        emit HookParameterChanged("sellFeeBps", PoolId.wrap(bytes32(0)), previous, value);
+        uint16 previous = _ampsFee;
+        _ampsFee = value;
+        emit HookParameterChanged("ampsFeeBps", PoolId.wrap(bytes32(0)), previous, value);
     }
 
     /// @inheritdoc IAmpsHook

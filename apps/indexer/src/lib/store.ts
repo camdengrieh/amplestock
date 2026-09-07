@@ -143,7 +143,7 @@ export async function getStateText(db: Db, key: string): Promise<string | undefi
 
 /** Keys used by more than one handler. */
 export const STATE = {
-  sellFeeBps: 'hook.sellFeeBps',
+  ampsFeeBps: 'hook.ampsFeeBps',
   navPerShareX18: 'vault.navPerShareX18',
   pRefX18: 'vault.pRefX18',
   pMktX18: 'vault.pMktX18',

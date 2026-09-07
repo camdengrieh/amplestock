@@ -473,7 +473,7 @@ Entry points restricted to the governance timelock (`onlyTimelock` / `_requireTi
 | BountyPot | `setChostUsd18()` | value ≤ 1000e18 | `chostUsd18` |
 | BountyPot | `setGasCapMultiple()` | value ∈ [1, 10] | `gasCapMultiple` |
 | BountyPot | `setDailyCeilingUsd18()` | value ≤ 100000e18 | `dailyCeilingUsd18` |
-| AmpsHook | `setSellFeeBps()` | value ∈ [100, 600] | `_sellFee` |
+| AmpsHook | `setAmpsFeeBps()` | value ∈ [100, 600] | `_ampsFee` |
 | AmpsHook | `setBuyFeeBps()` | poolId, value ∈ [5, 100] entry / [1, 50] spoke | `_cfg[poolId].buyFeeBps` |
 | AmpsHook | `setMaxTickMovePerBlock()` | poolId, value ∈ [10, 2000] | `_cfg[poolId].maxTickMovePerBlock` |
 | AmpsHook | `setFeePolicy()` | newPolicy (must have code) | `_policy` |

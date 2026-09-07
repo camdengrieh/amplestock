@@ -3,7 +3,7 @@ import {describe, expect, it} from 'vitest'
 
 import {
   applyFeePips,
-  blendedSellFeeBps,
+  blendedAmpsFeeBps,
   bpsOf,
   bpsToPips,
   clampTotalFeeBps,
@@ -35,22 +35,22 @@ describe('mulDivRoundingUp', () => {
   })
 })
 
-describe('blendedSellFeeBps — the rotation-credit blend', () => {
-  const sellFeeBps = 500
+describe('blendedAmpsFeeBps — the rotation-credit blend', () => {
+  const ampsFeeBps = 500
   const buyFeeBps = 5
 
   it('an uncredited sell pays the full sell fee', () => {
-    expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit: 0n})).toBe(500)
+    expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit: 0n})).toBe(500)
   })
 
   it('a fully credited sell pays the destination pool’s buy fee, not zero', () => {
-    expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit: WAD})).toBe(5)
-    expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit: 10n * WAD})).toBe(5)
+    expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit: WAD})).toBe(5)
+    expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit: 10n * WAD})).toBe(5)
   })
 
   it('a half-credited sell pays the exact delta form, rounded up', () => {
     // base = 5 + ceil((500 - 5) * (1e18 - 5e17) / 1e18) = 5 + ceil(247.5) = 5 + 248 = 253
-    expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit: WAD / 2n})).toBe(253)
+    expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit: WAD / 2n})).toBe(253)
   })
 
   it('rounds up so a credit never rounds the fee down in the swapper’s favour', () => {
@@ -58,7 +58,7 @@ describe('blendedSellFeeBps — the rotation-credit blend', () => {
     const amountIn = 7n
     const credit = 1n
     const exact = (495 * 6) / 7
-    const blended = blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn, credit})
+    const blended = blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn, credit})
     expect(blended).toBe(5 + Math.ceil(exact))
     expect(blended).toBeGreaterThan(5 + Math.floor(exact))
   })
@@ -66,7 +66,7 @@ describe('blendedSellFeeBps — the rotation-credit blend', () => {
   it('is monotone: more credit is never a higher fee', () => {
     let previous = 501
     for (let i = 0; i <= 10; i++) {
-      const fee = blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit: (WAD * BigInt(i)) / 10n})
+      const fee = blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit: (WAD * BigInt(i)) / 10n})
       expect(fee).toBeLessThanOrEqual(previous)
       previous = fee
     }
@@ -74,16 +74,16 @@ describe('blendedSellFeeBps — the rotation-credit blend', () => {
 
   it('never goes below the destination pool’s buy fee', () => {
     for (const credit of [0n, 1n, WAD / 3n, WAD, WAD * 2n]) {
-      expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: WAD, credit})).toBeGreaterThanOrEqual(buyFeeBps)
+      expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: WAD, credit})).toBeGreaterThanOrEqual(buyFeeBps)
     }
   })
 
   it('refuses the sellFee < buyFee case, which the hard bands make unreachable on chain', () => {
-    expect(() => blendedSellFeeBps({sellFeeBps: 5, buyFeeBps: 500, amountIn: WAD, credit: 0n})).toThrow()
+    expect(() => blendedAmpsFeeBps({ampsFeeBps: 5, buyFeeBps: 500, amountIn: WAD, credit: 0n})).toThrow()
   })
 
   it('treats a zero amount as an uncredited sell', () => {
-    expect(blendedSellFeeBps({sellFeeBps, buyFeeBps, amountIn: 0n, credit: WAD})).toBe(500)
+    expect(blendedAmpsFeeBps({ampsFeeBps, buyFeeBps, amountIn: 0n, credit: WAD})).toBe(500)
   })
 })
 
@@ -121,7 +121,7 @@ describe('rotationFeePips', () => {
     const result = rotationFeePips({
       hop1BuyFeeBps: 5,
       hop2BuyFeeBps: 5,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       ampsFromHop1: WAD,
       ampsIntoHop2: WAD,
     })
@@ -134,7 +134,7 @@ describe('rotationFeePips', () => {
     const result = rotationFeePips({
       hop1BuyFeeBps: 5,
       hop2BuyFeeBps: 5,
-      sellFeeBps: 500,
+      ampsFeeBps: 500,
       ampsFromHop1: 0n,
       ampsIntoHop2: WAD,
     })

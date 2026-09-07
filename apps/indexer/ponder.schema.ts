@@ -457,7 +457,7 @@ export const swap = onchainTable(
     /** The fee v4 actually charged, in hundredths of a bp, and the same number in bps. */
     feePips: t.integer().notNull(),
     feeBps: t.integer().notNull(),
-    /** `sellFeeBps` or the pool's `buyFeeBps`, blended when a rotation credit applied. */
+    /** `ampsFeeBps` or the pool's `buyFeeBps`, blended when a rotation credit applied. */
     baseFeeBps: t.integer().notNull(),
     /** `feeBps - baseFeeBps`, floored at zero: `f_vol + f_dev + f_div + f_session + surge`. */
     dynamicFeeBps: t.integer().notNull(),
@@ -1151,7 +1151,7 @@ export const pendingCredit = onchainTable('pending_credit', (t) => ({
 
 /**
  * Whatever a handler needs to remember across events without a natural home: the last
- * `NavCheckpoint` values, the last observed `sellFeeBps`, the reconciliation cursor.
+ * `NavCheckpoint` values, the last observed `ampsFeeBps`, the reconciliation cursor.
  */
 export const indexerState = onchainTable('indexer_state', (t) => ({
   id: t.text().primaryKey(),
