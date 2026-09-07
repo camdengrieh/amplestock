@@ -239,11 +239,17 @@ interface IPoolRegistry {
     ///      `k_w x (targetWeightBps - currentWeightBps) / targetWeightBps`, so a name the protocol is under-weight
     ///      in buys its collateral at a bigger discount than one it already holds enough of.
     ///
-    /// @dev **Phase 2 answers the target weight.** The realised weight is a function of the vault's valuation of
-    ///      each spoke's position, and Phase 2 ships `ZeroPositionValuer`, so there is no realised weight to
-    ///      report and every ratio would be `0/0`. Returning the target makes the deficit exactly zero — the
-    ///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued
-    ///      for the same collateral. Phase 3 sources it from the vault's valuation with no ABI change here.
+    /// @dev **The registry does not compute it; the vault does.** The realised weight is the value of that
+    ///      spoke's counter-side holdings — its position decomposed at the reference price, plus the idle and
+    ///      claim balances of the Stock Token — over `A`, and the asset enumeration, the reference price and the
+    ///      feed answers all live in `AmpsVault`. This view reads `IAmpsVault.spokeWeightBps` through a bounded
+    ///      `staticcall` and **falls back to the constituent's target weight** whenever the vault cannot answer:
+    ///      a revert, a short or out-of-range answer, or a caller that handed this view less gas than the walk
+    ///      needs. The target makes the deficit exactly zero — the protocol-favourable direction, since a smaller
+    ///      deficit means a smaller discount and less AMPS issued for the same collateral.
+    ///
+    /// @dev Phase 2 answered the target unconditionally, because it shipped `ZeroPositionValuer` and there was no
+    ///      position to value; with the Phase 3 valuer wired the deficit term is live.
     ///
     /// @dev **Callers must tolerate this reverting.** `AmpsBonds` reads it through a bounded `staticcall` and
     ///      treats any failure — a revert, an out-of-range answer, a registry that predates this function — as

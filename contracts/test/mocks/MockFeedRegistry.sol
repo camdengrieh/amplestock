@@ -31,6 +31,7 @@ contract MockFeedRegistry is IFeedRegistry {
         uint128 answerUsd8;
         uint32 updatedAt;
         bool fresh;
+        bool unconfirmed;
     }
 
     /// @notice When true, every read reverts.
@@ -67,7 +68,9 @@ contract MockFeedRegistry is IFeedRegistry {
     /// @param token The asset.
     /// @param answerUsd8 The answer, 8 decimals.
     function setAnswer(address token, uint128 answerUsd8) external {
-        _answers[token] = Answer({set: true, answerUsd8: answerUsd8, updatedAt: uint32(block.timestamp), fresh: true});
+        _answers[token] = Answer({
+            set: true, answerUsd8: answerUsd8, updatedAt: uint32(block.timestamp), fresh: true, unconfirmed: false
+        });
         _configs[token].set = true;
         _configs[token].decimals = 8;
         if (_configs[token].heartbeat == 0) _configs[token].heartbeat = Constants.ONE_DAY;
@@ -75,7 +78,8 @@ contract MockFeedRegistry is IFeedRegistry {
 
     /// @notice Sets every field of a token's answer, including a deliberately stale `updatedAt`.
     function setAnswerFull(address token, uint128 answerUsd8, uint32 updatedAt, bool fresh) external {
-        _answers[token] = Answer({set: true, answerUsd8: answerUsd8, updatedAt: updatedAt, fresh: fresh});
+        _answers[token] =
+            Answer({set: true, answerUsd8: answerUsd8, updatedAt: updatedAt, fresh: fresh, unconfirmed: false});
         _configs[token].set = true;
         _configs[token].decimals = 8;
         if (_configs[token].heartbeat == 0) _configs[token].heartbeat = Constants.ONE_DAY;
@@ -84,6 +88,14 @@ contract MockFeedRegistry is IFeedRegistry {
     /// @notice Marks a token's existing answer stale (or fresh) without changing it: the weekend case.
     function setFresh(address token, bool fresh) external {
         _answers[token].fresh = fresh;
+    }
+
+    /// @notice Marks a token's answer as held back: what the real registry reports while a >10% single-round move
+    ///         waits for its second confirmation, when {latestAnswer} is `min(heldLevel, candidate)`.
+    /// @dev The answer itself is left alone. What matters to the NAV path is the *flag*: the price it is using is
+    ///      deliberately below the market, so `A` and every NAV-denominated floor built on it are understated.
+    function setUnconfirmed(address token, bool unconfirmed) external {
+        _answers[token].unconfirmed = unconfirmed;
     }
 
     /// @notice Removes a token's answer entirely: `latestAnswer` then reports zero, the "no usable answer" case.
@@ -167,6 +179,7 @@ contract MockFeedRegistry is IFeedRegistry {
             : uint32(uint256(config.heartbeat) * _freshnessMultiplier[uint8(session_)] / 100);
         status.fresh = answer.answerUsd8 != 0 && answer.fresh;
         status.live = answer.set;
+        status.unconfirmed = answer.unconfirmed;
         return status;
     }
 

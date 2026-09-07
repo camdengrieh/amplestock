@@ -362,6 +362,29 @@ library Constants {
     ///         placement by burning gas: the call is capped and a failure is read as "unknown", not as a revert.
     uint256 internal constant STOCK_TOKEN_PROBE_GAS = 50_000;
 
+    /// @notice Gas forwarded to a bounded **state-changing** call into a pointer-upgradeable target — the market
+    ///         reference's `resetHighWater` and `armSurge`, which the placement path makes on every ladder.
+    ///
+    /// @dev Four times {STOCK_TOKEN_PROBE_GAS}, the same multiple `VaultRedeemLib` forwards to `PoolManager.sync`.
+    ///      The real work is one cold `SSTORE` plus a `slot0` read (~30k); the budget is generous enough that no
+    ///      honest implementation can run out of it and small enough that a hostile one cannot burn the caller's
+    ///      whole allowance, which is what makes "the call failed" a meaningful answer rather than an out-of-gas
+    ///      of the placement itself.
+    uint256 internal constant MARKET_REFERENCE_WRITE_GAS = 4 * STOCK_TOKEN_PROBE_GAS;
+
+    /// @notice Gas forwarded to a bounded read of a **composite** pointer target: the feed registry's
+    ///         `latestAnswer`, which probes an aggregator and up to two historical rounds behind budgets of its
+    ///         own, and the pool registry's `currentWeightBps`, which values a whole constituent.
+    ///
+    /// @dev **Deliberately generous, and the asymmetry is the point.** A failed read here is read as "no answer",
+    ///      and on the placement path "no answer" *skips* a guard — `VaultPlacementLib._requireConverged` returns
+    ///      without checking and `_referenceTick` falls back to the live tick — so a budget tight enough to fail
+    ///      on an honest registry would turn a liveness cap into a safety hole. 400,000 is more than an order of
+    ///      magnitude above the worst honest read (one `latestRoundData` staticcall is ~10k, and the stateless
+    ///      jump rule adds at most two more plus the session arithmetic) and still bounds a hostile one, which is
+    ///      all a cap on a governance-installed pointer is for.
+    uint256 internal constant COMPOSITE_READ_GAS = 400_000;
+
     /// @notice The largest `uiMultiplier()` step the hook treats as a dividend reinvestment rather than a corporate
     ///         action. 2%: above this the constituent is frozen instead of fee-captured.
     uint16 internal constant DIVIDEND_STEP_BPS_MAX = 200;
@@ -798,4 +821,18 @@ library Constants {
     ///      to the namespace every other vault slot is derived from. `test/unit/VaultPlacement.t.sol` pins both
     ///      the string and the value, exactly as `test/unit/RotationCredit.t.sol` does for the hook.
     bytes32 internal constant PLACEMENT_STAGE_SLOT = keccak256("amplestocks.vault.PLACEMENT_STAGE");
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Gas reserves on the ungated redemption path (audit fix wave 2, finding 1)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Gas `VaultRedeemLib.payout` holds back from the ERC-20 payout `unlock` so that the claims-only
+    ///         fallback unlock is always affordable.
+    /// @dev The redemption floor pays every asset either as an ERC-20 or as an ERC-6909 claim, and the second is
+    ///      unblockable: it moves balances inside the PoolManager and touches no token contract. That guarantee is
+    ///      only real if the fallback can still be *paid for* after the first attempt has failed, so the first
+    ///      `unlock` is given `gasleft() - REDEEM_PAYOUT_RESERVE_GAS` and never the whole frame. 700,000 is an
+    ///      `unlock` (~3k) plus one `transfer` of an ERC-6909 balance (~5k warm, ~25k cold) for every asset the
+    ///      protocol can register ({MAX_CONSTITUENTS} plus the two entry counters), with room to spare.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_GAS = 700_000;
 }

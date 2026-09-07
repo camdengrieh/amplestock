@@ -32,7 +32,11 @@ import {IMarketReference} from "./IMarketReference.sol";
 ///
 /// @dev **And it is keyed by the swap's `sender`**, not held in one transaction-global slot: see
 ///      {rotationCredit}. A rotation is one router call, so both hops report the same `sender` and the credit
-///      still blends; two parties settled in one transaction never share one.
+///      still blends. `sender` is the account that unlocked the PoolManager — the router or settlement contract,
+///      not the end user — so the credit is shared by everything one unlocker settles in one transaction, two
+///      unrelated parties included. That is an accepted design property and is written out in full under
+///      {rotationCredit}: what the key rules out is credit crossing *between* settlement paths in one
+///      transaction, not two counterparties inside one.
 interface IAmpsHook is IMarketReference {
     /// @notice Emitted by `afterSwap` when a pool's high-water tick advances.
     /// @param poolId The pool.
@@ -42,7 +46,8 @@ interface IAmpsHook is IMarketReference {
     /// @notice Emitted when the vault resets a pool's high-water mark at `compound()`.
     /// @param poolId The pool.
     /// @param previousHighWaterTick The mark that was consumed.
-    /// @param newHighWaterTick The mark it was reset to (the tick currently in force).
+    /// @param newHighWaterTick The mark it was reset to: `min(lastTruncatedTick, lastRawTick)`, so it is never
+    ///        left above where the pool actually is. See {resetHighWater}.
     event HighWaterReset(PoolId indexed poolId, int24 previousHighWaterTick, int24 newHighWaterTick);
 
     /// @notice Emitted when a surge fee is armed.
@@ -203,10 +208,21 @@ interface IAmpsHook is IMarketReference {
     /// @dev Reads EIP-1153 transient storage, so it is always zero when read from a fresh transaction — which is
     ///      exactly what makes it useless to an off-chain observer and safe to expose.
     /// @dev **The credit is per `sender`, not per transaction.** It is credited to, and spendable only by, the
-    ///      account the PoolManager reports as the swap's `sender` — the router that unlocked it. One
-    ///      transaction-global credit would let AMPS bought by one party discount an unrelated party's sell in the
-    ///      same transaction, so a filler settling someone else's buy alongside its own exit would pay the buy fee
-    ///      instead of the sell fee.
+    ///      account the PoolManager reports as the swap's `sender` — the router or settlement contract that
+    ///      unlocked it. One transaction-global credit would pool the credits of every settlement path in a
+    ///      transaction: two independent routers in one multicall, or two bundle-mates sharing a builder's
+    ///      transaction, would discount each other's sells, and a credit earned in the deep hub would discount a
+    ///      sell into a thin spoke. The `sender` key bounds a credit to the path that earned it.
+    ///
+    /// @dev **Two parties settled by one contract in one transaction do share a credit, and that is intended.**
+    ///      Because `sender` is the unlocker, a batching settlement contract that pairs one party's entry with
+    ///      another party's exit inside a single call blends them, and on the matched size the seller pays the buy
+    ///      fee rather than the 500 bp sell fee. That flow is rotation-equivalent: the AMPS leaving on the sell is
+    ///      AMPS that entered on the buy in the same transaction, no AMPS is sold out of the pool that was not
+    ///      bought into it in the same transaction, and the protocol collects two buy fees on the matched size —
+    ///      which is exactly what the credit is priced to charge for a rotation. It is a property of the design,
+    ///      not a bound the key promises to enforce; the bound it does enforce is that a credit earned under one
+    ///      unlocker can never discount a sell settled under a different one.
     /// @param sender The account whose credit to read; for a swap through a router, the router.
     /// @return credit The credit.
     function rotationCredit(address sender) external view returns (uint256 credit);
@@ -286,6 +302,11 @@ interface IAmpsHook is IMarketReference {
     /// @dev Called by `compound()` after the buyback burn has consumed the previous window. Vault-only because the
     ///      mark is what decides which AMPS is bought-back inventory: anyone able to reset it could hide a buyback
     ///      from the burn.
+    /// @dev The mark is re-armed at `min(lastTruncatedTick, lastRawTick)` and not at the truncated tick alone:
+    ///      the truncated tick is rate-limited and can sit thousands of ticks above the pool after a fast fall,
+    ///      and a mark left up there would cover the asks the same `compound` re-lays at the fallen price — which
+    ///      the next `compound` would then burn as inventory that was never sold. Flooring it can only lower the
+    ///      mark, so it never widens what the burn takes.
     /// @param poolId The pool.
     /// @return previousHighWaterTick The mark that was consumed.
     function resetHighWater(PoolId poolId) external returns (int24 previousHighWaterTick);

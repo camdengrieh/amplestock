@@ -15,7 +15,7 @@ import {IStockToken} from "../interfaces/IStockToken.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
 import {AlreadyInitialized} from "../types/Errors.sol";
-import {ConstituentConfig, GateSnapshot, GateState, PoolConfig} from "../types/Types.sol";
+import {ConstituentConfig, GateState, PoolConfig} from "../types/Types.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -45,6 +45,33 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 library VaultNavLib {
     using CurrencyLibrary for Currency;
 
+    // -------------------------------------------------------------------------------------------------------------
+    // Gas ceilings on the untrusted reads (audit fixes 18 and its wave-2 completion)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev Ceiling on each read of the oracle gate. It mirrors `AmpsVault.GATE_READ_GAS` and exists for the same
+    ///      reason: the cap is a griefing bound, not a budget. `OracleGate.snapshotByPool` makes several bounded
+    ///      probes of its own, so anything tight enough to be a budget would make an *honest* gate read as absent.
+    uint256 private constant GATE_READ_GAS = 1_500_000;
+
+    /// @dev Ceiling on each read of the feed registry (`latestAnswer`, `feedStatus`). The real registry walks a
+    ///      config, an accepted answer, a pending answer and a session, and every one of those is itself a bounded
+    ///      probe of an aggregator, so this is well above the honest cost and well below a block.
+    uint256 private constant FEED_READ_GAS = 400_000;
+
+    /// @dev Ceiling on each read of the market reference (`observationCoverage`, `twapTick`). Both walk the hook's
+    ///      observation ring, which is bounded by its own cardinality.
+    uint256 private constant MARKET_READ_GAS = 400_000;
+
+    /// @dev The number of static words a well-formed `GateSnapshot` returns. Thirteen value-typed fields, so the
+    ///      tuple is encoded in place with no offset and word `n` is field `n`.
+    uint256 private constant GATE_SNAPSHOT_WORDS = 13;
+
+    /// @dev The number of static words a well-formed `FeedStatus` returns: `answerUsd8`, `updatedAt`, `roundId`,
+    ///      `age`, `maxAgeSeconds`, `fresh`, `live`, `unconfirmed`, `configured`. `fresh` is word 5 and
+    ///      `unconfirmed` word 7, which is what {_feedHeldBack} reads.
+    uint256 private constant FEED_STATUS_WORDS = 9;
+
     /// @notice Everything the read side needs from the vault, gathered into one argument so the ABI of these
     ///         functions does not change when a pointer is added.
     /// @param poolManager The Uniswap v4 PoolManager: where the vault's ERC-6909 claims live.
@@ -73,16 +100,34 @@ library VaultNavLib {
     ///      outside the sum (I21) because the pot is a different account. A balance the protocol cannot price
     ///      reverts with {IFeedRegistry.FeedNotSet} rather than being silently valued at zero: the last checkpoint
     ///      then stands and every gated consumer refuses on `StaleCheckpoint`, which is the conservative failure.
+    ///
+    /// @dev **The idle leg is a bounded probe, not a `balanceOf`.** `_assets` is append-only, so a constituent
+    ///      whose `balanceOf` reverts or runs away with the gas — a paused beacon, a switched-off issuer view —
+    ///      would otherwise brick this function, and with it `checkpoint()`, every bond (`depositBonded`
+    ///      checkpoints first) and every placement, permanently and for every other asset too. An unreadable
+    ///      balance therefore contributes zero to `A`: the claim leg, which lives in the PoolManager and no token
+    ///      can interfere with, still counts, and understating `A` understates NAV, which is the direction that
+    ///      cannot mint AMPS too cheaply.
+    ///
+    /// @dev **`unconfirmed` is a NAV *quality* flag, not a price.** `FeedRegistry` reports `min(held, candidate)`
+    ///      with `unconfirmed = true` while a >10% single-round move waits for its second confirmation, and it
+    ///      marks an answer `!fresh` once it is past its session-scaled `maxAge`. Either way the price this sum
+    ///      uses is deliberately held below the market, so `A` — and therefore `navPerShareX18`, which is the
+    ///      denominator of `AmpsBonds._qFloorX18` — is understated, and a bond on *any other* collateral would
+    ///      mint below true NAV. The flag lets the vault record that and the bonds shell refuse to price on it;
+    ///      it is set when **any** asset that actually contributed to `A` was priced that way.
+    ///
     /// @param src The vault's pointers and the previous reference price.
     /// @param assets The vault's registered non-AMPS assets.
     /// @param holder The account whose balances are valued.
     /// @param withPositions Whether to add the position term. False when valuing an account that does not own the
     ///        vault's v4 positions, i.e. the standby inside `emergencyMigrate`.
     /// @return usd18 `A`, rounded down.
+    /// @return unconfirmed Whether any priced asset's answer was held back or stale.
     function totalAssetsUsd18(Sources memory src, address[] memory assets, address holder, bool withPositions)
         public
         view
-        returns (uint256 usd18)
+        returns (uint256 usd18, bool unconfirmed)
     {
         uint256 length = assets.length;
         for (uint256 i; i < length; ++i) {
@@ -90,7 +135,7 @@ library VaultNavLib {
             (uint8 decimals, PoolId poolId, bool hasPool) = assetMeta(src.registry, token);
 
             uint256 balance = IPoolManager(src.poolManager).balanceOf(holder, Currency.wrap(token).toId())
-                + IERC20(token).balanceOf(holder);
+                + _idleBalance(token, holder);
 
             if (withPositions && hasPool && src.positionValuer != address(0) && src.pRefPrevX18 != 0) {
                 uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, token, decimals);
@@ -104,9 +149,72 @@ library VaultNavLib {
 
             uint256 answerUsd8 = answer(src.feedRegistry, token);
             if (answerUsd8 == 0) revert IFeedRegistry.FeedNotSet(token);
+            if (_feedHeldBack(src.feedRegistry, token)) unconfirmed = true;
 
             usd18 += PriceLib.counterValueUsd18(balance, decimals, answerUsd8);
         }
+    }
+
+    /// @notice One spoke's realised share of the index, in bps of `A`.
+    ///
+    /// @dev This is what `PoolRegistry.currentWeightBps` answers with, and therefore the numerator of the bond
+    ///      discount's index-deficit term `k_w x (target - current) / target` and of the rollout schedule. Phase 2
+    ///      shipped the target weight as a stub, which made the deficit identically zero; with the Phase 3 valuer
+    ///      wired there is a real position to value, so the stub is gone.
+    ///
+    /// @dev **Counter side only.** A spoke pool is `AMPS/<stock>`, and the index weight is what the protocol holds
+    ///      *of the name* — the counter token — not the AMPS it laid beside it: AMPS is the share, and counting it
+    ///      would make every spoke's weight a function of the protocol's own inventory. The value is therefore the
+    ///      position's `amount1` at the reference sqrt price (I7's counterfactual, never `slot0`, so a swap cannot
+    ///      move a weight) plus the vault's idle and claim balances of that token.
+    ///
+    /// @dev **Zero when unpriceable**, never a revert and never a guess: no registry, no such constituent, no
+    ///      usable answer, nothing held, or an `A` of zero all read as zero, which prices `deficit == 0` — the
+    ///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued.
+    ///
+    /// @dev **The denominator is the last checkpoint's `A`, not a live walk.** Re-valuing every asset here would
+    ///      cost ~150k gas per valued pool (about 5M at 32 pools), far beyond any probe budget a consumer can
+    ///      afford, so the read would fail in production and silently fall back to the target weight while
+    ///      succeeding in small fixtures. Against the checkpointed `A` — `navPerShareX18 x (T + VIRTUAL_SHARES)`,
+    ///      which every placement, bond and `checkpoint()` refreshes — the read is one spoke's valuation plus a
+    ///      feed answer (~200k gas), the same cost everywhere.
+    ///
+    /// @param src The vault's pointers and the previous reference price.
+    /// @param checkpointAssetsUsd18 `A` as the vault last checkpointed it; zero reads as zero weight.
+    /// @param holder The vault.
+    /// @param constituentId The 1-based constituent id.
+    /// @return weightBps The realised weight, in bps, capped at `Constants.BPS`.
+    function spokeWeightBps(Sources memory src, uint256 checkpointAssetsUsd18, address holder, uint16 constituentId)
+        public
+        view
+        returns (uint16 weightBps)
+    {
+        if (checkpointAssetsUsd18 == 0) return 0;
+        if (src.registry == address(0) || constituentId == 0) return 0;
+
+        ConstituentConfig memory config = IPoolRegistry(src.registry).constituent(constituentId);
+        if (config.token == address(0)) return 0;
+
+        uint256 answerUsd8 = answer(src.feedRegistry, config.token);
+        if (answerUsd8 == 0) return 0;
+
+        uint256 balance = IPoolManager(src.poolManager).balanceOf(holder, Currency.wrap(config.token).toId())
+            + _idleBalance(config.token, holder);
+
+        if (src.positionValuer != address(0) && src.pRefPrevX18 != 0) {
+            uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, config.token, config.decimals);
+            if (sqrtPriceRefX96 != 0) {
+                (, uint256 amount1) = IPositionValuer(src.positionValuer)
+                    .valuePool(IPoolRegistry(src.registry).poolIdOf(constituentId), sqrtPriceRefX96);
+                balance += amount1;
+            }
+        }
+        if (balance == 0) return 0;
+
+        uint256 bps = FullMath.mulDiv(
+            PriceLib.counterValueUsd18(balance, config.decimals, answerUsd8), Constants.BPS, checkpointAssetsUsd18
+        );
+        return bps >= Constants.BPS ? uint16(Constants.BPS) : uint16(bps);
     }
 
     /// @notice Protocol-held AMPS: the idle balance, the ERC-6909 claim and the AMPS inside the vault's positions.
@@ -122,7 +230,7 @@ library VaultNavLib {
         view
         returns (uint256 amount)
     {
-        amount = IERC20(ampsToken).balanceOf(holder)
+        amount = _idleBalance(ampsToken, holder)
             + IPoolManager(src.poolManager).balanceOf(holder, Currency.wrap(ampsToken).toId());
         if (src.positionValuer == address(0) || src.pRefPrevX18 == 0) return amount;
 
@@ -163,19 +271,35 @@ library VaultNavLib {
     /// @param pMktX18 The market price just computed.
     /// @return overridden Whether `P_ref` must equal `navPerShareX18`.
     function referenceOverridden(Sources memory src, uint256 pMktX18) public view returns (bool overridden) {
-        // `code.length`, not `!= address(0)`: a `try` catches a callee that *reverts*, but a **codeless** pointer
-        // answers the call with success and zero bytes and the ABI decode of that empty buffer then reverts in
-        // this frame, where the `catch` cannot reach it. `AmpsVault.setPolicyPointer` refuses a codeless pointer,
-        // so this is the second lock on the same door — and it is the door `checkpoint()` walks through, which is
-        // permissionless and must not be brickable by a pointer.
-        if (src.oracleGate.code.length != 0 && src.registry != address(0)) {
-            try IOracleGate(src.oracleGate).snapshotByPool(IPoolRegistry(src.registry).hubPoolId()) returns (
-                GateSnapshot memory snap
-            ) {
-                if (snap.state == GateState.REF_DIVERGED || snap.state == GateState.WATCHDOG || snap.watchdogTripped) {
+        // A bounded, hand-decoded `staticcall`, for the reason {answer} gives at length: a typed `try` catches a
+        // callee that *reverts* and nothing else, and this is the read `checkpoint()` — permissionless, and the
+        // thing that keeps `P_ref` honest — walks through. A gate that answers short, answers with a `GateState`
+        // ordinal above the enum's maximum, or answers with a non-canonical bool would raise a `Panic` in this
+        // frame that no `catch` can reach.
+        if (src.registry != address(0)) {
+            (bool ok, bytes memory returndata) = src.oracleGate.staticcall{gas: GATE_READ_GAS}(
+                abi.encodeCall(IOracleGate.snapshotByPool, (IPoolRegistry(src.registry).hubPoolId()))
+            );
+            if (ok && returndata.length >= GATE_SNAPSHOT_WORDS * 32) {
+                uint256 state_;
+                uint256 tripped_;
+                assembly ("memory-safe") {
+                    let head := add(returndata, 0x20)
+                    state_ := mload(head) // 0: GateState
+                    tripped_ := mload(add(head, 0xa0)) // 5: watchdogTripped
+                }
+                // An ordinal outside the enum is "unknown", which is not evidence of divergence; any non-zero
+                // word is `true`, which is how a hand-decoded bool has to read.
+                bool known = state_ <= uint256(uint8(type(GateState).max));
+                if (
+                    tripped_ != 0
+                        || (known
+                            && (GateState(uint8(state_)) == GateState.REF_DIVERGED
+                                || GateState(uint8(state_)) == GateState.WATCHDOG))
+                ) {
                     return true;
                 }
-            } catch {}
+            }
         }
         if (pMktX18 == 0 || src.registry == address(0) || src.marketReference == address(0)) return false;
 
@@ -429,7 +553,45 @@ library VaultNavLib {
         uint256 idle = _firstWord(returndata);
         if (idle == 0) return false;
 
-        (moved,) = token.call(abi.encodeCall(IERC20.transfer, (to, idle)));
+        (moved,) = token.call{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(abi.encodeCall(IERC20.transfer, (to, idle)));
+    }
+
+    /// @dev The holder's idle ERC-20 balance of `token`, or zero when the token cannot be asked. A bounded
+    ///      `staticcall` with a hand-decoded answer, exactly like `VaultRedeemLib._probeBalance` and for the same
+    ///      reason: `_assets` is append-only, so one constituent whose `balanceOf` reverts or burns the gas it is
+    ///      handed would otherwise brick `A`, and with it the checkpoint, every bond and every placement, forever.
+    /// @param token The asset.
+    /// @param holder The account.
+    /// @return balance The balance, or zero when it cannot be read.
+    function _idleBalance(address token, address holder) private view returns (uint256 balance) {
+        (bool ok, bytes memory returndata) =
+            token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (holder)));
+        if (!ok || returndata.length < 32) return 0;
+        return _firstWord(returndata);
+    }
+
+    /// @dev Whether the answer `A` was priced at is one the registry is deliberately holding below the market:
+    ///      `!fresh` (past its session-scaled `maxAge`) or `unconfirmed` (a >10% single-round move reported as
+    ///      `min(held, candidate)` until its second confirmation). Both understate NAV, and NAV is the
+    ///      denominator of the bond floor, so both must reach `AmpsBonds` rather than being dropped here.
+    /// @dev A status that cannot be read reads as **held back**, not as confirmed. The read is the conservative
+    ///      one — it can only stop bonds pricing, never let one price too cheaply — and a registry that answers
+    ///      `latestAnswer` but not `feedStatus` is a pointer governance should replace, not a reason to issue.
+    /// @param feeds The feed registry.
+    /// @param token The asset.
+    /// @return heldBack Whether the answer is stale or unconfirmed.
+    function _feedHeldBack(address feeds, address token) private view returns (bool heldBack) {
+        (bool ok, bytes memory returndata) =
+            feeds.staticcall{gas: FEED_READ_GAS}(abi.encodeCall(IFeedRegistry.feedStatus, (token)));
+        if (!ok || returndata.length < FEED_STATUS_WORDS * 32) return true;
+        uint256 fresh;
+        uint256 unconfirmed;
+        assembly ("memory-safe") {
+            let head := add(returndata, 0x20)
+            fresh := mload(add(head, 0xa0)) // 5: fresh
+            unconfirmed := mload(add(head, 0xe0)) // 7: unconfirmed
+        }
+        return fresh == 0 || unconfirmed != 0;
     }
 
     /// @dev One gas-bounded low-level call whose failure is the caller's business rather than a revert.
@@ -441,20 +603,25 @@ library VaultNavLib {
     }
 
     /// @notice The last accepted answer for `token`, 8 decimals, or zero when none exists.
+    ///
     /// @dev Never reverts: a feed registry that reverts is indistinguishable, for valuation purposes, from one
     ///      with no answer, and the caller decides what to do about it.
+    ///
+    /// @dev **A bounded, hand-decoded `staticcall`, not a typed `try`.** Solidity decodes a *successful* call's
+    ///      returndata in the caller's frame, so `try IFeedRegistry(feeds).latestAnswer(token) returns (uint256,
+    ///      uint32, bool)` fails open only for a registry that reverts. It does not survive a codeless pointer
+    ///      (success, zero bytes, and the decode of that empty buffer reverts here), returndata shorter than the
+    ///      declared tuple, or a third word that is neither 0 nor 1 — each of which is a `Panic` no `catch` can
+    ///      reach, in the read `checkpoint()`, `depositBonded` and every placement depend on. Only the first word
+    ///      is needed, so only the first word is required and it is read as a word.
     /// @param feeds The feed registry.
     /// @param token The asset.
     /// @return answerUsd8 The answer, or zero.
     function answer(address feeds, address token) public view returns (uint256 answerUsd8) {
-        // A codeless pointer would answer with zero bytes and make the decode below revert here rather than in
-        // the `catch`; see {referenceOverridden} for the full note.
-        if (feeds.code.length == 0) return 0;
-        try IFeedRegistry(feeds).latestAnswer(token) returns (uint256 value, uint32, bool) {
-            return value;
-        } catch {
-            return 0;
-        }
+        (bool ok, bytes memory returndata) =
+            feeds.staticcall{gas: FEED_READ_GAS}(abi.encodeCall(IFeedRegistry.latestAnswer, (token)));
+        if (!ok || returndata.length < 32) return 0;
+        return _firstWord(returndata);
     }
 
     /// @notice Decimals and pool for one asset, from the registry, with a bounded ERC-20 `decimals()` fallback for
@@ -514,22 +681,23 @@ library VaultNavLib {
         view
         returns (uint256 price, bool usable)
     {
-        // Same reason as {referenceOverridden}: a codeless market reference is "no observation", not a revert.
-        if (src.marketReference.code.length == 0) return (0, false);
+        // Both reads are bounded hand-decoded `staticcall`s, for the reason {answer} gives: a codeless market
+        // reference answers with zero bytes, an `int24` that came back sign-extended out of range is a `Panic` on
+        // decode, and neither is catchable in this frame. A reference that cannot be read is "no observation",
+        // which degrades `P_ref` to the NAV anchor rather than bricking the permissionless checkpoint.
+        (bool ok, bytes memory returndata) = src.marketReference.staticcall{gas: MARKET_READ_GAS}(
+            abi.encodeCall(IMarketReference.observationCoverage, (poolId))
+        );
+        if (!ok || returndata.length < 32) return (0, false);
+        if (uint32(_firstWord(returndata)) < src.twapWindow) return (0, false);
 
-        try IMarketReference(src.marketReference).observationCoverage(poolId) returns (uint32 covered) {
-            if (covered < src.twapWindow) return (0, false);
-        } catch {
-            return (0, false);
-        }
-
-        int24 tick;
-        try IMarketReference(src.marketReference).twapTick(poolId, src.twapWindow) returns (int24 meanTick) {
-            tick = meanTick;
-        } catch {
-            return (0, false);
-        }
-        if (tick < TickMath.MIN_TICK || tick > TickMath.MAX_TICK) return (0, false);
+        (ok, returndata) = src.marketReference.staticcall{gas: MARKET_READ_GAS}(
+            abi.encodeCall(IMarketReference.twapTick, (poolId, src.twapWindow))
+        );
+        if (!ok || returndata.length < 32) return (0, false);
+        int256 tickWord = int256(_firstWord(returndata));
+        if (tickWord < TickMath.MIN_TICK || tickWord > TickMath.MAX_TICK) return (0, false);
+        int24 tick = int24(tickWord);
 
         uint256 answerUsd8 = answer(src.feedRegistry, counter);
         if (answerUsd8 == 0) return (0, false);

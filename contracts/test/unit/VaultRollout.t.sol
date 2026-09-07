@@ -10,6 +10,7 @@ import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {NotRegistry, RolloutLimitExceeded} from "../../src/types/Errors.sol";
 import {ConstituentStatus, PlacementRecord} from "../../src/types/Types.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Vm} from "forge-std/Vm.sol";
@@ -93,14 +94,16 @@ contract VaultRolloutTest is PlacementFixture {
         assertEq(usdg.balanceOf(KEEPER) - before, paidRaw, "exactly what the pot reported");
     }
 
-    /// @notice **The finding this closes.** `place(strictBudget = false)` may place less than rollout harvested —
-    ///         it merges into cells that already exist and leaves the rest idle rather than reverting (§12 ruling
-    ///         E). Charging the 24-hour window and paying the bounty on `moved` therefore billed the day's rollout
-    ///         allowance for inventory that never reached a spoke and paid a keeper for placing it, which turned a
-    ///         full live-cell budget into a way to burn the allowance for a bounty. Both are charged on `placed`;
-    ///         the gap is reported by `Rollout`, which carries both numbers, and the remainder stays as idle
-    ///         inventory that `A` still values.
-    function test_theWindowAndTheBountyAreChargedOnWhatWasPlacedNotOnWhatMoved() public {
+    /// @notice **The finding this closes** (second wave). `place(strictBudget = false)` may place less than
+    ///         rollout harvested — it merges into cells that already exist and leaves the rest idle rather than
+    ///         reverting (§12 ruling E) — and the first remediation charged the 24-hour window on `placed`.
+    ///         That was the wrong side of the trade: inventory leaves the entry pools on the **harvest**, whether
+    ///         or not the destination takes it, so with the live-cell budget saturated `placed` was zero, the
+    ///         window was never charged, and the same call could be repeated every sixty seconds — the entry
+    ///         pools emptied to `entryFloorBps` at a full daily allowance a minute. The window is charged on
+    ///         `moved`; the **bounty** stays on `placed`, because the work the keeper created is what reached the
+    ///         spoke; and the remainder goes back into the entry pools it came from in the same call.
+    function test_theWindowIsChargedOnWhatMovedAndTheBountyOnWhatWasPlaced() public {
         // A ladder wider than the cells the spoke already holds, and a full cell budget: the four cells the
         // genesis seed ask never opened cannot be opened now, so the destination takes only what it can merge and
         // the rest of the harvest stays idle.
@@ -125,10 +128,64 @@ contract VaultRolloutTest is PlacementFixture {
         assertGt(placedAmps, 0, "the ladder merged into the cells it had");
         assertLt(placedAmps, movedAmps, "but could not take all of it");
 
-        assertEq(_rolloutMoved24h(), placedAmps, "the window was charged what was placed, not what moved");
+        assertEq(_rolloutMoved24h(), movedAmps, "the window was charged what left the entry pools");
 
         (uint256 workValueUsd18,,,) = _bountyIn(logs);
-        assertEq(workValueUsd18, (placedAmps * pRefBefore) / 1e18, "and so was the bounty");
+        assertEq(workValueUsd18, (placedAmps * pRefBefore) / 1e18, "and the bounty only what reached the spoke");
+    }
+
+    /// @notice The other half of the same fix: what the destination could not take is put **back** into the entry
+    ///         pools' asks in the same call, at the same reference anchor, rather than left idle in the vault. The
+    ///         source pools' cooldowns are taken once, after that re-placement, which is what makes it reachable
+    ///         at all.
+    function test_theUnplacedRemainderGoesBackIntoTheEntryPools() public {
+        vm.prank(TIMELOCK);
+        vault.setLadderShape(
+            Constants.LADDER_TILT_X18_DEFAULT,
+            Constants.LADDER_DOUBLINGS_MAX,
+            Constants.SEED_HALVINGS_DEFAULT,
+            Constants.BOND_BID_HALVINGS_DEFAULT
+        );
+        forceLiveCells(Constants.MAX_LIVE_CELLS);
+
+        uint256 entryBefore = _entryAskInventory();
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        uint256 moved = vault.rollout(constituentIds[0]);
+        assertGt(moved, 0, "the entry pools gave up inventory");
+
+        (uint256 movedAmps, uint256 placedAmps) = _rolloutIn(vm.getRecordedLogs());
+        assertLt(placedAmps, movedAmps, "the destination could not take all of it");
+
+        // The whole point: the entry pools are not down by the gap. Whatever the spoke refused went back into
+        // cells the harvest had only partly emptied, so the drawdown is bounded by what actually reached the
+        // spoke plus the residue no cell could take.
+        assertGt(_entryAskInventory(), entryBefore - movedAmps, "the remainder did not stay idle");
+        assertEq(vault.lastPlacementAt(hubPool), uint32(block.timestamp), "the hub's cooldown was taken once");
+        assertSweepClean("rollout with a partial destination");
+    }
+
+    /// @notice And the property the finding is really about: **with the live-cell budget saturated, repeated
+    ///         `rollout` calls cannot move more than the daily allowance.** Under the old accounting each call
+    ///         charged `placed`, which was zero, so the window never advanced and the entry pools could be drained
+    ///         at one full allowance per `PLACEMENT_COOLDOWN_SECONDS`.
+    function test_i32_repeatedRolloutsAtASaturatedCellBudgetStayInsideTheDailyAllowance() public {
+        uint256 entryBefore = _entryAskInventory();
+        uint256 moved;
+
+        for (uint256 i; i < 12; ++i) {
+            // Re-saturate: the harvest closes source cells and hands the budget back, which is exactly what an
+            // attacker would rely on to keep the destination unable to open one.
+            forceLiveCells(Constants.MAX_LIVE_CELLS);
+            vm.prank(KEEPER);
+            moved += vault.rollout(constituentIds[i % SPOKES]);
+            warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+            syncMarket();
+        }
+
+        assertLe(moved, DAILY_BUDGET, "twelve minutes cannot spend more than one day's allowance");
+        assertGe(_entryAskInventory(), entryBefore - DAILY_BUDGET, "and the entry pools are inside the same bound");
+        assertGe(_entryAskInventory(), ENTRY_FLOOR, "never below the floor either");
     }
 
     /// @notice The move is in the log: `Rollout` names the destination and both the harvested and the placed
@@ -568,6 +625,58 @@ contract VaultRolloutTest is PlacementFixture {
         assertEq(placed, 0, "nothing could be placed with no cell to open");
         assertEq(vault.liveCells(), Constants.MAX_LIVE_CELLS, "and nothing was opened");
         assertGt(claimOf(address(stocks[0])), 0, "the collateral is still there, as a claim");
+    }
+
+    /// @notice **The finding this closes.** `place` wrote `cooldown[poolId]` unconditionally, and the two
+    ///         permissionless paths reach it with `strictBudget == false`: a `deployBonded` that could open no
+    ///         cell placed **nothing** and still dated the pool, so anyone could deny a real `compound` — or a
+    ///         governance `place` — on that pool for sixty seconds, once a minute, for a gas fee. The cooldown is
+    ///         a placement's, so a call that placed nothing does not take it.
+    function test_aDeployBondedThatPlacesNothingDoesNotTakeThePoolsCooldown() public {
+        bondDeposit(address(stocks[0]), 20e18);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        forceLiveCells(Constants.MAX_LIVE_CELLS);
+
+        uint32 dated = vault.lastPlacementAt(spokePools[0]);
+
+        vm.prank(KEEPER);
+        assertEq(vault.deployBonded(constituentIds[0]), 0, "nothing could be placed");
+        assertEq(vault.lastPlacementAt(spokePools[0]), dated, "so the pool was not dated");
+
+        // Same block, same pool: the placement that has something to do is not denied. (The counter is put back
+        // where the records say it is, so the governance path is refused by the budget rather than the cooldown.)
+        forceLiveCells(countLiveCells());
+        vm.prank(TIMELOCK);
+        assertGt(vault.place(spokePools[0], true, 1e18), 0, "the timelock still places");
+    }
+
+    /// @notice **The finding this closes.** `deployBonded` read the constituent's balance with a typed
+    ///         `IERC20.balanceOf`, so a Stock Token whose `balanceOf` reverts bricked the whole bonded-collateral
+    ///         deployment for that name. The read is a bounded, hand-decoded `staticcall` now, and bonded
+    ///         collateral lives as an ERC-6909 claim, which is readable whatever the issuer does.
+    ///
+    /// @dev **Cross-slice**, exactly as `VaultPlacement.t.sol`'s twin of this test:
+    ///      `AmpsVault.deployBonded` takes its R1 pre-image first and `VaultNavLib.totalAssetsUsd18` still reads
+    ///      the same balance with a typed call, which is the vault slice's to harden. Either outcome is asserted,
+    ///      and neither of them is `VaultRolloutLib` refusing for want of inventory.
+    function test_deployBondedSurvivesAStockTokenWhoseBalanceOfReverts() public {
+        bondDeposit(address(stocks[0]), 20e18);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        stocks[0].setBalanceOfReverts(true);
+
+        vm.prank(KEEPER);
+        try vault.deployBonded(constituentIds[0]) returns (uint256 placed) {
+            assertGt(placed, 0, "the claim balance alone was enough to deploy");
+        } catch (bytes memory reason) {
+            assertEq(
+                reason,
+                abi.encodeWithSelector(MockStockToken.BalanceUnavailable.selector),
+                "the only typed balance read left on this path is VaultNavLib's NAV pre-image"
+            );
+        }
+
+        stocks[0].setBalanceOfReverts(false);
     }
 
     /// @notice The count stays exact across a rollout, which both closes source cells and opens destination ones.

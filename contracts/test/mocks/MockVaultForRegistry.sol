@@ -51,6 +51,15 @@ contract MockVaultForRegistry {
     /// @notice Counter-asset amount {withdrawRetiredBids} reports moved.
     uint256 public retiredBidsMoved;
 
+    /// @notice The realised weight the mock reports per constituent, in bps. Zero unless a test sets one.
+    mapping(uint16 constituentId => uint16 weightBps) public spokeWeight;
+
+    /// @notice How {spokeWeightBps} misbehaves: 0 answers honestly, 1 reverts, 2 answers a single byte, 3 answers
+    ///         a word above `BPS`, 4 burns every unit of gas it is handed.
+    /// @dev The registry has to read the target weight in all four cases, because the deficit term must never be
+    ///      something a broken or hostile vault can inflate.
+    uint8 public spokeWeightFault;
+
     /// @dev The mock's stand-in for any vault-side failure.
     error VaultRefused();
 
@@ -61,6 +70,40 @@ contract MockVaultForRegistry {
     }
 
     /* ------------------------------------------ registry surface ------------------------------------------ */
+
+    /// @notice The realised index weight of one spoke, in bps, as `AmpsVault` reports it.
+    /// @param constituentId The 1-based constituent id.
+    /// @return weightBps The weight.
+    function spokeWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
+        uint8 fault = spokeWeightFault;
+        if (fault == 1) revert VaultRefused();
+        if (fault == 2) {
+            assembly ("memory-safe") {
+                mstore(0, 1)
+                return(0, 1)
+            }
+        }
+        if (fault == 3) {
+            assembly ("memory-safe") {
+                mstore(0, 10001)
+                return(0, 32)
+            }
+        }
+        if (fault == 4) {
+            while (gasleft() > 200) {}
+        }
+        return spokeWeight[constituentId];
+    }
+
+    /// @notice Sets the weight {spokeWeightBps} answers for one constituent.
+    function setSpokeWeight(uint16 constituentId, uint16 weightBps) external {
+        spokeWeight[constituentId] = weightBps;
+    }
+
+    /// @notice Arms one of the four ways the vault can fail to answer {spokeWeightBps}.
+    function setSpokeWeightFault(uint8 fault) external {
+        spokeWeightFault = fault;
+    }
 
     /// @notice Records the call and returns the id of `key`.
     function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external returns (PoolId poolId) {

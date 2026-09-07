@@ -666,6 +666,8 @@ contract Phase2IntegrationTest is Phase2Fixture {
     function test_g_emergencyMigrationDrill() public {
         bondAs(ALICE, NVDA, 0.05e18, 0);
 
+        // A codeless standby is refused (audit fix wave 2, finding 6); one `STOP` makes the constant a contract.
+        vm.etch(STANDBY, hex"00");
         vm.prank(TIMELOCK);
         vault.setStandbyVault(STANDBY);
 

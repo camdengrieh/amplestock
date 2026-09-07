@@ -146,6 +146,11 @@ abstract contract PlacementFixture is V4TestBase {
         vm.warp(GENESIS_TIME);
         vm.roll(GENESIS_BLOCK);
 
+        // `setStandbyVault` refuses a codeless target (audit fix wave 2, finding 6): the standby receives six
+        // `onlyVault` roles in a guardian call with no timelock behind it, so an EOA there is unrecoverable. One
+        // `STOP` is enough to make the constant a contract for every purpose the migration path exercises.
+        vm.etch(STANDBY, hex"00");
+
         deployV4();
         _deployAssets();
         _deployCore();

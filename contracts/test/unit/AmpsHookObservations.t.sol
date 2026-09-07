@@ -6,8 +6,10 @@ import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IMarketReference} from "../../src/interfaces/IMarketReference.sol";
 import {IStockToken} from "../../src/interfaces/IStockToken.sol";
 import {Constants} from "../../src/types/Constants.sol";
+import {GateState} from "../../src/types/Types.sol";
 import {HookFaultyGate} from "../mocks/HookFaultyGate.sol";
 import {HookTestFixture} from "../mocks/HookTestFixture.sol";
+import {MockOracleGate} from "../mocks/MockOracleGate.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Vm} from "forge-std/Vm.sol";
@@ -187,7 +189,61 @@ contract AmpsHookObservationsTest is HookTestFixture {
 
         int24 consumed = hook.resetHighWater(usdgId);
         assertEq(consumed, peak, "the reset returns the mark it consumed");
-        assertEq(hook.highWaterTick(usdgId), hook.lastTruncatedTick(usdgId), "and re-arms at the current tick");
+
+        // The mark re-arms at `min(truncated, raw)`: the truncated tick is rate-limited and the sell above ran the
+        // raw price straight through it, so here the raw tick is what the next window starts from.
+        int24 raw = _currentTick(usdgId);
+        int24 truncated = hook.lastTruncatedTick(usdgId);
+        assertEq(hook.highWaterTick(usdgId), raw < truncated ? raw : truncated, "re-arms at min(truncated, raw)");
+    }
+
+    /// @notice The reset lands on the **raw** clock, not the rate-limited one. `lastTruncatedTick` moves at most
+    ///         `maxTickMovePerBlock` per block, so after a fast fall it sits far above the pool; a mark left up
+    ///         there already covers the asks `compound` re-lays at the fallen price, and the *next* `compound`
+    ///         would withdraw and burn them as bought-back inventory that was never sold.
+    function test_theHighWaterResetIsFlooredAtTheRawTick() public {
+        int24 cap = hook.maxTickMovePerBlock(usdgId);
+
+        // Upwards first: the raw tick runs above the rate-limited one, so `min` picks the truncated tick and the
+        // floor changes nothing. This is the case the reset always handled.
+        _buy(usdgKey, 200_000e6);
+        assertGt(_currentTick(usdgId), hook.lastTruncatedTick(usdgId), "the raw tick led the truncated one up");
+        hook.resetHighWater(usdgId);
+        assertEq(hook.highWaterTick(usdgId), hook.lastTruncatedTick(usdgId), "min, so a high raw tick is ignored");
+
+        int24 peak = hook.highWaterTick(usdgId);
+
+        // Downwards is the case that was broken: crash the pool in one block, and the recorded tick is charged one
+        // cap while the raw price runs thousands of ticks further.
+        vm.warp(block.timestamp + 12);
+        vm.roll(block.number + 1);
+        _sell(usdgKey, 400_000e18);
+
+        int24 raw = _currentTick(usdgId);
+        int24 truncated = hook.lastTruncatedTick(usdgId);
+        assertLt(raw, truncated - cap, "the raw price ran far past the block's allowance");
+        assertEq(hook.highWaterTick(usdgId), peak, "and the mark is still the pre-crash peak");
+
+        int24 consumed = hook.resetHighWater(usdgId);
+        assertEq(consumed, peak, "the reset consumed the peak");
+        assertEq(hook.highWaterTick(usdgId), raw, "and re-armed on the raw clock");
+        assertLe(hook.highWaterTick(usdgId), _currentTick(usdgId), "never above where the pool actually is");
+        assertLt(hook.highWaterTick(usdgId), truncated, "so the lagging truncated tick did not set it");
+        assertEq(hook.lastTruncatedTick(usdgId), truncated, "and the truncated series is untouched");
+    }
+
+    /// @notice The reset is the vault's, and the mark it arms is what the event reports.
+    function test_theHighWaterResetAnnouncesTheMarkItArmed() public {
+        _buy(usdgKey, 100_000e6);
+        int24 peak = hook.highWaterTick(usdgId);
+
+        vm.warp(block.timestamp + 12);
+        vm.roll(block.number + 1);
+        _sell(usdgKey, 400_000e18);
+
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit IAmpsHook.HighWaterReset(usdgId, peak, _currentTick(usdgId));
+        hook.resetHighWater(usdgId);
     }
 
     function test_theHighWaterAdvanceIsAnnounced() public {
@@ -427,6 +483,93 @@ contract AmpsHookObservationsTest is HookTestFixture {
             HookStateLib.hasFlag(hook.poolState(usdgId).gateFlags, HookStateLib.FLAG_DEGRADED),
             "an unknown state is treated as degraded"
         );
+    }
+
+    /// @notice A spoke whose gate snapshot fails falls back to its own truncated TWAP for the fair tick, exactly
+    ///         as an entry pool always does. Leaving the cached value pinned is worse than it looks: a pool whose
+    ///         snapshot has never succeeded would keep the *opening* tick as its reference for the whole outage,
+    ///         so every deviation, rail check and `RebalanceNeeded` would be measured against a price that stopped
+    ///         being true at initialisation.
+    function test_aSpokeFallsBackToItsOwnTwapWhenTheSnapshotFails() public {
+        int24 opening = hook.poolState(stockId).fairTick;
+
+        // Move the spoke well away from where it opened, then buy the ring a full window of coverage.
+        _sell(stockKey, 300_000e18);
+        uint256 ts = block.timestamp;
+        uint256 bn = block.number;
+        for (uint256 i; i < 40; ++i) {
+            ts += 60;
+            bn += 1;
+            vm.warp(ts);
+            vm.roll(bn);
+            _pokeAfterSwap(stockKey, true);
+        }
+        assertGe(hook.observationCoverage(stockId), 1800, "the ring covers the window");
+
+        // The healthy mock gate derives no fair tick for this pool, so the cache is still pinned where it opened:
+        // this is the state the fallback has to rescue.
+        assertEq(hook.poolState(stockId).fairTick, opening, "pinned at the opening tick while the gate answers");
+        int24 twap = hook.twapTick30m(stockId);
+        assertLt(twap, opening - 100, "and the pool has genuinely moved away from it");
+
+        // Now the gate stops answering.
+        faultyGate.setMode(HookFaultyGate.Mode.REVERTS);
+        _setGatePointer(address(faultyGate));
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        vm.roll(block.number + 1);
+        _pokeAfterSwap(stockKey, true);
+
+        assertTrue(
+            HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_REFRESH_FAILED),
+            "the failure is still flagged"
+        );
+        assertEq(hook.poolState(stockId).fairTick, hook.twapTick30m(stockId), "the fair tick tracks the TWAP");
+        assertTrue(hook.poolState(stockId).fairTick != opening, "and is no longer pinned at the opening tick");
+    }
+
+    /// @notice The guard on that fallback: below a full window of coverage the ring is not a reference, so the
+    ///         last known fair tick stands rather than a half-covered reading or a zero.
+    function test_aSpokeWithNoCoverageKeepsItsLastFairTickWhenTheSnapshotFails() public {
+        int24 opening = hook.poolState(stockId).fairTick;
+        assertLt(hook.observationCoverage(stockId), 1800, "the ring does not reach back a window yet");
+
+        faultyGate.setMode(HookFaultyGate.Mode.REVERTS);
+        _setGatePointer(address(faultyGate));
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        vm.roll(block.number + 1);
+        _pokeAfterSwap(stockKey, true);
+
+        assertEq(hook.poolState(stockId).fairTick, opening, "the last known fair tick stands");
+    }
+
+    /// @notice And the fallback is only for a snapshot that failed: a gate that answers still owns a spoke's fair
+    ///         tick, however far the pool's own TWAP has wandered from it.
+    function test_aHealthyGateStillOwnsASpokesFairTick() public {
+        _sell(stockKey, 300_000e18);
+        uint256 ts = block.timestamp;
+        uint256 bn = block.number;
+        for (uint256 i; i < 40; ++i) {
+            ts += 60;
+            bn += 1;
+            vm.warp(ts);
+            vm.roll(bn);
+            _pokeAfterSwap(stockKey, true);
+        }
+        assertGe(hook.observationCoverage(stockId), 1800, "the ring covers the window");
+
+        MockOracleGate.PoolState memory ps;
+        ps.set = true;
+        ps.state = GateState.GREEN;
+        ps.dynCapBps = Constants.DYN_CAP_NORMAL_BPS;
+        ps.fairTick = 12_345;
+        gate.setPoolState(stockId, ps);
+
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        vm.roll(block.number + 1);
+        _pokeAfterSwap(stockKey, true);
+
+        assertEq(hook.poolState(stockId).fairTick, int24(12_345), "the gate's fair tick wins");
+        assertTrue(hook.poolState(stockId).fairTick != hook.twapTick30m(stockId), "the TWAP did not overwrite it");
     }
 
     /// @notice The registry is not on the swap path at all: `beforeSwap` reads three of the hook's own words and

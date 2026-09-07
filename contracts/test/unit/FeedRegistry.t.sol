@@ -796,6 +796,68 @@ contract FeedRegistryTest is OracleGateFixture {
         assertEq(status.answerUsd8, 360e8, "adopted");
     }
 
+    /// @notice **The stateless path runs with nothing latched at all.** A feed whose `setFeed` probe failed —
+    ///         an aggregator that was down for the minute governance configured it — records no accepted answer,
+    ///         and an empty latch used to disable *both* halves of the jump rule at once: the latch path had
+    ///         nothing to measure against and the stateless path was never reached, so every later round of that
+    ///         feed was adopted on sight until somebody paid for a {refresh} that nothing in production calls.
+    ///         The aggregator's own history is evidence whether or not this contract has written anything down.
+    function test_jump_statelessPathRunsWithNothingLatched() public {
+        MockHistoricalAggregator history = new MockHistoricalAggregator("hist/usd", 8, 1, 180e8);
+        history.setRevert(true); // down for exactly as long as it takes to configure it
+        vm.startPrank(TIMELOCK);
+        feeds.setStandardProxy(address(history), true);
+        feeds.setFeed(OTHER, address(history), _config(Constants.ONE_DAY));
+        vm.stopPrank();
+        assertEq(feeds.acceptedAnswer(OTHER).answerUsd8, 0, "the probe failed, so nothing was latched");
+
+        history.setRevert(false);
+        vm.warp(MON_REGULAR + 60);
+        history.publish(180e8); // round 2, an ordinary round
+        assertFalse(feeds.feedStatus(OTHER).unconfirmed, "an unchanged round is never a jump");
+        assertEq(feeds.feedStatus(OTHER).answerUsd8, 180e8, "and is reported directly");
+
+        vm.warp(block.timestamp + 60);
+        history.publish(360e8); // round 3: +100% against the round a minute earlier
+
+        FeedStatus memory status = feeds.feedStatus(OTHER);
+        assertTrue(status.unconfirmed, "held against the aggregator's own previous round, with no latch involved");
+        assertEq(status.answerUsd8, 180e8, "min(previous round, candidate)");
+        assertFalse(status.fresh, "and not fresh while it is held");
+
+        // Still nothing written: the stateless path decides by reading three rounds.
+        feeds.refresh(OTHER);
+        assertEq(feeds.pendingAnswer(OTHER).roundId, 0, "no Pending record");
+        assertEq(feeds.acceptedAnswer(OTHER).answerUsd8, 0, "and a held jump is not what bootstraps the latch");
+
+        // The escape still works, so a feed that came up during an outage cannot be held for ever.
+        vm.warp(block.timestamp + feeds.confirmSeconds());
+        FeedStatus memory adopted = feeds.feedStatus(OTHER);
+        assertFalse(adopted.unconfirmed, "the jump stood unrevised");
+        assertEq(adopted.answerUsd8, 360e8, "and is adopted");
+        feeds.refresh(OTHER);
+        assertEq(feeds.acceptedAnswer(OTHER).answerUsd8, 360e8, "now the latch is seeded");
+    }
+
+    /// @notice A first answer with no history behind it is still adopted on sight: the stateless path needs a
+    ///         readable previous round, and a feed at the start of its series has none. This is what keeps the
+    ///         rule from blocking a bootstrap it cannot possibly judge.
+    function test_jump_nothingLatchedAndNoHistoryIsStillAdopted() public {
+        MockHistoricalAggregator history = new MockHistoricalAggregator("hist/usd", 8, 1, 180e8);
+        history.setRevert(true);
+        vm.startPrank(TIMELOCK);
+        feeds.setStandardProxy(address(history), true);
+        feeds.setFeed(OTHER, address(history), _config(Constants.ONE_DAY));
+        vm.stopPrank();
+        assertEq(feeds.acceptedAnswer(OTHER).answerUsd8, 0, "nothing latched");
+
+        history.setRevert(false);
+        FeedStatus memory status = feeds.feedStatus(OTHER);
+        assertFalse(status.unconfirmed, "round 1 of the series has no previous round to be a jump against");
+        assertEq(status.answerUsd8, 180e8, "so it is adopted");
+        assertTrue(status.fresh, "and is fresh");
+    }
+
     /// @notice The latch path still decides while the latch is fresh: a keeper that *is* running keeps the
     ///         `Pending` record and its `confirmSeconds` stamp, exactly as before.
     function test_jump_freshLatchStillTakesTheLatchPath() public {
@@ -823,9 +885,52 @@ contract FeedRegistryTest is OracleGateFixture {
 
         (uint256 answer,, bool fresh) = feeds.latestAnswer(TOKEN);
         assertEq(answer, 100e8, "latestAnswer agrees");
-        assertTrue(fresh, "freshness is a separate question; `unconfirmed` is what marks the hold-back");
+        assertFalse(fresh, "and reports it as not fresh: `fresh` subsumes `unconfirmed`");
         (uint256 closedAnswer,,) = feeds.latestAnswerIn(TOKEN, Session.CLOSED);
         assertEq(closedAnswer, 100e8, "and so does the session-scoped read");
+    }
+
+    /// @notice **A held-back answer is never fresh.** `unconfirmed` and `fresh` used to be independent flags, and
+    ///         every consumer had to remember to read the second one: the gate did, the bond shell's haircut did,
+    ///         and `priceUsd8`, the entry-class markets and everything reading only the {latestAnswer} triple did
+    ///         not — so a jump nothing had confirmed was handed out as a current price. The flag is folded in, in
+    ///         every session, so the per-path staleness policy applies to it with no consumer opting in.
+    function test_jump_aHeldBackAnswerIsNeverFresh() public {
+        vm.warp(MON_REGULAR + 60);
+        feed.setAnswer(240e8); // +33%, held back
+
+        FeedStatus memory status = feeds.feedStatus(TOKEN);
+        assertTrue(status.unconfirmed, "held");
+        assertEq(status.age, 0, "and perfectly recent, which is exactly the case that used to slip through");
+        assertLe(status.age, status.maxAgeSeconds, "inside the session bound by every other measure");
+        assertFalse(status.fresh, "but not fresh, because nothing stands behind it");
+
+        // Including when the market is closed, where the age bound is disabled by design.
+        assertFalse(feeds.feedStatusIn(TOKEN, Session.CLOSED).fresh, "a closed session does not make it current");
+        assertFalse(feeds.feedStatusIn(TOKEN, Session.OVERNIGHT).fresh, "nor an overnight one");
+
+        // Every read agrees, including the ones that report nothing but the triple.
+        (,, bool fresh) = feeds.latestAnswer(TOKEN);
+        assertFalse(fresh, "latestAnswer");
+        (,, bool freshIn) = feeds.latestAnswerIn(TOKEN, Session.REGULAR);
+        assertFalse(freshIn, "latestAnswerIn");
+        (,, bool fresh18) = feeds.latestAnswerUsd18(TOKEN);
+        assertFalse(fresh18, "latestAnswerUsd18");
+
+        // And the reverting read pauses the placement path on it, exactly as it does on an aged answer.
+        vm.expectRevert(
+            abi.encodeWithSelector(IFeedRegistry.StaleAnswer.selector, TOKEN, status.age, status.maxAgeSeconds)
+        );
+        feeds.priceUsd8(TOKEN);
+
+        // Confirmation restores it: this is a hold, not a penalty. The escape needs the pending record the latch
+        // path stamps, which is what {refresh} is for.
+        feeds.refresh(TOKEN);
+        vm.warp(block.timestamp + feeds.confirmSeconds());
+        FeedStatus memory confirmed = feeds.feedStatus(TOKEN);
+        assertFalse(confirmed.unconfirmed, "adopted");
+        assertTrue(confirmed.fresh, "and fresh again");
+        assertEq(feeds.priceUsd8(TOKEN), 240e8, "the placement path prices it");
     }
 
     /// @notice The `confirmSeconds` escape adopts the *pending* level, never whatever round happens to arrive

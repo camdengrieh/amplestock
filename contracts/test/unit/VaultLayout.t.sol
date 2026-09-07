@@ -233,6 +233,22 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(uint256(vm.load(address(vault), bytes32(uint256(20)))), 4242e18, "and the setter writes slot 20");
     }
 
+    /// @notice Slot 21 [0..7]: `bool navUnconfirmed`. **Audit fix wave 2, finding 4.**
+    /// @dev Appended for the same reason slot 20 was, and it is the *whole* slot: a checkpoint that priced any
+    ///      asset off a `!fresh` or `unconfirmed` answer understates `A`, and `A` is what `navPerShareX18` — the
+    ///      denominator of the bond floor — is built from. `AmpsBonds` reads it back through
+    ///      `IAmpsVault.navUnconfirmed()`, so the slot is part of the layout a standby vault must reproduce.
+    function test_slot21_navUnconfirmedIsAppendedAfterTheDocumentedLayout() public {
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 0, "genesis checkpointed on live answers");
+        assertFalse(vault.navUnconfirmed(), "and the getter agrees");
+
+        feeds.setUnconfirmed(address(weth), true);
+        vault.checkpoint();
+
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 1, "the flag sits alone in slot 21");
+        assertTrue(vault.navUnconfirmed(), "and the getter reads it");
+    }
+
     /// @notice The immutables carry no slot at all: they live in the bytecode, as section 1.1 says.
     function test_immutablesOccupyNoSlot() public view {
         assertEq(vault.amps(), address(amps), "amps");
@@ -240,9 +256,9 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(vault.timelock(), TIMELOCK, "timelock");
         assertEq(vault.guardian(), GUARDIAN, "guardian");
 
-        // Slots 21 and beyond are unused: the layout ends at 20.
-        for (uint256 slot = 21; slot < 26; ++slot) {
-            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 20");
+        // Slots 22 and beyond are unused: the documented layout ends at 20 and slot 21 is the one append since.
+        for (uint256 slot = 22; slot < 26; ++slot) {
+            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 21");
         }
     }
 

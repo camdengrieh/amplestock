@@ -1087,6 +1087,102 @@ contract PoolRegistryTest is PoolRegistryFixture {
         assertTrue(bonds.marketOpen(1), "reopened on reinstatement");
     }
 
+    /// @notice **A re-added collateral gets a new market id, and retirement has to close *that* market.**
+    ///
+    /// @dev Removing a collateral and adding it again is the ordinary way to retune a market's class or caps, and
+    ///      `AmpsBonds` issues a fresh id for it. Reading only the id the registry recorded when the constituent
+    ///      was added therefore made {retireConstituent} log `BondMarketDetached` and leave the live market
+    ///      **open** — the one outcome retirement exists to produce. The live id is adopted into the record and
+    ///      driven instead.
+    function test_retire_closesAReAddedMarketRatherThanDetachingSilently() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        assertEq(registry.constituent(id).marketId, 1, "market 1 on registration");
+
+        // Governance retunes the market: remove the collateral, add it again. `AmpsBonds` issues id 2.
+        bonds.removeCollateral(address(stocks[0]));
+        bonds.addCollateral(address(stocks[0]), CollateralClass.CONSTITUENT, 500, 100, 1500, 1000, true);
+        assertEq(bonds.marketIdOf(address(stocks[0])), 2, "the same collateral is now market 2");
+        assertTrue(bonds.marketOpen(2), "and it is open");
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+
+        assertFalse(bonds.marketOpen(2), "retirement closed the market that is actually attached");
+        assertEq(registry.constituent(id).marketId, 2, "and the registry adopted the live id");
+
+        // And the record it adopted is what the reinstatement then drives.
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+        assertTrue(bonds.marketOpen(2), "reopened the same market");
+    }
+
+    /// @notice Reinstatement clears `retiredAt`: a name that is back is not a name that was retired on some date.
+    /// @dev The stamp survived reinstatement, so every consumer of the record — the dApp, the index reports, any
+    ///      future schedule keyed off it — read a live constituent as one retired at that timestamp.
+    function test_reinstate_clearsTheRetirementStamp() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+        assertEq(registry.constituent(id).retiredAt, uint32(block.timestamp), "stamped on retirement");
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+
+        assertEq(registry.constituent(id).retiredAt, 0, "and cleared on the way back");
+        assertEq(uint8(registry.constituent(id).status), uint8(ConstituentStatus.ACTIVE), "active again");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The realised index weight (audit fix wave 2, finding 5)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice `currentWeightBps` reports what the **vault** values that spoke at, not the target it is aiming for.
+    ///
+    /// @dev Phase 2 answered the target outright, which made `AmpsBonds`'s index-deficit term
+    ///      `k_w x (target - current) / target` identically zero however far under-weight a name actually was —
+    ///      so the discount that is supposed to pay for rebalancing never widened, and neither did the rollout
+    ///      schedule that reads the same number. With the Phase 3 valuer wired there is a realised weight, and it
+    ///      comes from `IAmpsVault.spokeWeightBps`.
+    function test_currentWeightBps_reportsTheVaultsRealisedWeight() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        assertEq(registry.constituent(id).targetWeightBps, 500, "the target is 5%");
+
+        // The spoke is at half its target.
+        vault.setSpokeWeight(id, 250);
+        assertEq(registry.currentWeightBps(id), 250, "half the target weight, as the vault values it");
+
+        vault.setSpokeWeight(id, 500);
+        assertEq(registry.currentWeightBps(id), 500, "and at target when it is at target");
+    }
+
+    /// @notice A vault that cannot answer reads as "unknown", and unknown is the **target** weight — which prices
+    ///         `deficit == 0`, the protocol-favourable direction. Four ways to fail, one answer.
+    function test_currentWeightBps_fallsBackToTheTargetWhenTheVaultCannotAnswer() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        vault.setSpokeWeight(id, 250);
+
+        for (uint8 fault = 1; fault <= 4; ++fault) {
+            vault.setSpokeWeightFault(fault);
+            assertEq(registry.currentWeightBps(id), 500, "the target weight stands in for an unanswerable read");
+        }
+
+        vault.setSpokeWeightFault(0);
+        assertEq(registry.currentWeightBps(id), 250, "and the realised weight comes back when it can answer");
+    }
+
+    /// @notice An unknown id still answers zero rather than reverting, so a bond market on a name the registry
+    ///         never knew still prices.
+    function test_currentWeightBps_unknownIdIsZero() public {
+        _registerEntryPools();
+        assertEq(registry.currentWeightBps(99), 0, "no such constituent");
+    }
+
     // -------------------------------------------------------------------------------------------------------------
     // The vault handover (§8)
     // -------------------------------------------------------------------------------------------------------------

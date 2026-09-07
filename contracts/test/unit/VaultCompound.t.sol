@@ -679,6 +679,46 @@ contract VaultCompoundTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // §3.6 step 8 — the surge and the mark follow an AMPS-side event, the cooldown follows a placement
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The finding this closes.** Step 8's condition included `counterFees != 0`, and the counter side
+    ///         is whatever a *buyer* paid the ladder — one wei of it, which anyone can produce for the price of a
+    ///         dust swap. That wei **erased the high-water mark**, which is the excursion the next `compound`
+    ///         needs in order to recognise its own bought-back inventory (§3.5): a buyer could keep the vault
+    ///         permanently forgetful of its own round trips, once every sixty seconds, for a gas fee. The mark and
+    ///         the step-8 surge are AMPS-side facts and now require an AMPS-side event — something burned, or
+    ///         something re-laddered out of the split.
+    function test_aCounterFeeOnlyCompoundResetsNoMark() public {
+        // A buy pays its fee on the way *in*, in USDG, so the AMPS side collects nothing at all.
+        buyAmps(hubPool, address(usdg), 100e6);
+        syncMarket();
+
+        // The mark at the live tick crosses no ask, so the buyback burns nothing either: the call's only work is
+        // the counter-side fee.
+        int24 mark = tickOf(hubPool);
+        hook.setHighWaterTick(hubPool, mark);
+
+        uint32 reset = hook.highWaterResetCount(hubPool);
+        uint32 armed = hook.surgeArmedCount(hubPool);
+
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+        assertEq(ampsFees, 0, "the buy paid its fee in the counter asset, not in AMPS");
+        assertEq(burned, 0, "and nothing was bought back");
+
+        assertEq(hook.highWaterResetCount(hubPool), reset, "the mark was not reset off a counter-side fee");
+        assertEq(hook.highWaterTick(hubPool), mark, "and still stands where the excursion left it");
+
+        // Step 8 arms nothing either. The one surge this call does arm is the *bid re-ladder's* own, from
+        // {VaultPlacementLib-_placeLadder}: a real placement happened and §3.8 step 8 says a placement is never
+        // left un-surged. Before the fix there were two — the placement's and step 8's — off the same wei.
+        assertEq(hook.surgeArmedCount(hubPool) - armed, 1, "only the placement armed a surge, not step 8 as well");
+        assertEq(vault.lastPlacementAt(hubPool), uint32(block.timestamp), "and the counter bids did date the pool");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // I32 — the re-laid ask ladder is anchored at `P_ref`, like every other ask
     // -------------------------------------------------------------------------------------------------------------
 

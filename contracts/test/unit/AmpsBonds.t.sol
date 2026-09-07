@@ -17,6 +17,7 @@ import {
     Reentrancy,
     SlippageExceeded,
     StaleCheckpoint,
+    UnconfirmedNav,
     UnknownMarket,
     UnknownPool,
     ZeroAddress,
@@ -33,6 +34,7 @@ import {
 } from "../../src/types/Types.sol";
 import {MockAmpsVault} from "../mocks/MockAmpsVault.sol";
 import {MockFeedRegistry} from "../mocks/MockFeedRegistry.sol";
+import {MockHostileCollateral} from "../mocks/MockHostileCollateral.sol";
 import {MockMarketReference} from "../mocks/MockMarketReference.sol";
 import {MockOracleGate} from "../mocks/MockOracleGate.sol";
 import {MockRegistryForBonds} from "../mocks/MockRegistryForBonds.sol";
@@ -851,6 +853,75 @@ contract AmpsBondsTest is BondsFixture {
         assertLt(ampsOut, FullMath.mulDiv(0.05e18, preCrashFloor, 1e18), "strictly less than the pre-crash price");
     }
 
+    /// @notice The other half of a held-back answer, and the one the haircut cannot reach: the **denominator**.
+    ///         `navPerShareX18` is the vault's own valuation of every asset it holds, priced through the same
+    ///         registry with the same hold-back rule, so a held-back *up*-jump on any one vault asset understates
+    ///         `A` and therefore NAV/share. The accretion floor divides by it, so bonds on every *other*
+    ///         collateral would mint below true NAV — with a perfectly fresh feed of their own and no haircut to
+    ///         show for it. The vault reports that state and the whole pricing path refuses while it holds.
+    function test_bondRefusesANavBuiltOnAnUnconfirmedAnswer() public {
+        // This market's own collateral is fresh and confirmed throughout: the defect is in the shared NAV.
+        (,, bool collateralFresh) = feeds.latestAnswer(address(stock));
+        assertTrue(collateralFresh, "the bonded collateral's own answer is beyond reproach");
+
+        vaultMock.setNavUnconfirmed(true);
+
+        vm.expectRevert(UnconfirmedNav.selector);
+        vm.prank(alice);
+        bonds.bond(marketId, 0.05e18, 0, alice);
+
+        (uint256 quotedOut, uint256 quotedQ,,,, bytes32 reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("unconfirmedNav"), "the view reports it rather than reverting");
+        assertEq(quotedOut, 0, "with no output");
+        assertEq(quotedQ, 0, "and no price");
+
+        // It is the NAV, not the market: every market refuses, including the entry-class one.
+        vm.prank(timelock);
+        bonds.setMarketOpen(entryMarketId, true);
+        (,,,,, bytes32 entryReason) = bonds.quote(entryMarketId, 20e6);
+        assertEq(entryReason, bytes32("unconfirmedNav"), "no collateral prices against an unconfirmed NAV");
+
+        // And it clears the moment the vault checkpoints a NAV every priced asset was confirmed for.
+        vaultMock.setNavUnconfirmed(false);
+        (uint256 reopenedOut,,,,, bytes32 reopenedReason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reopenedReason, bytes32(0), "the refusal is a state, not a latch");
+        (uint256 ampsOut2,) = _bond(alice, 0.05e18);
+        assertEq(ampsOut2, reopenedOut, "and the bond prices exactly as the view said");
+    }
+
+    /// @notice The probe is bounded and fails **open**: a vault that reverts on the view, one that answers
+    ///         nothing at all (deployed before it existed) and one that answers a short word all read as
+    ///         "confirmed". Reading a failure as `true` would hand anybody who can make one vault read fail a
+    ///         protocol-wide bond halt, which is strictly worse than the state this check exists to refuse.
+    function test_aVaultThatCannotAnswerNavUnconfirmedStillPrices() public {
+        vaultMock.setNavUnconfirmed(true);
+        vaultMock.setNavUnconfirmedReverts(true);
+        (uint256 quoted,,,,, bytes32 reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32(0), "a reverting probe is not a refusal");
+        assertGt(quoted, 0);
+        (uint256 ampsOut,) = _bond(alice, 0.05e18);
+        assertEq(ampsOut, quoted, "and the bond goes through");
+        vaultMock.setNavUnconfirmedReverts(false);
+
+        // A vault with no such view: the call succeeds with empty returndata, which is not an answer.
+        vm.mockCall(address(vaultMock), abi.encodeWithSignature("navUnconfirmed()"), "");
+        (, uint256 legacyQ,,,, bytes32 legacyReason) = bonds.quote(marketId, 0.05e18);
+        assertEq(legacyReason, bytes32(0), "an interface that predates the view reads as confirmed");
+        assertGt(legacyQ, 0);
+
+        // A short answer is no answer either.
+        vm.mockCall(address(vaultMock), abi.encodeWithSignature("navUnconfirmed()"), hex"01");
+        (,,,,, bytes32 shortReason) = bonds.quote(marketId, 0.05e18);
+        assertEq(shortReason, bytes32(0), "a short word is not a word");
+        vm.clearMockedCalls();
+
+        // A non-canonical `true` — any non-zero word — is still a refusal: the answer is hand-decoded.
+        vm.mockCall(address(vaultMock), abi.encodeWithSignature("navUnconfirmed()"), abi.encode(uint256(2)));
+        (,,,,, bytes32 dirtyReason) = bonds.quote(marketId, 0.05e18);
+        assertEq(dirtyReason, bytes32("unconfirmedNav"), "a dirty bool is read as a word, not decoded");
+        vm.clearMockedCalls();
+    }
+
     /// @notice The pricing table end to end: premium x session x feed freshness, always `q <= qFloor`.
     function test_pricingTableThroughTheShell() public {
         int256[5] memory premiumsBps = [-int256(500), int256(0), int256(500), int256(1250), int256(3000)];
@@ -1244,6 +1315,81 @@ contract AmpsBondsTest is BondsFixture {
         assertEq(stock.balanceOf(address(bonds)), 0, "still clean");
     }
 
+    /// @notice The dust forward is best effort against the **token** as well as against the donation. A
+    ///         `balanceOf` that reverts used to be a typed call in `bond()`'s frame, so a collateral that turned
+    ///         its balance view off — an issuer-side beacon switched off is exactly that — bricked its own market
+    ///         for everybody. The probe is bounded and hand-decoded: an unreadable balance simply skips the
+    ///         forward, and the dust waits for a token that can be asked again.
+    function test_anUnreadableCollateralBalanceDoesNotBrickTheMarket() public {
+        (MockHostileCollateral hostile, uint16 hostileMarket) = _installHostileCollateral();
+        hostile.mint(address(bonds), 7); // the donation
+
+        hostile.setBalanceProbeVictim(address(bonds));
+
+        vm.recordLogs();
+        vm.prank(alice);
+        (uint256 ampsOut,) = bonds.bond(hostileMarket, 0.05e18, 0, alice);
+        assertGt(ampsOut, 0, "the bond prices, settles and mints");
+        assertEq(_countForwards(), 0, "and forwards nothing it could not measure");
+
+        hostile.setBalanceProbeVictim(address(0));
+        assertEq(hostile.balanceOf(address(bonds)), 7, "the dust is still here, which is the harmless outcome");
+
+        // And once the balance can be read again the next bond forwards it.
+        vm.recordLogs();
+        vm.prank(alice);
+        bonds.bond(hostileMarket, 0.05e18, 0, alice);
+        assertEq(_countForwards(), 1, "forwarded on the next bond");
+        assertEq(hostile.balanceOf(address(bonds)), 0, "the shell is clean again (I12)");
+    }
+
+    /// @notice The forward's `transfer` carries its own gas cap. Without one a collateral that burns every wei it
+    ///         is handed consumed the whole remaining gas of `bond()` — the same denial of service as a reverting
+    ///         balance, with a different receipt. Capped, the burn costs the bond a bounded amount and nothing
+    ///         else: the position is written, the AMPS is minted, the dust stays put.
+    function test_aGasBurningCollateralTransferCannotConsumeTheBond() public {
+        (MockHostileCollateral hostile, uint16 hostileMarket) = _installHostileCollateral();
+        hostile.mint(address(bonds), 7);
+        hostile.setTransferBurnsGas(true);
+
+        vm.recordLogs();
+        vm.prank(alice);
+        (uint256 ampsOut, uint256 positionId) = bonds.bond(hostileMarket, 0.05e18, 0, alice);
+
+        assertGt(ampsOut, 0, "the bond completes");
+        assertEq(bonds.position(alice, positionId).principal, ampsOut, "the position is written");
+        assertEq(_countForwards(), 0, "the forward failed and said nothing");
+        assertEq(hostile.balanceOf(address(bonds)), 7, "the dust is untouched: the sub-call reverted whole");
+    }
+
+    /// @notice A `transfer` that answers the word `2` is a success, not a `Panic`. `abi.decode(returned, (bool))`
+    ///         reverts on any word that is not 0 or 1, in the shell's own frame, where no `try` can reach it — so
+    ///         the answer is read as a word and tested for non-zero, exactly as `SafeERC20` does.
+    function test_aNonCanonicalTransferAnswerIsAcceptedNotDecoded() public {
+        (MockHostileCollateral hostile, uint16 hostileMarket) = _installHostileCollateral();
+        hostile.mint(address(bonds), 7);
+        hostile.setTransferAnswer(2);
+
+        uint256 vaultBefore = hostile.balanceOf(address(vaultMock));
+
+        vm.expectEmit(true, false, false, true, address(bonds));
+        emit IAmpsBonds.CollateralForwarded(address(hostile), 7);
+        vm.prank(alice);
+        (uint256 ampsOut,) = bonds.bond(hostileMarket, 0.05e18, 0, alice);
+
+        assertGt(ampsOut, 0, "the bond completes");
+        assertEq(hostile.balanceOf(address(bonds)), 0, "the dust left");
+        assertEq(hostile.balanceOf(address(vaultMock)), vaultBefore + 0.05e18 + 7, "and reached the vault");
+
+        // A canonical `false`, by contrast, is a failure: nothing is announced, whatever the token did.
+        hostile.mint(address(bonds), 3);
+        hostile.setTransferAnswer(0);
+        vm.recordLogs();
+        vm.prank(alice);
+        bonds.bond(hostileMarket, 0.05e18, 0, alice);
+        assertEq(_countForwards(), 0, "a token that answers false is not reported as forwarded");
+    }
+
     /// @notice `quote` is the non-reverting half of this contract, and an arithmetic panic is still a revert: an
     ///         `amountIn` too large to normalise to 18 decimals is a `reason`, not a `Panic(0x11)`.
     function test_quoteRefusesAnAmountItCannotNormalise() public {
@@ -1255,10 +1401,34 @@ contract AmpsBondsTest is BondsFixture {
         assertEq(ampsOut, 0, "with no output");
         assertEq(qX18, 0, "and no price");
 
-        // The product `amountIn18 x q` is guarded the same way, so an amount that normalises but would overflow
-        // the multiplication is reported rather than thrown.
-        (,,,,, bytes32 productReason) = bonds.quote(entryMarketId, type(uint256).max / 1e12);
-        assertEq(productReason, bytes32("amountTooLarge"), "the product overflows even though the scale does not");
+        // The product `amountIn18 x q / 1e18` is guarded the same way — but by the bound `mulDiv` itself
+        // enforces, which is on the 512-bit product divided by 1e18, not on the product. The guard used to be
+        // `amountIn18 > type(uint256).max / q`, i.e. the bound for `amountIn18 x q` with no divide, and refused
+        // 1e18 times more deposits than the multiplication it was standing in front of.
+        (uint256 wideOut,,,, uint256 wideCapacity, bytes32 productReason) =
+            bonds.quote(entryMarketId, type(uint256).max / 1e12);
+        assertEq(productReason, bytes32(0), "q < 1e18, so the quotient fits and the quote stands");
+        assertEq(wideOut, wideCapacity, "clamped to the capacity, like any over-capacity quote");
+
+        // What genuinely overflows is a quotient past `uint256`, which needs `q >= 1e18` as well as a huge
+        // deposit: at $1,000 a unit the floor is three orders of magnitude above 1e18. The launch policy computes
+        // the product itself and refuses first (`policyRefused`), so the shell's own guard is exercised through a
+        // policy that prices without multiplying — which is exactly the case the shell must still be safe in,
+        // because `ampsOut` is the shell's number and not the policy's.
+        feeds.setAnswer(address(usdg), 1000e8);
+        address widePolicy = address(new InflatedOutputPolicy());
+        vm.prank(timelock);
+        bonds.setPolicy(widePolicy);
+
+        (uint256 overflowOut, uint256 overflowQ,,,, bytes32 overflowReason) =
+            bonds.quote(entryMarketId, type(uint256).max / 1e12);
+        assertEq(overflowReason, bytes32("amountTooLarge"), "reported, not thrown");
+        assertEq(overflowOut, 0, "with no output");
+        assertGt(overflowQ, 1e18, "the price is disclosed; it is the product that does not fit");
+
+        vm.prank(timelock);
+        bonds.setPolicy(address(policy));
+        feeds.setAnswer(address(usdg), 1e8);
 
         // An amount far larger than any capacity still quotes: the bound is an overflow bound, not a size limit.
         (uint256 hugeOut,,,, uint256 capacityLeft, bytes32 okReason) = bonds.quote(entryMarketId, 1e24);
@@ -1647,6 +1817,40 @@ contract AmpsBondsTest is BondsFixture {
         assertEq(reason, bytes32("zeroAmount"));
     }
 
+    /// @notice A pointer with **no code** is absent, not answering. A `staticcall` to a codeless address succeeds
+    ///         and returns nothing, and the ABI decode of that empty answer reverts in the *caller's* frame, where
+    ///         the `try` cannot reach it — so `quote()`, whose whole contract is that it never reverts for a known
+    ///         market, screens `code.length` before every typed read it makes.
+    function test_quoteTreatsACodelessPointerAsAbsent() public {
+        address codeless = address(0xC0DE1E55);
+        assertEq(codeless.code.length, 0, "nothing is deployed there");
+
+        vaultMock.setPointers(codeless, address(feeds), address(registry), address(marketRef));
+        (uint256 ampsOut,,,,, bytes32 reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("vaultDown"), "a codeless gate is an absent gate");
+        assertEq(ampsOut, 0, "with no output");
+
+        vaultMock.setPointers(address(gate), codeless, address(registry), address(marketRef));
+        (,,,,, reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("vaultDown"), "and so is a codeless feed registry");
+
+        vaultMock.setPointers(address(gate), address(feeds), address(registry), codeless);
+        (,,,,, reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("vaultDown"), "and a codeless market reference");
+        vaultMock.setPointers(address(gate), address(feeds), address(registry), address(marketRef));
+
+        // The pool registry is read for the pool id before the TWAP, and is screened the same way.
+        vm.etch(address(registry), "");
+        (,,,,, reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("noPool"), "a codeless registry has no pools, rather than panicking");
+
+        // And the vault pointer itself, which is what a migration to an address holding no code would look like.
+        vm.prank(address(vaultMock));
+        bonds.setVault(codeless);
+        (,,,,, reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32("vaultDown"), "a codeless vault is a dead vault");
+    }
+
     /// @notice The lens renders the whole board in one call, including the markets that would refuse a bond.
     function test_lensBoardCoversEveryMarket() public view {
         AmpsBondsLens.MarketQuote[] memory rows = lens.board(bonds, 0.01e18);
@@ -1694,6 +1898,47 @@ contract AmpsBondsTest is BondsFixture {
     }
 
     /* -------------------------------------------- helpers -------------------------------------------- */
+
+    /// @dev Deploys {MockHostileCollateral}, registers it as an active constituent with a pool, a feed answer and
+    ///      a TWAP, opens its bond market and funds `alice`. Every switch on the token starts off, so the market
+    ///      behaves exactly like the stock market until a test turns one on.
+    function _installHostileCollateral() internal returns (MockHostileCollateral hostile, uint16 hostileMarketId) {
+        hostile = new MockHostileCollateral();
+        PoolId hostilePool = PoolId.wrap(keccak256("AMPS/HOST"));
+        uint16 hostileConstituentId = registry.addConstituentAndPool(
+            address(hostile), address(0xFEED), hostilePool, PoolClass.SPOKE, 60, TARGET_WEIGHT_BPS
+        );
+        registry.setCurrentWeightBps(hostileConstituentId, TARGET_WEIGHT_BPS);
+        feeds.setAnswer(address(hostile), uint128(STOCK_PRICE_USD8));
+        int24 tick = _tickFor(NAV_X18, STOCK_PRICE_USD8, 18);
+        marketRef.setObservation(hostilePool, tick, tick, 1800);
+
+        vm.prank(timelock);
+        hostileMarketId = bonds.addCollateral(
+            address(hostile),
+            CollateralClass.CONSTITUENT,
+            Constants.BOND_D_BASE_BPS_DEFAULT,
+            Constants.BOND_D_MIN_BPS_DEFAULT,
+            Constants.BOND_D_MAX_BPS_DEFAULT,
+            Constants.BOND_CAP_BPS_PER_EPOCH_DEFAULT,
+            true
+        );
+
+        hostile.mint(alice, 100e18);
+        vm.prank(alice);
+        hostile.approve(address(vaultMock), type(uint256).max);
+    }
+
+    /// @dev How many {IAmpsBonds.CollateralForwarded} events the last recorded call emitted.
+    function _countForwards() internal returns (uint256 count) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(bonds) || logs[i].topics.length == 0) continue;
+            if (logs[i].topics[0] == IAmpsBonds.CollateralForwarded.selector) {
+                ++count;
+            }
+        }
+    }
 
     function _assertNoStorageAccess(address target, string memory label) internal view {
         (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(target);

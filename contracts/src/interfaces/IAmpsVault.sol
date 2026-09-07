@@ -362,6 +362,44 @@ interface IAmpsVault {
     /// @return value NAV/share, 18 decimals.
     function previewNavPerShareX18() external view returns (uint256 value);
 
+    /// @notice Whether the live checkpoint's `A` was computed from an answer the feed registry is deliberately
+    ///         holding below the market for at least one asset.
+    ///
+    /// @dev True when any asset that contributed to `A` was priced off a `!fresh` answer, or off one the registry
+    ///      reports as `unconfirmed` — the `min(heldLevel, candidate)` a >10% single-round move is held at until
+    ///      its second confirmation (`IFeedRegistry.latestAnswer`). Both understate `A`, so both understate
+    ///      `navPerShareX18`, which is the **denominator** of the bond floor: while this is true a bond on *any*
+    ///      collateral — including the ones whose own feeds are perfectly healthy — would mint AMPS below the
+    ///      protocol's true backing. `AmpsBonds` reads it through a bounded `staticcall` and refuses to price
+    ///      while it is set; a checkpoint against a confirmed answer clears it.
+    ///
+    /// @dev It describes the **checkpoint**, not the moment of the call: it is written by `checkpoint()` and by
+    ///      every path that checkpoints, and it is exactly as fresh as `checkpointData().timestamp`.
+    /// @return held Whether the checkpointed NAV rests on a held-back or stale answer.
+    function navUnconfirmed() external view returns (bool held);
+
+    /// @notice One spoke's **realised** share of the index, in bps of `A`: what `PoolRegistry.currentWeightBps`
+    ///         answers with and therefore the numerator of the bond discount's index-deficit term.
+    ///
+    /// @dev The counter side only — the value of the Stock Token the protocol holds for that name, as claims, as
+    ///      an idle balance and inside its pool position decomposed at the *reference* price (I7), never at
+    ///      `slot0`, so a swap cannot move a weight. The AMPS beside it is the share itself and is not part of any
+    ///      name's weight.
+    ///
+    /// @dev Zero rather than a revert whenever the answer would be invented: no registry, no such constituent, no
+    ///      usable feed answer, nothing held, or an `A` of zero. Zero prices `deficit == 0`, which is the
+    ///      protocol-favourable direction.
+    ///
+    /// @dev **Measured against the last checkpointed `A`** (`navPerShareX18 x (T + VIRTUAL_SHARES)`), not a live
+    ///      re-valuation of every asset: the live walk costs ~150k gas per valued pool, which no consumer's probe
+    ///      budget could carry at 32 pools, so the read would fail in production and fall back to the target
+    ///      weight while succeeding in a small fixture. Against the checkpoint the read is one spoke's valuation
+    ///      plus a feed answer (~200k gas) everywhere. A holding that landed after the last checkpoint is measured
+    ///      against the pre-landing `A` until the next placement, bond or `checkpoint()` refreshes it.
+    /// @param constituentId The 1-based constituent id.
+    /// @return weightBps The realised weight, in bps, never above `BPS`.
+    function spokeWeightBps(uint16 constituentId) external view returns (uint16 weightBps);
+
     /// @notice Protocol-held AMPS: `Amps.balanceOf(vault)` plus the vault's ERC-6909 AMPS claims plus AMPS inside
     ///         its positions. **Disclosure only** — it is never subtracted from the NAV denominator (I6), and it
     ///         excludes the AMPS `AmpsBonds` holds for vesting (I30).

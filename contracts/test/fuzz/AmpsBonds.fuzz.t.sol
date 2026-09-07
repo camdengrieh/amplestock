@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {Constants} from "../../src/types/Constants.sol";
+import {UnconfirmedNav} from "../../src/types/Errors.sol";
 import {BondMarket, GateState, Session} from "../../src/types/Types.sol";
 import {BondsFixture} from "../unit/AmpsBonds.t.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -178,6 +179,36 @@ contract AmpsBondsFuzzTest is BondsFixture {
             "ampsOut x nav x (1 + a) <= amountIn x P_i x (1 - h)"
         );
         assertGe(vaultMock.previewNavPerShareX18(), navBefore, "NAV/share never falls across a bond (I27)");
+    }
+
+    /// @notice A NAV built from an answer nothing stands behind refuses every bond, at every amount, premium and
+    ///         session: the haircut is not the instrument for a defect in the *denominator* of the floor, so the
+    ///         refusal is unconditional rather than a widening. And it is a state, not a latch: the same inputs
+    ///         price normally the moment the vault checkpoints a confirmed NAV.
+    /// @param amountIn The deposit.
+    /// @param premiumBps How far AMPS trades above NAV.
+    /// @param session Which equity session to judge it in.
+    function testFuzz_anUnconfirmedNavRefusesEveryBond(uint256 amountIn, uint256 premiumBps, uint8 session) public {
+        amountIn = bound(amountIn, 1e12, 1e17);
+        premiumBps = bound(premiumBps, 0, 20_000);
+        gate.setSession(Session(uint8(bound(session, 0, 3))));
+        _setSpokePriceUsd18(NAV_X18 + NAV_X18 * premiumBps / 10_000);
+
+        vaultMock.setNavUnconfirmed(true);
+
+        (uint256 ampsOut, uint256 qX18,,,, bytes32 reason) = bonds.quote(marketId, amountIn);
+        assertEq(reason, bytes32("unconfirmedNav"), "the view refuses whatever the price says");
+        assertEq(ampsOut, 0, "with no output");
+        assertEq(qX18, 0, "and no price");
+
+        vm.expectRevert(UnconfirmedNav.selector);
+        vm.prank(alice);
+        bonds.bond(marketId, amountIn, 0, alice);
+
+        vaultMock.setNavUnconfirmed(false);
+        (uint256 clearedOut,,,,, bytes32 clearedReason) = bonds.quote(marketId, amountIn);
+        assertEq(clearedReason, bytes32(0), "and prices again once the NAV is confirmed");
+        assertGt(clearedOut, 0);
     }
 
     /// @notice The quote view is total: for any amount and any market state it returns rather than reverts, and it

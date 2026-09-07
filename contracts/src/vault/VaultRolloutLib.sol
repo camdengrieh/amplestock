@@ -134,33 +134,60 @@ library VaultRolloutLib {
         if (amount > floorRoom) revert RolloutLimitExceeded(bytes32("entryFloor"), amount, floorRoom);
 
         // Only *unfilled* ask cells move, so no counter asset is touched (I29, I35). Each source pool pays the
-        // full gauntlet in its own right.
+        // full gauntlet in its own right, but **not** its cooldown: that is written once, below, after the
+        // re-placement has had its chance at the same pools.
+        uint256[2] memory movedFrom;
         for (uint256 i; i < 2 && moved < amount; ++i) {
-            moved += _harvestAsks(ladder, cooldown, poolManager, entries[i], amount - moved);
+            movedFrom[i] = _harvestAsks(ladder, cooldown, poolManager, entries[i], amount - moved);
+            moved += movedFrom[i];
         }
         if (moved == 0) return 0;
+
+        // **The 24-hour window is charged on `moved` — what left the entry pools** (audit fix, 2026-09-07).
+        //
+        // Charging it on `placed` was exactly backwards. The window is I32's rate limit on *draining the entry
+        // pools*, and inventory leaves them on the harvest, whether or not the destination takes it. With a full
+        // live-cell budget `place(strictBudget = false)` places nothing at all, so nothing was charged, and the
+        // same call could be repeated every `PLACEMENT_COOLDOWN_SECONDS`: the entry pools could be emptied to
+        // `entryFloorBps` at one full daily allowance per sixty seconds — seventeen days of budget in seventeen
+        // minutes — while the window stayed at zero. `moved <= amount <= budget` by the two checks above, so
+        // charging the harvest can never overrun the allowance, and it is the harvest the allowance is about.
+        _addRolloutMoved(moved);
 
         // The bountied paths merge into cells that already exist and leave the remainder idle rather than
         // revert when the live-cell budget is full (§12 ruling E), which is what `strictBudget == false` says.
         uint256 placed =
             VaultPlacementLib.place(ladder, cooldown, poolManager, amps, destination, true, moved, "rollout", false);
 
-        // **The window and the bounty are charged on `placed`, not on `moved`** — the two differ exactly when
-        // `strictBudget == false` let the destination take less than the entry pools gave up. Charging `moved`
-        // billed the daily budget for inventory that never reached a spoke and paid the keeper for placing it,
-        // which made a full live-cell budget into a way to burn the day's rollout allowance for a bounty.
-        //
-        // The unplaced remainder `moved - placed` stays where the harvest left it: idle AMPS in the vault, which
-        // `A` still values (I5) and which the next `compound` or `place` on any pool re-ladders. Leaving it idle
-        // rather than re-placing it into the entry pools' asks in the same call is deliberate — a second
-        // placement would take the entry pools' 60-second cooldown a second time in one transaction and could
-        // itself be partial, so the gap is *reported* instead: `Rollout` carries both numbers and their
-        // difference is the idle remainder.
-        if (placed != 0) _addRolloutMoved(placed);
+        // Whatever the destination could not take goes **back into the entry pools it came from**, in the same
+        // call, as asks at the same reference anchor {VaultPlacementLib-place} uses for every ask. The objection
+        // that used to stand here — that a second placement would take the source pools' cooldown twice in one
+        // transaction — is answered by moving that write out of {_harvestAsks}: the cooldown is taken once, after
+        // this loop, so the pools are in exactly the state they would have been in had the harvest been smaller.
+        // The re-placement is itself `strictBudget == false` and may place nothing (a full live-cell budget frees
+        // no room for a cell the harvest emptied), in which case the inventory stays idle in the vault, where `A`
+        // still values it (I5) and the next `compound` or `place` re-ladders it. Either way the gap is reported:
+        // `Rollout` carries both `moved` and `placed`, and their difference is what did not reach the spoke.
+        uint256 returned;
+        for (uint256 i; i < 2 && placed + returned < moved; ++i) {
+            if (movedFrom[i] == 0) continue;
+            returned += VaultPlacementLib.place(
+                ladder, cooldown, poolManager, amps, entries[i], true, moved - placed - returned, "rollback", false
+            );
+        }
+
+        // The source pools' cooldowns, written once and last: the harvest took them, the re-placement was the
+        // same keeper's same call, and everything after this is rate-limited by them as usual.
+        for (uint256 i; i < 2; ++i) {
+            if (movedFrom[i] != 0) cooldown[entries[i]] = uint32(block.timestamp);
+        }
+
         emit Rollout(constituentId, destination, moved, placed);
 
-        // The work value is the inventory this call actually placed, at the reference price (§12.4). A schedule
-        // that proposes nothing returns above, having paid nothing.
+        // **The bounty stays on `placed`**: the work the keeper created is inventory that reached the spoke, and
+        // paying for a harvest the destination refused is what made the drain above worth a keeper's gas. What
+        // went back into the entry pools is not new work either — it is the call undoing its own harvest.
+        // A schedule that proposes nothing returns above, having paid nothing.
         VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(placed), gasStart);
     }
 
@@ -199,7 +226,7 @@ library VaultRolloutLib {
         if (constituent.status != ConstituentStatus.ACTIVE) return 0;
 
         uint256 idle = IPoolManager(poolManager).balanceOf(address(this), Currency.wrap(constituent.token).toId())
-            + IERC20(constituent.token).balanceOf(address(this));
+            + _probeBalance(constituent.token);
         if (idle == 0) return 0;
 
         uint256 answerUsd8 = _answer(constituent.token);
@@ -305,6 +332,10 @@ library VaultRolloutLib {
     /// @dev Withdraws up to `wanted` AMPS from one source pool's unfilled ask cells, highest cell first so the
     ///      depth nearest the price survives longest. The source pays the gate, the cooldown and the divergence
     ///      check in its own right (§3.7: "Both pools pay the full gauntlet").
+    ///
+    /// @dev **It does not write the cooldown.** {rollout} does, once, after it has had the chance to put the
+    ///      unplaced remainder back into these same pools; taking the cooldown here would have made that
+    ///      re-placement revert on the very pool the inventory came out of.
     function _harvestAsks(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         mapping(PoolId => uint32) storage cooldown,
@@ -357,7 +388,6 @@ library VaultRolloutLib {
         (harvested,) = abi.decode(
             _unlock(poolManager, VaultRedeemLib.ACTION_HARVEST, abi.encode(key, lowers, removals)), (uint256, uint256)
         );
-        cooldown[poolId] = uint32(block.timestamp);
     }
 
     /// @dev The source side of §3.8: gate, cooldown and divergence, then the key and the live tick.
@@ -413,7 +443,9 @@ library VaultRolloutLib {
         bool spokeHasDepth
     ) private view returns (uint256 amount) {
         uint16 currentWeightBps;
-        try IPoolRegistry(registry).currentWeightBps(constituentId) returns (uint16 weight) {
+        try IPoolRegistry(registry).currentWeightBps{gas: Constants.COMPOSITE_READ_GAS}(constituentId) returns (
+            uint16 weight
+        ) {
             currentWeightBps = weight;
         } catch {}
 
@@ -430,7 +462,9 @@ library VaultRolloutLib {
             spokeHasDepth: spokeHasDepth
         });
 
-        try IRolloutPolicy(policy).propose(request) returns (IRolloutPolicy.RolloutDecision memory decision) {
+        try IRolloutPolicy(policy).propose{gas: Constants.MARKET_REFERENCE_WRITE_GAS}(request) returns (
+            IRolloutPolicy.RolloutDecision memory decision
+        ) {
             amount = decision.amountAmps;
         } catch {}
         if (amount > entryInventory) amount = entryInventory;
@@ -504,10 +538,32 @@ library VaultRolloutLib {
     function _answer(address token) private view returns (uint256 answerUsd8) {
         address feeds = _addr(SLOT_FEED_REGISTRY);
         if (feeds == address(0) || token == address(0)) return 0;
-        try IFeedRegistry(feeds).latestAnswer(token) returns (uint256 value, uint32, bool) {
+        try IFeedRegistry(feeds).latestAnswer{gas: Constants.COMPOSITE_READ_GAS}(token) returns (
+            uint256 value, uint32, bool
+        ) {
             return value;
         } catch {
             return 0;
+        }
+    }
+
+    /// @dev The vault's own ERC-20 balance of `token`, or zero when the token cannot be asked: a bounded,
+    ///      hand-decoded `staticcall`, exactly as `VaultPlacementLib._probeBalance` and `VaultRedeemLib` use.
+    ///
+    /// @dev **The finding this closes** (audit fix, 2026-09-07). `deployBonded` read the constituent's balance
+    ///      with a typed `IERC20.balanceOf`, so a Stock Token whose `balanceOf` reverts — the same third-party
+    ///      failure mode `sweepClean`, `evacuate` and `_payOut` are already hardened against — bricked the whole
+    ///      bonded-collateral deployment for that name for as long as the issuer chose. Unreadable reads as zero,
+    ///      which leaves `idle` at whatever the vault holds as an ERC-6909 claim and, below the deploy threshold,
+    ///      makes the call the same silent no-op every other "nothing is due" branch here is.
+    /// @param token The asset.
+    /// @return held The answer, or zero.
+    function _probeBalance(address token) private view returns (uint256 held) {
+        (bool ok, bytes memory returndata) =
+            token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        if (!ok || returndata.length < 32) return 0;
+        assembly ("memory-safe") {
+            held := mload(add(returndata, 0x20))
         }
     }
 

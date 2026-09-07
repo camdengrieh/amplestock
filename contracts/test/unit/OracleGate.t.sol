@@ -741,6 +741,38 @@ contract OracleGateTest is OracleGateFixture {
         assertEq(gate.divergedSince(spokePool), 0, "and the timer is cleared");
     }
 
+    /// @notice **Only a readable reading may clear the timer.** Arming has always required a deviation the gate
+    ///         could actually measure; clearing required only "not outside the band", which an *unreadable*
+    ///         reading also satisfies. So anybody could disarm a nearly-matured divergence by arranging for one
+    ///         of the reads to fail — an unobserved pool, a hub counter whose answer had just gone stale, a
+    ///         market reference briefly unreadable — and then poking, which reset the sustain window for free and
+    ///         could be repeated indefinitely. Unknown is now not evidence in either direction.
+    function test_divergence_anUnreadableDeviationLeavesTheTimerAlone() public {
+        marketRef.setObservation(spokePool, fairTick, fairTick + 700, 1800);
+        gate.pokePool(spokePool);
+        uint32 armedAt = gate.divergedSince(spokePool);
+        assertEq(armedAt, uint32(block.timestamp), "armed");
+
+        // One second short of the sustain window, the reading goes dark and a stranger pokes.
+        vm.warp(block.timestamp + gate.divergenceSustainSeconds() - 1);
+        marketRef.clear(spokePool);
+        vm.prank(STRANGER);
+        gate.pokePool(spokePool);
+        assertEq(gate.divergedSince(spokePool), armedAt, "an unreadable deviation is not evidence of convergence");
+
+        // The reading comes back, still outside the band, and the window that was never restarted matures.
+        marketRef.setObservation(spokePool, fairTick, fairTick + 700, 1800);
+        vm.warp(block.timestamp + 1);
+        assertEq(uint8(gate.state(constituentId)), uint8(GateState.DIVERGED), "the sustain window was not reset");
+
+        // A reading that is genuinely back inside the band still clears it, which is the only thing that may.
+        marketRef.setObservation(spokePool, fairTick, fairTick, 1800);
+        vm.expectEmit(true, false, false, true, address(gate));
+        emit IOracleGate.DivergenceLatched(spokePool, 0, false);
+        gate.pokePool(spokePool);
+        assertEq(gate.divergedSince(spokePool), 0, "a readable convergence clears the timer");
+    }
+
     /// @notice A deviation exactly at the threshold does not arm; one basis point past it does.
     function test_divergence_thresholdIsExclusive() public {
         marketRef.setObservation(spokePool, fairTick, fairTick + int24(uint24(gate.divergenceBps())), 1800);

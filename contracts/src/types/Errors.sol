@@ -235,3 +235,29 @@ error InsufficientInventory(uint256 requested, uint256 available);
 /// @param requested The amount the move asked for.
 /// @param available The amount that limit allowed.
 error RolloutLimitExceeded(bytes32 limit, uint256 requested, uint256 available);
+
+/// @notice The NAV a bond would have been priced against was built from an oracle answer nothing stands behind:
+///         the vault's last checkpoint valued at least one priced asset from a stale or held-back answer.
+/// @dev Thrown by `AmpsBonds.bond`. The registry reports the *lower* of a held-back jump's two levels, so a
+///      held-back up-jump on any single vault asset understates `A` and therefore `navPerShareX18` — which is the
+///      denominator of the bond accretion floor. Bonds on *every other* collateral would then price against a NAV
+///      below the live one and mint below true NAV, so the whole pricing path refuses until the vault has
+///      checkpointed a NAV every priced asset was confirmed and fresh for. The haircut is the wrong instrument
+///      here: it widens on the collateral being bonded, while this is a defect in the denominator common to all
+///      of them. `quote()` reports it as `reason == "unconfirmedNav"` rather than reverting.
+error UnconfirmedNav();
+
+/// @notice An ask placement could not reset the pool's high-water mark, so the mark it would have left behind is
+///         older than the AMPS the placement just laid.
+///
+/// @dev **Why this is a revert and not a shrug** (audit fix, 2026-09-07). `VaultPlacementLib._burnback` selects a
+///      cell for the buyback burn when `upperTick <= highWater && tick <= lowerTick`. An ask is placed strictly
+///      *above* the tick, so a freshly laid ask cell satisfies the second half from birth; the only thing keeping
+///      it out of the burn is the mark being reset to the live tick by the placement that laid it (§3.5's
+///      ordering rule). If that reset is swallowed — a mis-pointed or replaced market reference, a target with no
+///      code, a short or malformed answer a typed `try` cannot tell from a real one — the next permissionless
+///      `compound` burns never-sold protocol-owned inventory. Undoing a keeper's placement costs one wasted call;
+///      burning unsold POL is unrecoverable, so the placement reverts. Bid-only placements are unaffected and
+///      keep the best-effort behaviour, because a bid is never a burn candidate under the first half of the rule.
+/// @param poolId The pool, as `PoolId.unwrap`.
+error HighWaterResetFailed(bytes32 poolId);

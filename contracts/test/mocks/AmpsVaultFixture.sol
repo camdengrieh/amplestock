@@ -113,6 +113,11 @@ abstract contract AmpsVaultFixture is V4TestBase {
     function deployVaultWorld() internal {
         deployV4();
 
+        // `setStandbyVault` refuses a codeless target (audit fix wave 2, finding 6): the standby is the address
+        // `emergencyMigrate` hands six `onlyVault` roles to under duress, and an EOA there is unrecoverable. One
+        // `STOP` is enough to make it a contract for every purpose the migration path exercises.
+        vm.etch(STANDBY, hex"00");
+
         weth = deployToken("Wrapped Ether", "WETH", 18);
         usdg = deployToken("Global Dollar", "USDG", 6);
         stock = new MockStockToken("Mock Stock", "MSTK");

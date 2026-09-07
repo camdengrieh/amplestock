@@ -19,6 +19,7 @@ import {
     Reentrancy,
     SlippageExceeded,
     StaleCheckpoint,
+    UnconfirmedNav,
     UnknownMarket,
     UnknownPool,
     ZeroAddress,
@@ -433,6 +434,14 @@ contract AmpsBonds is IAmpsBonds {
     ///      no such edge: the dust leaves, the vault's own sweep absorbs it as a claim, and a collateral whose
     ///      `transfer` reverts or lies simply leaves its dust here rather than closing the market. The call's
     ///      outcome is therefore never a revert reason, only whether {CollateralForwarded} is emitted.
+    ///
+    /// @dev **And every leg of it is a probe.** "Best effort" has to hold against the token as well as against the
+    ///      donation, so none of the three reads may be a plain typed call: the balance is a bounded, hand-decoded
+    ///      `staticcall` (a `balanceOf` that reverts, that is codeless or that burns everything it is given leaves
+    ///      the dust where it is instead of bricking the market), the `transfer` carries its own gas cap so a
+    ///      token that burns gas cannot consume the bond's whole allowance, and its answer is tested as a
+    ///      first-word-non-zero rather than `abi.decode(..., (bool))`, which `Panic`s on any word that is not 0
+    ///      or 1. A collateral is registered by governance, but `bond()` must survive it turning hostile after.
     function _issue(
         uint16 marketId,
         address collateral,
@@ -457,10 +466,14 @@ contract AmpsBonds is IAmpsBonds {
             vestSeconds_
         );
 
-        uint256 dust = IERC20(collateral).balanceOf(address(this));
-        if (dust != 0) {
-            (bool ok, bytes memory returned) = collateral.call(abi.encodeCall(IERC20.transfer, (vault, dust)));
-            if (ok && (returned.length == 0 || (returned.length >= 32 && abi.decode(returned, (bool))))) {
+        // Every leg of the forward is a probe, because every leg is a call into a token this contract does not
+        // control: an unreadable balance is skipped, the transfer is gas-capped, and its answer is read as a word.
+        (bool readable, uint256 dust) = _probeBalance(collateral);
+        if (readable && dust != 0) {
+            (bool ok, bytes memory returned) = collateral.call{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(
+                abi.encodeCall(IERC20.transfer, (vault, dust))
+            );
+            if (ok && (returned.length == 0 || (returned.length >= 32 && _firstWord(returned) != 0))) {
                 emit CollateralForwarded(collateral, dust);
             }
         }
@@ -481,6 +494,19 @@ contract AmpsBonds is IAmpsBonds {
     ///      `ampsOut = amountIn18 * q / 1e18`, rounding down, out of the same `FullMath` the policy uses. The
     ///      policy still owns `q`; it no longer owns the multiplication.
     ///
+    /// @dev **A NAV nobody stands behind is not a denominator.** The haircut widens the *numerator* of
+    ///      {_qFloorX18} on the collateral being bonded, and that is the whole of what it can do. The denominator
+    ///      is `navPerShareX18`, and the vault builds it from every priced asset it holds — through the same
+    ///      registry, with the same hold-back rule: while a jump is unconfirmed the registry reports
+    ///      `min(held, candidate)`, so a held-back **up**-jump on any one vault asset understates `A` and
+    ///      therefore NAV/share. A bond on any *other* collateral would then be priced against a floor whose
+    ///      denominator is below the live one and mint below true NAV — the wrong direction, and unbounded by the
+    ///      bonded collateral's own haircut. So the vault reports whether the NAV it last checkpointed was built
+    ///      from any answer that was `!fresh || unconfirmed`, and the whole pricing path refuses while it was.
+    ///      The read is a bounded hand-decoded `staticcall`: a vault that cannot answer, or one deployed before
+    ///      the view existed, reads as `false` — this is a *tightening* of the pricing law, and a probe that
+    ///      cannot be answered must not be able to close every bond market at once.
+    ///
     /// @dev **The haircut may be wider than the gate's.** `hSessionBps` arrives from `checkBond`, but the shell
     ///      re-derives its own floor by design, so it also re-derives the input: an answer layer C reports as not
     ///      fresh is priced at no less than the gate's `CLOSED` haircut (see {_haircutFor}). The same widened
@@ -491,11 +517,13 @@ contract AmpsBonds is IAmpsBonds {
         view
         returns (_Priced memory priced)
     {
-        Checkpoint memory checkpoint = IAmpsVault(vault).checkpointData();
+        address vaultAddress = vault;
+        Checkpoint memory checkpoint = IAmpsVault(vaultAddress).checkpointData();
         uint32 age =
             checkpoint.timestamp >= uint32(block.timestamp) ? 0 : uint32(block.timestamp) - checkpoint.timestamp;
         if (age > Constants.CHECKPOINT_MAX_AGE) revert StaleCheckpoint(age, Constants.CHECKPOINT_MAX_AGE);
         if (checkpoint.navPerShareX18 == 0) revert NotInitialized();
+        if (_navUnconfirmed(vaultAddress)) revert UnconfirmedNav();
 
         (uint256 collateralPriceUsd18, bool feedFresh) = _collateralPriceUsd18(record);
 
@@ -852,9 +880,9 @@ contract AmpsBonds is IAmpsBonds {
         }
 
         // The same recomputation {_price} does, for the same reason: the policy owns `q`, never the product. The
-        // divide guards the multiplication the way {_tryAmountIn18} guards the scale: `q` is bounded by the floor
-        // but the product is not, and this half of the contract answers with a `reason` rather than a `Panic`.
-        if (result.qX18 != 0 && input.amountIn18 > type(uint256).max / result.qX18) {
+        // guard measures exactly what `mulDiv` measures — `q` is bounded by the floor but the product is not, and
+        // this half of the contract answers with a `reason` rather than a `Panic`.
+        if (_mulDivWadOverflows(input.amountIn18, result.qX18)) {
             result.reason = "amountTooLarge";
             return result;
         }
@@ -901,6 +929,12 @@ contract AmpsBonds is IAmpsBonds {
         }
         if (context.navPerShareX18 == 0) {
             context.reason = "noNav";
+            return context;
+        }
+        // {_price}'s `UnconfirmedNav`, as a reason: a NAV built from a stale or held-back answer is not a
+        // denominator this contract may price a bond against, whatever the collateral.
+        if (_navUnconfirmed(vaultAddress)) {
+            context.reason = "unconfirmedNav";
             return context;
         }
 
@@ -1024,6 +1058,7 @@ contract AmpsBonds is IAmpsBonds {
     function _haircutFor(address gate, uint16 haircutBps, bool fresh) internal view returns (uint16 effectiveBps) {
         if (fresh) return haircutBps;
         uint16 floorBps = Constants.H_SESSION_CLOSED_BPS_DEFAULT;
+        if (gate.code.length == 0) return haircutBps >= floorBps ? haircutBps : floorBps;
         try IOracleGate(gate).hSessionBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}(Session.CLOSED) returns (
             uint16 closedBps
         ) {
@@ -1054,6 +1089,8 @@ contract AmpsBonds is IAmpsBonds {
         if (record.class != CollateralClass.CONSTITUENT || record.constituentId == 0) return 0;
 
         address registryAddress = registry;
+        if (registryAddress.code.length == 0) return 0;
+
         uint16 targetWeightBps;
         try IPoolRegistry(registryAddress).constituent(record.constituentId) returns (ConstituentConfig memory config) {
             targetWeightBps = config.targetWeightBps;
@@ -1069,18 +1106,26 @@ contract AmpsBonds is IAmpsBonds {
     }
 
     /// @dev The bounded probe behind `IPoolRegistry.currentWeightBps`. The call is typed — the registry declares
-    ///      the view — but it is still capped at `Constants.STOCK_TOKEN_PROBE_GAS` and still `try`/`catch`ed: any
-    ///      failure (a revert, a short or malformed return, a registry deployed before the view existed) reads as
-    ///      "unknown" and prices `deficit == 0`, never as a weight. A registry that cannot answer must never be
-    ///      able to close a bond market, which is why this is not a plain call.
+    ///      the view — but it is still capped, still code-screened (a `try` cannot catch the empty answer of a
+    ///      codeless target) and still `try`/`catch`ed: any failure (a revert, a short or malformed return, a
+    ///      registry deployed before the view existed) reads as "unknown" and prices `deficit == 0`, never as a
+    ///      weight. A registry that cannot answer must never be able to close a bond market, which is why this is
+    ///      not a plain call.
+    ///
+    /// @dev **Budgeted at `COMPOSITE_READ_GAS`, not the 50k token probe.** The registry answers the realised
+    ///      weight by probing `AmpsVault.spokeWeightBps`, which values one spoke's position at the reference price
+    ///      and divides by the checkpointed `A` (~50–200k gas depending on the valuer). Under a 50k cap that read
+    ///      sat exactly at the budget edge, so `quote()` and `bond()` could see different deficits depending on
+    ///      which storage was already warm — a nondeterministic price (caught by
+    ///      `Phase2Integration.test_c_bondAtPremiumDiscountBinds` at the second-wave fold). 400k makes the read
+    ///      succeed whenever it is readable at all, so the deficit term is live and the same on both paths.
     function _tryCurrentWeightBps(address registryAddress, uint16 constituentId)
         internal
         view
         returns (bool ok, uint16 weightBps)
     {
-        try IPoolRegistry(registryAddress).currentWeightBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}(
-            constituentId
-        ) returns (
+        if (registryAddress.code.length == 0) return (false, 0);
+        try IPoolRegistry(registryAddress).currentWeightBps{gas: Constants.COMPOSITE_READ_GAS}(constituentId) returns (
             uint16 raw
         ) {
             if (raw > Constants.BPS) return (false, 0);
@@ -1171,11 +1216,20 @@ contract AmpsBonds is IAmpsBonds {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev The vault's pointers, wrapped so a dead or replaced vault degrades {quote} instead of reverting it.
+    ///
+    /// @dev **A codeless target is screened before the `try`, not caught by it.** A `staticcall` to an address
+    ///      with no code succeeds and returns nothing, and the ABI decode of that empty answer reverts in *this*
+    ///      frame, outside the `catch` — so a typed `try` cannot express "this pointer is absent" for a pointer
+    ///      that is merely codeless (a vault that was never deployed at the address, a self-destructed one, a
+    ///      pointer set to an EOA). {quote} is the non-reverting half of this contract, so every pointer it
+    ///      dereferences is code-screened first and read as absent when there is nothing there.
     function _tryPointers(address vaultAddress)
         internal
         view
         returns (bool ok, address gateAddress, address feedAddress, address referenceAddress)
     {
+        if (vaultAddress.code.length == 0) return (false, address(0), address(0), address(0));
+
         try IAmpsVault(vaultAddress).oracleGate() returns (address value) {
             gateAddress = value;
         } catch {
@@ -1191,7 +1245,8 @@ contract AmpsBonds is IAmpsBonds {
         } catch {
             return (false, address(0), address(0), address(0));
         }
-        ok = gateAddress != address(0) && feedAddress != address(0) && referenceAddress != address(0);
+        ok = gateAddress.code.length != 0 && feedAddress.code.length != 0 && referenceAddress.code.length != 0;
+        if (!ok) return (false, address(0), address(0), address(0));
     }
 
     /// @dev The pool a market prices against: the constituent's spoke, or whichever entry pool holds this
@@ -1202,6 +1257,7 @@ contract AmpsBonds is IAmpsBonds {
         returns (bool ok, PoolId poolId)
     {
         IPoolRegistry poolRegistry = IPoolRegistry(registry);
+        if (address(poolRegistry).code.length == 0) return (false, PoolId.wrap(bytes32(0)));
 
         if (class_ == CollateralClass.CONSTITUENT) {
             try poolRegistry.poolIdOf(constituentId) returns (PoolId value) {
@@ -1236,6 +1292,71 @@ contract AmpsBonds is IAmpsBonds {
     /// @dev Whether `collateral` is an entry pool's counter asset, i.e. eligible for an `ENTRY`-class market.
     function _isEntryCollateral(address collateral) internal view returns (bool ok) {
         (ok,) = _tryPoolId(CollateralClass.ENTRY, 0, collateral);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Internals — bounded probes
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev Whether the vault reports the NAV in its last checkpoint as built on an answer nothing stands behind:
+    ///      the checkpoint priced at least one asset from a feed reading `!fresh || unconfirmed`.
+    ///
+    /// @dev Hand-decoded on purpose, and *not* through `IAmpsVault`: the view is newer than the interface this
+    ///      contract was compiled against in some deployments, and a vault that cannot answer it — codeless,
+    ///      reverting, out of gas, answering short — must read as "confirmed" rather than close every bond market
+    ///      at once. Reading it as `true` on a failure would hand any party who can make the vault revert a
+    ///      protocol-wide bond halt; reading it as `false` restores exactly the behaviour that stood before this
+    ///      check existed. The answer is a word, never `abi.decode(..., (bool))`, so no return shape can `Panic`.
+    /// @param vaultAddress The vault to ask.
+    /// @return unconfirmed True only when the vault positively said so.
+    function _navUnconfirmed(address vaultAddress) internal view returns (bool unconfirmed) {
+        if (vaultAddress.code.length == 0) return false;
+        (bool ok, bytes memory returndata) =
+            vaultAddress.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeWithSignature("navUnconfirmed()"));
+        if (!ok || returndata.length < 32) return false;
+        return _firstWord(returndata) != 0;
+    }
+
+    /// @dev This contract's own balance of `token`, or "unreadable". A bounded `staticcall` with a hand-decoded
+    ///      answer, exactly as the vault probes its balances: a `balanceOf` that reverts, that is codeless or that
+    ///      consumes everything it is handed is skipped, never a revert of the caller.
+    /// @param token The asset.
+    /// @return readable Whether the answer can be believed.
+    /// @return balance The answer, or zero.
+    function _probeBalance(address token) internal view returns (bool readable, uint256 balance) {
+        (bool ok, bytes memory returndata) =
+            token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        if (!ok || returndata.length < 32) return (false, 0);
+        return (true, _firstWord(returndata));
+    }
+
+    /// @dev The first whole word of a returndata buffer whose length the caller has already checked: the
+    ///      hand-decode that replaces `abi.decode` on an untrusted answer, because a word is a word while
+    ///      `abi.decode(rd, (bool))` `Panic`s on any word that is not 0 or 1.
+    /// @param data The buffer; must hold at least 32 bytes.
+    /// @return word The first word.
+    function _firstWord(bytes memory data) internal pure returns (uint256 word) {
+        assembly ("memory-safe") {
+            word := mload(add(data, 0x20))
+        }
+    }
+
+    /// @dev Whether `FullMath.mulDiv(a, b, WAD)` would revert, measured the way `mulDiv` measures it: it computes
+    ///      the full 512-bit product and requires the denominator to exceed the high word, so it overflows exactly
+    ///      when `a * b >= WAD * 2**256`. The guard it replaces was `a > type(uint256).max / b`, which is the
+    ///      bound for `a * b` itself and therefore 1e18 times stricter than the multiplication it guards: {quote}
+    ///      answered `"amountTooLarge"` for deposits `mulDiv` would have priced without complaint.
+    /// @param a The first factor.
+    /// @param b The second factor.
+    /// @return overflows Whether the quotient would not fit in a `uint256`.
+    function _mulDivWadOverflows(uint256 a, uint256 b) internal pure returns (bool overflows) {
+        uint256 high;
+        assembly ("memory-safe") {
+            let low := mul(a, b)
+            let mm := mulmod(a, b, not(0))
+            high := sub(sub(mm, low), lt(mm, low))
+        }
+        return high >= Constants.WAD;
     }
 
     /// @dev The market record, reverting on an id that was never issued.

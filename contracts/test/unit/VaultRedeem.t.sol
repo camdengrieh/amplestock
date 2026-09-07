@@ -4,8 +4,11 @@ pragma solidity 0.8.30;
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {GateState, PlacementRecord} from "../../src/types/Types.sol";
+import {ClaimMinter} from "../mocks/ClaimMinter.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
 /// @notice A contract that reverts on every call, for the hostile-timelock half of the drill.
@@ -464,23 +467,37 @@ contract VaultRedeemTest is PlacementFixture {
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev Leaves the vault holding AMPS as an ERC-6909 claim. A cell that has accrued AMPS fees and is then
-    ///      merged into by a *small* placement settles to a positive `currency0` delta — the fees the merge
-    ///      collected exceed the principal it owes — and the residue is minted back as a claim (§3.9).
+    /// @dev Leaves the vault holding AMPS as an ERC-6909 claim, which is what §12 ruling F is about.
+    ///
+    /// @dev **How it used to be done, and why it cannot be any more** (audit fix, 2026-09-07). The old fixture
+    ///      merged a *tiny* placement into a cell holding accrued AMPS fees: `modifyLiquidity` returns
+    ///      `principal + feesAccrued`, so the settlement's `currency0` side came out **positive** and
+    ///      `VaultPlacementLib._settle` minted the residue back as a claim. That netting was itself the finding
+    ///      the remediation closes — it routed the AMPS-side fees straight back into the ladder without the
+    ///      creator, staker and burn slices of §3.6 step 5 — so `place` now collects and splits a pool's fees
+    ///      before it merges, every settlement it makes is principal, and no placement path can leave a positive
+    ///      `currency0` delta any more.
+    ///
+    ///      The ruling is about what the vault *does* with a claim it holds, not about where the claim came from,
+    ///      so the claim is minted directly: AMPS the vault already owns is settled into the PoolManager and
+    ///      minted back to the vault as an ERC-6909 claim, which leaves the vault's total AMPS inventory exactly
+    ///      as large as it was and moves a slice of it from the ERC-20 side to the claim side. That is precisely
+    ///      the state the ruling describes.
     function _leaveAnAmpsClaim() private {
         // Up into the first ask cell, so that cell is in range and earns; then back down *past* it, so it is a
-        // pure-AMPS ask again and holds the 500 bp of AMPS the sell paid.
+        // pure-AMPS ask again and holds the 500 bp of AMPS the sell paid. The positions are live, which is what
+        // makes the pro-rata base below more than the idle balance.
         buyAmps(hubPool, address(usdg), 40e6);
         giveShares(BOB, 200e18);
         sellAmps(hubPool, amps.balanceOf(BOB));
         syncMarket();
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
-        // A merge so small it owes a millionth of what the cell's accrued fees are worth: the settlement's AMPS
-        // side is positive and the residue is minted back as a claim (§3.9).
-        vm.prank(TIMELOCK);
-        vault.place(hubPool, true, 1e12);
-        assertGt(claimOf(address(amps)), 0, "the merge left an AMPS claim");
+        ClaimMinter minter = new ClaimMinter(IPoolManager(address(poolManager)));
+        vm.prank(address(vault));
+        amps.transfer(address(minter), 1e18);
+        minter.mintTo(address(vault), Currency.wrap(address(amps)), 1e18);
+        assertGt(claimOf(address(amps)), 0, "the vault holds AMPS as a claim");
     }
 
     /// @dev Every feed dead, the watchdog tripped, a guardian freeze running and the timelock replaced by a

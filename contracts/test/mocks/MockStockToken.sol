@@ -45,6 +45,24 @@ contract MockStockToken is ERC20, Ownable, Pausable {
     ///      `sweepClean` and the pro-rata payout probe balances precisely because of it.
     bool public balanceOfReverts;
 
+    /// @notice TEST ONLY. Gas the token burns inside every {transfer}/{transferFrom} before doing anything else.
+    /// @dev The griefing shape every bounded call on the redemption path exists for. An unbounded `transfer` into
+    ///      a token that spends whatever it is handed leaves the caller's "this failed, skip it" branch a
+    ///      sixty-fourth of the frame (EIP-150), so the *skip* runs out of gas instead of the token — which stops
+    ///      the one path §7 says nothing may stop, without ever reverting. Zero disarms it.
+    uint256 public transferGasBurn;
+
+    /// @notice TEST ONLY. A call the token makes from inside {transfer}/{transferFrom}, ignoring failure.
+    /// @dev The second half of the same shape: a Stock Token is a beacon proxy, so its `transfer` may call
+    ///      anything — including the PoolManager, from inside the vault's own `unlock`, where opening a delta of
+    ///      its own makes the vault's `unlock` revert with `CurrencyNotSettled` however clean the vault's books
+    ///      are. Unlike {reentrancyTarget} the result is **discarded**, because the interesting case is the one
+    ///      where the side effect lands and the token's own transfer still succeeds.
+    address public transferHookTarget;
+
+    /// @notice Calldata for {transferHookTarget}.
+    bytes public transferHookData;
+
     /// @notice Reentrancy phase: 0 none, 1 before balances move, 2 after balances move.
     uint8 public reentrancyMode;
 
@@ -139,6 +157,20 @@ contract MockStockToken is ERC20, Ownable, Pausable {
         balanceOfReverts = value;
     }
 
+    /// @notice TEST ONLY. Makes every transfer burn `gas` before moving anything. Zero disarms.
+    /// @param gas The gas to burn per transfer.
+    function setTransferGasBurn(uint256 gas) external {
+        transferGasBurn = gas;
+    }
+
+    /// @notice TEST ONLY. Arms a best-effort call the token makes from inside every transfer.
+    /// @param target The callee; `address(0)` disarms.
+    /// @param data The calldata.
+    function setTransferHook(address target, bytes calldata data) external {
+        transferHookTarget = target;
+        transferHookData = data;
+    }
+
     /// @inheritdoc ERC20
     /// @dev Reverts wholesale while {balanceOfReverts} is armed; otherwise the plain ERC-20 answer.
     function balanceOf(address account) public view override returns (uint256) {
@@ -169,6 +201,8 @@ contract MockStockToken is ERC20, Ownable, Pausable {
     }
 
     function transfer(address to, uint256 value) public override returns (bool) {
+        _burnGas();
+        _maybeCallOut();
         _maybeReenter(REENTRANCY_BEFORE);
         bool ok = super.transfer(to, value);
         _maybeReenter(REENTRANCY_AFTER);
@@ -176,10 +210,31 @@ contract MockStockToken is ERC20, Ownable, Pausable {
     }
 
     function transferFrom(address from, address to, uint256 value) public override returns (bool) {
+        _burnGas();
+        _maybeCallOut();
         _maybeReenter(REENTRANCY_BEFORE);
         bool ok = super.transferFrom(from, to, value);
         _maybeReenter(REENTRANCY_AFTER);
         return ok;
+    }
+
+    /// @dev Spends {transferGasBurn}, or everything it has when that is more than it was given: a caller that
+    ///      capped the call sees the cap consumed, a caller that did not sees its whole frame consumed.
+    function _burnGas() private view {
+        uint256 budget = transferGasBurn;
+        if (budget == 0) return;
+        uint256 floor_ = gasleft() > budget ? gasleft() - budget : 0;
+        while (gasleft() > floor_ + 200) {}
+    }
+
+    /// @dev The best-effort call out. Failure is deliberately ignored so the token's own transfer still succeeds.
+    function _maybeCallOut() private {
+        address target = transferHookTarget;
+        if (target == address(0) || _inCallback) return;
+        _inCallback = true;
+        (bool ok,) = target.call(transferHookData);
+        ok;
+        _inCallback = false;
     }
 
     /// @dev Bubbles the callee's revert so a reentrancy guard's error reaches the test unchanged.

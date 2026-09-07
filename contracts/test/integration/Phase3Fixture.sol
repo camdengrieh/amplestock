@@ -330,6 +330,8 @@ abstract contract Phase3Fixture is V4TestBase {
         vault.setPolicyPointer(bytes32("positionValuer"), address(valuer));
         vault.setPolicyPointer(bytes32("ladderPolicy"), address(ladderPolicy));
         vault.setPolicyPointer(bytes32("rolloutPolicy"), address(rolloutPolicy));
+        // A codeless standby is refused (audit fix wave 2, finding 6); one `STOP` makes the constant a contract.
+        vm.etch(STANDBY, hex"00");
         vault.setStandbyVault(STANDBY);
         vm.stopPrank();
     }

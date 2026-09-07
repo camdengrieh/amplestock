@@ -973,6 +973,30 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.emergencyMigrate(address(0));
     }
 
+    /// @notice **A codeless standby vault is refused** (audit fix wave 2, finding 6).
+    ///
+    /// @dev The standby is the address `emergencyMigrate` hands the whole estate and all six `onlyVault` roles to,
+    ///      in a guardian call with no timelock behind it. Every one of those roles is `onlyVault`, so an EOA or a
+    ///      mistyped address there is not a mistake anybody can undo — nobody can hand the roles back. This is the
+    ///      same guard `setPolicyPointer` already applies to every pointer the vault calls, and zero is simply the
+    ///      codeless case rather than a second check.
+    function test_setStandbyVaultRefusesACodelessTarget() public {
+        runGenesis();
+        address eoa = address(0xE0A);
+        assertEq(eoa.code.length, 0, "an ordinary address has no code");
+
+        vm.startPrank(TIMELOCK);
+        vm.expectRevert(ZeroAddress.selector);
+        vault.setStandbyVault(eoa);
+        vm.expectRevert(ZeroAddress.selector);
+        vault.setStandbyVault(address(0));
+
+        // A contract is accepted, and the fixture's own standby is one.
+        vault.setStandbyVault(STANDBY);
+        vm.stopPrank();
+        assertEq(vault.standbyVault(), STANDBY, "a target with code is registered");
+    }
+
     /// @notice `initializePool` is registry-only and registers the pool's counter asset when it succeeds.
     function test_initializePool_onlyRegistryAndRegistersTheCounter() public {
         runGenesis();

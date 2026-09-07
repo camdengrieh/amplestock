@@ -1370,6 +1370,15 @@ contract OracleGate is IOracleGate {
     }
 
     /// @dev Arms or clears the layer-E timer for one pool and reports any effective state change.
+    ///
+    /// @dev **Only a *readable* reading moves the timer, in either direction.** Arming has always required
+    ///      `ok`: a deviation that cannot be measured is not evidence of divergence. Clearing required only
+    ///      `!outside`, which an unreadable reading also satisfies — so anyone could disarm a sustained
+    ///      divergence by making one of the reads fail (an unobserved pool, a hub whose counter feed had just
+    ///      gone stale, a market reference briefly unreadable) and then poking, resetting a timer that
+    ///      `divergenceSustainSeconds` had nearly matured. The two directions now use the same evidence
+    ///      standard: unknown leaves the timer exactly where it is, and the verdict is unaffected either way —
+    ///      {state} recomputes the deviation on every read, so an armed timer alone never holds a pool closed.
     function _updateDivergence(PoolId poolId) internal {
         if (PoolId.unwrap(poolId) == bytes32(0)) return;
         Session session = sessionAt(block.timestamp);
@@ -1380,7 +1389,7 @@ contract OracleGate is IOracleGate {
         if (outside && since == 0) {
             _divergedSince[poolId] = uint32(block.timestamp);
             emit DivergenceLatched(poolId, deviationBps, true);
-        } else if (!outside && since != 0) {
+        } else if (ok && !outside && since != 0) {
             delete _divergedSince[poolId];
             emit DivergenceLatched(poolId, deviationBps, false);
         }

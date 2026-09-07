@@ -7,7 +7,6 @@ import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {Constants} from "../types/Constants.sol";
 import {
-    AlreadyInitialized,
     GateNotHealthy,
     LengthMismatch,
     NavBleedExceeded,
@@ -246,6 +245,23 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      that matters.
     uint256 private _deployThresholdUsd18;
 
+    /// @dev slot 21 [0..7] — whether the last {_checkpoint} priced any asset off an answer the feed registry is
+    ///      deliberately holding below the market: `!fresh`, or `unconfirmed` while a >10% single-round move waits
+    ///      for its second confirmation (`FeedRegistry` then reports `min(held, candidate)`).
+    ///
+    ///      **Why it is stored and not derived.** A held-back answer understates `A`, so it understates
+    ///      `navPerShareX18` — which is the *denominator* of `AmpsBonds._qFloorX18`. A bond on any **other**
+    ///      collateral would therefore mint below true NAV for as long as the hold lasts, and neither the bond
+    ///      shell nor the gate can see the condition: the gate is scoped to the pool it is asked about, and
+    ///      `VaultNavLib.answer` drops the flag on purpose (it is a valuation read, not a quote). The vault is the
+    ///      one place that knows which assets actually entered `A`, so it is the one place that can say it.
+    ///
+    ///      **Why slot 21 and not slot 15's free upper bits.** `docs/phase2-state-model.md` §1.1 documents slots
+    ///      0-19 field by field and a standby vault is written against them; `_deployThresholdUsd18` was appended
+    ///      at slot 20 rather than packed for exactly that reason, and this is the same decision one slot on.
+    ///      `test/unit/VaultLayout.t.sol` pins the slot and asserts that 22 upward stay empty.
+    bool private _navUnconfirmed;
+
     // -------------------------------------------------------------------------------------------------------------
     // Immutables (bytecode, no slot)
     // -------------------------------------------------------------------------------------------------------------
@@ -464,7 +480,22 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     function totalAssetsUsd18() external view returns (uint256 value) {
-        return VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+        (value,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+    }
+
+    /// @inheritdoc IAmpsVault
+    function navUnconfirmed() external view returns (bool held) {
+        return _navUnconfirmed;
+    }
+
+    /// @inheritdoc IAmpsVault
+    function spokeWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
+        // `A` as last checkpointed: `navPerShareX18 x (T + VIRTUAL_SHARES)`, the inverse of {_navPerShare} up to the
+        // `+ 1` wei. One multiplication instead of the ~150k-gas-per-pool walk `totalAssetsUsd18` would cost, so the
+        // registry's bounded probe of this view succeeds at 32 pools exactly as it does in a two-pool fixture.
+        uint256 total =
+            FullMath.mulDiv(_navPerShareX18, IAmps(_AMPS).totalSupply() + Constants.VIRTUAL_SHARES, Constants.WAD);
+        return VaultNavLib.spokeWeightBps(_sources(), total, address(this), constituentId);
     }
 
     /// @notice `A` measured over an arbitrary holder's balances rather than the vault's own.
@@ -475,7 +506,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @param holder The account to value.
     /// @return value `A` for that account, 18-decimal USD.
     function assetsUsd18Of(address holder) external view returns (uint256 value) {
-        return VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), holder, holder == address(this));
+        (value,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), holder, holder == address(this));
     }
 
     /// @inheritdoc IAmpsVault
@@ -813,9 +844,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         tokens = result.tokens;
         amounts = result.amounts;
 
-        _setUnlockAction(VaultRedeemLib.ACTION_PAYOUT);
-        IPoolManager(_POOL_MANAGER).unlock(abi.encode(tokens, result.fromClaims, result.fromIdle, to));
-        _setUnlockAction(0);
+        // The whole payout orchestration lives in the library: the ERC-20 attempt, the claims-only fallback that
+        // no token can block, and the best-effort idle leg outside the unlock. See {VaultRedeemLib-payout}.
+        VaultRedeemLib.payout(_POOL_MANAGER, tokens, result.fromClaims, result.fromIdle, to);
 
         if (result.inventoryBurned != 0) {
             IAmps(_AMPS).burn(address(this), result.inventoryBurned);
@@ -1183,9 +1214,14 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev **A codeless standby is refused**, and zero is the codeless case rather than a separate one. The
+    ///      standby is the address {emergencyMigrate} hands six `onlyVault` roles and the whole estate to, in a
+    ///      call the guardian makes under duress and with no timelock behind it; an EOA or a mistyped address
+    ///      there is unrecoverable — the roles are `onlyVault`, so nobody can hand them back. The check is the
+    ///      same one {setPolicyPointer} already makes for every pointer the vault calls.
     function setStandbyVault(address standby) external locked onlyTimelock {
         _requireHealthy();
-        if (standby == address(0)) revert ZeroAddress();
+        if (standby.code.length == 0) revert ZeroAddress();
         _standbyVault = standby;
         emit StandbyVaultRegistered(standby);
     }
@@ -1372,13 +1408,14 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev NAV/share recomputed from live balances, positions included: what {previewNavPerShareX18} returns and
     ///      what every Phase 3 entry point captures as `navBefore` for R1.
     function _previewNav() private view returns (uint256) {
-        return _navPerShare(VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true));
+        (uint256 assetsUsd18,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+        return _navPerShare(assetsUsd18);
     }
 
     /// @dev Recomputes `A`, NAV/share, `P_mkt` and `P_ref` and writes the two checkpoint words (section 5).
     function _checkpoint() private returns (Checkpoint memory snapshot) {
         VaultNavLib.Sources memory src = _sources();
-        uint256 assetsUsd18 = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
+        (uint256 assetsUsd18, bool unconfirmed) = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
         uint256 supply = IAmps(_AMPS).totalSupply();
         // The one formula, from the one place: {previewNavPerShareX18} and the checkpoint can never disagree.
         uint256 nav = _navPerShare(assetsUsd18);
@@ -1399,6 +1436,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _pMktX18 = _toUint128(pMkt);
         _checkpointTimestamp = uint32(block.timestamp);
         _checkpointBlock = uint32(block.number);
+        // Slot 21: whether the `A` just written was priced off a held-back or stale answer for any asset. A later
+        // checkpoint against a confirmed answer clears it, so the flag always describes the live checkpoint.
+        _navUnconfirmed = unconfirmed;
 
         emit NavCheckpoint(nav, assetsUsd18, supply);
         emit RefCheckpoint(pRef, pMkt, rateLimited, navFloored);
@@ -1521,11 +1561,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         for (uint256 i; i < length; ++i) {
             _registerAsset(tokens[i]);
         }
-    }
-
-    /// @dev Refuses a write to a set-once pointer once {genesis} has frozen the wiring.
-    function _requireWiringOpen() private view {
-        if (_wiringFrozen) revert AlreadyInitialized();
     }
 
     /// @dev Every governed numeric setter funnels through here: one band check, one {OutOfBand} revert site and

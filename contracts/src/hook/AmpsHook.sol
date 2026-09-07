@@ -71,22 +71,57 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///
     /// @dev **The credit is per `sender`, not per transaction.** The slot actually written is
     ///      `keccak256(abi.encode(ROTATION_CREDIT_SLOT, sender))` — see {_creditSlot}. One transaction-global slot
-    ///      would let AMPS bought by one party discount an unrelated party's sell in the same transaction: a
-    ///      filler settling a victim's buy alongside its own exit would pay the buy fee instead of the 500 bp sell
-    ///      fee, and a credit earned in the deep hub would discount a sell into a thin spoke. The `sender` the
-    ///      PoolManager hands both callbacks is the account that unlocked it — the router — so the same-transaction
-    ///      rotation the credit exists for (hop 1 buy, hop 2 sell, one router call) still sees one credit, while
-    ///      two parties routing through the same transaction never share one.
+    ///      would let AMPS bought through *any* settlement path discount an unrelated sell settled through *any
+    ///      other* one in the same transaction: two independent routers in one multicall, or two bundle-mates
+    ///      sharing a block builder's transaction, would pool their credits, and a credit earned in the deep hub
+    ///      would discount a sell into a thin spoke. Keying by `sender` bounds the credit to one settlement path.
+    ///
+    /// @dev **What `sender` is, and what that means.** The `sender` the PoolManager hands both callbacks is the
+    ///      account that took the lock — the router or settlement contract, not the end user behind it. The credit
+    ///      is therefore shared by *everything one unlocker settles in one transaction*. The rotation it exists
+    ///      for (hop 1 buy, hop 2 sell, one router call) sees one credit, as intended; so does a batching
+    ///      settlement contract that pairs one party's entry with another party's exit inside a single call, and
+    ///      on the matched size that seller is charged the buy fee rather than the 500 bp sell fee. **This is an
+    ///      accepted design property, not an oversight.** Such a batch is economically the rotation the credit is
+    ///      priced for: the AMPS leaving on the sell is AMPS that entered on the buy in the same transaction, the
+    ///      protocol collects two buy fees on the matched size, and no AMPS is sold out of the pool that was not
+    ///      bought into it in the same transaction — which is the invariant the sell fee defends. What remains
+    ///      excluded is the cross-path case: a credit earned under one unlocker can never discount a sell settled
+    ///      under a different one, so the exposure is bounded by what a single settlement contract itself pairs.
     uint256 private constant ROTATION_CREDIT_SLOT = 0x28ef4cf38086db5318537797461c68e4f15873dbd0e73f3e45f6b1f32032b976;
 
-    /// @dev Gas ceiling on the gate snapshot. Generous — the gate reads a feed, a TWAP and the registry — but
-    ///      finite, so a gate that loops cannot take the swap with it.
-    uint256 private constant GATE_PROBE_GAS = 400_000;
+    /// @dev Gas ceiling on the gate snapshot. Generous — but finite, so a gate that loops cannot take the swap
+    ///      with it. The budget only binds when the gate is genuinely that expensive: a normal refresh forwards
+    ///      what it forwards and costs what it costs, and this number never adds gas to a swap.
+    ///
+    /// @dev **Why 1,000,000 and not the 400,000 this started at.** `OracleGate.snapshotByPool` grew: it now reads
+    ///      `feedStatusIn` — itself budgeted at eight per-feed probes — and can take up to two extra
+    ///      `getRoundData` probes per feed read. Measured in-fixture against the mock feeds it costs 239k–252k;
+    ///      against real Chainlink aggregator proxies, whose reads are several storage slots deeper and whose
+    ///      round-data path is longer, the same call is estimated at 330k–390k. 400,000 left no room for a slow
+    ///      feed, another probe, or an aggregator upgrade, and the failure mode is not local: a refresh that runs
+    ///      out of budget raises `refreshFailed`, leaves the cache to age past `Constants.GATE_CACHE_MAX_AGE`, and
+    ///      then pins **every** pool on the conservative substitute with no path back, because every subsequent
+    ///      refresh runs out of the same budget. One million is roughly 2.5x the estimated real-feed cost and
+    ///      still a small fraction of a block, so a looping gate is bounded while a merely slow one is not.
+    uint256 private constant GATE_PROBE_GAS = 1_000_000;
 
     /// @dev Gas ceiling on a pure policy call (`quoteFee`, `innerBandTicks`, `outerRailTicks`).
     uint256 private constant POLICY_PROBE_GAS = 120_000;
 
-    /// @dev Gas ceiling on the cheap pointer reads (`IAmpsVault.oracleGate`, `IOracleGate.closedHours`).
+    /// @dev Gas ceiling on the reads that really are single-slot getters behind an external call:
+    ///      `IAmpsVault.oracleGate`, and the Stock Token's `oraclePaused` / `effectiveAt` in
+    ///      {_clearCorporateAction}. None of them can plausibly cost more than this.
+    ///
+    /// @dev **`IOracleGate.closedHours` used to be metered here and is not any more.** It is not a pointer read:
+    ///      it runs `Calendar.sessionAt`, which scans every DST window that started before now (two cold `SLOAD`s
+    ///      apiece) and reads the holiday bitmap, and then walks back up to 16 local days, each with another
+    ///      bitmap read and two more UTC-offset scans. Against the 2025–2032 table `script/03_Core` installs the
+    ///      scan grows by roughly 4k gas per calendar year covered, reaching ~45–50k on a holiday weekend in
+    ///      2032 — inside 60,000 today and outside it well before the table runs out. The failure would have been
+    ///      silent and seasonal: the read is only reached when the session is `CLOSED`, so it would have started
+    ///      failing on weekends and holidays only, dropping every pool onto the conservative substitute for the
+    ///      whole close. It is therefore read under {GATE_PROBE_GAS}, the same budget as the snapshot beside it.
     uint256 private constant POINTER_PROBE_GAS = 60_000;
 
     /// @dev A surge decays to nothing after eight half-lives; past that `afterSwap` clears the word.
@@ -612,16 +647,26 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      ~141 ticks.
     ///
     /// @dev **The store is X12, the wire is X18.** `141^2 x 1e18` ~ 2e22 does not fit the 64 bits §1.2 gives the
-    ///      packed field, so the hook keeps `EWMA(d^2) x 1e12` (saturating at 1.8e7 ticks^2, three orders of
-    ///      magnitude past the largest `d^2` a single swap can produce) and scales by `VARIANCE_SCALE_TO_X18` on
-    ///      the way out. `HookPoolState.varianceX18` reports the **stored X12 value**; see {poolState}.
+    ///      packed field, so the hook keeps `EWMA(d^2) x 1e12` and scales by `VARIANCE_SCALE_TO_X18` on the way
+    ///      out. `HookPoolState.varianceX18` reports the **stored X12 value**; see {poolState}.
+    ///
+    /// @dev **The clamp below is load-bearing, and the saturation point is *under* the arithmetic range, not
+    ///      over it.** `type(uint64).max / 1e12` is ~1.84e7 ticks^2, while the largest `d^2` one swap can produce
+    ///      is `(2 x MAX_TICK)^2` ~ 3.1e12 ticks^2 — about five orders of magnitude **above** the ceiling. One
+    ///      swap moving ~30,370 ticks saturates the store from zero (a new observation enters weighted by
+    ///      `1 - lambda = 0.02`), and a run of ~4,295-tick swaps saturates it in steady state. Dropping the clamp
+    ///      would let the `uint64` cast wrap and report a *lower* variance, and therefore a lower fee, on exactly
+    ///      the moves that must raise it. Saturating is otherwise harmless: `f_vol` is already pinned at
+    ///      `F_VOL_CAP_BPS` from `EWMA(d^2) ~ 20,000` ticks^2 (sigma ~ 141 ticks), three orders of magnitude below
+    ///      the ceiling, so every saturated value quotes the same capped `f_vol`.
     function _updateVariance(HookStateLib.Dynamic memory d, HookStateLib.Armed memory a, int24 tick) private pure {
         int256 delta = int256(tick) - int256(d.lastTick);
         uint256 squared = uint256(delta * delta);
         uint256 lambda = uint256(Constants.LAMBDA_X18);
 
         // Safe: `squared <= (2 * MAX_TICK)^2` ~ 3.1e12, so the second term is at most ~6.3e40 and the first at
-        // most ~1.8e37. Saturation, not overflow, is the failure mode, and it is three orders of magnitude out.
+        // most ~1.8e37 — both far inside `uint256`, so this cannot overflow. It *can* exceed `uint64`, by up to
+        // ~3.4e3 x, which is what the clamp on the next line is for; see the note above.
         uint256 varianceX12 =
             (lambda * uint256(a.varianceX12) + (Constants.WAD - lambda) * squared * VARIANCE_STORE_SCALE)
                 / Constants.WAD;
@@ -647,9 +692,9 @@ contract AmpsHook is BaseHook, IAmpsHook {
     }
 
     /// @dev §1.5 step 6. One bounded snapshot from the gate, the class's band and rail from the policy, and the
-    ///      entry pools' own truncated TWAP as their fair tick. Any failure raises `refreshFailed`, leaves every
-    ///      cached value in place and still advances `gateAttemptedAt`, so a broken gate costs one bounded call
-    ///      per pool per interval and never a swap.
+    ///      pool's own truncated TWAP as the fair tick for entry pools always and for a spoke whose snapshot did
+    ///      not answer. Any failure raises `refreshFailed`, leaves every cached value in place and still advances
+    ///      `gateAttemptedAt`, so a broken gate costs one bounded call per pool per interval and never a swap.
     function _refreshGate(
         PoolId id,
         HookStateLib.Config memory c,
@@ -703,19 +748,31 @@ contract AmpsHook is BaseHook, IAmpsHook {
         g.corporateFreeze = HookStateLib.hasFlag(d.gateFlags, HookStateLib.FLAG_CORPORATE_FREEZE);
 
         address gate = _gateAddress();
-        if (gate == address(0)) g.ok = false;
-        else _snapshotInto(gate, id, c.poolClass, g);
+        bool snapshotOk = gate != address(0) && _snapshotInto(gate, id, c.poolClass, g);
+        if (!snapshotOk) g.ok = false;
 
-        // An entry pool's fair tick is its own truncated TWAP: WETH and USDG trade 24/7 and have no equity feed
-        // to be measured against (§1.5 step 6).
-        if (c.poolClass == PoolClass.ENTRY) {
+        // An entry pool's fair tick is its own truncated TWAP: WETH and USDG trade 24/7 and have no equity feed to
+        // be measured against (§1.5 step 6).
+        //
+        // A spoke falls back to the same reading when — and only when — the snapshot did not answer. Its fair tick
+        // is normally `tickOf(P_mkt / P_i)` derived by the gate, and leaving that value pinned while the gate is
+        // unreachable is worse than it looks: a pool whose snapshot has *never* succeeded would keep the opening
+        // tick as its reference for as long as the outage lasts, so every deviation, every rail check and every
+        // `RebalanceNeeded` would be measured against a price that stopped being true at initialisation. Its own
+        // truncated TWAP is at least a real, manipulation-capped reading of where the pool has been. The ring is
+        // used only once it actually covers the window; below that the last known fair tick stands, because a
+        // half-covered ring is not a reference and zero is not one either.
+        if (c.poolClass == PoolClass.ENTRY || !snapshotOk) {
             if (_obs[id].observationCoverage(uint32(block.timestamp)) >= TruncatedOracleLib.TWAP_WINDOW) {
                 g.fairTick = _obs[id].twap30m(uint32(block.timestamp));
             }
         }
 
+        // `closedHours` walks the calendar (see {POINTER_PROBE_GAS}), so it is metered against the snapshot's
+        // budget and not the pointer one - it is the most expensive read on this path after the snapshot itself.
         if (g.session == uint8(Session.CLOSED) && gate != address(0)) {
-            (bool got, uint256 hoursClosed) = _staticUint(gate, abi.encodeCall(IOracleGate.closedHours, ()));
+            (bool got, uint256 hoursClosed) =
+                _staticUint(gate, abi.encodeCall(IOracleGate.closedHours, ()), GATE_PROBE_GAS);
             if (got) g.closedHours = hoursClosed > type(uint16).max ? type(uint16).max : uint16(hoursClosed);
             else g.ok = false;
         }
@@ -729,13 +786,17 @@ contract AmpsHook is BaseHook, IAmpsHook {
 
     /// @dev The five fields of `GateSnapshot` the hook caches, decoded by hand out of the thirteen static words a
     ///      well-formed snapshot returns and clamped so that no value a hostile gate can invent reaches storage.
-    function _snapshotInto(address gate, PoolId id, PoolClass poolClass, GateView memory g) private view {
+    /// @return ok Whether the gate answered with a well-formed snapshot at all. The caller needs this separately
+    ///         from `g.ok` — which the policy reads below can also clear — to decide whether a spoke's fair tick
+    ///         has to fall back to the pool's own truncated TWAP.
+    function _snapshotInto(address gate, PoolId id, PoolClass poolClass, GateView memory g)
+        private
+        view
+        returns (bool ok)
+    {
         (bool called, bytes memory ret) =
             gate.staticcall{gas: GATE_PROBE_GAS}(abi.encodeCall(IOracleGate.snapshotByPool, (id)));
-        if (!called || ret.length < GATE_SNAPSHOT_WORDS * 32) {
-            g.ok = false;
-            return;
-        }
+        if (!called || ret.length < GATE_SNAPSHOT_WORDS * 32) return false;
 
         uint256 state_;
         uint256 session_;
@@ -761,6 +822,8 @@ contract AmpsHook is BaseHook, IAmpsHook {
         if (poolClass != PoolClass.ENTRY && fair_ != 0 && fair_ >= TickMath.MIN_TICK && fair_ <= TickMath.MAX_TICK) {
             g.fairTick = int24(fair_);
         }
+
+        ok = true;
     }
 
     /// @dev The class's band and rail from the pure fee policy. Both are single words, so both are decoded by
@@ -853,10 +916,12 @@ contract AmpsHook is BaseHook, IAmpsHook {
     function _clearCorporateAction(address token, HookStateLib.Dynamic memory d) private view {
         if (token.code.length == 0) return;
 
-        (bool gotPaused, uint256 paused) = _staticUint(token, abi.encodeCall(IStockToken.oraclePaused, ()));
+        (bool gotPaused, uint256 paused) =
+            _staticUint(token, abi.encodeCall(IStockToken.oraclePaused, ()), POINTER_PROBE_GAS);
         if (!gotPaused || paused != 0) return;
 
-        (bool gotEffective, uint256 effectiveAt) = _staticUint(token, abi.encodeCall(IStockToken.effectiveAt, ()));
+        (bool gotEffective, uint256 effectiveAt) =
+            _staticUint(token, abi.encodeCall(IStockToken.effectiveAt, ()), POINTER_PROBE_GAS);
         if (!gotEffective) return;
         if (effectiveAt != 0) {
             uint256 nowTs = block.timestamp;
@@ -874,7 +939,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
     /// @dev The gate pointer, read from the vault rather than held immutable: `OracleGate` is pointer-upgradeable
     ///      and is redeployed in Phase 3 (§10 ruling 10), so a hook that froze its address would go blind.
     function _gateAddress() private view returns (address gate) {
-        (bool ok, uint256 word) = _staticUint(vault, abi.encodeCall(IAmpsVault.oracleGate, ()));
+        (bool ok, uint256 word) = _staticUint(vault, abi.encodeCall(IAmpsVault.oracleGate, ()), POINTER_PROBE_GAS);
         if (!ok) return address(0);
         gate = address(uint160(word));
         if (gate.code.length == 0) gate = address(0);
@@ -892,10 +957,16 @@ contract AmpsHook is BaseHook, IAmpsHook {
         }
     }
 
-    /// @dev One bounded `staticcall` returning one unsigned word.
-    function _staticUint(address target, bytes memory data) private view returns (bool ok, uint256 word) {
+    /// @dev One bounded `staticcall` returning one unsigned word. The budget is a parameter because the callers
+    ///      are not alike: `IAmpsVault.oracleGate` and the Stock Token's two flags are slot reads,
+    ///      `IOracleGate.closedHours` walks a calendar. See {POINTER_PROBE_GAS}.
+    function _staticUint(address target, bytes memory data, uint256 gasBudget)
+        private
+        view
+        returns (bool ok, uint256 word)
+    {
         bytes memory ret;
-        (ok, ret) = target.staticcall{gas: POINTER_PROBE_GAS}(data);
+        (ok, ret) = target.staticcall{gas: gasBudget}(data);
         if (!ok || ret.length < 32) return (false, 0);
         assembly ("memory-safe") {
             word := mload(add(ret, 0x20))
@@ -1198,13 +1269,22 @@ contract AmpsHook is BaseHook, IAmpsHook {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc IAmpsHook
+    /// @dev **The mark is re-armed on the raw clock, not on the truncated one.** The vault compares the mark
+    ///      against the *raw* tick bounds of the buckets it lays (`upperTick <= highWater && tick <= lowerTick`),
+    ///      but `lastTruncatedTick` moves at most `maxTickMovePerBlock` per block: after a fast fall it can sit
+    ///      thousands of ticks above the pool. Re-arming at it alone would leave a mark already covering the asks
+    ///      `compound` re-lays at the fallen price, and the next `compound` would withdraw and burn them as
+    ///      bought-back inventory that was never sold. So the mark is floored at the pool's raw tick — the same
+    ///      raw post-swap tick `afterSwap` writes into the DYNAMIC word, which between swaps *is* `slot0.tick`
+    ///      because nothing but a swap moves a tick — and `TruncatedOracleLib.resetHighWater` takes the minimum.
+    ///      The floor can only lower the mark, so it never makes the burn more aggressive than it already was.
     function resetHighWater(PoolId poolId) external returns (int24 previousHighWaterTick) {
         if (msg.sender != vault) revert NotVault(msg.sender);
         if (!HookStateLib.isInitialized(_cfg[poolId])) revert NotInitialized();
 
         previousHighWaterTick = _obs[poolId].highWaterTick;
-        _obs[poolId].resetHighWater();
-        emit HighWaterReset(poolId, previousHighWaterTick, _obs[poolId].highWaterTick);
+        int24 newHighWaterTick = _obs[poolId].resetHighWater(HookStateLib.lastTick(_dyn[poolId]));
+        emit HighWaterReset(poolId, previousHighWaterTick, newHighWaterTick);
     }
 
     /// @inheritdoc IAmpsHook

@@ -247,7 +247,7 @@ contract TruncatedOracleLibFuzzTest is Test {
     }
 
     /// @notice `highWaterTick` is exactly the maximum truncated tick recorded since the last `resetHighWater`, and a
-    ///         reset drops it to the live tick without disturbing the series.
+    ///         reset drops it to `min(live truncated tick, the caller's raw tick)` without disturbing the series.
     function testFuzz_highWaterIsTheMaximumSinceTheLastReset(
         int24 seedTick,
         int24 seedCap,
@@ -263,21 +263,26 @@ contract TruncatedOracleLibFuzzTest is Test {
         uint32 blockNumber = 1;
 
         int24 expectedHighWater = tick0;
+        int24 lastRawTick = tick0;
         assertEq(oracle.highWaterTick(), expectedHighWater, "seeded high water");
 
         for (uint256 i = 0; i < STEPS; ++i) {
             if (i == resetStep) {
-                // The vault resets after compounding: the mark drops to whatever the pool is worth right now.
+                // The vault resets after compounding: the mark drops to whatever the pool is worth right now, which
+                // is the *raw* tick when the truncation cap has left the recorded series above it.
                 int24 live = oracle.lastTruncatedTick();
-                oracle.resetHighWater();
-                assertEq(oracle.highWaterTick(), live, "reset lands on the live truncated tick");
+                int24 expectedReset = lastRawTick < live ? lastRawTick : live;
+                assertEq(oracle.resetHighWater(lastRawTick), expectedReset, "reset lands on the lower of the two");
+                assertEq(oracle.highWaterTick(), expectedReset, "and stores it");
+                assertLe(oracle.highWaterTick(), lastRawTick, "never above the raw tick");
                 assertEq(oracle.lastTruncatedTick(), live, "reset does not disturb the tick series");
-                expectedHighWater = live;
+                expectedHighWater = expectedReset;
             }
 
             (uint32 blocksElapsed, uint32 secondsElapsed, int24 rawTick) = _step(entropy, i);
             blockNumber += blocksElapsed;
             time += secondsElapsed;
+            lastRawTick = rawTick;
             int24 truncated = oracle.write(time, blockNumber, rawTick, cap);
 
             if (truncated > expectedHighWater) expectedHighWater = truncated;

@@ -57,9 +57,17 @@ import {FeedConfig, FeedStatus, Session} from "../types/Types.sol";
 ///      `min(heldLevel, candidate)` — the accepted answer or, on the stateless path, the previous round — stamped
 ///      with the *candidate's* `updatedAt` and flagged `unconfirmed`. Reporting the pre-jump level as if nothing
 ///      had happened would price collateral that just crashed at its pre-crash price; taking the minimum makes the
-///      hold-back protocol-favouring in NAV, in the bond accretion floor and in the gate's fair tick alike, and
-///      `unconfirmed` lets `OracleGate` treat it as staleness (which widens the bond haircut) rather than as a
-///      current price.
+///      hold-back protocol-favouring in NAV, in the bond accretion floor and in the gate's fair tick alike.
+///
+/// @dev **`unconfirmed` is folded into `fresh`, not reported beside it.** `status.fresh` is false for the whole
+///      time a jump is held, in every session — including `CLOSED`, where the age bound is disabled by design.
+///      The two flags were independent, and every consumer then had to remember to read the second one: the gate
+///      did (`feedStale = !fresh || unconfirmed`) and the bond shell's `_haircutFor` did, but `priceUsd8`, the
+///      entry-class markets and anything reading only the {latestAnswer} triple did not, and they priced a
+///      number nothing stands behind as a current price. `fresh` now means what its callers already assume it
+///      means — "this is the price, act on it" — so folding the flag in widens the bond haircut and pauses the
+///      placement path automatically, with no consumer having to opt in. `unconfirmed` stays on {feedStatus} as
+///      the *reason*, for callers that distinguish an aged answer from a held-back one.
 ///
 /// @dev **Where the latch is written.** Reads are `view` and cannot latch, so `accepted`/`pending` are advanced by
 ///      {refresh} (permissionless and unpaid, like `OracleGate.poke()`) and seeded by {setFeed}. Until a feed has
@@ -553,7 +561,9 @@ contract FeedRegistry is IFeedRegistry {
 
         status.age =
             block.timestamp > status.updatedAt ? uint32(block.timestamp - uint256(status.updatedAt)) : uint32(0);
-        status.fresh = status.answerUsd8 != 0 && (session == Session.CLOSED || status.age <= status.maxAgeSeconds);
+        // `unconfirmed` is folded into `fresh` rather than left beside it: see the contract-level NatSpec.
+        status.fresh = status.answerUsd8 != 0 && !status.unconfirmed
+            && (session == Session.CLOSED || status.age <= status.maxAgeSeconds);
     }
 
     /// @dev One bounded probe of `latestRoundData()`, plus positivity, timestamp and per-ticker bound checks.
@@ -623,10 +633,16 @@ contract FeedRegistry is IFeedRegistry {
     ///      against the accepted answer and confirmed through {_jumpConfirmed}, i.e. by a later agreeing round or
     ///      by `confirmSeconds` since the pending record was stamped.
     ///
-    ///      **Stateless path**, taken when the latch is older than one heartbeat — which is every read in a
-    ///      deployment where nobody calls {refresh}. The move is measured against the aggregator's own previous
-    ///      round, and confirmed by `confirmSeconds` since the candidate's `updatedAt` or by agreement with round
+    ///      **Stateless path**, taken when the latch is older than one heartbeat **or when there is no latch at
+    ///      all** — which is every read in a deployment where nobody calls {refresh}, and every read of a feed
+    ///      whose `setFeed` probe failed. The move is measured against the aggregator's own previous round, and
+    ///      confirmed by `confirmSeconds` since the candidate's `updatedAt` or by agreement with round
     ///      `roundId - 2`. Any probe that cannot answer reads as "no previous round", i.e. not a jump.
+    ///
+    ///      An empty `accepted` used to disable *both* halves at once: a feed configured while its aggregator was
+    ///      unreadable latches nothing, and every later round of it was then adopted on sight until somebody paid
+    ///      for a {refresh} that nothing in production calls. The aggregator's own history is evidence whether or
+    ///      not this contract has written anything down, so the stateless path runs regardless.
     ///
     /// @param token The asset.
     /// @param config Its feed record.
@@ -647,15 +663,18 @@ contract FeedRegistry is IFeedRegistry {
         uint256 candidateUsd8,
         uint32 candidateUpdatedAt
     ) internal view returns (bool holdBack, uint256 heldUsd8, bool againstLatch) {
-        if (accepted.answerUsd8 == 0 || roundId == accepted.roundId) return (false, 0, false);
-
-        if (
-            candidateUpdatedAt >= accepted.updatedAt
-                && uint256(candidateUpdatedAt) - uint256(accepted.updatedAt) <= uint256(config.heartbeat)
-        ) {
-            if (_agrees(accepted.answerUsd8, candidateUsd8)) return (false, 0, true);
-            if (_jumpConfirmed(_pending[token], roundId, candidateUsd8)) return (false, 0, true);
-            return (true, accepted.answerUsd8, true);
+        // The latch path needs a latch. Nothing latched, or a latch older than one heartbeat, falls through to the
+        // stateless path below — which is the only half of the rule that stands in a deployment with no keeper.
+        if (accepted.answerUsd8 != 0) {
+            if (roundId == accepted.roundId) return (false, 0, false);
+            if (
+                candidateUpdatedAt >= accepted.updatedAt
+                    && uint256(candidateUpdatedAt) - uint256(accepted.updatedAt) <= uint256(config.heartbeat)
+            ) {
+                if (_agrees(accepted.answerUsd8, candidateUsd8)) return (false, 0, true);
+                if (_jumpConfirmed(_pending[token], roundId, candidateUsd8)) return (false, 0, true);
+                return (true, accepted.answerUsd8, true);
+            }
         }
 
         // `roundId` is `phaseId << 64 | aggregatorRoundId` on a Chainlink proxy, so a low half below 2 means

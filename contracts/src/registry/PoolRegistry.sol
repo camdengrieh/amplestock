@@ -137,6 +137,12 @@ contract PoolRegistry is IPoolRegistry {
     // Storage — the layout of state model §1.4, slot for slot
     // -------------------------------------------------------------------------------------------------------------
 
+    /// @dev Ceiling on the one call this contract makes into the vault for a *number* rather than for an action:
+    ///      {currentWeightBps}. The answer walks every registered asset, so the cap is generous; it is a griefing
+    ///      bound, not a budget, and a caller that hands this view less than the vault needs simply reads the
+    ///      target weight instead. See {currentWeightBps}.
+    uint256 private constant VAULT_WEIGHT_PROBE_GAS = 2_000_000;
+
     /// @dev slot 0 [0..159]. Written in the constructor; movable afterwards only by {setVault}, whose sole caller
     ///      is the address stored here.
     address private _vault;
@@ -360,6 +366,10 @@ contract PoolRegistry is IPoolRegistry {
 
         config.status = ConstituentStatus.ACTIVE;
         config.rolloutWeightBps = rolloutWeightBps;
+        // A reinstated name is not a retired one: leaving the stamp behind made `retiredAt` read as the date of a
+        // retirement that has been undone, which every consumer of the record — the dApp, the rollout schedule,
+        // the index reports — takes at face value.
+        config.retiredAt = 0;
         unchecked {
             _activeCount = _activeCount + 1;
         }
@@ -527,16 +537,46 @@ contract PoolRegistry is IPoolRegistry {
     }
 
     /// @inheritdoc IPoolRegistry
-    /// @dev Phase 2 answers the constituent's **target** weight, which makes `AmpsBonds`'s deficit term exactly
-    ///      zero. The realised weight is the vault's valuation of that spoke's position divided by the whole
-    ///      index, and Phase 2 ships `ZeroPositionValuer`: there is no position to value, so any other answer
-    ///      would be invented. Zero deficit is also the protocol-favourable reading — a smaller deficit means a
-    ///      smaller discount and less AMPS issued — so a wrong-because-unknowable input cannot dilute anyone.
-    ///      Phase 3 sources the numerator from `AmpsVault`'s valuation; the ABI and this call site do not change.
-    ///      An unknown id reads zero rather than reverting, so a bond market on a retired or never-registered
+    /// @dev **The realised weight, from the vault, with the target weight as the fallback.** Phase 2 answered the
+    ///      target outright, which made `AmpsBonds`'s index-deficit term identically zero: the realised weight is
+    ///      the vault's valuation of that spoke's counter-side holdings over the whole index, and Phase 2 shipped
+    ///      `ZeroPositionValuer`, so there was no position to value. With the Phase 3 valuer wired there is, and
+    ///      `AmpsVault.spokeWeightBps` is where it lives — the vault owns the asset enumeration, the reference
+    ///      price the positions are decomposed at and the feed answers, and none of the three belongs here.
+    ///
+    /// @dev **The read is bounded and hand-decoded, and its failure is the target weight.** The vault is a
+    ///      pointer this contract does not control the code of, its answer walks every registered asset, and this
+    ///      view sits behind `AmpsBonds`'s own bounded probe on the bond path. A vault that reverts, that answers
+    ///      short, that answers above `BPS`, or that runs out of the gas it is handed therefore reads as
+    ///      "unknown", and unknown prices `deficit == 0` — the protocol-favourable direction, since a smaller
+    ///      deficit means a smaller discount and less AMPS issued for the same collateral. The target is read
+    ///      **before** the call so the fallback needs no further storage access, which matters precisely in the
+    ///      case where the sub-call consumed everything it was given.
+    ///
+    /// @dev An unknown id reads zero rather than reverting, so a bond market on a retired or never-registered
     ///      name still prices.
     function currentWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
         weightBps = _constituents[constituentId].targetWeightBps;
+
+        // Hand-rolled rather than `abi.encodeCall` + `bytes memory`: this contract has a few hundred bytes of
+        // EIP-170 headroom and the call is four bytes of selector and one word of argument. The answer replaces
+        // the target only when the call succeeded, returned a whole word, and that word is a legal weight; every
+        // other outcome leaves `weightBps` as the target the caller already has.
+        address vaultAddress = _vault;
+        uint256 gasCap = VAULT_WEIGHT_PROBE_GAS;
+        uint256 selector = uint256(uint32(IAmpsVault.spokeWeightBps.selector));
+        uint256 bpsMax = Constants.BPS;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, shl(224, selector))
+            mstore(add(ptr, 4), and(constituentId, 0xffff))
+            if staticcall(gasCap, vaultAddress, ptr, 36, ptr, 32) {
+                if gt(returndatasize(), 31) {
+                    let answer := mload(ptr)
+                    if iszero(gt(answer, bpsMax)) { weightBps := answer }
+                }
+            }
+        }
     }
 
     /// @inheritdoc IPoolRegistry
@@ -828,28 +868,68 @@ contract PoolRegistry is IPoolRegistry {
         if (pRefUsd18 == 0) pRefUsd18 = Constants.WAD;
     }
 
-    /// @dev Opens or closes a constituent's bond market, **only while `AmpsBonds` still attributes that market to
-    ///      this constituent's token**.
+    /// @dev Opens or closes a constituent's bond market, against **the market `AmpsBonds` currently attributes to
+    ///      this constituent's token**, whichever id that is.
     ///
     ///      `AmpsBonds.removeCollateral` detaches a market from its collateral and `setMarketOpen` refuses a
-    ///      detached market forever, so an unconditional call here would make {reinstateConstituent} revert for
-    ///      the rest of the registry's life once governance had removed the collateral — the constituent could be
-    ///      retired but never brought back. The registry's own record (`config.marketId`) is what it wrote when
-    ///      the constituent was added and is never cleared, so it is not evidence that the market is still
-    ///      attached; `AmpsBonds.marketIdOf(token)` is. When the two disagree the flag is not the registry's to
-    ///      set, and it says so in a log instead of reverting.
+    ///      detached market forever, so an unconditional call against the stored id would make
+    ///      {reinstateConstituent} revert for the rest of the registry's life once governance had removed the
+    ///      collateral — the constituent could be retired but never brought back. The registry's own record
+    ///      (`config.marketId`) is what it wrote when the constituent was added, so it is not evidence that the
+    ///      market is still attached; `AmpsBonds.marketIdOf(token)` is, and it is the id this drives.
+    ///
+    ///      **A re-added collateral gets a new id, and the registry has to follow it.** Governance removing a
+    ///      collateral and adding it again — the ordinary way to retune a market's class or caps — issues a
+    ///      *different* market id for the same token. Reading only the stored id then meant
+    ///      {retireConstituent} logged `BondMarketDetached` and left the live market **open**, which is the one
+    ///      outcome retirement exists to prevent. The live id is therefore adopted into the record before the
+    ///      toggle, so the next call sees it too. `marketIdOf == 0` is the genuinely detached case and is
+    ///      disclosed rather than reverted.
+    ///
+    ///      **The live id is read on every call**, including for a constituent the registry never opened a market
+    ///      for, because that is exactly the case where the stored id is no evidence. The read itself is bounded
+    ///      and failure-tolerant ({_liveMarketId}): a shell that cannot answer reads as "no market", which is the
+    ///      behaviour that stood before the live id was consulted at all, and it keeps a bonds pointer the
+    ///      registry does not control from being able to block a retirement.
     /// @param constituentId The constituent, for the log.
     /// @param config Its record.
     /// @param open Whether the market should accept new bonds.
     function _setMarketOpen(uint16 constituentId, ConstituentConfig storage config, bool open) private {
-        uint16 marketId = config.marketId;
-        if (marketId == 0) return;
+        uint16 stored = config.marketId;
         address bonds = _bonds();
-        if (IAmpsBonds(bonds).marketIdOf(config.token) != marketId) {
-            emit BondMarketDetached(constituentId, marketId);
+        uint16 live = _liveMarketId(bonds, config.token);
+        if (live == 0) {
+            if (stored != 0) emit BondMarketDetached(constituentId, stored);
             return;
         }
-        IAmpsBonds(bonds).setMarketOpen(marketId, open);
+        if (live != stored) config.marketId = live;
+        IAmpsBonds(bonds).setMarketOpen(live, open);
+    }
+
+    /// @dev The market `AmpsBonds` currently attributes to `token`, or zero when it cannot be asked. A bounded,
+    ///      hand-decoded `staticcall`, because the bonds pointer comes back from the vault and this contract does
+    ///      not control its code: a shell that reverts, answers short, burns the gas it is handed or predates
+    ///      `marketIdOf` must read as "no market to toggle" rather than block {retireConstituent}.
+    /// @param bonds The bonds shell.
+    /// @param token The collateral.
+    /// @return marketId The live market id, or zero.
+    function _liveMarketId(address bonds, address token) private view returns (uint16 marketId) {
+        uint256 selector = uint256(uint32(IAmpsBonds.marketIdOf.selector));
+        uint256 gasCap = Constants.STOCK_TOKEN_PROBE_GAS;
+        uint256 idMax = type(uint16).max;
+        // Hand-rolled for the reason {currentWeightBps} gives: this contract is at the EIP-170 ceiling and the
+        // call is a selector and one word. Anything but a whole word inside `uint16` leaves `marketId` zero.
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, shl(224, selector))
+            mstore(add(ptr, 4), token)
+            if staticcall(gasCap, bonds, ptr, 36, ptr, 32) {
+                if gt(returndatasize(), 31) {
+                    let answer := mload(ptr)
+                    if iszero(gt(answer, idMax)) { marketId := answer }
+                }
+            }
+        }
     }
 
     /// @dev `AmpsBonds`, read from the vault rather than stored: the vault is the system of record for every

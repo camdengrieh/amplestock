@@ -238,8 +238,10 @@ interface IOracleGate {
     function refDivergenceBps() external view returns (uint16 value);
 
     /// @notice Layer E: when the deviation first left the band for a pool, or 0 while it is inside it.
-    /// @dev Armed and cleared by the permissionless {pokePool}. The effective `DIVERGED` verdict re-checks the
-    ///      *current* deviation as well, so an armed timer nobody clears cannot hold a pool closed on its own.
+    /// @dev Armed and cleared by the permissionless {pokePool}, and only ever on a deviation that could actually
+    ///      be read: a poke whose reading fails leaves the timer exactly where it is, in either direction. The
+    ///      effective `DIVERGED` verdict re-checks the *current* deviation as well, so an armed timer nobody
+    ///      clears cannot hold a pool closed on its own.
     /// @param poolId The pool.
     /// @return since The arming timestamp.
     function divergedSince(PoolId poolId) external view returns (uint32 since);
@@ -348,7 +350,10 @@ interface IOracleGate {
 
     /// @notice Stamps layer A and re-evaluates the sustained-divergence timer for one pool. **Permissionless and
     ///         unpaid.**
-    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation returns.
+    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation is read
+    ///      as back inside it. A deviation that cannot be read at all — an unobserved pool, an unreadable
+    ///      reference, a hub counter with no answer — is not evidence either way and moves nothing, so the
+    ///      sustain timer cannot be reset by arranging for one of the reads to fail.
     /// @param poolId The pool to re-evaluate.
     function pokePool(PoolId poolId) external;
 

@@ -59,6 +59,18 @@ contract MockAmpsVault {
     ///         exercised without a fee-on-transfer token.
     uint256 public settleShortfall;
 
+    /// @notice Whether the NAV in {checkpointData} was built from an answer nothing stands behind.
+    /// @dev The real vault sets this in its own checkpoint whenever any priced asset read `!fresh || unconfirmed`
+    ///      from the feed registry. It is a *vault-wide* flag and not a per-collateral one, which is the whole
+    ///      point: the held-back answer that understates `A` may belong to an asset nobody is bonding, and the
+    ///      NAV it produced is the denominator of every market's accretion floor. `AmpsBonds` reads it through a
+    ///      bounded hand-decoded `staticcall`, so {setNavUnconfirmedReverts} models a vault that cannot answer.
+    bool public navUnconfirmedFlag;
+
+    /// @notice When true, {navUnconfirmed} reverts: the "vault too old to answer, or answering badly" case, which
+    ///         the bond shell must read as `false` rather than as a protocol-wide bond halt.
+    bool public navUnconfirmedReverts;
+
     /// @notice How much of each collateral this mock has received through {depositBonded}.
     mapping(address collateral => uint256 amount) public bondedBalance;
 
@@ -196,6 +208,18 @@ contract MockAmpsVault {
         settleShortfall = shortfall;
     }
 
+    /// @notice Sets the flag {navUnconfirmed} reports.
+    /// @param value Whether the checkpointed NAV priced an asset from a stale or held-back answer.
+    function setNavUnconfirmed(bool value) external {
+        navUnconfirmedFlag = value;
+    }
+
+    /// @notice Makes {navUnconfirmed} revert, leaving every other view working.
+    /// @param value Whether the view reverts.
+    function setNavUnconfirmedReverts(bool value) external {
+        navUnconfirmedReverts = value;
+    }
+
     /// @notice `(A + 1) x 1e18 / (T + VIRTUAL_SHARES)`, the vault's own NAV/share formula.
     /// @return value NAV per share, 18 decimals.
     function previewNavPerShareX18() public view returns (uint256 value) {
@@ -210,6 +234,13 @@ contract MockAmpsVault {
     function checkpointData() external view returns (Checkpoint memory snapshot) {
         if (reverting) revert VaultDown();
         snapshot = _checkpoint;
+    }
+
+    /// @notice Whether the NAV in the last checkpoint was built from any answer that was stale or held back.
+    /// @return value The flag.
+    function navUnconfirmed() external view returns (bool value) {
+        if (reverting || navUnconfirmedReverts) revert VaultDown();
+        value = navUnconfirmedFlag;
     }
 
     /// @notice The checkpointed NAV per share.

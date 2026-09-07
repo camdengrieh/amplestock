@@ -86,10 +86,20 @@ library HookStateLib {
     /// @dev **`varianceX12` is the one field whose unit is not its name's.** `IFeePolicy.FeeInput.varianceX18` is
     ///      `EWMA(d^2) x 1e18` with `d` the raw tick change of one swap (§12.1 ruling H), and at the 100 bp cap
     ///      that is `141^2 x 1e18` ~ 2e22 - which does not fit the 64 bits §1.2 gives this field. The store is
-    ///      therefore **X12** (`EWMA(d^2) x 1e12`, so up to 1.8e7 ticks^2 before it saturates, against a maximum
-    ///      reachable `d^2` of ~3.1e12), and `AmpsHook` multiplies by `VARIANCE_SCALE_TO_X18 = 1e6` on the way
-    ///      into `FeeInput` and into `f_vol`. Widening the packed field was the alternative and does not fit: the
-    ///      ARMED word is full and DYNAMIC has 24 free bits, so the value would have to straddle two words.
+    ///      therefore **X12** (`EWMA(d^2) x 1e12`) and `AmpsHook` multiplies by `VARIANCE_SCALE_TO_X18 = 1e6` on
+    ///      the way into `FeeInput` and into `f_vol`. Widening the packed field was the alternative and does not
+    ///      fit: the ARMED word is full and DYNAMIC has 24 free bits, so the value would have to straddle two
+    ///      words.
+    ///
+    /// @dev **The X12 ceiling is below the arithmetic range, so the clamp in `AmpsHook._updateVariance` is
+    ///      load-bearing.** `type(uint64).max / 1e12` is ~1.84e7 ticks^2, while the largest `d^2` a single swap
+    ///      can produce is `(2 x MAX_TICK)^2` ~ 3.1e12 ticks^2 - about **five orders of magnitude above** the
+    ///      ceiling, not below it. Concretely, one swap moving ~30,370 ticks saturates the store from zero (the
+    ///      EWMA weights a new observation by `1 - lambda = 0.02`), and a series of ~4,295-tick swaps saturates
+    ///      it in steady state. Without the explicit clamp the `uint64` cast would wrap and report a *lower*
+    ///      variance - and therefore a lower fee - on exactly the moves that should raise it. Saturation itself
+    ///      is fee-neutral: `f_vol` is already pinned at `F_VOL_CAP_BPS` from `EWMA(d^2) ~ 20,000` ticks^2
+    ///      (sigma ~ 141 ticks), three orders of magnitude below the ceiling.
     struct Armed {
         uint16 surgeBps;
         uint32 surgeArmedAt;
@@ -166,6 +176,17 @@ library HookStateLib {
         d.fVolBps = uint8((word >> 160) & MASK_8);
         d.gateRefreshedAt = uint32((word >> 168) & MASK_32);
         d.gateAttemptedAt = uint32((word >> 200) & MASK_32);
+    }
+
+    /// @notice The raw post-swap tick out of a DYNAMIC word, without unpacking the rest.
+    /// @dev    One mask instead of a full unpack, for `AmpsHook.resetHighWater`, which needs the pool's raw tick and
+    ///         nothing else out of this word. Ticks only move on swaps and `afterSwap` writes this field on every
+    ///         one, so between swaps it is exactly `slot0.tick` - which is what lets the high-water reset floor
+    ///         itself on the raw clock without an `extsload` into the PoolManager.
+    /// @param word The packed DYNAMIC word.
+    /// @return tick The last raw tick, or 0 for a pool the hook has never initialised.
+    function lastTick(uint256 word) internal pure returns (int24 tick) {
+        tick = int24(uint24(word & MASK_24));
     }
 
     /// @notice Packs an {Armed} into its storage word.

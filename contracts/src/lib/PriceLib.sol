@@ -221,8 +221,40 @@ library PriceLib {
         pure
         returns (int24 tick)
     {
+        return fairTick(pRefUsd18, counterPriceUsd8, counterDecimals, tickSpacing, false);
+    }
+
+    /// @notice The spacing-aligned tick a pool "should" trade at, snapped in the caller's own direction.
+    ///
+    /// @dev **Why the direction has to be the caller's** (audit fix, 2026-09-07). The four-argument {fairTick} is a
+    ///      *measurement* reference — the centre of the hook's fee wall and of the placement divergence check —
+    ///      and floors, because a measurement wants to be deterministic and monotone. A placement *anchor* is a
+    ///      different object: `VaultPlacementLib` snaps it onto the canonical grid with a `ceil`, and two roundings
+    ///      in opposite directions can straddle a cell boundary. Aligning the anchor **down** first therefore let
+    ///      the first ask cell start up to `tickSpacing - 1` ticks below the reference price, which is exactly what
+    ///      I32 ("no ask is ever offered below `P_ref`") forbids. `roundUp == true` is the anchor's direction: the
+    ///      aligned tick is at or above the raw one, so every cell at or above it is at or above the reference.
+    ///
+    ///      One tick of quantisation residue survives in both directions and is not removable here:
+    ///      `TickMath.getTickAtSqrtPrice` returns the greatest tick whose sqrt price is at or below the target, so
+    ///      a target strictly inside a tick that already sits on the spacing reports that tick unchanged. That is a
+    ///      sub-basis-point of price on any spacing this protocol uses, and it is the same residue the divergence
+    ///      reference has always carried.
+    /// @param pRefUsd18 The AMPS reference price in USD, 18 decimals.
+    /// @param counterPriceUsd8 The counter asset's Chainlink USD answer, 8 decimals.
+    /// @param counterDecimals The counter asset's ERC-20 decimals.
+    /// @param tickSpacing The pool's tick spacing.
+    /// @param roundUp Ceil onto the spacing when true, floor when false.
+    /// @return tick The aligned fair tick.
+    function fairTick(
+        uint256 pRefUsd18,
+        uint256 counterPriceUsd8,
+        uint8 counterDecimals,
+        int24 tickSpacing,
+        bool roundUp
+    ) internal pure returns (int24 tick) {
         uint160 sqrtPriceX96 = ampsPerCounterToSqrtPriceX96(pRefUsd18, counterPriceUsd8, counterDecimals);
-        tick = alignTick(TickMath.getTickAtSqrtPrice(sqrtPriceX96), tickSpacing, false);
+        tick = alignTick(TickMath.getTickAtSqrtPrice(sqrtPriceX96), tickSpacing, roundUp);
     }
 
     // -------------------------------------------------------------------------------------------------------------
