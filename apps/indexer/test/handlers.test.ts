@@ -28,12 +28,17 @@ import {
   ADDRESSES,
   CALLER,
   COUNTER,
+  NEW_VAULT,
   POOL_ID,
   TOKEN,
+  bondMarketDetached,
+  collateralForwarded,
   makeContext,
   makeEvent,
   resetLogIndex,
   run,
+  sweepResidue,
+  vaultChanged,
   type TestContext,
 } from './support/events'
 import {registeredHandlers} from './support/registry'
@@ -136,8 +141,11 @@ describe('registration', () => {
       'AmpsVault:GateChanged',
       'AmpsVault:BondedDeposit',
       'AmpsVault:VestingMinted',
+      'AmpsVault:SweepResidue',
       'AmpsBonds:Bond',
       'AmpsBonds:Claim',
+      'AmpsBonds:CollateralForwarded',
+      'AmpsBonds:CollateralRemoved',
       'AmpsStaking:RewardNotified',
       'PoolRegistry:ConstituentAdded',
       'PoolRegistry:ConstituentRetired',
@@ -147,11 +155,14 @@ describe('registration', () => {
       'PoolRegistry:PoolRegistered',
       'PoolRegistry:PoolOpened',
       'PoolRegistry:PoolGridSet',
+      'PoolRegistry:BondMarketDetached',
+      'PoolRegistry:VaultChanged',
       'PoolManager:Swap',
       'PoolManager:ModifyLiquidity',
       'PoolManager:Initialize',
       'AmpsHook:RebalanceNeeded',
       'AmpsHook:RotationCreditConsumed',
+      'AmpsHook:VaultChanged',
       'OracleGate:GateChanged',
       'FeedRegistry:AnswerLatched',
       'BountyPot:BountyPaid',
@@ -1473,5 +1484,183 @@ describe('the bounty pot', () => {
     const [job] = db.rows(schema.keeperJob)
     expect(job!.job).toBe('compound')
     expect(job!.bountyPaidUsd18).toBe(WAD)
+  })
+})
+
+/**
+ * The four disclosures the audited contracts added, all of them the same shape: a fact a hostile or
+ * frozen counterparty could otherwise have turned into a permanent revert is now emitted instead.
+ * The indexer's job is therefore to make each of them *visible*, and — just as importantly — to
+ * leave NAV, the supply and the market's issuance history alone, because none of them moves money.
+ */
+describe('the disclosures that replaced reverts', () => {
+  /** `AmpsBonds.CollateralAdded`, which is what materialises the collateral to market index. */
+  async function addMarket(
+    marketId = 1,
+    collateral: `0x${string}` = TOKEN,
+    constituentId = 1,
+  ): Promise<void> {
+    await run(
+      'AmpsBonds:CollateralAdded',
+      makeEvent({
+        args: {marketId, collateral, class: 0, constituentId},
+        blockNumber: 50n,
+        logIndex: 0,
+        address: ADDRESSES.AmpsBonds,
+      }),
+      context,
+    )
+  }
+
+  it('raises a sweep-residue alert naming the token the vault could not absorb', async () => {
+    await run(
+      'PoolRegistry:ConstituentAdded',
+      makeEvent({
+        args: {constituentId: 1, token: TOKEN, poolId: POOL_ID, targetWeightBps: 500},
+        blockNumber: 60n,
+        logIndex: 0,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    await run(
+      'AmpsVault:SweepResidue',
+      sweepResidue({balance: 1n}, {blockNumber: 61n, logIndex: 3}),
+      context,
+    )
+
+    const alerts = db.rows(schema.alert).filter((a) => a.kind === 'sweep-residue')
+    expect(alerts).toHaveLength(1)
+    // Disclosure, not a breach: the residue is still backing, valued in `A` and paid out by
+    // redemption, so it pages at `warning` rather than `critical`.
+    expect(alerts[0]!.severity).toBe('warning')
+    expect(alerts[0]!.subject).toBe(TOKEN)
+    expect(alerts[0]!.id).toBe('000000000061-000003')
+    const detail = alerts[0]!.detail as Record<string, unknown>
+    expect(detail.balance).toBe('1')
+    expect(detail.constituentId).toBe(1)
+
+    // Nothing about the vault's money moved.
+    expect(db.count(schema.navCheckpoint)).toBe(0)
+    expect(db.count(schema.burnEvent)).toBe(0)
+  })
+
+  it('still records a residue for a token that is not one of ours', async () => {
+    const donated = '0x00000000000000000000000000000000000000f9' as const
+    await run(
+      'AmpsVault:SweepResidue',
+      sweepResidue({token: donated, balance: 7n}, {blockNumber: 62n, logIndex: 0}),
+      context,
+    )
+    const [alert] = db.rows(schema.alert)
+    expect(alert!.subject).toBe(donated)
+    expect((alert!.detail as Record<string, unknown>).constituentId).toBeNull()
+  })
+
+  it('attributes forwarded collateral to its market and accumulates it there', async () => {
+    await addMarket()
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({amount: 3n}, {blockNumber: 52n, logIndex: 4}),
+      context,
+    )
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({amount: 5n}, {blockNumber: 53n, logIndex: 2}),
+      context,
+    )
+
+    const market = await db.find(schema.bondMarket, {id: '1'})
+    expect(market!.forwardedCollateral).toBe(8n)
+    // A donation is not issuance: nothing else on the market moved.
+    expect(market!.totalCollateral).toBe(0n)
+    expect(market!.bondCount).toBe(0)
+
+    const state = await db.find(schema.parameterState, {id: 'bonds:collateralForwarded:1'})
+    expect(state!.value).toBe(5n)
+    expect(db.rows(schema.parameterChange)).toHaveLength(2)
+  })
+
+  it('buckets a forward whose collateral it cannot place under market 0', async () => {
+    await addMarket()
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({collateral: COUNTER, amount: 9n}, {blockNumber: 54n, logIndex: 0}),
+      context,
+    )
+    expect((await db.find(schema.bondMarket, {id: '1'}))!.forwardedCollateral).toBe(0n)
+    const state = await db.find(schema.parameterState, {id: 'bonds:collateralForwarded:0'})
+    expect(state!.value).toBe(9n)
+  })
+
+  it('detaches a market when its collateral is removed, and forgets the reverse lookup', async () => {
+    await addMarket()
+    expect((await db.find(schema.collateralIndex, {id: TOKEN}))!.marketId).toBe(1)
+
+    await run(
+      'AmpsBonds:CollateralRemoved',
+      makeEvent({
+        args: {marketId: 1, collateral: TOKEN},
+        blockNumber: 55n,
+        logIndex: 0,
+        address: ADDRESSES.AmpsBonds,
+      }),
+      context,
+    )
+
+    const market = await db.find(schema.bondMarket, {id: '1'})
+    expect(market!.open).toBe(false)
+    expect(market!.detached).toBe(true)
+    // The market row survives — its issuance history is still true — but the lookup is gone, so a
+    // later forward of the same collateral cannot be attributed to a market that no longer owns it.
+    expect(await db.find(schema.collateralIndex, {id: TOKEN})).toBeNull()
+  })
+
+  it('records the registry finding the bond market already gone', async () => {
+    await addMarket()
+    await run(
+      'PoolRegistry:BondMarketDetached',
+      bondMarketDetached({constituentId: 1, marketId: 1}, {blockNumber: 56n, logIndex: 1}),
+      context,
+    )
+
+    expect((await db.find(schema.bondMarket, {id: '1'}))!.detached).toBe(true)
+    const [detached] = db.rows(schema.constituentEvent).filter((e) => e.kind === 'bondMarketDetached')
+    expect(detached!.constituentId).toBe(1)
+    expect(detached!.field).toBe('marketId')
+    expect(detached!.newValue).toBe(1n)
+    expect(detached!.id).toBe('000000000056-000001')
+  })
+
+  it('logs the detachment even when the market was never indexed', async () => {
+    await run(
+      'PoolRegistry:BondMarketDetached',
+      bondMarketDetached({constituentId: 4, marketId: 9}, {blockNumber: 57n, logIndex: 0}),
+      context,
+    )
+    expect(db.count(schema.bondMarket)).toBe(0)
+    expect(db.rows(schema.constituentEvent)).toHaveLength(1)
+  })
+
+  it('follows the vault pointer through the registry and the hook', async () => {
+    await run(
+      'PoolRegistry:VaultChanged',
+      vaultChanged('PoolRegistry', {}, {blockNumber: 80n, logIndex: 0}),
+      context,
+    )
+    await run(
+      'AmpsHook:VaultChanged',
+      vaultChanged('AmpsHook', {}, {blockNumber: 80n, logIndex: 1}),
+      context,
+    )
+
+    const registry = await db.find(schema.parameterState, {id: 'registry.pointer:vault'})
+    expect(registry!.addressValue).toBe(NEW_VAULT)
+    expect(registry!.previousAddress).toBe(ADDRESSES.AmpsVault)
+    const hook = await db.find(schema.parameterState, {id: 'hook.pointer:vault'})
+    expect(hook!.addressValue).toBe(NEW_VAULT)
+    // Same shape as the pointers `AmpsBonds`, `AmpsStaking` and `BountyPot` already emit, so the
+    // Governance page reads one table for all of them.
+    expect(db.rows(schema.parameterChange).filter((c) => c.name === 'vault')).toHaveLength(2)
   })
 })

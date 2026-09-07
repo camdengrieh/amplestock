@@ -16,6 +16,12 @@
  *    `P_ref`, `warning` on the rest — a supply or inventory drift is a bug in the indexer, a NAV
  *    drift means the number the dApp is showing is wrong.
  *
+ * Four more kinds are raised from the handlers themselves and share the same table and sink:
+ * `nav-bleed` (a `compound` past the R1 bound), `gate` (a watchdog trip, a protocol freeze, a
+ * migration), `corporate-action` (an unannounced `uiMultiplier` step) and `sweep-residue` (the
+ * vault's exit sweep could not absorb a registered token's idle balance — the token is paused,
+ * denylisting the vault or unreadable, and says so in a log rather than a revert).
+ *
  * **The sink is a no-op by default.** Every alert is always written to the `alert` table, which is
  * the durable record and what the HTTP layer serves. Delivery on top of that is a single webhook:
  * set `AMPS_ALERT_WEBHOOK` and each alert is POSTed as JSON. Nothing is retried inside the
@@ -26,7 +32,7 @@
 export type AlertSeverity = 'info' | 'warning' | 'critical'
 
 export interface AlertPayload {
-  kind: 'denylist' | 'reconciliation' | 'gate' | 'nav-bleed' | 'corporate-action'
+  kind: 'denylist' | 'reconciliation' | 'gate' | 'nav-bleed' | 'corporate-action' | 'sweep-residue'
   severity: AlertSeverity
   /** What the alert is about: a pool id, a token, a block. */
   subject: string

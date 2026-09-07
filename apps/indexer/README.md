@@ -35,7 +35,7 @@ that reason.
 
 ```
 ponder.config.ts     sources: eleven log contracts, two account (transaction) sources, two block jobs
-ponder.schema.ts     46 tables
+ponder.schema.ts     47 tables
 src/config/          the address book and the environment, both read at start-up
 src/abi/external.ts  the Stock Token and Chainlink ABIs (ours come from @amplestocks/abis)
 src/lib/             fee decoding, tick and liquidity maths, reconciliation, alerts, ids, flywheel

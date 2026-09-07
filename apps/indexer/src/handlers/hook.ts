@@ -184,6 +184,14 @@ ponder.on('AmpsHook:FeePolicyChanged', async ({event, context}) => {
   })
 })
 
+/** The hook's `vault` is storage now, not an immutable, so a migration repoints it here. */
+ponder.on('AmpsHook:VaultChanged', async ({event, context}) => {
+  await recordParameter(context, event, 'hook.pointer', 'vault', {
+    previousAddress: event.args.previousVault,
+    newAddress: event.args.newVault,
+  })
+})
+
 // -------------------------------------------------------------------------------------------------
 
 type HookEventShape = {

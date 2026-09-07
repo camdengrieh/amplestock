@@ -38,6 +38,12 @@ import {BOUNTIED_JOBS, type BountyReport, type JobCandidate, type JobKind, type 
  * which are **linked libraries**: solc puts their errors in the library's ABI, not the vault's, so the vault
  * ABI this package exports cannot decode a revert that comes from one. Restating the six signatures the keeper
  * reacts to is the smallest honest fix; anything not on this list is reported by its raw selector.
+ *
+ * `SweepDirty` is the one entry the audited contracts no longer raise: `sweepClean` discloses a residue with
+ * `IAmpsVault.SweepResidue` instead of reverting on it, precisely so a donated wei of a paused token cannot
+ * brick every entry point. The declaration survives in `Errors.sol` and the signature stays here, because a
+ * keeper pointed at a vault deployed before that change must still name the revert rather than print a
+ * selector — and a signature that never matches costs nothing.
  */
 export const KEEPER_ERROR_ABI = parseAbi([
   'error PlacementCooldown(bytes32 poolId, uint32 readyAt)',

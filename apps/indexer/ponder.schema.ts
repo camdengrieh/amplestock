@@ -762,6 +762,14 @@ export const bondMarket = onchainTable(
     collateralClassLabel: t.text().notNull(),
     constituentId: t.integer().notNull(),
     open: t.boolean().notNull(),
+    /**
+     * `AmpsBonds` no longer attributes this market to its collateral — `removeCollateral` ran, so
+     * `marketIdOf(collateral) != marketId` and `setMarketOpen` refuses the market forever. Set by
+     * `AmpsBonds.CollateralRemoved` and confirmed from the registry's side by
+     * `PoolRegistry.BondMarketDetached`, which is the log `retireConstituent` /
+     * `reinstateConstituent` emit instead of reverting when they find the market gone.
+     */
+    detached: t.boolean().notNull(),
     dBaseBps: t.integer().notNull(),
     dMinBps: t.integer().notNull(),
     dMaxBps: t.integer().notNull(),
@@ -777,10 +785,27 @@ export const bondMarket = onchainTable(
     bondCount: t.integer().notNull(),
     lastBondAt: t.bigint().notNull(),
     lastDiscountBps: t.integer().notNull(),
+    /**
+     * Cumulative residual collateral `bond()` forwarded to the vault at its exit
+     * (`CollateralForwarded`), in the collateral's own decimals. Non-zero only when somebody
+     * donated to the bonds shell: the collateral itself never rests there.
+     */
+    forwardedCollateral: t.bigint().notNull(),
     createdAt: t.bigint().notNull(),
   }),
   (table) => ({byConstituent: index().on(table.constituentId), byOpen: index().on(table.open)}),
 )
+
+/** Collateral address -> market id: the reverse of `bondMarket.collateral`, and the mirror of
+ *  `AmpsBonds.marketIdOf`. `CollateralForwarded` names only the collateral, and `context.db` has a
+ *  `find` but no query side, so the lookup is materialised here exactly as `tokenIndex` is. A
+ *  `CollateralRemoved` detaches the market on-chain and deletes the row here. */
+export const collateralIndex = onchainTable('collateral_index', (t) => ({
+  /** The collateral address, lower-cased. */
+  id: t.hex().primaryKey(),
+  marketId: t.integer().notNull(),
+  constituentId: t.integer().notNull(),
+}))
 
 export const bondPurchase = onchainTable(
   'bond_purchase',
@@ -1094,7 +1119,7 @@ export const alert = onchainTable(
     id: t.text().primaryKey(),
     blockNumber: t.bigint().notNull(),
     timestamp: t.bigint().notNull(),
-    /** `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action`. */
+    /** `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action` | `sweep-residue`. */
     kind: t.text().notNull(),
     severity: t.text().notNull(),
     subject: t.text().notNull(),

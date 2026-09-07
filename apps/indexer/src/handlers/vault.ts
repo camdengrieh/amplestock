@@ -418,6 +418,48 @@ ponder.on('AmpsVault:Compound', async ({event, context}) => {
 })
 
 // -------------------------------------------------------------------------------------------------
+// The exit sweep
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * `sweepClean` (I12) could not fold a registered token's idle balance into the vault's ERC-6909
+ * claims, so the balance is still sitting on the vault at function exit.
+ *
+ * **This is the log that replaced the `SweepDirty` revert, and the difference matters to the
+ * index.** Reverting on the residue handed anybody a one-transaction kill switch: donate one wei of
+ * a Stock Token to the vault, have the issuer pause it or denylist the vault, and every entry point
+ * — `redeemProRata` included, which §7 says can never be gated — reverts forever. The residue is
+ * therefore disclosed rather than enforced: it stays part of the vault's holdings, is valued in `A`,
+ * is paid out by redemption when the token allows a transfer again, and is absorbed by the next
+ * sweep that succeeds. **Nothing about NAV or the supply moves here**, which is why this handler
+ * writes no checkpoint, no summary patch and no share movement.
+ *
+ * What is left is an operational fact: a token the vault holds has stopped accepting a transfer
+ * from it. That is one alert at `warning` — the same fact the denylist alarm would raise at
+ * `critical` if it could see the issuer's call, which for a `blockAccounts` routed through a
+ * multicall or a Safe it cannot.
+ */
+ponder.on('AmpsVault:SweepResidue', async ({event, context}) => {
+  const token = event.args.token.toLowerCase() as `0x${string}`
+  const indexed = await context.db.find(schema.tokenIndex, {id: token})
+
+  await raiseAlert(context.db, event.log.logIndex, {
+    kind: 'sweep-residue',
+    severity: 'warning',
+    subject: token,
+    message: `sweepClean could not absorb ${event.args.balance.toString()} of ${token}; it is still on the vault`,
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    detail: {
+      token,
+      balance: event.args.balance,
+      constituentId: indexed === null ? null : indexed.constituentId,
+      txHash: event.transaction.hash,
+    },
+  })
+})
+
+// -------------------------------------------------------------------------------------------------
 // Gate, parameters, governance
 // -------------------------------------------------------------------------------------------------
 

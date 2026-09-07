@@ -311,6 +311,45 @@ ponder.on('PoolRegistry:IndexWeightsSet', async ({event, context}) => {
   }
 })
 
+/**
+ * `retireConstituent` / `reinstateConstituent` found the constituent's bond market gone from
+ * `AmpsBonds` — `removeCollateral` had detached it, and `setMarketOpen` refuses a detached market
+ * forever — so the flag was not the registry's to set and it said so in a log instead of reverting.
+ * Without this the constituent could be retired but never brought back.
+ *
+ * The registry's own `config.marketId` is what it wrote when the constituent was added and is never
+ * cleared, so it is *not* evidence the market is still attached. That is exactly what
+ * `bondMarket.detached` records, and it is set here as well as by `AmpsBonds.CollateralRemoved`,
+ * because an indexer that started after the removal has only this log to learn it from.
+ */
+ponder.on('PoolRegistry:BondMarketDetached', async ({event, context}) => {
+  const id = event.args.marketId.toString()
+  const market = await context.db.find(schema.bondMarket, {id})
+  if (market !== null) {
+    await context.db.update(schema.bondMarket, {id}).set({open: false, detached: true})
+  }
+
+  await context.db.insert(schema.constituentEvent).values({
+    id: eventId(event.block.number, event.log.logIndex),
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    txHash: event.transaction.hash,
+    constituentId: event.args.constituentId,
+    kind: 'bondMarketDetached',
+    field: 'marketId',
+    previousValue: null,
+    newValue: BigInt(event.args.marketId),
+  })
+})
+
+/** The migration handover: `setVault` repointed the registry at a new vault. */
+ponder.on('PoolRegistry:VaultChanged', async ({event, context}) => {
+  await recordParameter(context, event, 'registry.pointer', 'vault', {
+    previousAddress: event.args.previousVault,
+    newAddress: event.args.newVault,
+  })
+})
+
 ponder.on('PoolRegistry:RetiredBidsWithdrawn', async ({event, context}) => {
   await context.db.insert(schema.constituentEvent).values({
     id: eventId(event.block.number, event.log.logIndex),
