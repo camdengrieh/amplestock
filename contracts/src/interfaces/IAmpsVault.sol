@@ -108,9 +108,15 @@ interface IAmpsVault {
     event BondedDeposit(address indexed collateral, address indexed from, uint256 amount, uint16 constituentId);
 
     /// @notice Emitted when `AmpsBonds` mints vesting AMPS.
+    /// @dev **`reason` is what tells a bond's mint from the team's vest.** The mint a bond causes and the `Bond`
+    ///      that caused it are the same AMPS and must not both be added to supply; the team's 5% is minted inside
+    ///      {genesis} and reported by `Genesis`, never here. `bytes32("bond")` is the only value the immutable
+    ///      bytecode can emit — {mintVesting} is `onlyBonds` (I10) — and it is a field rather than an inference so
+    ///      that a reader never has to cross-reference two logs to know which of the two it is looking at.
     /// @param to Always the `AmpsBonds` address.
     /// @param amount The AMPS wei minted.
-    event VestingMinted(address indexed to, uint256 amount);
+    /// @param reason Why the mint happened. `bytes32("bond")`.
+    event VestingMinted(address indexed to, uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every AMPS burn the vault performs, whatever the cause.
     /// @param amount The AMPS wei burned.
@@ -119,12 +125,40 @@ interface IAmpsVault {
     event Burn(uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every ladder placement. **Phase 3.**
+    /// @dev `reason` and the cell range are appended fields (§12.4). Before them a reader had to classify a
+    ///      placement from the transaction's four-byte selector, which is exact for a direct call and a heuristic
+    ///      for one routed through a multicall or a Safe, and had to rebuild the range from the vault's own
+    ///      `ModifyLiquidity` logs. Both are now in the log itself.
     /// @param poolId The pool.
     /// @param above True for an ask ladder, false for a bid ladder.
     /// @param buckets The bucket count placed.
     /// @param amount The token amount committed.
     /// @param anchorTick The anchor the ladder was measured from.
-    event Placement(PoolId indexed poolId, bool above, uint8 buckets, uint256 amount, int24 anchorTick);
+    /// @param reason Why the placement happened: `bytes32("place")` (governance, genesis included),
+    ///        `bytes32("spokeSeed")`, `bytes32("compound")`, `bytes32("rollout")`, `bytes32("bonded")` or
+    ///        `bytes32("migrate")`.
+    /// @param lowerTick The lowest tick written by this placement, `0` when nothing was written.
+    /// @param upperTick The highest tick written by this placement, `0` when nothing was written.
+    event Placement(
+        PoolId indexed poolId,
+        bool above,
+        uint8 buckets,
+        uint256 amount,
+        int24 anchorTick,
+        bytes32 reason,
+        int24 lowerTick,
+        int24 upperTick
+    );
+
+    /// @notice Emitted on every `rollout()` that moves inventory. **Phase 3.**
+    /// @dev The counterpart of `Placement` on the source side: without it a reader had to reconstruct a rollout
+    ///      from the destination's `Placement` plus the entry pools' negative `ModifyLiquidity` in the same
+    ///      transaction (§12.4).
+    /// @param constituentId The destination constituent.
+    /// @param poolId The destination spoke.
+    /// @param movedAmps AMPS wei harvested out of the entry pools' unfilled asks.
+    /// @param placedAmps AMPS wei the destination ladder actually committed; the remainder stays idle.
+    event Rollout(uint16 indexed constituentId, PoolId indexed poolId, uint256 movedAmps, uint256 placedAmps);
 
     /// @notice Emitted on every `compound()`. **Phase 3.**
     /// @param poolId The pool.
@@ -346,6 +380,78 @@ interface IAmpsVault {
     function initialized() external view returns (bool done);
 
     // -------------------------------------------------------------------------------------------------------------
+    // Reads — the ladder (Phase 3, `view`-only)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // `docs/phase3-state-model.md` §10 ruling 1. These exist for the dApp's ladder chart, for the keeper, and for
+    // the tests — **not** for NAV. `LadderPositionValuer` deliberately does not read them: it enumerates the
+    // canonical grid at the PoolManager by `extsload`, so the PoolManager rather than the vault's own bookkeeping
+    // is the authority on what the vault owns, and a bug in these records cannot inflate `A` (§4).
+    //
+    // They are permitted additions to a final ABI because they are `view`: the I14 enumeration and
+    // `scripts/selector-gate.py` classify only non-`view`/non-`pure` selectors, so a read-only getter changes
+    // nothing about which selectors are gated and how.
+    //
+    // Ruling 1 names exactly these two. {ladderAt} returns the record's fields flattened rather than a
+    // `Types.PlacementRecord` struct, and there is no by-cell getter, for one reason: `AmpsVault` has 802 bytes of
+    // EIP-170 headroom in total and the struct-returning forms cost more of it than the getters are worth. A
+    // consumer that wants a cell reads `ladderLength` once and scans at most `Constants.GRID_CELLS` (24) records
+    // for the `bucketIndex` it wants, which is the same work the vault would have done. `VaultRedeemLib`
+    // (ruling 6) is what reopens the headroom; until it lands, this is the shape that fits.
+
+    /// @notice The number of live ladder cells (records with non-zero liquidity) across every pool.
+    /// @dev Bounded by `Constants.MAX_LIVE_CELLS`, which is what bounds the gas of {redeemProRata}. Maintained by
+    ///      the placement path on every open, merge, unwind and removal.
+    /// @return count The live cell count.
+    function liveCells() external view returns (uint32 count);
+
+    /// @notice When the vault last placed into a pool, which is what the 60-second per-pool cooldown is measured
+    ///         from (§3.8 step 6).
+    /// @dev The keeper's screening step 5. Without it a caller had to approximate the stamp from the newest
+    ///      `placedAt` across the pool's `ladderAt` records — a lower bound, because a placement that merges into
+    ///      no cell (a no-op `compound`) stamps the cooldown and moves no record.
+    /// @param poolId The pool.
+    /// @return timestamp The stamp, or 0 if the vault has never placed into that pool.
+    function lastPlacementAt(PoolId poolId) external view returns (uint32 timestamp);
+
+    /// @notice How many grid cells the vault currently holds a position in, for one pool.
+    /// @dev Bounded by `Constants.GRID_CELLS` (24) by construction: placements merge into the cell they belong to
+    ///      rather than appending a second record for the same range (invariant I39). That bound is what makes
+    ///      `redeemProRata`'s per-pool work measurable rather than unbounded.
+    /// @param poolId The pool.
+    /// @return length The record count.
+    function ladderLength(PoolId poolId) external view returns (uint256 length);
+
+    /// @notice One placement record by array index.
+    /// @param poolId The pool.
+    /// @param index The index, `< ladderLength(poolId)`.
+    /// @return lowerTick Lower bound of the cell.
+    /// @return upperTick Upper bound of the cell.
+    /// @return liquidity Live position liquidity in the cell.
+    /// @return bucketIndex The canonical grid cell index, `m - GRID_MIN_M`. The record's real identity.
+    /// @return buckets The ladder length at first placement.
+    /// @return above True while the cell is an ask, false once it has converted to a bid.
+    /// @return placedAt Timestamp of the last add into the cell.
+    /// @return amount Cumulative token added, disclosure only.
+    /// @return tiltX18 The tilt in force at placement.
+    /// @return anchorTick The anchor the ladder was measured from.
+    function ladderAt(PoolId poolId, uint256 index)
+        external
+        view
+        returns (
+            int24 lowerTick,
+            int24 upperTick,
+            uint128 liquidity,
+            uint8 bucketIndex,
+            uint8 buckets,
+            bool above,
+            uint32 placedAt,
+            uint128 amount,
+            uint64 tiltX18,
+            int24 anchorTick
+        );
+
+    // -------------------------------------------------------------------------------------------------------------
     // Reads — governed parameters
     // -------------------------------------------------------------------------------------------------------------
 
@@ -402,6 +508,15 @@ interface IAmpsVault {
     /// @notice The entry-pool inventory floor, in bps of the POL tranche. 3,000 at launch. **Phase 3.**
     /// @return value The parameter.
     function entryFloorBps() external view returns (uint16 value);
+
+    /// @notice The idle-collateral floor below which {deployBonded} does nothing, in 18-decimal USD. $100 at
+    ///         launch. **Phase 3.**
+    /// @dev `docs/phase3-state-model.md` §10 ruling 15. {deployBonded} is permissionless and paid from
+    ///      `BountyPot`; without a floor it can be made to fire on dust, which drains the pot without placing
+    ///      anything worth placing. Below the threshold the call is a **no-op that returns zero**, never a revert,
+    ///      so a mistimed keeper call costs its caller gas and nothing else.
+    /// @return value The threshold.
+    function deployThresholdUsd18() external view returns (uint256 value);
 
     // -------------------------------------------------------------------------------------------------------------
     // Reads — hard bands
@@ -490,6 +605,15 @@ interface IAmpsVault {
     /// @notice Hard ceiling of `spokeSeedBps`. 1,000.
     /// @return value The bound.
     function SPOKE_SEED_BPS_MAX() external view returns (uint16 value);
+
+    /// @notice Hard floor of `deployThresholdUsd18`. $10.
+    /// @return value The bound.
+    function DEPLOY_THRESHOLD_USD18_MIN() external view returns (uint256 value);
+
+    /// @notice Hard ceiling of `deployThresholdUsd18`. $10,000 — twice the whole launch book, so setting it here
+    ///         already means "bonded stock is never deployed automatically".
+    /// @return value The bound.
+    function DEPLOY_THRESHOLD_USD18_MAX() external view returns (uint256 value);
 
     /// @notice The R1 bound: a placement may not lower NAV/share by more than this. 2 bp (I11).
     /// @return value The bound.
@@ -687,6 +811,14 @@ interface IAmpsVault {
     /// @notice Sets the seed ask a new spoke receives. **Only timelock (48 h).** **Phase 3.**
     /// @param value The new value, inside `[SPOKE_SEED_BPS_MIN, SPOKE_SEED_BPS_MAX]`.
     function setSpokeSeedBps(uint16 value) external;
+
+    /// @notice Sets the idle-collateral floor {deployBonded} refuses to fire below. **Only timelock (48 h).**
+    ///         **Phase 3.**
+    /// @dev `docs/phase3-state-model.md` §10 ruling 15. Takes the management gate policy and the transient lock
+    ///      like every other governed setter, and reverts `OutOfBand("deployThresholdUsd18", ...)` outside its
+    ///      hard band.
+    /// @param value The new threshold, inside `[DEPLOY_THRESHOLD_USD18_MIN, DEPLOY_THRESHOLD_USD18_MAX]`.
+    function setDeployThresholdUsd18(uint256 value) external;
 
     /// @notice Replaces a pointer-upgradeable policy **and carries the set-once protocol wiring**. **Only timelock
     ///         (7 d).** None of these can move a fund.

@@ -1,0 +1,8 @@
+{
+  "$comment": "Written by script/05_Registry.s.sol: the 32 pools it opened, their ids and the price each pool actually opened at, read out of the PoolOpened event (docs/phase3-state-model.md §12.1 ruling J: the vault snaps the requested price down to the grid origin, so the event, not the request, is the truth). Empty until 05 has run.",
+  "chainId": 0,
+  "registry": "0x0000000000000000000000000000000000000000",
+  "hook": "0x0000000000000000000000000000000000000000",
+  "poolCount": 0,
+  "pools": []
+}

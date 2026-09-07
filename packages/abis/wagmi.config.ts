@@ -1,33 +1,19 @@
 // SPDX-License-Identifier: MIT
 import {defineConfig} from '@wagmi/cli'
-import {foundry} from '@wagmi/cli/plugins'
+import {loadContracts} from './scripts/artifacts.mjs'
 
 /**
  * Codegen for the Amplestocks contract ABIs.
  *
- * Reads Foundry artifacts from `contracts/out` — it never invokes `forge` itself, so a build must
- * already exist (`pnpm --filter @amplestocks/contracts build`). Nothing generated is committed
- * while `contracts/src` is still empty; run `pnpm --filter @amplestocks/abis generate` once the
- * production contracts land.
+ * Run it with `pnpm --filter @amplestocks/abis generate`, which builds `contracts/` into `out-abis` first and
+ * then invokes this. The output, `src/generated.ts`, is **committed**: every other workspace package consumes it
+ * as ordinary TypeScript, so a checkout with no Foundry toolchain still typechecks, builds and tests.
+ *
+ * The contract list is not a glob. It is the explicit export set in `scripts/artifacts.mjs`, resolved across
+ * Foundry's per-compiler-profile artefact variants — see the note at the top of that file for why the
+ * `@wagmi/cli` `foundry` plugin cannot be pointed at this project directly.
  */
 export default defineConfig({
   out: 'src/generated.ts',
-  plugins: [
-    foundry({
-      project: '../../contracts',
-      artifacts: 'out',
-      // The contracts workspace owns its own build; do not let the CLI shell out to forge.
-      forge: {clean: false, build: false, rebuild: false},
-      include: [
-        'Amps.json',
-        'Amps*.json',
-        'AmpsVault*.json',
-        'AmpsHook*.json',
-        'AmpsBonds*.json',
-        'AmpsStaking*.json',
-        'AmpsQuoter*.json',
-        'PoolRegistry*.json',
-      ],
-    }),
-  ],
+  contracts: loadContracts(),
 })

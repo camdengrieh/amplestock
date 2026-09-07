@@ -549,7 +549,9 @@ contract AmpsVaultTest is AmpsVaultFixture {
     // Access control and Phase 3 stubs (section 2)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Only the registry may initialise a pool or withdraw retired bids.
+    /// @notice Only the registry may initialise a pool or withdraw retired bids. With no bid records to remove
+    ///         the registry's call is a no-op rather than a revert — a retirement of a spoke that never traded
+    ///         must not be able to fail.
     function test_registryOnlyEntryPoints() public {
         runGenesis();
         vm.expectRevert(abi.encodeWithSelector(NotRegistry.selector, ALICE));
@@ -557,21 +559,24 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.withdrawRetiredBids(1);
 
         vm.prank(address(registry));
-        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
-        vault.withdrawRetiredBids(1);
+        assertEq(vault.withdrawRetiredBids(1), 0, "nothing to withdraw, nothing withdrawn");
     }
 
-    /// @notice The four Phase 3 keeper entry points are in the ABI and refuse until the hook exists.
-    function test_phase3EntryPointsRevert() public {
+    /// @notice The Phase 3 entry points are live: `place` is timelock-or-registry
+    ///         (`docs/phase3-state-model.md` §10 ruling 11), and the permissionless three are no-ops rather than
+    ///         reverts when nothing is due, so an unpaid keeper call costs the caller gas and nothing else.
+    /// @dev The ladders themselves are exercised in `unit/VaultPlacement.t.sol`, `unit/VaultCompound.t.sol`,
+    ///      `unit/VaultRollout.t.sol` and `unit/VaultRedeem.t.sol`, which run against live v4 pools. This fixture
+    ///      has none, so what belongs here is the access control and the nothing-to-do behaviour.
+    function test_phase3EntryPointsAreLiveAndNoOpWhenNothingIsDue() public {
         runGenesis();
-        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
+
+        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
+        vm.prank(ALICE);
         vault.place(spokePool, true, 1e18);
-        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
-        vault.compound(spokePool);
-        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
-        vault.rollout(1);
-        vm.expectRevert(IAmpsVault.Phase3NotImplemented.selector);
-        vault.deployBonded(1);
+
+        assertEq(vault.rollout(1), 0, "no rollout policy is pointed at, so nothing moves");
+        assertEq(vault.deployBonded(1), 0, "no idle collateral, so nothing is deployed");
     }
 
     /// @notice The unlock callback belongs to the PoolManager alone.
@@ -649,6 +654,8 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setSpokeSeedBps(100);
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
+        vault.setDeployThresholdUsd18(100e18);
+        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setPolicyPointer(bytes32("oracleGate"), address(gate));
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setStandbyVault(STANDBY);
@@ -670,6 +677,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.spokeSeedBps(), Constants.SPOKE_SEED_BPS_DEFAULT, "spokeSeedBps");
         assertEq(vault.rolloutBpsPerDay(), Constants.ROLLOUT_BPS_PER_DAY_DEFAULT, "rolloutBpsPerDay");
         assertEq(vault.entryFloorBps(), Constants.ENTRY_FLOOR_BPS_DEFAULT, "entryFloorBps");
+        assertEq(vault.deployThresholdUsd18(), Constants.DEPLOY_THRESHOLD_USD18_DEFAULT, "deployThresholdUsd18");
     }
 
     /// @notice Each band's edges are accepted and each violation throws `OutOfBand` naming the parameter.
@@ -816,7 +824,62 @@ contract AmpsVaultTest is AmpsVaultFixture {
         );
         vault.setLadderShape(1.25e18, 10, 4, Constants.HALVINGS_MAX + 1);
 
+        // Ruling 15's `deployThresholdUsd18`: both edges are legal and both violations name the parameter.
+        vault.setDeployThresholdUsd18(Constants.DEPLOY_THRESHOLD_USD18_MIN);
+        assertEq(vault.deployThresholdUsd18(), Constants.DEPLOY_THRESHOLD_USD18_MIN, "at the floor");
+        vault.setDeployThresholdUsd18(Constants.DEPLOY_THRESHOLD_USD18_MAX);
+        assertEq(vault.deployThresholdUsd18(), Constants.DEPLOY_THRESHOLD_USD18_MAX, "at the ceiling");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OutOfBand.selector,
+                bytes32("deployThresholdUsd18"),
+                Constants.DEPLOY_THRESHOLD_USD18_MIN - 1,
+                Constants.DEPLOY_THRESHOLD_USD18_MIN,
+                Constants.DEPLOY_THRESHOLD_USD18_MAX
+            )
+        );
+        vault.setDeployThresholdUsd18(Constants.DEPLOY_THRESHOLD_USD18_MIN - 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OutOfBand.selector,
+                bytes32("deployThresholdUsd18"),
+                Constants.DEPLOY_THRESHOLD_USD18_MAX + 1,
+                Constants.DEPLOY_THRESHOLD_USD18_MIN,
+                Constants.DEPLOY_THRESHOLD_USD18_MAX
+            )
+        );
+        vault.setDeployThresholdUsd18(Constants.DEPLOY_THRESHOLD_USD18_MAX + 1);
+        assertEq(vault.deployThresholdUsd18(), Constants.DEPLOY_THRESHOLD_USD18_MAX, "a refused write changes nothing");
+
         vm.stopPrank();
+    }
+
+    /// @notice The Phase 3 governed threshold emits the same `VaultParameterChanged` every other parameter does, so
+    ///         the indexer needs no special case for it.
+    function test_setDeployThresholdUsd18_emitsTheParameterEvent() public {
+        runGenesis();
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit IAmpsVault.VaultParameterChanged(
+            bytes32("deployThresholdUsd18"), Constants.DEPLOY_THRESHOLD_USD18_DEFAULT, 250e18
+        );
+        vm.prank(TIMELOCK);
+        vault.setDeployThresholdUsd18(250e18);
+    }
+
+    /// @notice The Phase 3 ladder getters (ruling 1) read the vault's own placement book and report an empty pool
+    ///         as empty rather than reverting.
+    /// @dev They are `view`, which is why they can be added to a final ABI at all: `scripts/selector-gate.py` and
+    ///      the I14 enumeration classify only non-`view`/non-`pure` selectors. Nothing in the NAV path reads them —
+    ///      `LadderPositionValuer` enumerates the canonical grid at the PoolManager instead — so they are
+    ///      disclosure, not accounting.
+    function test_ladderGetters_reportAnEmptyBookWithoutReverting() public {
+        runGenesis();
+        assertEq(vault.ladderLength(hubPool), 0, "hub");
+        assertEq(vault.ladderLength(wethPool), 0, "weth");
+        assertEq(vault.ladderLength(spokePool), 0, "spoke");
+
+        // An unknown pool is empty too: the getter reads a mapping, not a registry.
+        assertEq(vault.ladderLength(PoolId.wrap(bytes32(uint256(0xdead)))), 0, "unknown pool");
     }
 
     /// @notice The hard bands the interface exposes are the ones `Constants` holds — never a restated literal.
@@ -846,6 +909,8 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.MIGRATION_BLEED_BPS_MAX(), Constants.MIGRATION_BLEED_BPS_MAX, "MIGRATION_BLEED_BPS_MAX");
         assertEq(vault.CREATOR_FEE_BPS(), Constants.CREATOR_FEE_BPS, "CREATOR_FEE_BPS");
         assertEq(vault.CREATOR_DECAY_SECONDS(), Constants.CREATOR_DECAY_SECONDS, "CREATOR_DECAY_SECONDS");
+        assertEq(vault.DEPLOY_THRESHOLD_USD18_MIN(), Constants.DEPLOY_THRESHOLD_USD18_MIN, "DEPLOY_THRESHOLD_USD18_MIN");
+        assertEq(vault.DEPLOY_THRESHOLD_USD18_MAX(), Constants.DEPLOY_THRESHOLD_USD18_MAX, "DEPLOY_THRESHOLD_USD18_MAX");
     }
 
     /// @notice A redemption fee at the ceiling still pays 95% and never blocks the exit.

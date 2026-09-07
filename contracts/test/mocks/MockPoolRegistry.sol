@@ -101,7 +101,15 @@ contract MockPoolRegistry is IPoolRegistry {
         _pools[poolId] = config;
         _constituentOfPool[poolId] = config.constituentId;
         if (config.constituentId != 0) _poolIdOf[config.constituentId] = poolId;
-        emit PoolRegistered(poolId, config.counter, config.poolClass, config.constituentId);
+        emit PoolRegistered(
+            poolId,
+            config.counter,
+            config.poolClass,
+            config.constituentId,
+            config.tickSpacing,
+            config.counterDecimals,
+            config.buyFeeBps
+        );
     }
 
     /// @notice Stores the `PoolKey` a registered pool reports.
@@ -177,7 +185,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: tickSpacing,
                 buyFeeBps: Constants.BUY_FEE_BPS_SPOKE_DEFAULT,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         emit ConstituentAdded(constituentId, token, poolId, targetWeightBps);
@@ -201,7 +210,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: tickSpacing,
                 buyFeeBps: buyFeeBps,
                 constituentId: 0,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
     }
@@ -440,7 +450,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: key.tickSpacing,
                 buyFeeBps: buyFeeBps,
                 constituentId: 0,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
     }
@@ -481,7 +492,8 @@ contract MockPoolRegistry is IPoolRegistry {
                 tickSpacing: params.tickSpacing,
                 buyFeeBps: params.buyFeeBps,
                 constituentId: constituentId,
-                registered: true
+                registered: true,
+                gridBaseTick: 0
             })
         );
         emit ConstituentAdded(constituentId, params.token, poolId, params.targetWeightBps);

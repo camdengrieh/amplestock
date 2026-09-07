@@ -1,0 +1,7 @@
+{
+  "$comment": "Written by script/03_Core.s.sol at the moment the contracts are deployed. `args` is the ABI-encoded constructor argument blob Blockscout matches the creation code against; script/12_Verify.s.sol turns this and deployments.json into script/config/verify.sh. Empty until a deployment has run.",
+  "chainId": 0,
+  "solc": "0.8.30",
+  "compilerNote": "src/vault/*, src/bonds/* and src/hook/* compile at optimizer_runs = 200 via_ir",
+  "contracts": []
+}

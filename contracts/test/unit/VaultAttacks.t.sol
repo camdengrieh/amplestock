@@ -257,7 +257,7 @@ contract VaultAttackTest is AmpsVaultFixture {
             hooks: IHooks(address(0))
         });
 
-        payloads = new bytes[](25);
+        payloads = new bytes[](26);
         payloads[0] = abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE));
         payloads[1] = abi.encodeCall(IAmpsVault.checkpoint, ());
         payloads[2] = abi.encodeCall(IAmpsVault.touch, ());
@@ -283,5 +283,6 @@ contract VaultAttackTest is AmpsVaultFixture {
         payloads[22] = abi.encodeCall(IAmpsVault.setStandbyVault, (STANDBY));
         payloads[23] = abi.encodeCall(IAmpsVault.setCreator, (BOB));
         payloads[24] = abi.encodeCall(IAmpsVault.emergencyMigrate, (STANDBY));
+        payloads[25] = abi.encodeCall(IAmpsVault.setDeployThresholdUsd18, (100e18));
     }
 }

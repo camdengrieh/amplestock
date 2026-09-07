@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsHook} from "../interfaces/IAmpsHook.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../interfaces/IMarketReference.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
@@ -8,7 +9,7 @@ import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {IStockToken} from "../interfaces/IStockToken.sol";
 import {Constants} from "../types/Constants.sol";
 import {LengthMismatch, NotGuardian, NotTimelock, OutOfBand, ZeroAddress} from "../types/Errors.sol";
-import {ConstituentConfig, GateSnapshot, GateState, PoolConfig, Session} from "../types/Types.sol";
+import {GateSnapshot, GateState, Session} from "../types/Types.sol";
 import {GatePriceMath} from "./GatePriceMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
@@ -41,8 +42,12 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///        disabled when Closed, plus positivity, per-ticker bounds and the two-confirmation rule.
 ///      - **D, corporate actions.** Four bounded `staticcall`s into the Stock Token — `oraclePaused()`,
 ///        `effectiveAt()`, `newUIMultiplier()`, `uiMultiplier()` — each capped at
-///        `Constants.STOCK_TOKEN_PROBE_GAS`. A pause, or a pending `effectiveAt` within
-///        `+/- corporateActionWindow` of now, is `SCHEDULED_FREEZE` for that constituent.
+///        `Constants.STOCK_TOKEN_PROBE_GAS`, **ORed with the hook's own multiplier-step detector**
+///        (`IAmpsHook.poolState(poolId).gateFlags` bit 3, `docs/phase3-state-model.md` §10 ruling 10). A pause, a
+///        pending `effectiveAt` within `+/- corporateActionWindow` of now, or an armed hook flag is
+///        `SCHEDULED_FREEZE` for that constituent and for nothing else. The hook read is bounded and its failure
+///        is silent: a market reference that is absent, is not a hook or reverts leaves layer D exactly as Phase 2
+///        left it, which is why the token probes are still the primary source rather than a legacy path.
 ///      - **E, divergence.** `|poolTick - fairTick| > divergenceBps` sustained for `divergenceSustainSeconds`
 ///        latches `DIVERGED` for that one pool. `fairTick` is derived from the hub TWAP, the counter asset's
 ///        Chainlink answer and the registry's pool config; the hook never writes here.
@@ -98,6 +103,29 @@ contract OracleGate is IOracleGate {
 
     /// @notice Gas forwarded to every bounded probe into a Stock Token or a market-reference source.
     uint256 public constant PROBE_GAS = Constants.STOCK_TOKEN_PROBE_GAS;
+
+    /// @notice Bit 3 of `HookPoolState.gateFlags`: the hook's own corporate-action arm (`caArmed`), set by its
+    ///         `uiMultiplier()` step detector when a step exceeds `Constants.DIVIDEND_STEP_BPS_MAX`.
+    uint256 public constant HOOK_GATE_FLAG_CA_ARMED = 0x08;
+
+    /// @dev Words in an ABI-encoded `HookPoolState`: 25 static fields, one word each. A hook that appends fields
+    ///      still answers with at least this many, and every field this contract reads keeps its index.
+    uint256 private constant HOOK_POOL_STATE_WORDS = 25;
+
+    /// @dev Index of `gateFlags` inside that encoding.
+    uint256 private constant HOOK_POOL_STATE_GATE_FLAGS_WORD = 22;
+
+    /// @dev Words in an ABI-encoded `ConstituentConfig`: thirteen static fields, one word each. Appending a
+    ///      fourteenth keeps every index this contract reads (0 `token`, 5 `hSessionOverrideBps`,
+    ///      6 `hSessionOverrideSet`, 7 `caFreezeOverride`), which is what the append-only rule on the struct buys.
+    uint256 private constant CONSTITUENT_WORDS = 13;
+
+    /// @dev Words in an ABI-encoded `PoolConfig`: eight static fields. This contract reads 0 `counter`,
+    ///      2 `counterDecimals`, 3 `tickSpacing` and 6 `registered`.
+    uint256 private constant POOL_WORDS = 8;
+
+    /// @dev Words in an ABI-encoded `(uint256, uint32, bool)`: the feed registry's answer triple.
+    uint256 private constant ANSWER_WORDS = 3;
 
     // -------------------------------------------------------------------------------------------------------------
     // Storage (slot layout per `docs/phase2-state-model.md` §1.5)
@@ -582,8 +610,8 @@ contract OracleGate is IOracleGate {
         _stamp();
         PoolId poolId = _poolOf(constituentId);
         _updateDivergence(poolId);
-        ConstituentConfig memory config = _constituent(constituentId);
-        (bool frozen, uint32 effectiveAt) = _corporateAction(config);
+        (address token, bool caFreezeOverride,,) = _constituent(constituentId);
+        (bool frozen, uint32 effectiveAt) = _corporateAction(token, caFreezeOverride, poolId);
         emit CorporateActionFreeze(constituentId, frozen, effectiveAt);
     }
 
@@ -872,14 +900,17 @@ contract OracleGate is IOracleGate {
         (bool refDiverged, bool coverageMissing) = _referenceIntegrity(gate.session);
         gate.watchdogTripped = _watchdogTripped() || coverageMissing;
 
-        ConstituentConfig memory config;
+        bool hSessionOverrideSet;
+        uint16 hSessionOverrideBps;
         if (constituentId != 0) {
-            config = _constituent(constituentId);
-            (uint256 answerUsd8, uint32 answerUpdatedAt, bool fresh) = _feedAnswer(config.token, gate.session);
+            address token;
+            bool caFreezeOverride;
+            (token, caFreezeOverride, hSessionOverrideSet, hSessionOverrideBps) = _constituent(constituentId);
+            (uint256 answerUsd8, uint32 answerUpdatedAt, bool fresh) = _feedAnswer(token, gate.session);
             gate.answerUsd8 = answerUsd8 > type(uint64).max ? type(uint64).max : uint64(answerUsd8);
             gate.answerUpdatedAt = answerUpdatedAt;
             gate.feedStale = !fresh;
-            (gate.corporateFreeze,) = _corporateAction(config);
+            (gate.corporateFreeze,) = _corporateAction(token, caFreezeOverride, poolId);
         }
 
         uint16 deviationBps;
@@ -891,7 +922,7 @@ contract OracleGate is IOracleGate {
                 && block.timestamp >= uint256(since) + uint256(_divergenceSustainSeconds);
         }
 
-        gate.hSessionBps = config.hSessionOverrideSet ? config.hSessionOverrideBps : hSessionBps(gate.session);
+        gate.hSessionBps = hSessionOverrideSet ? hSessionOverrideBps : hSessionBps(gate.session);
 
         bool frozen =
             _protocolFrozen() || (constituentId != 0 && _constituentFrozen(constituentId)) || gate.corporateFreeze;
@@ -962,29 +993,41 @@ contract OracleGate is IOracleGate {
         view
         returns (uint256 answerUsd8, uint32 updatedAt, bool fresh)
     {
+        if (token == address(0)) return (0, 0, false);
         address feeds = _feedRegistry;
-        if (token == address(0) || feeds == address(0) || feeds.code.length == 0) return (0, 0, false);
-        try IFeedRegistry(feeds).latestAnswerIn{gas: PROBE_GAS * 4}(token, session) returns (
-            uint256 answerUsd8_, uint32 updatedAt_, bool fresh_
-        ) {
-            return (answerUsd8_, updatedAt_, fresh_);
-        } catch {}
-        try IFeedRegistry(feeds).latestAnswer{gas: PROBE_GAS * 8}(token) returns (
-            uint256 answerUsd8_, uint32 updatedAt_, bool fresh_
-        ) {
-            return (answerUsd8_, updatedAt_, fresh_);
-        } catch {
-            return (0, 0, false);
+        (bool ok, bytes memory data) = _read(
+            feeds,
+            PROBE_GAS * 4,
+            abi.encodeWithSelector(IFeedRegistry.latestAnswerIn.selector, token, uint8(session)),
+            ANSWER_WORDS
+        );
+        if (!ok) {
+            (ok, data) = _read(
+                feeds, PROBE_GAS * 8, abi.encodeWithSelector(IFeedRegistry.latestAnswer.selector, token), ANSWER_WORDS
+            );
         }
+        if (!ok) return (0, 0, false);
+        return (_wordAt(data, 0), _u32At(data, 1), _wordAt(data, 2) != 0);
     }
 
-    /// @dev Layer D: four bounded probes into the Stock Token, plus the registry's forced-freeze override. A probe
-    ///      that fails is *unknown*, never a revert; an unknown `oraclePaused()` is read as not-paused, but an
-    ///      unknown multiplier pair alongside a pending `effectiveAt` is read as a change in flight, because the
-    ///      only thing an `effectiveAt` is ever set for is a change.
-    function _corporateAction(ConstituentConfig memory config) internal view returns (bool frozen, uint32 effectiveAt) {
-        if (config.caFreezeOverride) frozen = true;
-        address token = config.token;
+    /// @dev Layer D: the hook's own multiplier-step detector, four bounded probes into the Stock Token, and the
+    ///      registry's forced-freeze override, ORed. A probe that fails is *unknown*, never a revert; an unknown
+    ///      `oraclePaused()` is read as not-paused, but an unknown multiplier pair alongside a pending
+    ///      `effectiveAt` is read as a change in flight, because the only thing an `effectiveAt` is ever set for
+    ///      is a change.
+    /// @dev **Ruling 10.** The hook watches `uiMultiplier()` on every gate-cache refresh and arms
+    ///      {HOOK_GATE_FLAG_CA_ARMED} on a step larger than `Constants.DIVIDEND_STEP_BPS_MAX`, which is a signal
+    ///      this contract cannot see for itself: the gate is only called when somebody calls it, while the hook is
+    ///      called on every swap. Reading it here gives layer D a detector with the pool's own cadence. The token
+    ///      probes stay exactly as they were and are the fallback whenever the hook is absent, is not a hook, or
+    ///      cannot answer.
+    function _corporateAction(address token, bool caFreezeOverride, PoolId poolId)
+        internal
+        view
+        returns (bool frozen, uint32 effectiveAt)
+    {
+        if (caFreezeOverride) frozen = true;
+        if (!frozen && _hookCorporateArmed(poolId)) frozen = true;
         if (token == address(0) || token.code.length == 0) return (frozen, 0);
 
         (bool okPaused, uint256 paused) = _probeWord(token, IStockToken.oraclePaused.selector);
@@ -1012,34 +1055,42 @@ contract OracleGate is IOracleGate {
         view
         returns (bool ok, uint16 deviationBps, int24 poolTick, int24 fairTick)
     {
-        PoolConfig memory pool = _poolConfig(poolId);
-        if (!pool.registered) return (false, 0, 0, 0);
-
         // Cheapest read first: with no tick of its own the pool has nothing to compare, whatever the reference
         // would have said.
         (bool havePool, int24 observed) = _lastTruncatedTick(poolId);
         if (!havePool) return (false, 0, 0, 0);
 
-        (bool haveAmps, uint256 ampsUsd18) = _ampsPriceViaPool(_hubPoolId(), session);
-        if (!haveAmps) return (false, 0, observed, 0);
-
-        (uint256 counterUsd8,,) = _feedAnswer(pool.counter, session);
-        if (counterUsd8 == 0) return (false, 0, observed, 0);
-
-        int24 fair;
-        try _priceMath.fairTick{gas: PROBE_GAS}(
-            ampsUsd18, counterUsd8, pool.counterDecimals, pool.tickSpacing
-        ) returns (
-            int24 fair_
-        ) {
-            fair = fair_;
-        } catch {
-            return (false, 0, observed, 0);
-        }
+        (bool haveFair, int24 fair) = _fairTick(poolId, session);
+        if (!haveFair) return (false, 0, observed, 0);
 
         int256 delta = int256(observed) - int256(fair);
         uint256 magnitude = delta >= 0 ? uint256(delta) : uint256(-delta);
         return (true, magnitude >= type(uint16).max ? type(uint16).max : uint16(magnitude), observed, fair);
+    }
+
+    /// @dev The tick one pool *should* trade at: the hub's implied AMPS price against the pool's own counter
+    ///      answer, converted by `GatePriceMath` behind a bounded call. Split out of {_deviation} so neither
+    ///      function carries the other's locals.
+    function _fairTick(PoolId poolId, Session session) internal view returns (bool ok, int24 tick) {
+        (bool registered, address counter, uint8 counterDecimals, int24 tickSpacing) = _poolConfig(poolId);
+        if (!registered) return (false, 0);
+
+        (bool haveAmps, uint256 ampsUsd18) = _ampsPriceViaPool(_hubPoolId(), session);
+        if (!haveAmps) return (false, 0);
+
+        (uint256 counterUsd8,,) = _feedAnswer(counter, session);
+        if (counterUsd8 == 0) return (false, 0);
+
+        (bool haveFair, bytes memory data) = _read(
+            address(_priceMath),
+            PROBE_GAS,
+            abi.encodeWithSelector(
+                GatePriceMath.fairTick.selector, ampsUsd18, counterUsd8, counterDecimals, tickSpacing
+            ),
+            1
+        );
+        if (!haveFair) return (false, 0);
+        return (true, _tickAt(data, 0));
     }
 
     /// @dev Layer F. `coverageMissing` is the hub's ring failing to reach back over the TWAP window, which is the
@@ -1062,22 +1113,24 @@ contract OracleGate is IOracleGate {
     /// @dev The AMPS price in USD implied by one entry pool's TWAP and its counter asset's Chainlink answer.
     function _ampsPriceViaPool(PoolId poolId, Session session) internal view returns (bool ok, uint256 priceUsd18) {
         if (PoolId.unwrap(poolId) == bytes32(0)) return (false, 0);
-        PoolConfig memory pool = _poolConfig(poolId);
-        if (!pool.registered) return (false, 0);
+        (bool registered, address counter, uint8 counterDecimals,) = _poolConfig(poolId);
+        if (!registered) return (false, 0);
 
         (bool haveTick, int24 meanTick) = _twapTick(poolId);
         if (!haveTick) return (false, 0);
 
-        (uint256 counterUsd8,,) = _feedAnswer(pool.counter, session);
+        (uint256 counterUsd8,,) = _feedAnswer(counter, session);
         if (counterUsd8 == 0) return (false, 0);
 
-        try _priceMath.ampsPriceUsd18{gas: PROBE_GAS}(meanTick, counterUsd8, pool.counterDecimals) returns (
-            uint256 price18
-        ) {
-            return (price18 != 0, price18);
-        } catch {
-            return (false, 0);
-        }
+        (bool havePrice, bytes memory data) = _read(
+            address(_priceMath),
+            PROBE_GAS,
+            abi.encodeWithSelector(GatePriceMath.ampsPriceUsd18.selector, meanTick, counterUsd8, counterDecimals),
+            1
+        );
+        if (!havePrice) return (false, 0);
+        priceUsd18 = _wordAt(data, 0);
+        return (priceUsd18 != 0, priceUsd18);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1096,106 +1149,191 @@ contract OracleGate is IOracleGate {
         return (true, word);
     }
 
-    /// @dev The registry's constituent record, or an empty one when the registry is unset or unreadable.
-    function _constituent(uint16 constituentId) internal view returns (ConstituentConfig memory config) {
-        address reg = _registry;
-        if (reg == address(0) || reg.code.length == 0) return config;
-        try IPoolRegistry(reg).constituent{gas: PROBE_GAS * 2}(constituentId) returns (
-            ConstituentConfig memory config_
-        ) {
-            return config_;
-        } catch {
-            return config;
-        }
+    /// @dev The four fields of the registry's constituent record this contract consumes: the token layer D
+    ///      probes, the governance-forced freeze, and the per-constituent bond-haircut override. Narrower than
+    ///      `ConstituentConfig` on purpose — a helper that rebuilt the whole thirteen-field struct would cost
+    ///      EIP-170 headroom to produce nine fields nobody here reads.
+    function _constituent(uint16 constituentId)
+        internal
+        view
+        returns (address token, bool caFreezeOverride, bool hSessionOverrideSet, uint16 hSessionOverrideBps)
+    {
+        (bool ok, bytes memory data) = _read(
+            _registry,
+            PROBE_GAS * 2,
+            abi.encodeWithSelector(IPoolRegistry.constituent.selector, constituentId),
+            CONSTITUENT_WORDS
+        );
+        if (!ok) return (address(0), false, false, 0);
+        return (address(uint160(_wordAt(data, 0))), _wordAt(data, 7) != 0, _wordAt(data, 6) != 0, _u16At(data, 5));
     }
 
-    /// @dev The registry's pool record, or an empty one when the registry is unset or unreadable.
-    function _poolConfig(PoolId poolId) internal view returns (PoolConfig memory config) {
-        address reg = _registry;
-        if (reg == address(0) || reg.code.length == 0) return config;
-        try IPoolRegistry(reg).poolConfig{gas: PROBE_GAS * 2}(poolId) returns (PoolConfig memory config_) {
-            return config_;
-        } catch {
-            return config;
-        }
+    /// @dev The four fields of the registry's pool record this contract consumes. Same reasoning as
+    ///      {_constituent}: `PoolConfig`'s other four fields are the hook's and the valuer's, not the gate's.
+    function _poolConfig(PoolId poolId)
+        internal
+        view
+        returns (bool registered, address counter, uint8 counterDecimals, int24 tickSpacing)
+    {
+        (bool ok, bytes memory data) = _read(
+            _registry, PROBE_GAS * 2, abi.encodeWithSelector(IPoolRegistry.poolConfig.selector, poolId), POOL_WORDS
+        );
+        if (!ok) return (false, address(0), 0, 0);
+        uint256 decimals = _wordAt(data, 2);
+        return (
+            _wordAt(data, 6) != 0,
+            address(uint160(_wordAt(data, 0))),
+            decimals > type(uint8).max ? type(uint8).max : uint8(decimals),
+            _tickAt(data, 3)
+        );
     }
 
     /// @dev The pool a constituent trades in, or `bytes32(0)`.
     function _poolOf(uint16 constituentId) internal view returns (PoolId poolId) {
-        address reg = _registry;
-        if (constituentId == 0 || reg == address(0) || reg.code.length == 0) return PoolId.wrap(bytes32(0));
-        try IPoolRegistry(reg).poolIdOf{gas: PROBE_GAS}(constituentId) returns (PoolId poolId_) {
-            return poolId_;
-        } catch {
-            return PoolId.wrap(bytes32(0));
-        }
+        if (constituentId == 0) return PoolId.wrap(bytes32(0));
+        (bool ok, bytes memory data) =
+            _read(_registry, PROBE_GAS, abi.encodeWithSelector(IPoolRegistry.poolIdOf.selector, constituentId), 1);
+        return PoolId.wrap(ok ? bytes32(_wordAt(data, 0)) : bytes32(0));
     }
 
     /// @dev The constituent behind a pool, or 0 for an entry pool or an unknown one.
     function _constituentOfPool(PoolId poolId) internal view returns (uint16 constituentId) {
-        address reg = _registry;
-        if (reg == address(0) || reg.code.length == 0) return 0;
-        try IPoolRegistry(reg).constituentOfPool{gas: PROBE_GAS}(poolId) returns (uint16 constituentId_) {
-            return constituentId_;
-        } catch {
-            return 0;
-        }
+        (bool ok, bytes memory data) =
+            _read(_registry, PROBE_GAS, abi.encodeWithSelector(IPoolRegistry.constituentOfPool.selector, poolId), 1);
+        return ok ? _u16At(data, 0) : 0;
     }
 
     /// @dev The `AMPS/USDG` hub pool id, or `bytes32(0)`.
     function _hubPoolId() internal view returns (PoolId poolId) {
-        address reg = _registry;
-        if (reg == address(0) || reg.code.length == 0) return PoolId.wrap(bytes32(0));
-        try IPoolRegistry(reg).hubPoolId{gas: PROBE_GAS}() returns (PoolId poolId_) {
-            return poolId_;
-        } catch {
-            return PoolId.wrap(bytes32(0));
-        }
+        (bool ok, bytes memory data) =
+            _read(_registry, PROBE_GAS, abi.encodeWithSelector(IPoolRegistry.hubPoolId.selector), 1);
+        return PoolId.wrap(ok ? bytes32(_wordAt(data, 0)) : bytes32(0));
     }
 
     /// @dev The `AMPS/WETH` entry pool id, or `bytes32(0)`.
     function _wethPoolId() internal view returns (PoolId poolId) {
-        address reg = _registry;
-        if (reg == address(0) || reg.code.length == 0) return PoolId.wrap(bytes32(0));
-        try IPoolRegistry(reg).wethPoolId{gas: PROBE_GAS}() returns (PoolId poolId_) {
-            return poolId_;
-        } catch {
-            return PoolId.wrap(bytes32(0));
+        (bool ok, bytes memory data) =
+            _read(_registry, PROBE_GAS, abi.encodeWithSelector(IPoolRegistry.wethPoolId.selector), 1);
+        return PoolId.wrap(ok ? bytes32(_wordAt(data, 0)) : bytes32(0));
+    }
+
+    /// @dev The pool's mean truncated tick over the reference's own window, refusing to shorten it: an uncovered
+    ///      ring is "no reference", which is what layer F reports as missing coverage.
+    /// @dev **The window is bounded by the governable band, not taken on trust.** A market reference that claims a
+    ///      zero window, or one wider than `Constants.TWAP_WINDOW_MAX`, is not a reference this contract can use:
+    ///      the first cannot be consulted at all and the second is a claim no honest hook can make, because
+    ///      `TruncatedOracleLib`'s ring is sized to exactly that ceiling. Both read as "no reference" rather than
+    ///      as a window to obey, which is what stops a garbage answer from becoming a garbage price.
+    function _twapTick(PoolId poolId) internal view returns (bool ok, int24 meanTick) {
+        address ref = _marketReference;
+        (bool haveWindow, bytes memory data) =
+            _read(ref, PROBE_GAS, abi.encodeWithSelector(IMarketReference.twapWindow.selector), 1);
+        if (!haveWindow) return (false, 0);
+        uint32 window = _u32At(data, 0);
+        if (window < Constants.TWAP_WINDOW_MIN || window > Constants.TWAP_WINDOW_MAX) return (false, 0);
+
+        (bool haveCoverage, bytes memory coverage) =
+            _read(ref, PROBE_GAS, abi.encodeWithSelector(IMarketReference.observationCoverage.selector, poolId), 1);
+        if (!haveCoverage || _u32At(coverage, 0) < window) return (false, 0);
+
+        (bool haveTick, bytes memory tick) =
+            _read(ref, PROBE_GAS * 2, abi.encodeWithSelector(IMarketReference.twapTick.selector, poolId, window), 1);
+        if (!haveTick) return (false, 0);
+        return (true, _tickAt(tick, 0));
+    }
+
+    /// @dev Ruling 10's read: bit 3 (`caArmed`) of `IAmpsHook.poolState(poolId).gateFlags`, through one bounded
+    ///      `staticcall` whose result is unpacked by hand rather than ABI-decoded.
+    ///
+    ///      Hand-unpacking is not fussiness. `HookPoolState` carries two enums and a `bool`, and a market reference
+    ///      that is not the hook — a Phase 2 mock, a mis-pointed address, a hostile contract — can answer with an
+    ///      out-of-range ordinal, which Solidity's decoder answers with a `Panic` that `try`/`catch` does **not**
+    ///      catch. That would turn a fallback into a revert on `snapshot`, `state` and `isBondAllowed`, which is
+    ///      the opposite of what a fallback is for. Reading two words out of the returndata cannot fail that way.
+    ///      This was ruling 10's read alone; §12.4 ruling AA extended the same treatment to every external read in
+    ///      this file, which is why it is now built on {_read} like the rest of them.
+    ///
+    ///      Bit 3 and not bit 1: bit 1 (`corporateFreeze`) is the hook's *cache of this contract's own verdict*,
+    ///      refreshed at most once per `Constants.GATE_CACHE_SECONDS_DEFAULT`. Reading it back would close a loop —
+    ///      gate freezes, hook caches the freeze, gate reads its own freeze — and latch `SCHEDULED_FREEZE` for that
+    ///      constituent forever. Bit 3 is the hook's own observation of the token and has no such feedback path.
+    function _hookCorporateArmed(PoolId poolId) internal view returns (bool armed) {
+        address ref = _marketReference;
+        if (PoolId.unwrap(poolId) == bytes32(0) || ref == address(0) || ref.code.length == 0) return false;
+
+        (bool ok, bytes memory data) = _read(
+            ref, PROBE_GAS * 4, abi.encodeWithSelector(IAmpsHook.poolState.selector, poolId), HOOK_POOL_STATE_WORDS
+        );
+        if (!ok) return false;
+        return _wordAt(data, 0) != 0 && _wordAt(data, HOOK_POOL_STATE_GATE_FLAGS_WORD) & HOOK_GATE_FLAG_CA_ARMED != 0;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Internals: the read primitive every bounded call above is built from
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // **Nothing above is a typed `try`, and that is the point.** Solidity decodes a *successful* call's returndata
+    // in the caller's frame, so a callee that answers with five bytes, with no bytes, or with a word that does not
+    // fit the declared type raises a `Panic` that `try`/`catch` cannot catch. A gate built on typed `try` reads
+    // therefore survives a dependency that *reverts* and not one that lies about its shape, which would turn
+    // `snapshot`, `state`, `isBondAllowed`, `checkBond`, `isPlacementAllowed` and `dynCapBps` — every read the
+    // hook, the quoter, the bond shell and the placement path make — into reverts precisely when they most need to
+    // degrade. Reading whole words out of the returndata and saturating them into their declared ranges cannot
+    // fail that way: a short answer is "unknown", and a garbage word is a saturated value the layers above already
+    // treat as garbage.
+    //
+    // The three pointers behind these reads (`marketReference`, `registry`, `feedRegistry`) are 7-day timelocked
+    // addresses and never user input, so this is defence in depth against a mis-pointed or half-migrated
+    // dependency rather than against a caller. `redeemProRata` reads none of it.
+
+    /// @dev One bounded `staticcall`, answered only when the callee returned at least `minWords` whole words.
+    ///      A zero, codeless, reverting, out-of-gas or too-short target is "unknown"; the caller decides what
+    ///      unknown means for its layer.
+    function _read(address target, uint256 gasCap, bytes memory payload, uint256 minWords)
+        private
+        view
+        returns (bool ok, bytes memory data)
+    {
+        if (target == address(0) || target.code.length == 0) return (false, data);
+        (bool success, bytes memory returned) = target.staticcall{gas: gasCap}(payload);
+        if (!success || returned.length < minWords * 32) return (false, data);
+        return (true, returned);
+    }
+
+    /// @dev Word `index` of a buffer whose length {_read} has already checked.
+    function _wordAt(bytes memory data, uint256 index) private pure returns (uint256 word) {
+        assembly ("memory-safe") {
+            word := mload(add(data, add(0x20, mul(index, 0x20))))
         }
     }
 
-    /// @dev The pool's mean truncated tick over the canonical window, refusing to shorten the window: an
-    ///      uncovered ring is "no reference", which is what layer F reports as missing coverage.
-    function _twapTick(PoolId poolId) internal view returns (bool ok, int24 meanTick) {
-        address ref = _marketReference;
-        if (ref == address(0) || ref.code.length == 0) return (false, 0);
-        uint32 window;
-        try IMarketReference(ref).twapWindow{gas: PROBE_GAS}() returns (uint32 window_) {
-            window = window_;
-        } catch {
-            return (false, 0);
-        }
-        try IMarketReference(ref).observationCoverage{gas: PROBE_GAS}(poolId) returns (uint32 covered) {
-            if (covered < window) return (false, 0);
-        } catch {
-            return (false, 0);
-        }
-        try IMarketReference(ref).twapTick{gas: PROBE_GAS * 2}(poolId, window) returns (int24 tick) {
-            return (true, tick);
-        } catch {
-            return (false, 0);
-        }
+    /// @dev One returndata word as an `int24`, saturating instead of reverting on anything that does not fit.
+    function _tickAt(bytes memory data, uint256 index) private pure returns (int24 tick) {
+        int256 value = int256(_wordAt(data, index));
+        if (value > type(int24).max) return type(int24).max;
+        if (value < type(int24).min) return type(int24).min;
+        return int24(value);
+    }
+
+    /// @dev One returndata word as a `uint32`, saturating.
+    function _u32At(bytes memory data, uint256 index) private pure returns (uint32 value) {
+        uint256 word = _wordAt(data, index);
+        return word > type(uint32).max ? type(uint32).max : uint32(word);
+    }
+
+    /// @dev One returndata word as a `uint16`, saturating.
+    function _u16At(bytes memory data, uint256 index) private pure returns (uint16 value) {
+        uint256 word = _wordAt(data, index);
+        return word > type(uint16).max ? type(uint16).max : uint16(word);
     }
 
     /// @dev The pool's current truncated tick, or "unknown".
     function _lastTruncatedTick(PoolId poolId) internal view returns (bool ok, int24 tick) {
-        address ref = _marketReference;
-        if (ref == address(0) || ref.code.length == 0) return (false, 0);
-        try IMarketReference(ref).lastTruncatedTick{gas: PROBE_GAS}(poolId) returns (int24 tick_) {
-            return (true, tick_);
-        } catch {
-            return (false, 0);
-        }
+        (bool read, bytes memory data) = _read(
+            _marketReference, PROBE_GAS, abi.encodeWithSelector(IMarketReference.lastTruncatedTick.selector, poolId), 1
+        );
+        if (!read) return (false, 0);
+        return (true, _tickAt(data, 0));
     }
 
     /// @dev Arms or clears the layer-E timer for one pool and reports any effective state change.

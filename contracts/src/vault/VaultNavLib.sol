@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../interfaces/IMarketReference.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
@@ -9,9 +10,11 @@ import {IPositionValuer} from "../interfaces/IPositionValuer.sol";
 import {IStockToken} from "../interfaces/IStockToken.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
+import {AlreadyInitialized} from "../types/Errors.sol";
 import {ConstituentConfig, GateSnapshot, GateState, PoolConfig} from "../types/Types.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -38,6 +41,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      also rounds down.
 library VaultNavLib {
     using CurrencyLibrary for Currency;
+    using SafeERC20 for IERC20;
 
     /// @notice Everything the read side needs from the vault, gathered into one argument so the ABI of these
     ///         functions does not change when a pointer is added.
@@ -179,6 +183,57 @@ library VaultNavLib {
         return FullMath.mulDiv(gap, Constants.BPS, pMktX18) > src.refDivergenceBps;
     }
 
+    /// @notice The reference-price law of section 5, in one place: `P_ref = max(navPerShare, rateLimited(P_mkt))`.
+    ///
+    /// @dev Three rules, in order. An override — `REF_DIVERGED`, a tripped watchdog, an unusable `P_mkt`, or the
+    ///      layer-F cross-check failing — pins the reference at NAV outright. Otherwise a downward move to `P_mkt`
+    ///      is immediate and unlimited, and an upward one is capped at `refUpRateBps` per hour of elapsed time.
+    ///      Whatever comes out is then floored at NAV, which is what makes `P_ref >= navPerShare` unconditional
+    ///      (I24) and what makes every ask the ladder places sit at or above the protocol's own backing.
+    ///
+    /// @dev `pure`, and separated from {AmpsVault-_checkpoint} so the vault pays for the call and not the code:
+    ///      the arithmetic is several hundred bytes and the vault has none to spare.
+    ///
+    /// @param nav `navPerShareX18`, just recomputed.
+    /// @param pMktX18 The market price, or zero.
+    /// @param overridden Whether the reference must be pinned at NAV outright.
+    /// @param pRefPrevX18 The previous checkpoint's reference price.
+    /// @param elapsed Seconds since the previous checkpoint; zero when there has never been one.
+    /// @param refUpRateBps The governed upward rate limit, in bps per hour.
+    /// @return pRefX18 The new reference price.
+    /// @return rateLimited Whether the upward cap bound the answer.
+    /// @return navFloored Whether NAV bound the answer.
+    function referencePrice(
+        uint256 nav,
+        uint256 pMktX18,
+        bool overridden,
+        uint256 pRefPrevX18,
+        uint256 elapsed,
+        uint16 refUpRateBps
+    ) public pure returns (uint256 pRefX18, bool rateLimited, bool navFloored) {
+        if (overridden) return (nav, false, true);
+
+        uint256 candidate;
+        if (pMktX18 <= pRefPrevX18) {
+            // Down is immediate and unlimited.
+            candidate = pMktX18;
+        } else {
+            uint256 cap = pRefPrevX18
+                + FullMath.mulDiv(
+                    pRefPrevX18, uint256(refUpRateBps) * elapsed, uint256(Constants.ONE_HOUR) * Constants.BPS
+                );
+            if (pMktX18 > cap) {
+                candidate = cap;
+                rateLimited = true;
+            } else {
+                candidate = pMktX18;
+            }
+        }
+
+        if (nav > candidate) return (nav, rateLimited, true);
+        return (candidate, rateLimited, false);
+    }
+
     /// @notice Section 8's on-chain migration predicate.
     /// @dev True when `isBlocked(vault) == true` for at least one registered constituent, or when a bounded
     ///      self-transfer probe fails for at least two. Every probe is capped at
@@ -213,6 +268,82 @@ library VaultNavLib {
             }
         }
         return false;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Two write helpers that do not fit in the vault
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // This library is the read side, and these two are not reads. They are here because `AmpsVault` is at the
+    // EIP-170 ceiling and because both are cold paths — a governance pointer move and an evacuation — where one
+    // extra `DELEGATECALL` costs nothing that matters. Neither can be reached from `redeemProRata`.
+
+    /// @notice The pointer set, written by slot. Backs `AmpsVault.setPolicyPointer`.
+    /// @dev The slot numbers are `docs/phase2-state-model.md` §1.1's, pinned field-for-field by
+    ///      `test/unit/VaultLayout.t.sol`. Five pointers are **set-once** and refuse once `genesis()` has frozen
+    ///      the wiring; `marketReference` is set-once before genesis and may be re-pointed afterwards exactly once
+    ///      more, to `AmpsHook`; the rest are freely pointer-upgradeable and none of them can move a fund.
+    /// @param name The pointer's short-string name.
+    /// @param newPointer The replacement.
+    /// @param wiringFrozen Whether `genesis()` has run.
+    /// @return previous The pointer being replaced.
+    function setPointer(bytes32 name, address newPointer, bool wiringFrozen) public returns (address previous) {
+        uint256 slot;
+        bool setOnce;
+        if (name == bytes32("registry")) {
+            (slot, setOnce) = (4, true);
+        } else if (name == bytes32("bonds")) {
+            (slot, setOnce) = (5, true);
+        } else if (name == bytes32("staking")) {
+            (slot, setOnce) = (6, true);
+        } else if (name == bytes32("bountyPot")) {
+            (slot, setOnce) = (7, true);
+        } else if (name == bytes32("marketReference")) {
+            slot = 8;
+        } else if (name == bytes32("oracleGate")) {
+            slot = 9;
+        } else if (name == bytes32("feedRegistry")) {
+            slot = 10;
+        } else if (name == bytes32("positionValuer")) {
+            slot = 11;
+        } else if (name == bytes32("ladderPolicy")) {
+            slot = 12;
+        } else if (name == bytes32("rolloutPolicy")) {
+            slot = 13;
+        } else {
+            revert IAmpsVault.UnknownPointerSlot(name);
+        }
+        if (setOnce && wiringFrozen) revert AlreadyInitialized();
+
+        assembly ("memory-safe") {
+            previous := sload(slot)
+            sstore(slot, newPointer)
+        }
+    }
+
+    /// @notice Moves every claim and every idle balance the vault holds to the standby. Backs the asset half of
+    ///         `AmpsVault.emergencyMigrate`.
+    /// @dev Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the
+    ///      evacuation. An idle ERC-20 balance is transferred as a best effort; by I12 there should not be one.
+    /// @param assets The vault's registered non-AMPS assets.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param ampsToken The AMPS token, evacuated alongside them.
+    /// @param standby The pre-registered standby vault.
+    function evacuate(address[] storage assets, address poolManager, address ampsToken, address standby) public {
+        IPoolManager pm = IPoolManager(poolManager);
+        uint256 length = assets.length;
+        for (uint256 i; i < length; ++i) {
+            address token = assets[i];
+            uint256 claim = pm.balanceOf(address(this), Currency.wrap(token).toId());
+            if (claim != 0) pm.transfer(standby, Currency.wrap(token).toId(), claim);
+            uint256 idle = IERC20(token).balanceOf(address(this));
+            if (idle != 0) IERC20(token).safeTransfer(standby, idle);
+        }
+
+        uint256 ampsClaim = pm.balanceOf(address(this), Currency.wrap(ampsToken).toId());
+        if (ampsClaim != 0) pm.transfer(standby, Currency.wrap(ampsToken).toId(), ampsClaim);
+        uint256 ampsIdle = IERC20(ampsToken).balanceOf(address(this));
+        if (ampsIdle != 0) IERC20(ampsToken).safeTransfer(standby, ampsIdle);
     }
 
     /// @notice The last accepted answer for `token`, 8 decimals, or zero when none exists.

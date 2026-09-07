@@ -5,10 +5,12 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
     "noEmit": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "wagmi.config.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.d.mts", "wagmi.config.ts"]
 }

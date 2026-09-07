@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {IAmpsBonds} from "../../src/interfaces/IAmpsBonds.sol";
+import {IBountyPot} from "../../src/interfaces/IBountyPot.sol";
 import {IPoolRegistry} from "../../src/interfaces/IPoolRegistry.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
 import {Constants} from "../../src/types/Constants.sol";
@@ -9,6 +10,7 @@ import {GateNotHealthy, OutOfBand} from "../../src/types/Errors.sol";
 import {ConstituentStatus, GateState} from "../../src/types/Types.sol";
 import {Phase2Fixture} from "./Phase2Fixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
 
 /// @title Phase2IntegrationTest
@@ -741,6 +743,39 @@ contract Phase2IntegrationTest is Phase2Fixture {
         assertEq(vault.totalAssetsUsd18(), 5000e18, "and its USDG is outside the numerator");
 
         assertSweepClean("h/bounty");
+    }
+
+    /// @notice The vault reports the work it **measured**, not a flat `$1`, so the dust guard the pot has always
+    ///         carried can finally fire on the path that matters (`docs/phase3-state-model.md` §12.4 ruling W).
+    /// @dev The Phase 2 wiring has no ladder, so a `compound()` collects nothing, buys nothing back and is worth
+    ///      exactly zero. Under the flat constants it was paid the full `tip + chip` — `$0.05 + 2% x $1 = $0.07`
+    ///      — every 60 seconds, per pool, up to the $25 daily ceiling; now it is paid nothing and says why.
+    function test_h_anEmptyJobReportsZeroWorkAndIsPaidNothing() public {
+        usdg.mint(address(this), 50e6);
+        usdg.approve(address(pot), type(uint256).max);
+        pot.fund(50e6);
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+        assertEq(ampsFees, 0, "nothing to collect");
+        assertEq(burned, 0, "nothing to burn");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(pot) || logs[i].topics[0] != IBountyPot.BountyPaid.selector) continue;
+            (uint256 workValueUsd18,, uint256 paidRaw, bytes32 reason) =
+                abi.decode(logs[i].data, (uint256, uint256, uint256, bytes32));
+            assertEq(workValueUsd18, 0, "the job measured zero work");
+            assertEq(reason, bytes32("chost"), "and the dust guard refused it");
+            assertEq(paidRaw, 0, "so nothing was paid");
+            seen = true;
+        }
+        assertTrue(seen, "the refusal reached the keeper as an event");
+        assertEq(usdg.balanceOf(KEEPER), 0, "the caller earned nothing");
+        assertEq(pot.balance(), 50e6, "and the pot is exactly where it started");
+        assertSweepClean("h/emptyJob");
     }
 
     // -------------------------------------------------------------------------------------------------------------

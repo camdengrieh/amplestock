@@ -32,6 +32,20 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      *previous* checkpoint, not at `slot0`. Invariant I7 asserts the consequence: forcing `slot0` +/-50% moves
 ///      `A` by no more than dust, so a flash move of a pool cannot inflate NAV. The denominator is
 ///      `Amps.totalSupply()`, which is exact by definition and never reads a price at all.
+///
+/// @dev **The Phase 3 implementation enumerates the grid, not the vault's records** (`docs/phase3-state-model.md`
+///      §4, §10 ruling 1). `LadderPositionValuer` rebuilds the pool's `Constants.GRID_CELLS` canonical ranges from
+///      `PoolConfig.gridBaseTick`, `PoolConfig.tickSpacing` and `Constants.POSITION_SALT`, and reads their
+///      liquidity in one batched `IExtsload.extsload(bytes32[])`. Three reasons, in order of weight: `IAmpsVault`
+///      exposes no ladder getter on any path NAV may depend on and the ABI is final; the PoolManager, not the
+///      vault, is the authority on what the vault actually owns; and a bookkeeping bug in the vault's own records
+///      therefore cannot inflate `A`.
+///
+/// @dev **Uncollected fees are excluded, normatively.** `A` must never be overstated, and fee growth is the one
+///      term an attacker can inflate cheaply by wash-trading. Including it would also make `A` depend on
+///      `slot0.tick` through `feeGrowthInside`'s branch, which contradicts I7 outright. The next `compound()`
+///      collects those fees into ERC-6909 claims, where `A` picks them up like any other balance, so the omission
+///      is a lag and never a loss.
 interface IPositionValuer {
     /// @notice Values every position the vault holds in `poolId`, decomposed at a supplied reference sqrt price.
     /// @dev Called once per registered pool by `AmpsVault._computeNav`. Implementations must be `view`, must never

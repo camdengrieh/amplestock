@@ -259,6 +259,16 @@ contract AmpsBonds is IAmpsBonds {
     }
 
     /// @inheritdoc IAmpsBonds
+    function unvestedOf(address owner) external view returns (uint256 amount) {
+        VestingPosition[] storage list = _positions[owner];
+        uint256 length = list.length;
+        for (uint256 i; i < length; ++i) {
+            VestingPosition storage record = list[i];
+            amount += record.principal - _vested(record);
+        }
+    }
+
+    /// @inheritdoc IAmpsBonds
     function quote(uint16 marketId, uint256 amountIn)
         external
         view
@@ -404,7 +414,7 @@ contract AmpsBonds is IAmpsBonds {
         );
 
         // 7. The mint, the event and `sweepClean`.
-        _issue(marketId, stored.collateral, amountIn, ampsOut, positionId, priced);
+        _issue(marketId, stored.collateral, amountIn, ampsOut, positionId, vestSeconds, priced);
     }
 
     /// @dev Everything `bond` does after its effects are written: the AMPS is minted to this contract and is in
@@ -416,6 +426,7 @@ contract AmpsBonds is IAmpsBonds {
         uint256 amountIn,
         uint256 ampsOut,
         uint256 positionId,
+        uint32 vestSeconds_,
         _Priced memory priced
     ) internal {
         IAmpsVault(vault).mintVesting(address(this), ampsOut);
@@ -429,7 +440,8 @@ contract AmpsBonds is IAmpsBonds {
             positionId,
             priced.qX18,
             priced.discountBps,
-            priced.floorBinding
+            priced.floorBinding,
+            vestSeconds_
         );
 
         uint256 dust = IERC20(collateral).balanceOf(address(this));

@@ -63,6 +63,52 @@ interface IAmpsHook is IMarketReference {
     /// @param blendedFeeBps The blended base fee that resulted.
     event RotationCreditConsumed(PoolId indexed poolId, uint256 consumed, uint16 blendedFeeBps);
 
+    /// @notice Emitted by `afterSwap` when a pool has drifted far enough from fair to be worth a keeper's look.
+    /// @dev Advisory only. Nothing on-chain reads it, no path is gated on it, and it is emitted when
+    ///      `abs(tick - fairTick) > innerBandTicks / 2`. Ladders are static: the keeper's answer to this event is
+    ///      `compound()` or `rollout()`, never a re-centring, which does not exist.
+    /// @param poolId The pool.
+    /// @param tick The raw post-swap tick.
+    /// @param fairTick The fair tick in force.
+    event RebalanceNeeded(PoolId indexed poolId, int24 tick, int24 fairTick);
+
+    /// @notice Emitted when `afterSwap` refreshes a pool's cached gate view, at most once per
+    ///         `Constants.GATE_CACHE_SECONDS_DEFAULT`.
+    /// @dev Emitted on a *failed* refresh as well, with `gateFlags` bit2 (`refreshFailed`) set and the previous
+    ///      values repeated: the indexer must be able to tell a stale cache from a fresh one, and no refresh
+    ///      failure may ever reach the swapper as a revert.
+    /// @param poolId The pool.
+    /// @param gateFlags bit0 degraded, bit1 corporateFreeze, bit2 refreshFailed, bit3 caArmed.
+    /// @param session The equity session cached.
+    /// @param dynCapBps The dynamic-fee cap now in force.
+    /// @param innerBandTicks The inner band half-width now in force.
+    /// @param outerRailTicks The outer rail half-width now in force.
+    /// @param fairTick The fair tick now in force.
+    event GateCacheRefreshed(
+        PoolId indexed poolId,
+        uint8 gateFlags,
+        uint8 session,
+        uint16 dynCapBps,
+        int24 innerBandTicks,
+        int24 outerRailTicks,
+        int24 fairTick
+    );
+
+    /// @notice Emitted by every governed hook setter, so the indexer and the governance drill can follow a
+    ///         parameter without decoding calldata. Mirrors `IAmpsVault.VaultParameterChanged`.
+    /// @param parameter The parameter name as a short string, e.g. `bytes32("sellFeeBps")`.
+    /// @param poolId The pool the change applies to, or `bytes32(0)` for a protocol-wide parameter.
+    /// @param previousValue The value before.
+    /// @param newValue The value after.
+    event HookParameterChanged(
+        bytes32 indexed parameter, PoolId indexed poolId, uint256 previousValue, uint256 newValue
+    );
+
+    /// @notice Emitted when the fee policy pointer moves. **7-day timelock.**
+    /// @param previousPolicy The policy replaced.
+    /// @param newPolicy The policy installed.
+    event FeePolicyChanged(address indexed previousPolicy, address indexed newPolicy);
+
     /// @notice `currency0` of the pool being initialised is not AMPS. Hard requirement: it fixes the sign of every
     ///         fee direction and every one-sided placement in the protocol.
     error Currency0NotAmps();
@@ -74,8 +120,20 @@ interface IAmpsHook is IMarketReference {
     /// @param poolId The pool.
     error PoolNotRegistered(PoolId poolId);
 
-    /// @notice A deviation-increasing swap beyond the outer rail. The **only** reason the hook ever reverts a
-    ///         swap: no gate state, no freeze and no oracle failure can (I15).
+    /// @notice The `PoolKey` the PoolManager is initialising disagrees with the registry's record for it.
+    /// @dev `beforeInitialize` re-derives `counter` and `tickSpacing` from `PoolRegistry.poolConfig` and compares
+    ///      them with `key.currency1` and `key.tickSpacing`. Two contracts hold the pool's shape, so one of them
+    ///      has to be the authority and the other has to check; the registry is the authority.
+    /// @param field The field that disagreed, as a short string: `bytes32("counter")` or `bytes32("tickSpacing")`.
+    error PoolKeyMismatch(bytes32 field);
+
+    /// @notice **Superseded.** The Phase 2 spelling of the rail refusal, retained because a declared error
+    ///         selector is ABI and this interface never removes a member.
+    /// @dev `docs/phase3-state-model.md` §10 ruling 2 fixes the thrown error as `Errors.BeyondRail(bytes32 poolId,
+    ///      int24 devTicks, int24 outerRailTicks)`, shared at file level because the vault-side tests, the quoter
+    ///      and the invariant handler all decode it, and checked **twice** — on the start-of-swap tick in
+    ///      `beforeSwap` and on the post-swap tick in `afterSwap`. `AmpsHook` throws `Errors.BeyondRail`; nothing
+    ///      throws this. Do not add a second thrower.
     /// @param poolId The pool.
     /// @param devTicks The deviation after the swap.
     /// @param outerRailTicks The rail in force.
@@ -104,6 +162,26 @@ interface IAmpsHook is IMarketReference {
     /// @notice The fee policy pointer.
     /// @return policyAddress The `IFeePolicy` address.
     function feePolicy() external view returns (address policyAddress);
+
+    /// @notice The governance timelock: the only caller of {setSellFeeBps}, {setBuyFeeBps},
+    ///         {setMaxTickMovePerBlock} and {setFeePolicy}.
+    /// @return timelockAddress The timelock address.
+    function timelock() external view returns (address timelockAddress);
+
+    /// @notice How often `afterSwap` may refresh a pool's cached gate view, in seconds.
+    /// @dev The whole caching strategy in one number: `beforeSwap` reads three of the hook's own words plus the
+    ///      pure fee policy and nothing else, and every external read — gate, registry, feeds, hub TWAP,
+    ///      `uiMultiplier()` — happens in `afterSwap` at most this often per pool.
+    /// @return seconds_ The interval. `Constants.GATE_CACHE_SECONDS_DEFAULT` (60) at launch.
+    function gateCacheSeconds() external view returns (uint32 seconds_);
+
+    /// @notice The origin of a pool's canonical doubling grid, as the hook cached it at `afterInitialize`.
+    /// @dev `PriceLib.alignTick(openingTick, tickSpacing, true)`. The same value the registry stores in
+    ///      `PoolConfig.gridBaseTick`; the registry's copy is the one `LadderPositionValuer` reads, this one is
+    ///      the hook's own so a placement check needs no registry call.
+    /// @param poolId The pool.
+    /// @return tick The grid origin.
+    function gridBaseTick(PoolId poolId) external view returns (int24 tick);
 
     /// @notice The whole per-pool hook state.
     /// @param poolId The pool.

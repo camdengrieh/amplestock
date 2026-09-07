@@ -154,3 +154,84 @@ error SweepDirty(address token, uint256 balance);
 /// @param requested The amount asked for.
 /// @param available The amount still available.
 error CapacityExceeded(uint256 requested, uint256 available);
+
+// -------------------------------------------------------------------------------------------------------------
+// The fee wall and the placement gauntlet (Phase 3)
+// -------------------------------------------------------------------------------------------------------------
+//
+// `BeyondRail` is thrown by `AmpsHook`; the rest are thrown by `AmpsVault` *and* by the linked
+// `VaultPlacementLib`, which is why they are shared rather than local to either. Every one of them is a deliberate,
+// deterministic refusal on a caller's own input — none of them is a downstream failure. That distinction is the
+// whole of `afterSwap`'s "may never revert" rule (ruling 2): an oracle, registry, gate or arithmetic failure raises
+// a flag and keeps the cached value; {BeyondRail} is the single exception, and it is a decision, not a fault.
+
+/// @notice A deviation-increasing swap at or beyond the pool's outer rail. The **only** reason the hook ever
+///         reverts a swap: no gate state, no freeze and no oracle failure can (I15, as restated by
+///         `docs/phase3-state-model.md` §10 ruling 2).
+///
+/// @dev **Checked twice, thrown identically.** `beforeSwap` refuses a swap that *begins* beyond the rail on the
+///      deviation-increasing side — the rail is a start-of-swap condition, because v4 needs the fee before the
+///      swap and the post-swap tick does not exist yet (§9 decision 2). `afterSwap` refuses one that *ends* beyond
+///      it having increased the deviation. One swap may therefore overshoot the rail; the next one in the same
+///      direction cannot, and the overshoot is bounded by I25 and by the wall's quadratic ramp.
+///
+/// @dev A price-improving swap is never refused, at any deviation, in any gate state. That is what lets a hub pump
+///      propagate into the spokes through arbitrage instead of being walled out of existence.
+/// @param poolId The pool, as `PoolId.unwrap`. `bytes32` rather than `PoolId` so the error is shared by contracts
+///        that do not otherwise import v4-core's types.
+/// @param devTicks `|poolTick - fairTick|` measured at the point of refusal.
+/// @param outerRailTicks The rail half-width in force for that pool.
+error BeyondRail(bytes32 poolId, int24 devTicks, int24 outerRailTicks);
+
+/// @notice A placement was attempted inside the pool's 60-second cooldown.
+/// @param poolId The pool, as `PoolId.unwrap`.
+/// @param readyAt The timestamp the pool becomes placeable again.
+error PlacementCooldown(bytes32 poolId, uint32 readyAt);
+
+/// @notice `|slot0.tick - tickOf(P_mkt / P_i)|` exceeded `PLACEMENT_DIVERGENCE_TICKS` at the entry or the exit of
+///         a placement. Checked at **both** ends, so a placement cannot be sandwiched into a manipulated tick.
+/// @param poolId The pool, as `PoolId.unwrap`.
+/// @param poolTick The pool's tick.
+/// @param fairTick The fair tick it was measured against.
+/// @param maxTicks The bound from `Constants`.
+error PlacementDiverged(bytes32 poolId, int24 poolTick, int24 fairTick, int24 maxTicks);
+
+/// @notice A proposed bucket was on the wrong side of the current tick: an ask at or below it, or a bid at or
+///         above it. Invariant I9, and it is unconditional — no gate state, no session and no policy can relax it.
+/// @param poolId The pool, as `PoolId.unwrap`.
+/// @param above True when the offending bucket was proposed as an ask.
+/// @param bucketTick The bucket bound that failed: `lowerTick` for an ask, `upperTick` for a bid.
+/// @param boundTick The tick it had to clear: `alignUp(slot0.tick)` for an ask, `alignDown(slot0.tick)` for a bid.
+error WrongSide(bytes32 poolId, bool above, int24 bucketTick, int24 boundTick);
+
+/// @notice A proposed bucket was not a cell of the pool's canonical doubling grid (invariant I39).
+/// @dev Thrown when `lowerTick != gridBaseTick + m * cellWidth` for any `m` in `[GRID_MIN_M, GRID_MAX_M)`, or when
+///      the bucket is not exactly one cell wide. The vault re-derives the lattice itself and never trusts the
+///      policy's arithmetic: an off-grid position would silently defeat merge-by-cell, the bounded record count
+///      and `LadderPositionValuer`'s enumeration at once.
+/// @param poolId The pool, as `PoolId.unwrap`.
+/// @param lowerTick The offending lower bound.
+/// @param gridBaseTick The pool's grid origin.
+/// @param cellWidth One doubling in ticks, `LadderLib.doublingTicks(tickSpacing)`.
+error OffGrid(bytes32 poolId, int24 lowerTick, int24 gridBaseTick, int24 cellWidth);
+
+/// @notice A placement would open a new ladder cell beyond the vault-wide live-cell budget that bounds the gas of
+///         `redeemProRata` (`Constants.MAX_LIVE_CELLS`). Thrown by `place`; the bountied paths merge and idle
+///         instead of reverting.
+/// @param poolId The pool the cell would have opened in.
+/// @param liveCells The live cells the vault already has.
+/// @param budget The budget.
+error CellBudgetExceeded(bytes32 poolId, uint32 liveCells, uint32 budget);
+
+/// @notice A placement asked to commit more than the vault actually holds of that side.
+/// @param requested The amount the buckets summed to.
+/// @param available The inventory available.
+error InsufficientInventory(uint256 requested, uint256 available);
+
+/// @notice A rollout move breached one of its three hard limits (invariant I32). Re-checked by the vault after the
+///         policy has proposed, never taken on trust.
+/// @param limit Which one, as a short string: `bytes32("dailyBudget")`, `bytes32("entryFloor")` or
+///        `bytes32("belowPRef")`.
+/// @param requested The amount the move asked for.
+/// @param available The amount that limit allowed.
+error RolloutLimitExceeded(bytes32 limit, uint256 requested, uint256 available);

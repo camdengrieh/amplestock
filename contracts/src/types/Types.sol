@@ -19,6 +19,15 @@ pragma solidity 0.8.30;
 // member. Members are only ever appended, never reordered or removed; an obsolete member stays in place. `Session`
 // doubles as an index into the four-element `h_session` and inner-band tables, so its ordering is also load-bearing
 // in-contract: it is monotone non-decreasing in "closedness" (invariant I19).
+//
+// PHASE 3. `docs/phase3-state-model.md` §10 rulings 1, 4 and 14 add three things here and nothing else: `PoolConfig`
+// gains `gridBaseTick` (the canonical doubling grid's origin, ruling 14); `HookPoolState` becomes the *memory view*
+// `AmpsHook.poolState()` assembles from its three packed words rather than a storage layout, and gains the fields
+// that view was missing (ruling 4); and the placement path gains `PlaceParams`, `Placed` and `GridCell`. No existing
+// field moved: `PoolConfig`'s new field is appended (it starts a second slot, which is append-only for a struct held
+// in a mapping), and `HookPoolState` is memory-only so its shape is free.
+
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 // -----------------------------------------------------------------------------------------------------------------
 // Enums
@@ -133,7 +142,25 @@ enum PoolClass {
 ///      [216..231] uint16  constituentId    1-based index into the constituent array; 0 for the entry pools
 ///      [232..239] bool    registered       true once `beforeInitialize` has accepted the pool
 ///      [240..255] (free)
+///
+///      slot +1                                                                              Phase 3, ruling 14
+///      [  0.. 23] int24   gridBaseTick     origin of the pool's canonical doubling grid
+///      [ 24..255] (free)
 ///      ```
+///      `gridBaseTick` is appended, not squeezed into slot +0's last 16 bits, because it is an `int24`. Appending
+///      starts a second slot for the struct; every field above keeps its slot and its bit range, which is what the
+///      append-only rule protects. It costs one extra cold SLOAD in {IPoolRegistry-poolConfig}, paid by
+///      `AmpsHook.afterInitialize` (once per pool, ever) and by `LadderPositionValuer.valuePool` (once per pool per
+///      NAV read) — never on a swap.
+///
+///      **What it is.** `docs/phase3-state-model.md` §3.2: every vault position in a pool lies on that pool's
+///      canonical doubling grid, cell `m` covering `[gridBaseTick + m*D, gridBaseTick + (m+1)*D)` with
+///      `D = LadderLib.doublingTicks(tickSpacing)` and `m` in `[Constants.GRID_MIN_M, Constants.GRID_MAX_M)`. The
+///      grid is what makes placements merge by cell instead of accumulating, bounds `redeemProRata`'s work at
+///      `GRID_CELLS` positions per pool, and lets `LadderPositionValuer` enumerate the vault's positions by
+///      `extsload` without a ladder getter (invariant I39). The registry writes it when it opens the pool, from the
+///      initial price: `PriceLib.alignTick(sqrtPriceX96ToTick(sqrtPriceX96), tickSpacing, true)`. The hook mirrors
+///      the same value into its own CONFIG word at `afterInitialize`; the registry is the copy the valuer reads.
 /// @param counter The pool's `currency1`. AMPS is `currency0` in all 32 pools by construction.
 /// @param poolClass The fee bucket and band regime.
 /// @param counterDecimals ERC-20 decimals of `counter`, cached so `PriceLib` calls need no external read.
@@ -141,6 +168,7 @@ enum PoolClass {
 /// @param buyFeeBps Base fee charged on `zeroForOne == false` (AMPS out) swaps.
 /// @param constituentId 1-based constituent id, or 0 for an entry pool.
 /// @param registered Whether the pool has been initialised through the hook.
+/// @param gridBaseTick Origin of the pool's canonical doubling grid, spacing-aligned upward from the opening tick.
 struct PoolConfig {
     address counter;
     PoolClass poolClass;
@@ -149,6 +177,7 @@ struct PoolConfig {
     uint16 buyFeeBps;
     uint16 constituentId;
     bool registered;
+    int24 gridBaseTick;
 }
 
 /// @notice `PoolRegistry`'s per-constituent record, keyed by 1-based id. Two slots.
@@ -437,35 +466,125 @@ struct PlacementRecord {
     int24 anchorTick;
 }
 
-/// @notice The hook's per-pool state, excluding the observation ring. Two slots.
-/// @dev The ring lives beside this in `mapping(PoolId => TruncatedOracleLib.State)`: that struct already owns
-///      `index`, `cardinality`, `highWaterTick`, `lastTruncatedTick`, `blockAnchorTick` and `lastBlockNumber` in a
-///      single head slot, and duplicating them here would cost a third SSTORE per swap. `beforeSwap` reads slot +0
-///      and (only when a surge or capture fee is armed) slot +1; `afterSwap` writes the ring's head and, at most,
-///      slot +1.
-///      ```
-///      slot +0
-///      [  0..  7] bool      initialized        set by `afterInitialize`; a zero word means "not our pool"
-///      [  8.. 15] PoolClass poolClass          copied from the registry at initialisation
-///      [ 16.. 31] uint16    constituentId      0 for the entry pools
-///      [ 32.. 47] uint16    buyFeeBps          the pool's base buy fee, cached from the registry
-///      [ 48.. 71] int24     tickSpacing        cached from the pool key
-///      [ 72.. 95] int24     maxTickMovePerBlock the truncation cap charged by `TruncatedOracleLib.write`
-///      [ 96..159] uint64    uiMultiplierX18    last observed `uiMultiplier()`; 0 for the entry pools
-///      [160..223] uint64    varianceX18        EWMA realised variance, lambda = 0.98
-///      [224..255] uint32    lastSwapAt         timestamp of the last swap through this pool
+/// @notice One cell of a pool's canonical doubling grid, in the compact shape the placement path passes around.
+///         Memory-only: the durable record of a cell the vault actually holds is {PlacementRecord}.
 ///
-///      slot +1
-///      [  0.. 15] uint16    surgeBps           surge fee at `surgeArmedAt`, before decay
-///      [ 16.. 47] uint32    surgeArmedAt       when the surge was armed (60 s half-life)
-///      [ 48.. 63] uint16    captureFeeBps      dividend-step capture fee, 0.8 x delta, 300 s half-life
-///      [ 64.. 95] uint32    captureArmedAt     when the capture fee was armed
-///      [ 96..119] int24     innerBandTicks     the band width in force, by session and class
-///      [120..143] int24     outerRailTicks     max(3 x innerBand, 800) for spokes, 2000 for entry pools
-///      [144..159] uint16    dynCapBps          the dynamic-fee cap for the pool's current gate state
-///      [160..191] uint32    lastCorporateCheck last bounded staticcall to `uiMultiplier()`/`effectiveAt()`
-///      [192..255] (free)
+/// @dev **The grid** (`docs/phase3-state-model.md` §3.2, ruling 1). A v4 position is keyed by
+///      `(owner, tickLower, tickUpper, salt)` and Amplestocks uses `salt == Constants.POSITION_SALT` (`bytes32(0)`)
+///      everywhere (ruling 12), so two placements over the same range are **one** position at the PoolManager.
+///      Confining every placement to a lattice is therefore not an optimisation, it is what makes the bookkeeping
+///      correct: records merge by cell rather than accumulate, `redeemProRata`'s work is bounded at
+///      `Constants.GRID_CELLS` positions per pool, and `LadderPositionValuer` can enumerate what the vault owns by
+///      `extsload` without any getter on the vault.
 ///      ```
+///      D      = LadderLib.doublingTicks(tickSpacing)             one doubling, rounded up to a whole spacing
+///      cell m = [gridBaseTick + m*D, gridBaseTick + (m+1)*D)     m in [GRID_MIN_M, GRID_MAX_M)
+///      index  = uint8(m - GRID_MIN_M)                            0 .. GRID_CELLS-1, the {PlacementRecord} key
+///      ```
+///      Genesis asks occupy `m = 0..9` and seed bids `m = -4..-1`; re-laddered fee asks, rolled-out asks and bonded
+///      bids snap to the same lattice. Invariant I39: every record in pool `p` has
+///      `lowerTick == gridBase_p + m*D_p` for some `m` in range, and no two records share an `m`.
+/// @param index The cell index `m - GRID_MIN_M`, in `[0, GRID_CELLS)`. The merge key.
+/// @param lowerTick The cell's lower bound, `gridBaseTick + m*D`.
+/// @param upperTick The cell's upper bound, `lowerTick + D`.
+/// @param liquidity Position liquidity in this cell: what is being added, removed or observed, depending on the
+///        caller. Never a cumulative token amount — that is {PlacementRecord-amount}.
+/// @param above True while the cell is an ask (AMPS above the tick), false once it has converted to a bid.
+struct GridCell {
+    uint8 index;
+    int24 lowerTick;
+    int24 upperTick;
+    uint128 liquidity;
+    bool above;
+}
+
+/// @notice Everything one placement needs, in the shape `AmpsVault` hands to `VaultPlacementLib`.
+///
+/// @dev **Chosen shape.** `docs/phase3-state-model.md` §3.1 fixes the *signature*
+///      `placeLadder(mapping ladder, mapping cooldown, PlaceParams memory p) -> Placed memory` but not the fields;
+///      these are chosen to be exactly the inputs §3.3 and §3.8 need and nothing else, so the library never has to
+///      call back out to the registry or the checkpoint mid-placement. The vault fills every field before it takes
+///      the lock, which is what lets the gauntlet run entirely on values captured at entry.
+///
+/// @dev **The gauntlet the vault runs around this** (§3.8, and it is the vault's job, never the policy's): the
+///      transient lock and `_requireHealthy`; `IOracleGate.checkPlacement`; divergence at entry *and* exit;
+///      sidedness (I9 — asks strictly above `alignUp(currentTick)`, bids strictly below `alignDown(currentTick)`);
+///      grid membership (I39) and `sum(amounts) <= amount`; the 60-second cooldown; the R1 revert; `armSurge`
+///      after; `_sweepClean` at exit. Every bucket a policy proposes is re-checked here, never trusted.
+/// @param key The pool key. Carries `tickSpacing`, and is what `modifyLiquidity` needs inside the unlock.
+/// @param poolClass The pool's fee bucket, for the class-dependent limits.
+/// @param above True for an ask ladder (AMPS above the tick), false for a bid ladder (counter below it).
+/// @param amount The inventory to place: AMPS wei for an ask, counter raw units for a bid. An upper bound — a
+///        ladder may commit less when liquidity rounding leaves a residue, and the residue stays idle.
+/// @param anchorTick The tick the ladder is measured from, already snapped to the grid.
+/// @param currentTick `slot0.tick` captured at entry, the sidedness reference.
+/// @param gridBaseTick The pool's grid origin, from {PoolConfig-gridBaseTick}.
+/// @param buckets The ladder length: `ladderDoublings` for asks, `seedHalvings` or `bondBidHalvings` for bids.
+/// @param tiltX18 The tilt in force, inside `[LADDER_TILT_X18_MIN, LADDER_TILT_X18_MAX]`.
+/// @param reason A short identifier for the event and the surge that follows: `bytes32("genesis")`,
+///        `bytes32("spokeSeed")`, `bytes32("compound")`, `bytes32("rollout")`, `bytes32("bonded")`.
+struct PlaceParams {
+    PoolKey key;
+    PoolClass poolClass;
+    bool above;
+    uint256 amount;
+    int24 anchorTick;
+    int24 currentTick;
+    int24 gridBaseTick;
+    uint8 buckets;
+    uint64 tiltX18;
+    bytes32 reason;
+}
+
+/// @notice What a placement actually did, returned by `VaultPlacementLib` to the vault's forwarder.
+/// @dev `amountPlaced <= PlaceParams.amount` always: what a bucket loses to liquidity rounding stays in the vault
+///      as idle inventory rather than disappearing, and `cells == 0` with `amountPlaced == 0` is a legitimate
+///      no-op (nothing was due) rather than a revert.
+/// @param amountPlaced The token amount actually committed, in the placed side's units.
+/// @param liquidityAdded The sum of the position liquidity added across the cells.
+/// @param cells How many grid cells the placement wrote or merged into.
+/// @param lowestTick The lowest `lowerTick` written, or 0 when `cells == 0`.
+/// @param highestTick The highest `upperTick` written, or 0 when `cells == 0`.
+struct Placed {
+    uint256 amountPlaced;
+    uint128 liquidityAdded;
+    uint8 cells;
+    int24 lowestTick;
+    int24 highestTick;
+}
+
+/// @notice The hook's per-pool state as one flat **memory view**, excluding the observation ring.
+///
+/// @dev **This is a view, not a layout** (`docs/phase3-state-model.md` §10 ruling 4). It is what
+///      `AmpsHook.poolState(poolId)` assembles and returns; it is never written to storage by anything. The hook's
+///      real storage is three packed words plus the ring (§1.2 of that document):
+///      ```
+///      CONFIG _cfg                                DYNAMIC _dyn                        ARMED _arm
+///      [  0.. 15] uint16 buyFeeBps                [  0.. 23] int24  lastTick          [  0.. 15] uint16 surgeBps
+///      [ 16.. 31] uint16 constituentId            [ 24.. 55] uint32 lastUpdate        [ 16.. 47] uint32 surgeArmedAt
+///      [ 32.. 39] uint8  poolClass                [ 56.. 79] int24  fairTick          [ 48.. 63] uint16 captureFeeBps
+///      [ 40.. 63] int24  tickSpacing              [ 80..103] int24  innerBandTicks    [ 64.. 95] uint32 captureArmedAt
+///      [ 64.. 87] int24  maxTickMovePerBlock      [104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX18
+///      [ 88.. 95] uint8  counterDecimals          [128..143] uint16 dynCapBps         [160..223] uint64 varianceX18
+///      [ 96..119] int24  gridBaseTick             [144..151] uint8  session           [224..255] uint32 lastCorporate
+///      [120..127] bool   initialized              [152..159] uint8  gateFlags                            Check
+///                                                 [160..167] uint8  fVolBps
+///                                                 [168..199] uint32 gateRefreshedAt
+///      ```
+///      so the field order below is presentation, not packing, and adding a field here costs no storage and moves
+///      nothing. The ring lives beside those words in `mapping(PoolId => TruncatedOracleLib.State)`, which already
+///      owns `index`, `cardinality`, `highWaterTick`, `lastTruncatedTick`, `blockAnchorTick` and `lastBlockNumber`;
+///      none of those is duplicated here — read them through {IMarketReference} (ruling 4 is explicit that
+///      `highWaterTick` stays there).
+///
+/// @dev **`lastTick` is the raw post-swap `slot0.tick`**, the deviation and EWMA input. The *truncated* tick, which
+///      is what a TWAP and the high-water mark advance on, is `IMarketReference.lastTruncatedTick`. They differ
+///      whenever `maxTickMovePerBlock` bound the last write, and that difference is the security property (I25).
+///
+/// @dev **`gateFlags` is a bitfield**: bit0 `degraded`, bit1 `corporateFreeze`, bit2 `refreshFailed`, bit3
+///      `caArmed`. `refreshFailed` records that a bounded `staticcall` inside the last gate refresh failed and the
+///      cached values were kept — `afterSwap` never reverts for a downstream failure, it raises this flag instead.
+///
 /// @param initialized Whether `afterInitialize` has run for this pool.
 /// @param poolClass The pool's fee bucket.
 /// @param constituentId The constituent id, or 0 for an entry pool.
@@ -483,6 +602,17 @@ struct PlacementRecord {
 /// @param outerRailTicks The outer rail half-width in ticks.
 /// @param dynCapBps The dynamic-fee cap in force.
 /// @param lastCorporateCheck Timestamp of the last corporate-action probe.
+/// @param counterDecimals ERC-20 decimals of `currency1`, cached from the registry at initialisation.
+/// @param gridBaseTick Origin of the pool's canonical doubling grid, mirrored from {PoolConfig-gridBaseTick}.
+/// @param lastTick The raw `slot0.tick` after the last swap. Not the truncated tick.
+/// @param fairTick The tick the deviation is measured against: `tickOf(P_mkt / P_i)` for a spoke, the pool's own
+///        truncated TWAP for an entry pool. Refreshed with the gate cache, never on every swap.
+/// @param session The equity session cached at the last gate refresh. Entry pools always report `REGULAR`.
+/// @param gateFlags The bitfield above.
+/// @param fVolBps The volatility component pre-computed by `afterSwap` from `varianceX18`, so `beforeSwap` needs no
+///        `k_vol` multiply. Capped at `Constants.F_VOL_CAP_BPS` (100), which is why a `uint8` suffices.
+/// @param gateRefreshedAt When the gate cache was last refreshed. Older than `Constants.GATE_CACHE_MAX_AGE` and
+///        `beforeSwap` substitutes the most conservative values for the pool's class.
 struct HookPoolState {
     bool initialized;
     PoolClass poolClass;
@@ -501,6 +631,14 @@ struct HookPoolState {
     int24 outerRailTicks;
     uint16 dynCapBps;
     uint32 lastCorporateCheck;
+    uint8 counterDecimals;
+    int24 gridBaseTick;
+    int24 lastTick;
+    int24 fairTick;
+    Session session;
+    uint8 gateFlags;
+    uint8 fVolBps;
+    uint32 gateRefreshedAt;
 }
 
 /// @notice `FeedRegistry`'s record for one Chainlink aggregator. Two slots.

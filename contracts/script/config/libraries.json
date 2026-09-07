@@ -1,0 +1,37 @@
+{
+  "$comment": "The four linked vault libraries (docs/phase3-state-model.md §12 ruling A). AmpsVault is a DELEGATECALL consumer of all four; an unlinked artefact carries __$...$__ placeholders and cannot be deployed. script/02_Libraries.s.sol deploys them through the canonical CREATE2 factory at the salts below and rewrites this file. Addresses are zero until that script has run on the target chain. NOTE: these do NOT belong in foundry.toml's `libraries` key -- pinning them there would bake one chain's addresses into every test build.",
+  "chainId": 0,
+  "factory": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+  "factoryNote": "Canonical deterministic-deployment proxy. Recorded as UNVERIFIED on 4663 in the plan's reference table: assert its code before relying on it.",
+  "solc": "0.8.30",
+  "profile": "src/vault/* at optimizer_runs = 200, via_ir = true",
+  "deployOrder": ["VaultNavLib", "VaultRedeemLib", "VaultPlacementLib", "VaultRolloutLib"],
+  "deployOrderNote": "VaultRolloutLib calls VaultPlacementLib.place, which is `public`, so its artefact carries a link reference and it must be built with --libraries pointing at the already-deployed VaultPlacementLib. The other three have no library link references of their own.",
+  "libraries": {
+    "VaultNavLib": {
+      "path": "src/vault/VaultNavLib.sol:VaultNavLib",
+      "address": "0x0000000000000000000000000000000000000000",
+      "salt": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "initCodeHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "VaultRedeemLib": {
+      "path": "src/vault/VaultRedeemLib.sol:VaultRedeemLib",
+      "address": "0x0000000000000000000000000000000000000000",
+      "salt": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "initCodeHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "VaultPlacementLib": {
+      "path": "src/vault/VaultPlacementLib.sol:VaultPlacementLib",
+      "address": "0x0000000000000000000000000000000000000000",
+      "salt": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "initCodeHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "VaultRolloutLib": {
+      "path": "src/vault/VaultRolloutLib.sol:VaultRolloutLib",
+      "address": "0x0000000000000000000000000000000000000000",
+      "salt": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "initCodeHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "librariesFlag": ""
+}

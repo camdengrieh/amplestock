@@ -1,0 +1,10 @@
+{
+  "$comment": "Written by script/10_TestnetPools.s.sol on chain 46630: the mock counter assets, mock aggregators and mock stock tokens it deployed, so a re-run skips everything already there. Nothing in this file exists on 4663 and nothing on 4663 may read it.",
+  "chainId": 46630,
+  "usdg": "0x0000000000000000000000000000000000000000",
+  "usdgFeed": "0x0000000000000000000000000000000000000000",
+  "weth9": "0x0000000000000000000000000000000000000000",
+  "wethFeed": "0x0000000000000000000000000000000000000000",
+  "stockCount": 0,
+  "stocks": []
+}

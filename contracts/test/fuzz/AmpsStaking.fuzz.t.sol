@@ -330,11 +330,17 @@ contract AmpsStakingFuzzTest is Test {
         vm.prank(alice);
         uint256 victimOut = staking.redeem(victimShares, alice, alice);
 
-        assertLt(attackerOut, attackerSeed + gift, "the inflation attack never returns what it cost");
-        assertGt(
-            (attackerSeed + gift) - attackerOut,
+        // `<=`, not `<`: at the exact break-even point (a maximal donation against a maximal victim deposit) the
+        // attacker's withdrawal equals its outlay to the wei, which is a loss of the gas and the time value and
+        // never a profit. The ci profile's 4,096 runs reach that point; the claim is "never profitable".
+        assertLe(attackerOut, attackerSeed + gift, "the inflation attack never returns more than it cost");
+        // The attacker's loss bounds the victim's loss from above, to within one wei of redemption rounding: at
+        // the break-even point above the attacker loses nothing while the victim's own redemption floors a wei
+        // that stays in the vault, owned by the virtual shares rather than by the attacker.
+        assertGe(
+            (attackerSeed + gift) - attackerOut + 1,
             victimIn - victimOut,
-            "the attacker always loses strictly more than the victim: the donation is a subsidy"
+            "the attacker loses at least as much as the victim, to a wei of rounding: the donation is a subsidy"
         );
     }
 

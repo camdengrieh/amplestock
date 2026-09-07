@@ -74,7 +74,7 @@ interface IFeePolicy {
         int24 devTicks;
         int24 innerBandTicks;
         int24 outerRailTicks;
-        uint64 varianceX18;
+        uint128 varianceX18;
         uint16 surgeBps;
         uint32 surgeElapsed;
         uint16 captureFeeBps;
@@ -105,7 +105,7 @@ interface IFeePolicy {
     /// @notice Quotes the fee for one swap.
     /// @param input The assembled inputs.
     /// @return quote The fee and its decomposition.
-    function quoteFee(FeeInput calldata input) external pure returns (FeeQuote memory quote);
+    function quoteFee(FeeInput calldata input) external view returns (FeeQuote memory quote);
 
     /// @notice The inner band half-width for a pool class and session.
     /// @dev Monotone non-decreasing in session closedness, and never widened or narrowed by the breaker (I19).
@@ -127,12 +127,27 @@ interface IFeePolicy {
     function outerRailTicks(PoolClass poolClass, int24 innerBand) external pure returns (int24 ticks);
 
     /// @notice The surge fee remaining after `elapsed` seconds of exponential decay.
-    /// @dev Half-life `Constants.SURGE_HALF_LIFE` (60 s). Reimplemented from the published description of Bunni
-    ///      v2's surge shape; see `NOTICES.md`.
+    /// @dev Half-life `Constants.SURGE_HALF_LIFE` (60 s), zero at 8 half-lives. Reimplemented from the published
+    ///      description of Bunni v2's surge shape; see `NOTICES.md`.
     /// @param armedBps The surge at arming time.
     /// @param elapsed Seconds since arming.
     /// @return bps The decayed surge.
     function surgeDecay(uint16 armedBps, uint32 elapsed) external pure returns (uint16 bps);
+
+    /// @notice The dividend-step capture fee remaining after `elapsed` seconds of exponential decay.
+    /// @dev Same shape as {surgeDecay}, **different half-life**: `Constants.DIVIDEND_CAPTURE_HALF_LIFE` (300 s)
+    ///      rather than 60 s. The two are separate functions because they are separate control loops — a surge
+    ///      exists to stop a placement being sandwiched over the next block or two, while a capture fee exists to
+    ///      hold an asymmetric toll long enough for the arbitrage against a `uiMultiplier()` step to be taken
+    ///      through the pool rather than around it (the plan's "300 s half-life", and `DIVIDEND_CAPTURE_HALF_LIFE`
+    ///      would otherwise have no consumer).
+    /// @dev `f_div` is this value, and it is charged **only** on the swap direction that takes the Stock Token out
+    ///      of the pool ({FeeInput-captureDirectionTakesStock}). A `+Delta` step makes each raw stock token worth
+    ///      more, so that is the profitable direction, and it is `zeroForOne == true` because AMPS is `currency0`.
+    /// @param armedBps The capture fee at arming time, `deltaBps x DIVIDEND_CAPTURE_NUMERATOR_BPS / BPS`.
+    /// @param elapsed Seconds since arming.
+    /// @return bps The decayed capture fee.
+    function captureDecay(uint16 armedBps, uint32 elapsed) external pure returns (uint16 bps);
 
     /// @notice Absolute floor on the returned fee, in bps. 3.
     /// @return value The bound.
@@ -161,6 +176,41 @@ interface IFeePolicy {
     /// @notice The largest total fee this policy can ever return, in bps. 2,600.
     /// @return value The bound.
     function TOTAL_FEE_BPS_MAX() external view returns (uint16 value);
+
+    /// @notice Floor applied to the dynamic component while the gate is not GREEN, in bps. 100.
+    /// @return value The bound.
+    function FROZEN_FEE_FLOOR_BPS() external view returns (uint16 value);
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Coefficients — the four numbers that make this policy pointer-upgradeable rather than immutable
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // `docs/phase3-state-model.md` §10 ruling 5: `k_vol`, `k_dev`, `f_wall` and `lambda` live **here**, in the
+    // 7-day-replaceable policy, with their hard bands in `Constants`. They are Phase 0 placeholders calibrated
+    // against a cadence and volatility sample the protocol does not have yet, which is precisely why they must not
+    // sit in the immutable hook. An implementation reads all four from `Constants` and restates none of them as a
+    // literal; these getters exist so the dApp, the governance drill and the fuzz suite can read the live law
+    // rather than assume it.
+
+    /// @notice `k_vol`, the coefficient on EWMA realised variance in `f_vol = k_vol x sigma^2`. 1e18 fixed point.
+    /// @return value The coefficient, inside `[K_VOL_X18_MIN, K_VOL_X18_MAX]`.
+    function K_VOL_X18() external view returns (uint256 value);
+
+    /// @notice `k_dev`, the coefficient on the squared deviation inside the inner band:
+    ///         `f_dev = K_DEV_BPS x dev^2 / 1e4`, with `dev` in ticks.
+    /// @return value The coefficient, inside `[K_DEV_BPS_MIN, K_DEV_BPS_MAX]`.
+    function K_DEV_BPS() external view returns (uint16 value);
+
+    /// @notice `f_wall`, the fee the quadratic ramp reaches at the outer rail, in bps. 1,500.
+    /// @dev Between band and rail: `f_inner + (F_WALL_BPS - f_inner) x (dev - band)^2 / (rail - band)^2`. A wall,
+    ///      not a clamp — the swap is still accepted at the wall; only a deviation-increasing swap beyond the rail
+    ///      is refused, and that comes back as {FeeQuote-refuse}, never as a throw.
+    /// @return value The wall, inside `[F_WALL_BPS_MIN, F_WALL_BPS_MAX]`.
+    function F_WALL_BPS() external view returns (uint16 value);
+
+    /// @notice `lambda`, the EWMA decay on realised variance. 1e18 fixed point, 0.98 at launch.
+    /// @return value The decay, inside `[LAMBDA_X18_MIN, LAMBDA_X18_MAX]`.
+    function LAMBDA_X18() external view returns (uint64 value);
 
     /// @notice Identifier of this fee law, for governance diffs and the dApp.
     /// @return id A short identifier, e.g. `bytes32("directional-wall-v1")`.

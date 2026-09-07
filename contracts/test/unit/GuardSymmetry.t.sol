@@ -53,7 +53,7 @@ contract AlwaysReverts {
 ///      extra exemptions are asserted below to refuse for their own reason in every gate state.
 contract GuardSymmetryTest is AmpsVaultFixture {
     /// @dev Every external state-changing selector on `AmpsVault`. Update the count deliberately, never silently.
-    uint256 internal constant EXPECTED_MUTATING_COUNT = 26;
+    uint256 internal constant EXPECTED_MUTATING_COUNT = 27;
 
     // -------------------------------------------------------------------------------------------------------------
     // The `AmpsBonds` half of step 1
@@ -153,7 +153,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         }
         assertEq(exempt, 3, "redeemProRata, emergencyMigrate and unlockCallback, and nothing else");
         assertEq(bondsGated, 2, "depositBonded and mintVesting, and nothing else");
-        assertEq(entries.length - exempt - bondsGated, 21, "the rest take the management policy");
+        assertEq(entries.length - exempt - bondsGated, 22, "the rest take the management policy");
     }
 
     /// @notice The `AmpsBonds` classification is complete, disjoint and the size the ABI says it should be.
@@ -412,6 +412,57 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         _assertUntouched(address(marketRef), "marketReference");
     }
 
+    /// @notice **The linked-library extension of the proof** (`docs/phase3-state-model.md` §10 ruling 6). Phase 3
+    ///         moves the redemption's position removal, its pro-rata arithmetic and `sweepClean` out of the vault
+    ///         and into `VaultRedeemLib`, and moves the placement path into `VaultPlacementLib` and
+    ///         `VaultRolloutLib`. A `DELEGATECALL`ed library runs *in the vault's context*, so its storage reads
+    ///         are recorded against the vault, not against the library — which is exactly what makes the proof
+    ///         extend to the union of the vault and every library it links:
+    ///
+    ///           * a library that *called* the gate, the feed registry, the pool registry or the market reference
+    ///             would show up in the four `_assertUntouched` assertions above, and
+    ///           * a library that merely *read the vault's own pointer slot* for one of them would show up here.
+    ///
+    ///         So this asserts the second half: across the whole call tree of a redemption, not one of the vault
+    ///         slots that holds a gate, a registry, a feed registry, a valuer, a policy, the market reference or
+    ///         the standby vault is read or written. `redeemProRata` cannot be gated, in the vault or in any
+    ///         library reachable from it.
+    function test_step4_noLinkedLibraryReadsAGateOrRegistryPointerSlot() public {
+        vm.record();
+        vm.prank(ALICE);
+        vault.redeemProRata(500e18, ALICE);
+
+        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(vault));
+        assertGt(reads.length, 0, "the vault's own storage was read, so the recording was on");
+
+        for (uint256 i; i < reads.length; ++i) {
+            _assertNotAGatedSlot(reads[i], "read");
+        }
+        for (uint256 i; i < writes.length; ++i) {
+            _assertNotAGatedSlot(writes[i], "written");
+        }
+    }
+
+    /// @notice And the same across `previewRedeem`, which shares the arithmetic.
+    function test_step4_previewReadsNoGatedSlotEither() public {
+        vm.record();
+        vault.previewRedeem(500e18);
+
+        (bytes32[] memory reads,) = vm.accesses(address(vault));
+        for (uint256 i; i < reads.length; ++i) {
+            _assertNotAGatedSlot(reads[i], "read");
+        }
+    }
+
+    /// @dev The seven slots of `docs/phase2-state-model.md` §1.1 that hold something the redemption path must
+    ///      never consult: 4 `registry`, 8 `marketReference`, 9 `oracleGate`, 10 `feedRegistry`,
+    ///      11 `positionValuer`, 12 `ladderPolicy`, 13 `rolloutPolicy` and 14 `standbyVault`.
+    function _assertNotAGatedSlot(bytes32 slot, string memory how) private pure {
+        uint256 value = uint256(slot);
+        bool gated = value == 4 || (value >= 8 && value <= 14);
+        assertFalse(gated, string.concat("redeemProRata ", how, " a gate or registry pointer slot"));
+    }
+
     // -------------------------------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
@@ -464,7 +515,10 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             address(registry),
             Guard.MANAGEMENT
         );
-        _add("place", abi.encodeCall(IAmpsVault.place, (spokePool, true, 1e18)), ALICE, Guard.MANAGEMENT);
+        // `place` is timelock-or-registry (`docs/phase3-state-model.md` §10 ruling 11), so the entry that
+        // proves the *gate* refuses it has to be called by one of those two: a wrong caller would refuse for
+        // access control and the refusal would not be the gate's. The classification is unchanged.
+        _add("place", abi.encodeCall(IAmpsVault.place, (spokePool, true, 1e18)), TIMELOCK, Guard.MANAGEMENT);
         _add("compound", abi.encodeCall(IAmpsVault.compound, (spokePool)), ALICE, Guard.MANAGEMENT);
         _add("rollout", abi.encodeCall(IAmpsVault.rollout, (1)), ALICE, Guard.MANAGEMENT);
         _add("deployBonded", abi.encodeCall(IAmpsVault.deployBonded, (1)), ALICE, Guard.MANAGEMENT);
@@ -485,6 +539,12 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         );
         _add("setRolloutParams", abi.encodeCall(IAmpsVault.setRolloutParams, (200, 3000)), TIMELOCK, Guard.MANAGEMENT);
         _add("setSpokeSeedBps", abi.encodeCall(IAmpsVault.setSpokeSeedBps, (100)), TIMELOCK, Guard.MANAGEMENT);
+        _add(
+            "setDeployThresholdUsd18",
+            abi.encodeCall(IAmpsVault.setDeployThresholdUsd18, (100e18)),
+            TIMELOCK,
+            Guard.MANAGEMENT
+        );
         _add(
             "setPolicyPointer",
             abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("positionValuer"), address(valuer))),

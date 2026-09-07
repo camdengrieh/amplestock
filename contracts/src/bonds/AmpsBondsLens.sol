@@ -79,6 +79,51 @@ contract AmpsBondsLens {
         claimableNow = bonds.claimableTotal(owner);
     }
 
+    /// @notice The exact unvested and unclaimed principal across an owner list.
+    /// @dev **The global figure, assembled from a list the caller supplies.** `AmpsBonds` cannot enumerate its own
+    ///      positions — they live in per-owner arrays — so "how much bonded AMPS is still vesting" is exact only
+    ///      over a set of owners, which the indexer holds as the distinct `Bond.buyer` set and the dApp reads from
+    ///      it. Pass that set and this is the number; pass nothing and `Amps.balanceOf(bonds)` remains the upper
+    ///      bound. Duplicated owners are double-counted, so the caller must pass a set.
+    /// @param bonds The `AmpsBonds` instance.
+    /// @param owners The bonders to sum over.
+    /// @return unvestedAmps AMPS wei still vesting.
+    /// @return claimableAmps AMPS wei vested and not yet claimed.
+    function unvested(IAmpsBonds bonds, address[] calldata owners)
+        external
+        view
+        returns (uint256 unvestedAmps, uint256 claimableAmps)
+    {
+        uint256 count = owners.length;
+        for (uint256 i; i < count; ++i) {
+            unvestedAmps += bonds.unvestedOf(owners[i]);
+            claimableAmps += bonds.claimableTotal(owners[i]);
+        }
+    }
+
+    /// @notice The exact unvested principal of one market, across an owner list.
+    /// @dev Same contract as {unvested}, filtered by the `marketId` each position froze at purchase.
+    /// @param bonds The `AmpsBonds` instance.
+    /// @param marketId The market.
+    /// @param owners The bonders to sum over.
+    /// @return unvestedAmps AMPS wei of that market still vesting.
+    function unvestedOf(IAmpsBonds bonds, uint16 marketId, address[] calldata owners)
+        external
+        view
+        returns (uint256 unvestedAmps)
+    {
+        uint256 count = owners.length;
+        for (uint256 i; i < count; ++i) {
+            address owner = owners[i];
+            uint256 positions = bonds.positionCount(owner);
+            for (uint256 j; j < positions; ++j) {
+                VestingPosition memory record = bonds.position(owner, j);
+                if (record.marketId != marketId) continue;
+                unvestedAmps += record.principal - (bonds.claimable(owner, j) + record.claimed);
+            }
+        }
+    }
+
     /// @notice The whole bond board: every market from 1 to `marketCount`, quoted at `amountIn` of its own
     ///         collateral.
     /// @dev `IAmpsBonds.quote` never reverts for a known market, so this never reverts either: a closed, gated or

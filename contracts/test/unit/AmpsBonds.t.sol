@@ -724,7 +724,9 @@ contract AmpsBondsTest is BondsFixture {
         uint256 expectedOut = FullMath.mulDiv(amountIn, expectedFloor, 1e18);
 
         vm.expectEmit(true, true, true, true, address(bonds));
-        emit IAmpsBonds.Bond(alice, marketId, address(stock), amountIn, expectedOut, 0, expectedFloor, 1250, true);
+        emit IAmpsBonds.Bond(
+            alice, marketId, address(stock), amountIn, expectedOut, 0, expectedFloor, 1250, true, bonds.vestSeconds()
+        );
         (uint256 ampsOut, uint256 positionId) = _bond(alice, amountIn);
 
         assertEq(ampsOut, expectedOut, "priced at the floor");
