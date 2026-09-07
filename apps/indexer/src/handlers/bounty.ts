@@ -49,10 +49,14 @@ ponder.on('BountyPot:BountyPaid', async ({event, context}) => {
       poolId: null,
       constituentId: null,
       outcome: 'ok',
+      workValueUsd18: event.args.workValueUsd18,
       bountyPaidUsd18: event.args.paidUsd18,
       detail: {reason, paidRaw: event.args.paidRaw.toString(), to: event.args.to},
     })
     .onConflictDoUpdate((row) => ({
+      // `BountyPot` measures the work now, so both the value it assessed and what it paid are real
+      // numbers rather than the flat allowance v1 reported.
+      workValueUsd18: row.workValueUsd18 + event.args.workValueUsd18,
       bountyPaidUsd18: row.bountyPaidUsd18 + event.args.paidUsd18,
       outcome: 'ok',
     }))

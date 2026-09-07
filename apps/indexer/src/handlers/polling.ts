@@ -32,7 +32,7 @@ import {jobId} from '../lib/ids'
 import {changeBps} from '../lib/math'
 import type {Db} from '../lib/store'
 import {recordProbe} from './denylist'
-import {runReconciliation, sampleShares, type JobContext} from './reconcile'
+import {checkLadders, runReconciliation, sampleShares, type JobContext} from './reconcile'
 
 const ZERO = '0x0000000000000000000000000000000000000000'
 
@@ -157,4 +157,5 @@ ponder.on('reconcile:block', async ({event, context}) => {
   const job = context as unknown as JobContext
   await sampleShares(job, event.block.number, event.block.timestamp, 'interval')
   await runReconciliation(job, event.block.number, event.block.timestamp, 'interval')
+  await checkLadders(job, event.block.number)
 })

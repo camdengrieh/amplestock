@@ -27,11 +27,12 @@ reasoning that is too fine-grained for here.
 | `AmpsHook` | logs | its address | rotation credits, surges, dividend steps, high-water marks, `RebalanceNeeded` |
 | `BountyPot` | logs | its address | bounty payments, and the keeper-job ledger they anchor |
 | `PoolManager` | logs | our `PoolId`s | `Swap`, `ModifyLiquidity`, `Initialize` |
+| `LadderPositionValuer` | **reads only** | its address | `amountsOf` and `referenceSqrtPriceX96` for the ladder cross-check (§4). It emits nothing; it is configured so `context.contracts` carries its address and ABI |
 | `ChainlinkAggregator` | logs | factory over `FeedSet` | `AnswerUpdated`, where the registered address is the aggregator |
 | `StockTokenCalls` | **transactions** | factory over `ConstituentAdded` | the denylist alarm |
 | `DenylistWatch` | **transactions** | the beacon + `AMPS_DENYLIST_WATCH` | the denylist alarm |
 | `constituentPoll` | block interval | `AMPS_MULTIPLIER_POLL_BLOCKS` | `uiMultiplier` / `newUIMultiplier` / `effectiveAt` / `oraclePaused` state diff, `isBlocked` probe |
-| `reconcile` | block interval | `AMPS_RECONCILE_POLL_BLOCKS` | NAV and supply reconciliation heartbeat |
+| `reconcile` | block interval | `AMPS_RECONCILE_POLL_BLOCKS` | NAV and supply reconciliation heartbeat, and the ladder cross-check against `LadderPositionValuer` |
 
 The Stock Tokens themselves are deliberately *not* a log source: they emit only ERC-20 events, which
 the index has no use for. What is watched is their **transactions**, for the reason below.
@@ -83,17 +84,17 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 
 | Table | Key | What it holds |
 |---|---|---|
-| `placement` | event | `poolId`, `above`, `buckets`, `amount`, `anchorTick`, the classified `action`, the caller, and the cells and liquidity the same transaction wrote |
+| `placement` | event | `poolId`, `above`, `buckets`, `amount`, `anchorTick`, the vault's own `reason` (raw and decoded) and the `action` it maps to, the caller, the `lowerTick`/`upperTick` range written, the cell count, and the liquidity the same transaction added |
 | `ladder_cell` | `"<poolId>-<tickLower>"` | the durable ladder record: `cellIndex` (`m - GRID_MIN_M`), `m`, the tick bounds, live `liquidity`, `above`, cumulative `principal`, and — recomputed at the pool's live price — `ampsRemaining`, `counterRaised` and `fillBps` |
 | `liquidity_change` | event | every `ModifyLiquidity` on our pools: the audit trail behind `ladder_cell` |
 | `compound_event` | event | the four-way split (`creatorPaid`, `stakerPaid`, `burned`, `relaid`), the creator bps in force, NAV either side and the change in bps, the bounty paid |
-| `rollout_event` | event | `constituentId`, AMPS `moved` into the spoke and `withdrawn` from the entry pools in the same transaction |
+| `rollout_event` | event | `AmpsVault.Rollout`: `constituentId`, the destination `toPoolId`, `movedAmps` taken out of the entry pools' unfilled asks and `placedAmps` the destination ladder committed, the caller |
 
 ### Pools and swaps
 
 | Table | Key | What it holds |
 |---|---|---|
-| `pool` | `PoolId` | counter and its decimals, class, constituent, tick spacing, `doublingTicks`, `gridBaseTick`, `buyFeeBps`, feed, the price it opened at, live `sqrtPriceX96`/`tick`/`liquidity`, gate state, cumulative volume and fees by direction, rotation credit, ladder totals, realised LVR and fee revenue in USD |
+| `pool` | `PoolId` | counter and its decimals, class, constituent, tick spacing, `doublingTicks`, `gridBaseTick`, `buyFeeBps`, feed, the price it opened at, live `sqrtPriceX96`/`tick`/`liquidity`, gate state, cumulative volume and fees by direction, rotation credit, ladder totals, the valuer cross-check (`valuerAmps`, `valuerCounter`, `valuerDeltaBps`, `valuerCheckedBlock`, §4), realised LVR and fee revenue in USD |
 | `swap` | event | direction, both deltas, `amountIn`/`amountOut`, the AMPS and counter legs, the post-swap price and tick, `feePips`/`feeBps`, **`baseFeeBps`**, **`dynamicFeeBps`**, **`creditedAmount`**, the fee amount in the input currency and in AMPS, notional and fee in USD |
 | `pool_day` | `"<poolId>-<day>"` | per-pool per-UTC-day volume, fees, credited AMPS, swap count, realised LVR, the day's tick range |
 | `rebalance_signal` | event | `RebalanceNeeded`: tick, fair tick, deviation |
@@ -155,9 +156,9 @@ paying currency0 (`amount0 < 0`) is exactly that sell. Nothing infers direction 
 router or the tick move.
 
 **Base fee.** `base = sell ? sellFeeBps : pool.buyFeeBps`. `sellFeeBps` is hook-wide and is tracked
-from `HookParameterChanged("sellFeeBps", 0, …)`; `buyFeeBps` is per pool, set at registration (read
-from `AmpsHook.buyFeeBps(poolId)` at that block, because no event carries it) and moved by
-`HookParameterChanged("buyFeeBps", poolId, …)` or `ConstituentReconfigured(id, "buyFeeBps", …)`.
+from `HookParameterChanged("sellFeeBps", 0, …)`; `buyFeeBps` is per pool, carried by
+`PoolRegistered` itself and moved by `HookParameterChanged("buyFeeBps", poolId, …)` or
+`ConstituentReconfigured(id, "buyFeeBps", …)`. Neither is ever read from the chain.
 
 **Rotation credit.** An exact-input sell covered by a same-transaction credit pays
 
@@ -225,7 +226,7 @@ Three of them breach:
 |---|---|---|---|
 | NAV/share | the last `NavCheckpoint`'s `navPerShareX18` | `checkpointData().navPerShareX18` | yes |
 | `P_ref` | the last `RefCheckpoint`'s `pRefX18` | `checkpointData().pRefX18` | yes |
-| total supply | `S0 + VestingMinted - Burn - Redeem.shares`, from the events alone | `Amps.totalSupply()` | yes |
+| total supply | `S0 + VestingMinted - Burn`, from the events alone | `Amps.totalSupply()` | yes |
 | NAV/share, live | — | `previewNavPerShareX18()` | no |
 | `A` | the last checkpoint's `totalAssetsUsd18` | `vault.totalAssetsUsd18()` | no |
 | inventory | the last sample | `vault.inventoryAmps()` | no |
@@ -239,12 +240,18 @@ sides of that pair are the same chain read and it can only ever agree; it is car
 number itself belongs on the dashboard.
 
 Total supply *is* a real two-sided check, and it is exact. The indexed side never touches a chain
-read: it is seeded from the first checkpoint the indexer sees and then moved only by
-`VestingMinted` (which is how **every** post-genesis mint arrives, bond issuance included — I30
-mints a bond's principal to `AmpsBonds` through `mintVesting`), by `Burn` (which covers the vault's
-own `Redeem.inventoryBurned` slice as `Burn(amount, "redeemInventory")`) and by `Redeem.shares`
-(the redeemer's own). A disagreement therefore means the indexer's bookkeeping has drifted from the
-chain — which is the bug this job exists to catch.
+read: it is seeded from the first checkpoint the indexer sees and then moved by exactly two events.
+
+- **`VestingMinted`** is how **every** post-genesis mint arrives, bond issuance included — I30 mints
+  a bond's principal to `AmpsBonds` through `mintVesting`, and the log now says so with
+  `reason == "bond"`. `Bond.ampsOut` describes that same mint and is never added on top.
+- **`Burn`** is every burn, and since the polish slice that is *all* of them: `redeemProRata` emits
+  `Burn(shares, "redeem")` for the redeemer's own shares as well as
+  `Burn(inventoryBurned, "redeemInventory")` for the vault's slice, so `Redeem` moves no supply at
+  all. Both are real burns of different AMPS and both are counted.
+
+A disagreement therefore means the indexer's bookkeeping has drifted from the chain — which is the
+bug this job exists to catch.
 
 **The dust bound.** A pair passes when it is within `AMPS_DUST_BPS` of *relative* divergence **or**
 within `AMPS_DUST_WEI` of *absolute* divergence. Two bounds because one is not enough in both
@@ -268,6 +275,28 @@ for `nav` or `pRef` (the dApp is showing a wrong number), `warning` for `supply`
 bookkeeping drifted).
 
 `/api/reconciliation` serves the runs and the totals; `?failing=1` gives only the breaches.
+
+**The ladder cross-check.** On the `AMPS_RECONCILE_POLL_BLOCKS` heartbeat — the interval trigger
+only, not the per-checkpoint one — `checkLadders` re-derives each pool's AMPS side
+from the indexer's own cell table and compares it with `LadderPositionValuer.amountsOf(poolId)`.
+Both sides are taken at `referenceSqrtPriceX96(poolId)`, not at `slot0`: `A` is valued at the
+reference price precisely so it does not move when the pool price does (I7), and comparing at the
+live price would measure the wrong thing. The result lands on the `pool` row as `valuerAmps`,
+`valuerCounter`, `valuerDeltaBps` and `valuerCheckedBlock`.
+
+This is the check on the riskiest code in the indexer: the `bigint` port of `TickMath` and
+`LiquidityAmounts` in `src/lib/math.ts`, which every ladder number — cell principal, fill,
+proceeds — is derived from and which nothing else would notice had drifted. It is deliberately
+**not** a breach: a pool whose cells the indexer has not seen in full (an indexer started mid-life,
+past the genesis placements) would diverge for a reason that is not a fault. It is asserted in the
+end-to-end suite instead, where the index does start from block zero — and there the agreement is
+exact, 0 bp across all five pools.
+
+The pools it walks come from the key set `PoolRegistry:PoolRegistered` writes into `indexer_state`
+under `registry.poolIds`. `context.db` is a key-value store with no query side, so a job that has to
+reach *every* pool needs the id set written down as it is discovered; walking the constituents
+instead would silently skip the two entry pools, which have no constituent id and carry the largest
+ladders there are.
 
 ---
 
@@ -317,10 +346,18 @@ AMPS_E2E=1 pnpm --filter @amplestocks/indexer test:e2e
 ```
 
 It starts `anvil`, deploys the whole system through the Phase 3 scripts, drives genesis, a swap, a
-bond, a compound, a redemption and a simulated `blockAccounts` call, then runs the indexer against
-the resulting chain and asserts the reconciliation. It needs Foundry on `PATH` (or at
-`/root/.foundry/bin`) and is skipped without `AMPS_E2E=1`, so `pnpm test` stays offline and
-toolchain-free — which is what keeps CI's `node` job green on a runner with no Foundry.
+bond, a compound, a redemption and a real `blockAccounts` call, then runs the indexer against the
+resulting chain and asserts, in order: the reconciliation at every block, the denylist alarm, the
+journey itself (genesis, the ladders, the fee decomposition, the bond's accretion, the compound's
+four-way split, the redemption), the placement reasons and tick ranges, the ladder cross-check
+against `LadderPositionValuer`, the bond's vesting term, the measured keeper work value, and the
+GraphQL layer. It needs Foundry on `PATH` (or at `/root/.foundry/bin`) and is skipped without
+`AMPS_E2E=1`, so `pnpm test` stays offline and toolchain-free — which is what keeps CI's `node` job
+green on a runner with no Foundry.
+
+The last full run: **13 reconciliation runs, 0 failures, worst NAV 0 bp and worst `P_ref` 0 bp**;
+the valuer cross-check **0 bp across all five pools**; the denylist alarm `critical` in the same
+block as the call.
 
 ### Tests
 
@@ -332,6 +369,12 @@ pnpm --filter @amplestocks/indexer typecheck
 The handler tests import the *real* indexing functions (through `src/index.ts`, which is what
 registers them) and call them with synthetic events against an in-memory `context.db`. The three
 Ponder virtual modules are aliased to test doubles in `vitest.config.ts`.
+
+**Counts.** 121 offline tests across five files — 78 over the pure libraries (`lib` 33, `math` 18,
+`fee` 15, `reconcile` 12) and 43 handler tests on synthetic logs — plus 14 end-to-end tests behind
+`AMPS_E2E=1`.
+The offline suite runs in about four seconds and touches no network; the end-to-end suite takes
+about 75 seconds including the Foundry build.
 
 ---
 
@@ -374,42 +417,73 @@ query away. The typed layer is for the shapes the dApp asks for repeatedly:
 
 ## 8. Known gaps on the contract side
 
-None of these block the indexer — each is worked around as described — but each would remove a chain
-read or a heuristic if it were closed.
+The pre-audit polish slice closed six of the seven gaps this section listed. What follows records
+what each was and what the indexer now does instead, because the *shape* of the workaround is what
+a reader of the handlers would otherwise still expect to find.
 
-1. **`AmpsVault.Placement` carries no reason.** `PlaceParams.reason` exists in memory
-   (`"genesis"`, `"spokeSeed"`, `"compound"`, `"rollout"`, `"bonded"`) and is used to arm the surge,
-   but is not an event field. The indexer classifies a placement from the transaction's four-byte
-   selector instead, which is exact for every direct call and falls back to a shape heuristic for a
-   call routed through a multicall or a Safe. Adding `reason` to `Placement` would make it exact
-   unconditionally. There is also no `Rollout` event: `rollout_event` is reconstructed from the
-   `Placement` in the destination spoke plus the negative `ModifyLiquidity` in the entry pools in the
-   same transaction.
-2. **`PoolRegistry.PoolRegistered` carries no geometry.** `tickSpacing`, `counterDecimals`,
-   `buyFeeBps` and `gridBaseTick` are all in `PoolConfig` but none is in the event, so the indexer
-   reads `poolConfig(poolId)` and `AmpsHook.buyFeeBps(poolId)` once per pool at the registration
-   block. Adding them to the event would make registration fully log-derived.
-3. **`Placement` carries no per-cell data.** `cells` is in the event but not which cells, at what
-   liquidity. The ladder is therefore rebuilt from the vault's own `ModifyLiquidity` logs, which is
-   exact and needs no change; the note is only that `PlacementRecord` is not directly observable.
-4. **`AmpsBonds.Bond` does not carry `vestSeconds`.** The position's vest length is frozen at
-   purchase (I38) and is what a claim schedule is drawn from, but the event omits it, so
-   `bond_position.vestSeconds` is zero until a lens read fills it in. The claim series is complete
-   regardless.
-5. **A bond's mint is indistinguishable from a team vest in the events.** `AmpsBonds` receives its
-   principal through `AmpsVault.mintVesting` (I30), so a `Bond` is always accompanied by a
-   `VestingMinted(bonds, ampsOut)` and the two must not both be added to the supply. The indexer
-   handles it by attributing every post-genesis mint to `VestingMinted` alone, which is exact; a
-   `reason` on `VestingMinted`, or a distinct `BondMinted`, would make the two legible without the
-   cross-reference.
-6. **`redeemProRata` does not emit a `Burn` for the redeemer's own shares** — only for the vault's
-   `inventoryBurned` slice, as `Burn(amount, "redeemInventory")`. `Redeem.shares` is therefore load
-   bearing for the supply accounting, which is fine, but it means "sum the `Burn` events" is not the
-   supply reduction and a reader has to know that.
-7. **The mock aggregators do not emit `AnswerUpdated`.** `contracts/test/mocks/MockAggregator.sol`
+### Closed
+
+1. **`AmpsVault.Placement` now carries `reason`, `lowerTick` and `upperTick`.** ✅ The placement's
+   own word — `place` (governance and genesis alike), `spokeSeed`, `compound`, `rollout`, `bonded`
+   or `migrate` — decides `placement.action`. The four-byte selector heuristic survives only as the
+   fallback for a `reason` the indexer does not recognise, so a placement routed through a multicall
+   or a Safe is now classified exactly. `buckets` is the cell count the placement actually wrote
+   (`VaultPlacementLib` emits `result.cells`), and the tick range is the range it wrote into, so
+   `placement.cells`, `lowerTick` and `upperTick` come straight off the log.
+2. **`AmpsVault.Rollout(constituentId, poolId, movedAmps, placedAmps)` exists.** ✅ `rollout_event`
+   is the log, not a reconstruction: what left the entry pools and what the destination spoke's
+   ladder committed are both stated, and the difference is the residue that stayed idle. The keeper
+   ledger takes its `ok`/`noop` outcome from `placedAmps > 0` rather than from the presence of a
+   destination `Placement`.
+3. **`PoolRegistry.PoolRegistered` now carries `tickSpacing`, `counterDecimals` and `buyFeeBps`,
+   and `PoolGridSet(poolId, gridBaseTick)` fires beside `PoolOpened`.** ✅ Registering a pool costs
+   **no chain read at all**; `poolConfig(poolId)` and `AmpsHook.buyFeeBps(poolId)` are gone from the
+   handlers. `PoolGridSet` lands at a higher log index than `PoolOpened`, so the mirrored grid
+   origin correctly overwrites the opening-tick fallback `PoolOpened` seeds for a pool the registry
+   could not mirror.
+4. **`AmpsBonds.Bond` now carries `vestSeconds`.** ✅ `bond_purchase.vestSeconds` and
+   `bond_position.vestSeconds` are log-derived at purchase, so a claim schedule is drawable from the
+   index without a lens read. (`AmpsBonds.unvestedOf` and `AmpsBondsLens.unvested`/`unvestedOf` also
+   exist now; the reconciliation's share-class sample uses the former for the bond-unvested class.)
+5. **`AmpsVault.VestingMinted` now carries `reason`.** ✅ A bond's mint says `"bond"`, so it is
+   legible as such without cross-referencing the `Bond` in the same transaction. The accounting rule
+   is unchanged and is the one that matters: **`VestingMinted` is the only mint the supply follows**,
+   and `Bond.ampsOut` describes that same mint rather than a second one.
+6. **`redeemProRata` now emits `Burn(shares, "redeem")`** beside
+   `Burn(inventoryBurned, "redeemInventory")`. ✅ Summing the `Burn` events *is* the supply
+   reduction, and `AmpsVault:Redeem` no longer moves the supply at all — it records the redemption
+   and its NAV pricing only. Both burns are real and both are counted; the redeemer's shares and the
+   vault's inventory slice are different AMPS.
+
+The event-derived supply is therefore exactly `S0 + Σ VestingMinted − Σ Burn`, with nothing
+inferred, and that is the number the reconciliation compares against `Amps.totalSupply()`.
+
+### Still open
+
+7. **`Placement` carries no per-cell data.** `buckets`, `lowerTick` and `upperTick` bound the write
+   but do not say which cells took what liquidity. The ladder is therefore still rebuilt from the
+   vault's own `ModifyLiquidity` logs, which is exact and needs no change; the note is only that
+   `PlacementRecord` is not directly observable. §4's valuer cross-check is what proves the rebuild
+   is right.
+8. **The mock aggregators do not emit `AnswerUpdated`.** `contracts/test/mocks/MockAggregator.sol`
    implements the read surface only, so on a local or testnet deployment the raw-round series is
    empty and only `AnswerLatched` populates `feed_answer`. This is a test-fixture gap, not a
    production one.
+
+### Newly available, and used
+
+- **`LadderPositionValuer.amountsOf(poolId)` and `referenceSqrtPriceX96(poolId)`** are what §4's
+  ladder cross-check reads. See §4.
+- **`BountyPot` measures the work.** `BountyPaid` carries `workValueUsd18` as well as `paidUsd18`
+  and `paidRaw`, so `keeper_job.workValueUsd18` and `bounty_payment.workValueUsd18` are the assessed
+  value of the job and not a flat allowance. The two are independent: the pot emits `BountyPaid`
+  whether or not it can pay, and a zero payment carries the refusal in `reason` (`chost`, `gasCap`,
+  `dailyCeiling`, `depleted`). On the end-to-end fixture, which runs `anvil --base-fee 0`, the gas
+  allowance is zero and every payment is therefore `gasCap`-refused at a real, non-zero work value —
+  which is exactly the pair the tables are meant to distinguish.
+- **`AmpsQuoter.PoolQuote` gained a trailing `tickSpacing`.** The indexer does not read the quoter
+  (it decomposes the ladder itself), so this is noted only because it moves the struct's shape for
+  anything that does.
 
 ## 9. Licence
 

@@ -151,15 +151,22 @@ export const STATE = {
   totalSupply: 'amps.totalSupply',
   /**
    * The running supply the *events* imply, which is what reconciliation compares against
-   * `Amps.totalSupply()`. Exact: `S0 + VestingMinted - Burn - Redeem.shares`. Bond issuance is not
-   * added separately — `AmpsBonds` receives its AMPS through `mintVesting`, so a `Bond` is always
-   * accompanied by a `VestingMinted` of the same amount, and `Redeem.inventoryBurned` is not
-   * subtracted separately either, because the vault emits `Burn(amount, "redeemInventory")` for it.
+   * `Amps.totalSupply()`. Exact, and *only* from the mint and burn logs: `S0 + VestingMinted -
+   * Burn`. Neither `Bond.ampsOut` nor `Redeem.shares` is applied on top — `AmpsBonds` receives its
+   * AMPS through `mintVesting`, so a `Bond` always has a `VestingMinted(reason: "bond")` of the
+   * same amount beside it, and `redeemProRata` emits `Burn(shares, "redeem")` for the redeemer's
+   * shares as well as `Burn(inventoryBurned, "redeemInventory")` for the vault's slice.
    */
   supplyEvented: 'amps.supplyFromEvents',
   inventory: 'vault.inventoryAmps',
   genesisAt: 'vault.genesisAt',
   lastCheckpointBlock: 'vault.lastCheckpointBlock',
+  /**
+   * Every pool id the registry has announced, comma-joined in `text`, with the count in `value`.
+   * `context.db` is a key-value store with no query side, so a job that has to walk *all* the pools
+   * — the ladder cross-check — needs the key set written down as it is discovered.
+   */
+  poolIds: 'registry.poolIds',
 } as const
 
 /**

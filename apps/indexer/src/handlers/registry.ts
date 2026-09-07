@@ -6,14 +6,15 @@
  * announced it here. `PoolRegistered` creates the `pool` row and `poolManager.ts` drops any
  * `Swap`, `ModifyLiquidity` or `Initialize` whose id has no row.
  *
- * `PoolRegistered` carries the counter, the class and the constituent id but not the tick spacing,
- * the counter decimals or the buy fee, and `PoolOpened` carries the price the pool actually opened
- * at (§12.1 ruling J) but not the grid origin. Those five are read from the registry and the hook
- * at the registration block — one `multicall`, once per pool, and never again. See
- * `docs/indexer.md` for the (small) contract-side change that would remove the read.
+ * Pool geometry now arrives entirely in the logs: `PoolRegistered` carries the tick spacing, the
+ * counter's decimals and the buy fee alongside the counter, the class and the constituent id;
+ * `PoolOpened` carries the price the pool actually opened at (§12.1 ruling J); and `PoolGridSet`,
+ * emitted immediately after `PoolOpened` when the registry mirrored the vault's grid, carries the
+ * grid origin. Registering a pool therefore costs **no chain read at all**. `PoolGridSet` lands at
+ * a higher log index than `PoolOpened`, so the mirrored origin correctly overwrites the
+ * opening-tick fallback `PoolOpened` seeds for a pool the registry could not mirror.
  */
 
-import {ampsHookAbi, poolRegistryAbi} from '@amplestocks/abis'
 import {ponder} from 'ponder:registry'
 import schema from 'ponder:schema'
 
@@ -28,6 +29,7 @@ import {eventId, poolKey} from '../lib/ids'
 import {clampInt} from '../lib/math'
 import {recordParameter} from '../lib/parameters'
 import {jsonSafe} from '../lib/json'
+import {STATE, getStateText, setState, type Db} from '../lib/store'
 
 const tickFromSqrtPrice = (sqrtPriceX96: bigint): number => {
   if (sqrtPriceX96 <= 0n) return 0
@@ -41,28 +43,11 @@ const tickFromSqrtPrice = (sqrtPriceX96: bigint): number => {
 ponder.on('PoolRegistry:PoolRegistered', async ({event, context}) => {
   const id = poolKey(event.args.poolId)
 
-  const [config, buyFee] = await Promise.all([
-    context.client
-      .readContract({
-        abi: poolRegistryAbi,
-        address: context.contracts.PoolRegistry.address as `0x${string}`,
-        functionName: 'poolConfig',
-        args: [event.args.poolId],
-      })
-      .catch(() => undefined),
-    context.client
-      .readContract({
-        abi: ampsHookAbi,
-        address: context.contracts.AmpsHook.address as `0x${string}`,
-        functionName: 'buyFeeBps',
-        args: [event.args.poolId],
-      })
-      .catch(() => undefined),
-  ])
-
-  const tickSpacing = config ? Number(config.tickSpacing) : 60
-  const counterDecimals = config ? Number(config.counterDecimals) : 18
-  const gridBaseTick = config ? Number(config.gridBaseTick) : null
+  // The tick spacing, the counter's decimals and the buy fee are all in the log now, so registering
+  // a pool costs no chain read at all. The grid origin arrives separately, on `PoolGridSet`.
+  const tickSpacing = Number(event.args.tickSpacing)
+  const counterDecimals = Number(event.args.counterDecimals)
+  const gridBaseTick = null
 
   await context.db
     .insert(schema.pool)
@@ -77,7 +62,7 @@ ponder.on('PoolRegistry:PoolRegistered', async ({event, context}) => {
       tickSpacing,
       doublingTicks: doublingTicks(tickSpacing),
       gridBaseTick,
-      buyFeeBps: buyFee !== undefined ? Number(buyFee) : config ? Number(config.buyFeeBps) : 0,
+      buyFeeBps: event.args.buyFeeBps,
       feed: null,
       registeredAt: event.block.timestamp,
       registeredBlock: event.block.number,
@@ -105,10 +90,14 @@ ponder.on('PoolRegistry:PoolRegistered', async ({event, context}) => {
       counterInLadder: 0n,
       ladderFillBps: 0,
       cellTicks: [],
+      valuerAmps: 0n,
+      valuerCounter: 0n,
+      valuerDeltaBps: 0,
+      valuerCheckedBlock: 0n,
       realisedLvrUsd18: 0n,
       feeRevenueUsd18: 0n,
     })
-    .onConflictDoUpdate(() => ({
+    .onConflictDoUpdate((row) => ({
       counter: event.args.counter,
       counterDecimals,
       poolClass: event.args.poolClass,
@@ -116,8 +105,37 @@ ponder.on('PoolRegistry:PoolRegistered', async ({event, context}) => {
       constituentId: event.args.constituentId,
       tickSpacing,
       doublingTicks: doublingTicks(tickSpacing),
-      gridBaseTick,
+      buyFeeBps: event.args.buyFeeBps,
+      // A re-registration must not throw away a grid origin `PoolGridSet` already supplied.
+      gridBaseTick: row.gridBaseTick,
     }))
+
+  await rememberPool(context.db, id, event.block.number)
+})
+
+/**
+ * Add a pool id to the set the interval jobs walk. `context.db` has no query side, so the only way
+ * for a job to reach *every* pool — rather than every pool that happens to have a constituent — is
+ * for the registration to write the key set down. Entry pools have no constituent id at all, which
+ * is exactly the case a constituent walk would miss.
+ */
+async function rememberPool(db: Db, id: `0x${string}`, blockNumber: bigint): Promise<void> {
+  const known = (await getStateText(db, STATE.poolIds)) ?? ''
+  const ids = known === '' ? [] : known.split(',')
+  if (ids.includes(id)) return
+  ids.push(id)
+  await setState(db, STATE.poolIds, BigInt(ids.length), blockNumber, ids.join(','))
+}
+
+/**
+ * The canonical doubling grid's origin, announced beside `PoolOpened`. It is what every ladder cell
+ * index is measured from, and it is the one piece of pool geometry that used to need a chain read.
+ */
+ponder.on('PoolRegistry:PoolGridSet', async ({event, context}) => {
+  const id = poolKey(event.args.poolId)
+  const existing = await context.db.find(schema.pool, {id})
+  if (existing === null) return
+  await context.db.update(schema.pool, {id}).set({gridBaseTick: Number(event.args.gridBaseTick)})
 })
 
 ponder.on('PoolRegistry:PoolOpened', async ({event, context}) => {
@@ -133,7 +151,8 @@ ponder.on('PoolRegistry:PoolOpened', async ({event, context}) => {
     sqrtPriceX96: existing.sqrtPriceX96 === 0n ? event.args.sqrtPriceX96 : existing.sqrtPriceX96,
     tick: existing.sqrtPriceX96 === 0n ? tick : existing.tick,
     // Ruling C: the pool opens exactly on the grid origin, so the opening tick *is* `gridBaseTick`
-    // whenever the registry did not already hand one over.
+    // whenever `PoolGridSet` has not already supplied one — which it does not when the registry
+    // could not mirror it.
     gridBaseTick: existing.gridBaseTick ?? tick,
   })
 })

@@ -86,15 +86,33 @@ export interface Anvil {
   stop(): void
 }
 
-/** Start `anvil` on a free-ish port with room for the vault's 20M-gas placements. */
+/**
+ * Whether something is already answering JSON-RPC on `port`.
+ *
+ * A stale `anvil` from an earlier run would answer `eth_chainId` and then be killed by whatever
+ * still owns it, halfway through the fixture — a failure that looks like a chain fault and is not
+ * one. So a busy port is skipped rather than adopted.
+ */
+async function portTaken(port: number): Promise<boolean> {
+  try {
+    await rpc(`http://127.0.0.1:${port}`, 'eth_chainId', [])
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Start `anvil` on a free port at or above `port`, with room for the vault's 20M-gas placements. */
 export async function startAnvil(port: number): Promise<Anvil> {
   const bin = foundryBin('anvil')
   if (bin === undefined) throw new Error('[e2e] anvil not found')
+  let chosen = port
+  for (; chosen < port + 40; chosen += 2) if (!(await portTaken(chosen))) break
   const child = spawn(
     bin,
     [
       '--port',
-      String(port),
+      String(chosen),
       '--gas-limit',
       '3000000000',
       '--code-size-limit',
@@ -107,9 +125,10 @@ export async function startAnvil(port: number): Promise<Anvil> {
     ],
     {stdio: 'ignore', detached: false},
   )
-  const url = `http://127.0.0.1:${port}`
+  const url = `http://127.0.0.1:${chosen}`
   const deadline = Date.now() + 30_000
   for (;;) {
+    if (child.exitCode !== null) throw new Error(`[e2e] anvil exited with ${child.exitCode}`)
     try {
       await rpc(url, 'eth_chainId', [])
       break
@@ -121,7 +140,7 @@ export async function startAnvil(port: number): Promise<Anvil> {
       await sleep(200)
     }
   }
-  return {url, port, stop: () => child.kill('SIGKILL')}
+  return {url, port: chosen, stop: () => child.kill('SIGKILL')}
 }
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -318,17 +337,29 @@ export async function startIndexer(options: {
         DATABASE_URL: '',
         DATABASE_PRIVATE_URL: '',
       },
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
     },
   )
+
+  // Kept so a start-up failure — a config that does not validate, a handler that throws on the
+  // first block — is reported as what Ponder actually said rather than as a bare timeout.
+  let log = ''
+  const keep = (chunk: Buffer | string) => {
+    log = (log + String(chunk)).slice(-8_000)
+  }
+  child.stdout?.on('data', keep)
+  child.stderr?.on('data', keep)
 
   const url = `http://127.0.0.1:${options.port}`
   const deadline = Date.now() + 300_000
   for (;;) {
-    if (Date.now() > deadline) {
+    if (Date.now() > deadline || child.exitCode !== null) {
+      const why = child.exitCode !== null ? `exited with ${child.exitCode}` : 'timed out'
       child.kill('SIGKILL')
       rmSync(directory, {recursive: true, force: true})
-      throw new Error(`[e2e] the indexer did not reach block ${options.endBlock}`)
+      throw new Error(
+        `[e2e] the indexer did not reach block ${options.endBlock} (${why}):\n${log.trimEnd()}`,
+      )
     }
     try {
       const status = (await (await fetch(`${url}/status`)).json()) as Record<

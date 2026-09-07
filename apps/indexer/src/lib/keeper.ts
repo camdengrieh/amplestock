@@ -44,6 +44,7 @@ export async function recordKeeperJob(input: KeeperJobInput): Promise<void> {
       poolId: input.poolId ?? null,
       constituentId: input.constituentId ?? null,
       outcome: input.outcome,
+      workValueUsd18: 0n,
       bountyPaidUsd18: 0n,
       detail: jsonRecord(input.detail ?? {}),
     })

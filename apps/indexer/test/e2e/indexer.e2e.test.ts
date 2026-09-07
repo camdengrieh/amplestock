@@ -91,7 +91,9 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
       rpcUrl: anvil.url,
       addresses,
       endBlock: lastActionBlock,
-      port: port + 1,
+      // `startAnvil` may have moved off a busy port; the indexer takes the one next to whichever
+      // port the node actually came up on.
+      port: anvil.port + 1,
       schema: 'e2e',
     })
   }, 1_800_000)
@@ -175,6 +177,10 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     // And NAV/share only goes up from there — the buy through the asks, the bond and the compound
     // are each accretive by construction, which is the whole flywheel.
     const nav = BigInt(s.navPerShareX18 as string)
+    // eslint-disable-next-line no-console
+    console.log(
+      `[e2e] NAV/share ${genesisNav} -> ${nav}, P_ref ${s.pRefX18}, supply ${s.totalSupply}`,
+    )
     expect(nav).toBeGreaterThan(genesisNav)
     expect(BigInt(s.pRefX18 as string)).toBeGreaterThanOrEqual(nav)
     expect(s.creator).not.toBe('0x0000000000000000000000000000000000000000')
@@ -304,6 +310,92 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     expect(gate.transitions).toHaveLength(gate.status.length === 0 ? 0 : gate.transitions.length)
     const pools = (await indexer.get('/api/pools')) as {pools: Json[]}
     for (const pool of pools.pools) expect(pool.gateStateLabel).toBe('GREEN')
+  })
+
+  // -----------------------------------------------------------------------------------------------
+  // The data the pre-audit polish slice added
+  // -----------------------------------------------------------------------------------------------
+
+  it('takes the placement reason and the cell range from the log, not from the selector', async () => {
+    const pools = (await indexer.get('/api/pools')) as {pools: Json[]}
+    const hub = pools.pools.find(
+      (p) => p.poolClassLabel === 'ENTRY' && Number(p.counterDecimals) === 6,
+    )!
+    const body = (await indexer.get(`/api/pools/${hub.id}/placements`)) as {placements: Json[]}
+    expect(body.placements.length).toBeGreaterThan(0)
+
+    const reasons = new Set(body.placements.map((p) => p.reason as string))
+    // Genesis lays asks and bids with `reason == "place"`; the compound relays with `"compound"`.
+    expect(reasons.has('place')).toBe(true)
+    for (const placement of body.placements) {
+      expect(
+        ['place', 'spokeSeed', 'compound', 'rollout', 'bonded', 'migrate'],
+        `unexpected placement reason ${placement.reason}`,
+      ).toContain(placement.reason)
+      // The reason drives the action now; the transaction selector is only the fallback.
+      expect(placement.action).toBe(placement.reason)
+      expect(Number(placement.cells)).toBeGreaterThan(0)
+      expect(Number(placement.upperTick)).toBeGreaterThan(Number(placement.lowerTick))
+      expect(placement.reasonRaw as string).toMatch(/^0x[0-9a-f]{64}$/)
+    }
+  })
+
+  it('agrees with LadderPositionValuer on what every ladder is worth', async () => {
+    // The cross-check that matters most: the indexer's own `bigint` port of `TickMath` and
+    // `LiquidityAmounts` re-decomposed against the vault's own valuer, at the same reference price.
+    const body = (await indexer.get('/api/pools')) as {pools: Json[]}
+    const checked = body.pools.filter((p) => Number(p.valuerCheckedBlock) > 0)
+    expect(checked.length).toBe(body.pools.length)
+
+    const worst = Math.max(...checked.map((p) => Math.abs(Number(p.valuerDeltaBps))))
+    // eslint-disable-next-line no-console
+    console.log(`[e2e] valuer cross-check over ${checked.length} pools, worst ${worst} bps`)
+    for (const pool of checked) {
+      expect(BigInt(pool.valuerAmps as string)).toBeGreaterThan(0n)
+      expect(Math.abs(Number(pool.valuerDeltaBps)), `pool ${pool.id}`).toBeLessThanOrEqual(2)
+    }
+  })
+
+  it('carries the vesting term and the measured keeper work value', async () => {
+    const bonds = (await indexer.get('/api/bonds')) as {recent: Json[]}
+    expect(Number(bonds.recent[0]!.vestSeconds)).toBeGreaterThan(0)
+
+    const owner = (bonds.recent[0]!.buyer as string).toLowerCase()
+    const positions = (await indexer.get(`/api/bonds/positions/${owner}`)) as {positions: Json[]}
+    expect(Number(positions.positions[0]!.vestSeconds)).toBe(Number(bonds.recent[0]!.vestSeconds))
+
+    const keeper = (await indexer.get('/api/keeper')) as {jobs: Json[]; payments: Json[]}
+    const paid = keeper.payments.filter((p) => p.kind === 'paid')
+    expect(paid.length).toBeGreaterThan(0)
+    // `BountyPot` measures the work whether or not it can pay for it, so the value is real even
+    // here, where `anvil --base-fee 0` makes the gas allowance — and therefore the payment — zero.
+    const worked = paid.filter((p) => BigInt(p.workValueUsd18 as string) > 0n)
+    expect(worked.length).toBeGreaterThan(0)
+    // eslint-disable-next-line no-console
+    console.log(
+      `[e2e] ${paid.length} bounty payments, work value ` +
+        `${worked.map((p) => p.workValueUsd18).join(', ')}, paid ` +
+        `${paid.map((p) => p.paidUsd18).join(', ')}`,
+    )
+    const compound = keeper.jobs.find((j) => j.job === 'compound')!
+    expect(BigInt(compound.workValueUsd18 as string)).toBeGreaterThan(0n)
+  })
+
+  it('counts the redemption as two burns and never twice', async () => {
+    // `redeemProRata` emits `Burn(shares, "redeem")` beside `Burn(inventoryBurned,
+    // "redeemInventory")`, so summing the `Burn` events *is* the supply reduction. `Redeem` no
+    // longer moves the supply itself, and the reconciliation above is what proves it: the
+    // event-derived supply matches `Amps.totalSupply()` at every checkpoint.
+    const burns = (await indexer.get('/api/burns')) as {burns: Json[]; total: string}
+    const reasons = burns.burns.map((b) => b.reason as string)
+    expect(reasons).toContain('redeem')
+
+    const supply = (await indexer.get('/api/supply')) as Json
+    const redeemed = burns.burns
+      .filter((b) => b.reason === 'redeem' || b.reason === 'redeemInventory')
+      .reduce((total, b) => total + BigInt(b.amount as string), 0n)
+    expect(redeemed).toBeGreaterThan(0n)
+    expect(BigInt(supply.burned as string)).toBeGreaterThanOrEqual(redeemed)
   })
 
   it('serves the GraphQL schema as well as the typed layer', async () => {

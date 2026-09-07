@@ -21,6 +21,8 @@ import {beforeEach, describe, expect, it} from 'vitest'
 import '../src/index'
 
 import * as schema from '../ponder.schema'
+import {checkLadders as checkLaddersJob} from '../src/handlers/reconcile'
+import {amountsForLiquidity} from '../src/lib/math'
 import {createFakeDb, type FakeDb} from './support/db'
 import {
   ADDRESSES,
@@ -40,21 +42,16 @@ const WAD = 10n ** 18n
 const Q96 = 2n ** 96n
 const TX = `0x${'cd'.repeat(32)}` as `0x${string}`
 
+/** A Solidity `bytes32` short string, the way the vault emits its `reason` fields. */
+const REASON = (text: string): `0x${string}` =>
+  `0x${Buffer.from(text, 'utf8').toString('hex').padEnd(64, '0')}` as `0x${string}`
+
 let db: FakeDb
 let context: TestContext
 
+// The chain reads the handlers still make. `poolConfig()` and `buyFeeBps()` are gone: pool geometry
+// arrives in `PoolRegistered` and `PoolGridSet`, so registration costs no read at all.
 const READS = {
-  poolConfig: {
-    counter: COUNTER,
-    poolClass: 1,
-    counterDecimals: 6,
-    tickSpacing: 60,
-    buyFeeBps: 30,
-    constituentId: 0,
-    registered: true,
-    gridBaseTick: 0,
-  },
-  buyFeeBps: 30,
   symbol: 'USDG',
   decimals: 6,
   totalSupply: 5_000n * WAD,
@@ -84,7 +81,15 @@ async function registerPool(blockNumber = 10n): Promise<void> {
   await run(
     'PoolRegistry:PoolRegistered',
     makeEvent({
-      args: {poolId: POOL_ID, counter: COUNTER, poolClass: 1, constituentId: 0},
+      args: {
+        poolId: POOL_ID,
+        counter: COUNTER,
+        poolClass: 1,
+        constituentId: 0,
+        tickSpacing: 60,
+        counterDecimals: 6,
+        buyFeeBps: 30,
+      },
       blockNumber,
       logIndex: 0,
       address: ADDRESSES.PoolRegistry,
@@ -97,6 +102,17 @@ async function registerPool(blockNumber = 10n): Promise<void> {
       args: {poolId: POOL_ID, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
       blockNumber,
       logIndex: 1,
+      address: ADDRESSES.PoolRegistry,
+    }),
+    context,
+  )
+  // Emitted immediately after `PoolOpened` whenever the registry mirrored the vault's grid.
+  await run(
+    'PoolRegistry:PoolGridSet',
+    makeEvent({
+      args: {poolId: POOL_ID, gridBaseTick: 0},
+      blockNumber,
+      logIndex: 2,
       address: ADDRESSES.PoolRegistry,
     }),
     context,
@@ -115,6 +131,7 @@ describe('registration', () => {
       'AmpsVault:Redeem',
       'AmpsVault:Burn',
       'AmpsVault:Placement',
+      'AmpsVault:Rollout',
       'AmpsVault:Compound',
       'AmpsVault:GateChanged',
       'AmpsVault:BondedDeposit',
@@ -129,6 +146,7 @@ describe('registration', () => {
       'PoolRegistry:ConstituentFrozen',
       'PoolRegistry:PoolRegistered',
       'PoolRegistry:PoolOpened',
+      'PoolRegistry:PoolGridSet',
       'PoolManager:Swap',
       'PoolManager:ModifyLiquidity',
       'PoolManager:Initialize',
@@ -148,7 +166,7 @@ describe('registration', () => {
 })
 
 describe('the registry is the allowlist', () => {
-  it('creates the pool row and reads the geometry the events do not carry', async () => {
+  it('creates the pool row from the geometry the events now carry', async () => {
     await registerPool()
     const pool = await db.find(schema.pool, {id: POOL_ID})
     expect(pool).not.toBeNull()
@@ -158,6 +176,66 @@ describe('the registry is the allowlist', () => {
     expect(pool!.buyFeeBps).toBe(30)
     expect(pool!.gridBaseTick).toBe(0)
     expect(pool!.openSqrtPriceX96).toBe(Q96)
+  })
+
+  it('lets PoolGridSet override the opening-tick fallback PoolOpened seeds', async () => {
+    // `PoolOpened` seeds `gridBaseTick` from the opening price for a pool the registry could not
+    // mirror; `PoolGridSet` lands at a higher log index and carries the vault's real origin.
+    await run(
+      'PoolRegistry:PoolRegistered',
+      makeEvent({
+        args: {
+          poolId: POOL_ID,
+          counter: COUNTER,
+          poolClass: 1,
+          constituentId: 0,
+          tickSpacing: 60,
+          counterDecimals: 6,
+          buyFeeBps: 30,
+        },
+        blockNumber: 10n,
+        logIndex: 0,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    await run(
+      'PoolRegistry:PoolOpened',
+      makeEvent({
+        args: {poolId: POOL_ID, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
+        blockNumber: 10n,
+        logIndex: 1,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    expect((await db.find(schema.pool, {id: POOL_ID}))!.gridBaseTick).toBe(0)
+
+    await run(
+      'PoolRegistry:PoolGridSet',
+      makeEvent({
+        args: {poolId: POOL_ID, gridBaseTick: -13_860},
+        blockNumber: 10n,
+        logIndex: 2,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    expect((await db.find(schema.pool, {id: POOL_ID}))!.gridBaseTick).toBe(-13_860)
+  })
+
+  it('ignores a PoolGridSet for a pool the registry never announced', async () => {
+    await run(
+      'PoolRegistry:PoolGridSet',
+      makeEvent({
+        args: {poolId: `0x${'99'.repeat(32)}`, gridBaseTick: 120},
+        blockNumber: 10n,
+        logIndex: 0,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    expect(db.rows(schema.pool)).toHaveLength(0)
   })
 
   it('drops a v4 swap on a pool the registry never announced', async () => {
@@ -354,7 +432,7 @@ describe('checkpoints', () => {
 
 describe('supply movements', () => {
   it('decodes a burn reason and moves the net supply', async () => {
-    const reason = `0x${Buffer.from('compound', 'utf8').toString('hex').padEnd(64, '0')}`
+    const reason = REASON('compound')
     await run(
       'AmpsVault:Burn',
       makeEvent({args: {amount: 10n * WAD, reason}, blockNumber: 100n, logIndex: 0}),
@@ -365,6 +443,80 @@ describe('supply movements', () => {
     expect(burn!.amount).toBe(10n * WAD)
     const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
     expect(summary!.netSupplyChange).toBe(-10n * WAD)
+  })
+
+  it('mints through VestingMinted and never double-counts the bond it funds', async () => {
+    await run(
+      'AmpsVault:VestingMinted',
+      makeEvent({
+        args: {to: ADDRESSES.AmpsBonds, amount: 100n * WAD, reason: REASON('bond')},
+        blockNumber: 100n,
+        logIndex: 0,
+      }),
+      context,
+    )
+    const [mint] = db.rows(schema.vestingMint)
+    expect(mint!.reason).toBe('bond')
+    expect(mint!.to).toBe(ADDRESSES.AmpsBonds)
+
+    // `AmpsBonds:Bond` describes this same mint, so the summary must not move again.
+    await run(
+      'AmpsBonds:Bond',
+      makeEvent({
+        args: {
+          buyer: CALLER,
+          marketId: 1,
+          collateral: TOKEN,
+          amountIn: 10n * WAD,
+          ampsOut: 100n * WAD,
+          positionId: 0n,
+          qX18: 10n * WAD,
+          discountBps: 1_250,
+          floorBinding: false,
+          vestSeconds: 604_800,
+        },
+        blockNumber: 100n,
+        logIndex: 1,
+        address: ADDRESSES.AmpsBonds,
+      }),
+      context,
+    )
+    const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
+    expect(summary!.vestingMintedTotal).toBe(100n * WAD)
+    expect(summary!.netSupplyChange).toBe(100n * WAD)
+  })
+
+  it('leaves the supply to the two Burns a redemption emits', async () => {
+    // `redeemProRata` burns the redeemer's shares and the vault's inventory slice as two `Burn`
+    // logs, then emits `Redeem`. Moving the supply on `Redeem` too would double-count the exit.
+    await run(
+      'AmpsVault:Burn',
+      makeEvent({args: {amount: 100n * WAD, reason: REASON('redeem')}, blockNumber: 101n, logIndex: 0}),
+      context,
+    )
+    await run(
+      'AmpsVault:Burn',
+      makeEvent({
+        args: {amount: 5n * WAD, reason: REASON('redeemInventory')},
+        blockNumber: 101n,
+        logIndex: 1,
+      }),
+      context,
+    )
+    await run(
+      'AmpsVault:Redeem',
+      makeEvent({
+        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryBurned: 5n * WAD, feeBps: 100},
+        blockNumber: 101n,
+        logIndex: 2,
+      }),
+      context,
+    )
+    const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
+    expect(summary!.netSupplyChange).toBe(-105n * WAD)
+    expect(summary!.burnedAllTotal).toBe(105n * WAD)
+    expect(summary!.redeemedSharesTotal).toBe(100n * WAD)
+    expect(db.rows(schema.burnEvent).map((b) => b.reason)).toEqual(['redeem', 'redeemInventory'])
   })
 
   it('prices a redemption at the NAV in force', async () => {
@@ -390,6 +542,132 @@ describe('supply movements', () => {
     expect(redemption!.navPerShareX18).toBe(2n * WAD)
     expect(redemption!.grossUsd18).toBe(200n * WAD)
     expect(redemption!.feeUsd18).toBe(2n * WAD)
+  })
+})
+
+describe('the valuer cross-check', () => {
+  // The job takes Ponder's own `db`, whose type carries a `sql` escape hatch the in-memory double
+  // has no use for. Everything the job actually touches — `find`, `update` — is on both.
+  const checkLadders = (ctx: TestContext, block: bigint) =>
+    checkLaddersJob(ctx as unknown as Parameters<typeof checkLaddersJob>[0], block)
+
+  /** Register a pool, name it as constituent 7's, and give it one live ask cell. */
+  async function ladderWithOneCell(): Promise<void> {
+    await registerPool()
+    await run(
+      'PoolRegistry:ConstituentAdded',
+      makeEvent({
+        args: {constituentId: 7, token: TOKEN, poolId: POOL_ID, targetWeightBps: 500},
+        blockNumber: 11n,
+        logIndex: 0,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    await run(
+      'PoolManager:ModifyLiquidity',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: ADDRESSES.AmpsVault,
+          tickLower: 0,
+          tickUpper: 6960,
+          liquidityDelta: 10n ** 18n,
+          salt: `0x${'00'.repeat(32)}`,
+        },
+        blockNumber: 20n,
+        logIndex: 0,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+  }
+
+  /** What the indexer's own port of `LiquidityAmounts` makes of that cell at the reference price. */
+  const expectedAmps = amountsForLiquidity(Q96, 0, 6960, 10n ** 18n).amount0
+
+  it('agrees with the valuer when the maths matches', async () => {
+    await ladderWithOneCell()
+    context = makeContext({...READS, amountsOf: [expectedAmps, 7n], referenceSqrtPriceX96: Q96}, db)
+    await checkLadders(context, 21n)
+
+    const pool = await db.find(schema.pool, {id: POOL_ID})
+    expect(pool!.valuerAmps).toBe(expectedAmps)
+    expect(pool!.valuerCounter).toBe(7n)
+    expect(pool!.valuerDeltaBps).toBe(0)
+    expect(pool!.valuerCheckedBlock).toBe(21n)
+  })
+
+  it('records the divergence when it does not, without raising a breach', async () => {
+    await ladderWithOneCell()
+    context = makeContext(
+      {...READS, amountsOf: [(expectedAmps * 12_000n) / 10_000n, 7n], referenceSqrtPriceX96: Q96},
+      db,
+    )
+    await checkLadders(context, 21n)
+
+    const pool = await db.find(schema.pool, {id: POOL_ID})
+    expect(pool!.valuerDeltaBps).toBe(1_666) // 20% high on the valuer side
+    expect(db.rows(schema.alert)).toHaveLength(0)
+  })
+
+  it('does nothing when the valuer is not deployed', async () => {
+    await ladderWithOneCell()
+    context = makeContext({...READS, amountsOf: [expectedAmps, 7n], referenceSqrtPriceX96: Q96}, db)
+    context.contracts.LadderPositionValuer = {address: '0x' + '00'.repeat(20)}
+    await checkLadders(context, 21n)
+    expect((await db.find(schema.pool, {id: POOL_ID}))!.valuerCheckedBlock).toBe(0n)
+  })
+})
+
+describe('rollout', () => {
+  it('records both halves of the move and the keeper job that did it', async () => {
+    await registerPool()
+    await run(
+      'AmpsVault:Rollout',
+      makeEvent({
+        args: {
+          constituentId: 7,
+          poolId: POOL_ID,
+          movedAmps: 500n * WAD,
+          placedAmps: 480n * WAD,
+        },
+        blockNumber: 30n,
+        logIndex: 0,
+        txHash: TX,
+        input: toFunctionSelector('rollout(uint16)'),
+      }),
+      context,
+    )
+
+    const [rollout] = db.rows(schema.rolloutEvent)
+    expect(rollout!.constituentId).toBe(7)
+    expect(rollout!.toPoolId).toBe(POOL_ID)
+    expect(rollout!.movedAmps).toBe(500n * WAD)
+    // The residue — what the destination ladder could not commit — stays idle and is the gap.
+    expect(rollout!.placedAmps).toBe(480n * WAD)
+
+    const job = await db.find(schema.keeperJob, {id: TX})
+    expect(job!.job).toBe('rollout')
+    expect(job!.outcome).toBe('ok')
+    expect(job!.constituentId).toBe(7)
+  })
+
+  it('marks a rollout that placed nothing as a no-op', async () => {
+    await registerPool()
+    await run(
+      'AmpsVault:Rollout',
+      makeEvent({
+        args: {constituentId: 7, poolId: POOL_ID, movedAmps: 0n, placedAmps: 0n},
+        blockNumber: 30n,
+        logIndex: 0,
+        txHash: TX,
+        input: toFunctionSelector('rollout(uint16)'),
+      }),
+      context,
+    )
+    expect((await db.find(schema.keeperJob, {id: TX}))!.outcome).toBe('noop')
   })
 })
 
@@ -523,7 +801,16 @@ describe('the ladder', () => {
     await run(
       'AmpsVault:Placement',
       makeEvent({
-        args: {poolId: POOL_ID, above: true, buckets: 10, amount: 1_662n * WAD, anchorTick: 0},
+        args: {
+          poolId: POOL_ID,
+          above: true,
+          buckets: 1,
+          amount: 1_662n * WAD,
+          anchorTick: 0,
+          reason: REASON('place'),
+          lowerTick: 0,
+          upperTick: 6960,
+        },
         blockNumber: 20n,
         logIndex: 1,
         txHash: TX,
@@ -543,6 +830,9 @@ describe('the ladder', () => {
     const [placement] = db.rows(schema.placement)
     expect(placement!.cells).toBe(1)
     expect(placement!.action).toBe('place')
+    expect(placement!.reason).toBe('place')
+    expect(placement!.lowerTick).toBe(0)
+    expect(placement!.upperTick).toBe(6960)
     expect(placement!.liquidityAdded).toBe(10n ** 18n)
 
     const pool = await db.find(schema.pool, {id: POOL_ID})
@@ -823,6 +1113,7 @@ describe('bonds', () => {
           qX18: 10n * WAD,
           discountBps: 1_250,
           floorBinding: false,
+          vestSeconds: 604_800,
         },
         blockNumber: 51n,
         logIndex: 1,
@@ -846,6 +1137,7 @@ describe('bonds', () => {
     )
 
     const [purchase] = db.rows(schema.bondPurchase)
+    expect(purchase!.vestSeconds).toBe(604_800) // straight off the log, no lens read
     expect(purchase!.navBeforeX18).toBe(WAD)
     expect(purchase!.navAfterX18).toBe((WAD * 10_100n) / 10_000n)
     expect(purchase!.accretionUsd18).toBe(50n * WAD) // 0.01 x 5,000 shares
@@ -884,6 +1176,7 @@ describe('bonds', () => {
           qX18: 10n * WAD,
           discountBps: 1_250,
           floorBinding: true,
+          vestSeconds: 259_200,
         },
         blockNumber: 51n,
         logIndex: 1,
@@ -902,6 +1195,7 @@ describe('bonds', () => {
       context,
     )
     let position = await db.find(schema.bondPosition, {id: `${CALLER}-0`})
+    expect(position!.vestSeconds).toBe(259_200)
     expect(position!.claimed).toBe(60n * WAD)
     expect(position!.fullyClaimed).toBe(false)
 
@@ -1164,7 +1458,7 @@ describe('the bounty pot', () => {
           workValueUsd18: WAD,
           paidUsd18: WAD,
           paidRaw: 10n ** 6n,
-          reason: `0x${Buffer.from('compound', 'utf8').toString('hex').padEnd(64, '0')}`,
+          reason: REASON('compound'),
         },
         blockNumber: 90n,
         logIndex: 0,

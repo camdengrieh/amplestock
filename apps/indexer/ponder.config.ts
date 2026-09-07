@@ -36,6 +36,7 @@ import {
   ampsVaultAbi,
   bountyPotAbi,
   feedRegistryAbi,
+  ladderPositionValuerAbi,
   oracleGateAbi,
   poolManagerAbi,
   poolRegistryAbi,
@@ -90,6 +91,14 @@ export default createConfig({
     FeedRegistry: {chain: 'amps', abi: feedRegistryAbi, address: book.feedRegistry, ...window},
     AmpsHook: {chain: 'amps', abi: ampsHookAbi, address: book.hook, ...window},
     BountyPot: {chain: 'amps', abi: bountyPotAbi, address: book.bountyPot, ...window},
+    // Read-only: the valuer emits nothing. It is listed so `context.contracts` carries its address
+    // and ABI for the ladder cross-check in `handlers/reconcile.ts`.
+    LadderPositionValuer: {
+      chain: 'amps',
+      abi: ladderPositionValuerAbi,
+      address: book.positionValuer,
+      ...window,
+    },
     PoolManager: {
       chain: 'amps',
       abi: poolManagerAbi,

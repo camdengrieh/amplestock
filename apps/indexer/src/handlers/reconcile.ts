@@ -16,13 +16,14 @@
  * disagreement rather than a race.
  */
 
-import {ampsAbi, ampsVaultAbi} from '@amplestocks/abis'
+import {ampsAbi, ampsVaultAbi, ladderPositionValuerAbi} from '@amplestocks/abis'
 import schema from 'ponder:schema'
 
 import {readEnv} from '../config/env'
-import {jobId} from '../lib/ids'
+import {cellKey, jobId} from '../lib/ids'
+import {amountsForLiquidity, divergenceBps} from '../lib/math'
 import {reconcile, reconcileSeverity} from '../lib/reconcile'
-import {STATE, getState, raiseAlert, updateSummary, type Db} from '../lib/store'
+import {STATE, getState, getStateText, raiseAlert, updateSummary, type Db} from '../lib/store'
 import {jsonRecord} from '../lib/json'
 
 const env = readEnv()
@@ -133,6 +134,64 @@ export async function sampleShares(
     staked,
     circulating: circulating > 0n ? circulating : 0n,
   }))
+}
+
+/**
+ * Cross-check the indexer's own ladder decomposition against the vault's valuer.
+ *
+ * `LadderPositionValuer.amountsOf(poolId)` is what `A` is actually built from: the AMPS and counter
+ * the vault's positions in that pool decompose into **at the reference-implied sqrt price**, not at
+ * `slot0` (that is I7 — `A` must not move when the pool price does). So the comparison reads
+ * `referenceSqrtPriceX96(poolId)` too and re-runs the indexer's own `amountsForLiquidity` over the
+ * pool's cells at that same price. A disagreement means the `bigint` port of `TickMath` and
+ * `LiquidityAmounts` has drifted from the on-chain maths, which is the single thing in this indexer
+ * most likely to be subtly wrong and least likely to be noticed.
+ *
+ * Recorded on the `pool` row, never a breach: a pool whose cells the indexer has not seen in full
+ * (an indexer started mid-life) would diverge for a reason that is not a fault.
+ */
+export async function checkLadders(context: JobContext, blockNumber: bigint): Promise<void> {
+  const valuer = addressOf(context, 'LadderPositionValuer')
+  if (valuer === ZERO) return
+
+  for (const pool of await poolsToCheck(context)) {
+    const [amounts, referenceSqrt] = await Promise.all([
+      read<readonly [bigint, bigint]>(context, valuer, ladderPositionValuerAbi, 'amountsOf', [pool.id]),
+      read<bigint>(context, valuer, ladderPositionValuerAbi, 'referenceSqrtPriceX96', [pool.id]),
+    ])
+    if (amounts === undefined || referenceSqrt === undefined || referenceSqrt === 0n) continue
+
+    let amps = 0n
+    for (const tickLower of (pool.cellTicks as number[] | null) ?? []) {
+      const cell = await context.db.find(schema.ladderCell, {id: cellKey(pool.id, tickLower)})
+      if (cell === null || cell.liquidity <= 0n) continue
+      amps += amountsForLiquidity(referenceSqrt, cell.tickLower, cell.tickUpper, cell.liquidity).amount0
+    }
+
+    await context.db.update(schema.pool, {id: pool.id}).set({
+      valuerAmps: amounts[0],
+      valuerCounter: amounts[1],
+      valuerDeltaBps: divergenceBps(amps, amounts[0]),
+      valuerCheckedBlock: blockNumber,
+    })
+  }
+}
+
+/**
+ * The pools the ladder check walks: every id `PoolRegistry.PoolRegistered` has announced, from the
+ * key set `handlers/registry.ts` maintains. Walking the *constituents* instead would silently skip
+ * the two entry pools, which have no constituent id and carry the largest ladders there are.
+ */
+async function poolsToCheck(
+  context: JobContext,
+): Promise<{id: `0x${string}`; cellTicks: unknown}[]> {
+  const known = (await getStateText(context.db, STATE.poolIds)) ?? ''
+  const out: {id: `0x${string}`; cellTicks: unknown}[] = []
+  for (const id of known === '' ? [] : known.split(',')) {
+    const pool = await context.db.find(schema.pool, {id: id as `0x${string}`})
+    if (pool !== null) out.push({id: pool.id, cellTicks: pool.cellTicks})
+  }
+  return out
 }
 
 /**

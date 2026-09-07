@@ -35,10 +35,12 @@ import {jsonRecord} from '../lib/json'
 /** `sellFeeBps` at launch (`Constants.SELL_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
 const SELL_FEE_BPS_DEFAULT = 500
 
-const PLACEMENT_CELLS = (tx: string, pool: string) => `placement.cells.${tx}.${pool}`
+/**
+ * Scratch the `Placement` handler consumes. Only the liquidity is carried now: the cell count and
+ * the tick range are in `Placement` itself, and a `Rollout` is its own event, so nothing else has to
+ * be reconstructed from these logs.
+ */
 const PLACEMENT_LIQ = (tx: string, pool: string) => `placement.liquidity.${tx}.${pool}`
-/** AMPS removed from any pool in this transaction — what a `rollout` took out of the entry pools. */
-const WITHDRAWN = (tx: string) => `rollout.withdrawn.${tx}`
 
 // -------------------------------------------------------------------------------------------------
 // Initialize
@@ -154,26 +156,9 @@ ponder.on('PoolManager:ModifyLiquidity', async ({event, context}) => {
   cellTicks.add(tickLower)
   await context.db.update(schema.pool, {id}).set({cellTicks: [...cellTicks].sort((a, b) => a - b)})
 
-  if (delta < 0n) {
-    const removed = amountsForLiquidity(sqrtPrice, tickLower, tickUpper, -delta)
-    const key2 = WITHDRAWN(event.transaction.hash)
-    const total = ((await getState(context.db, key2)) ?? 0n) + removed.amount0
-    await context.db
-      .insert(schema.indexerState)
-      .values({id: key2, value: total, text: null, updatedBlock: event.block.number})
-      .onConflictDoUpdate(() => ({value: total, updatedBlock: event.block.number}))
-  }
-
-  // Scratch the placement handler consumes when the vault emits `Placement` after the unlock.
   if (delta > 0n) {
-    const cellsKey = PLACEMENT_CELLS(event.transaction.hash, id)
     const liqKey = PLACEMENT_LIQ(event.transaction.hash, id)
-    const cells = ((await getState(context.db, cellsKey)) ?? 0n) + 1n
     const liq = ((await getState(context.db, liqKey)) ?? 0n) + delta
-    await context.db
-      .insert(schema.indexerState)
-      .values({id: cellsKey, value: cells, text: null, updatedBlock: event.block.number})
-      .onConflictDoUpdate(() => ({value: cells, updatedBlock: event.block.number}))
     await context.db
       .insert(schema.indexerState)
       .values({id: liqKey, value: liq, text: null, updatedBlock: event.block.number})

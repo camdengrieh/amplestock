@@ -144,6 +144,7 @@ ponder.on('AmpsBonds:Bond', async ({event, context}) => {
     qX18: event.args.qX18,
     discountBps: event.args.discountBps,
     floorBinding: event.args.floorBinding,
+    vestSeconds: Number(event.args.vestSeconds),
     navBeforeX18: navBefore,
     navAfterX18: 0n,
     accretionUsd18: 0n,
@@ -163,7 +164,9 @@ ponder.on('AmpsBonds:Bond', async ({event, context}) => {
     principal: event.args.ampsOut,
     claimed: 0n,
     start: event.block.timestamp,
-    vestSeconds: 0,
+    // Frozen at purchase (I38) and now in the log, so a claim schedule is computable from the index
+    // alone rather than from a lens read.
+    vestSeconds: Number(event.args.vestSeconds),
     fullyClaimed: false,
     lastClaimAt: null,
   })

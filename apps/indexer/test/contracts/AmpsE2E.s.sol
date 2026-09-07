@@ -233,9 +233,11 @@ contract AmpsE2E is Script {
     function deploy() external {
         _roles();
         _ensurePoolManager();
+        // `TestnetPools` **is** a `Registry` now — it inherits the script rather than delegating to an
+        // instance of it, because a broadcast window opened inside a helper contract writes every
+        // transaction with the same nonce under Foundry 1.8.1. One deployment therefore serves both roles.
         TestnetPools testnet = new TestnetPools();
-        Registry registrar = new Registry();
-        testnet.setRegistrar(registrar);
+        Registry registrar = Registry(address(testnet));
 
         uint256 spokeCount = vm.envOr("AMPS_E2E_SPOKES", uint256(3));
         TestnetPools.Assets memory empty;

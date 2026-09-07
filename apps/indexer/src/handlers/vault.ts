@@ -17,7 +17,7 @@
 import {ponder} from 'ponder:registry'
 import schema from 'ponder:schema'
 
-import {classifyAction} from '../lib/actions'
+import {actionFromReason, classifyAction} from '../lib/actions'
 import {decodeBytes32String} from '../lib/bytes32'
 import {
   CREATOR_DECAY_SECONDS,
@@ -42,7 +42,6 @@ import {settleAccretion} from './bonds'
 import {reconcileAgain, runReconciliation, sampleShares} from './reconcile'
 
 const PREV_NAV = 'vault.navPerSharePrevX18'
-const PLACEMENT_CELLS = (tx: string, pool: string) => `placement.cells.${tx}.${pool}`
 const PLACEMENT_LIQ = (tx: string, pool: string) => `placement.liquidity.${tx}.${pool}`
 
 // -------------------------------------------------------------------------------------------------
@@ -179,20 +178,16 @@ ponder.on('AmpsVault:Redeem', async ({event, context}) => {
     feeUsd18,
   })
 
-  // The redeemer's own `shares` are burned here; the vault's `inventoryBurned` slice arrives as its
-  // own `Burn(amount, "redeemInventory")`, so subtracting both would double-count it.
-  const supply = ((await getState(context.db, STATE.supplyEvented)) ?? 0n) - event.args.shares
-  await setState(context.db, STATE.supplyEvented, supply, event.block.number)
-
+  // The supply is *not* moved here. `redeemProRata` now emits `Burn(shares, "redeem")` for the
+  // redeemer's own shares beside `Burn(inventoryBurned, "redeemInventory")` for the vault's slice,
+  // and both are real burns the `Burn` handler already subtracts; doing it again here would
+  // double-count the exit.
   await updateSummary(context.db, event.block.number, event.block.timestamp, (row) => ({
     redeemedSharesTotal: row.redeemedSharesTotal + event.args.shares,
-    netSupplyChange: row.netSupplyChange - event.args.shares,
   }))
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
     redeemedShares: row.redeemedShares + event.args.shares,
-    netSupplyChange: row.netSupplyChange - event.args.shares,
   }))
-  await reconcileAgain(context, event.block.number, event.block.timestamp)
 })
 
 ponder.on('AmpsVault:Burn', async ({event, context}) => {
@@ -222,7 +217,8 @@ ponder.on('AmpsVault:Burn', async ({event, context}) => {
 
 ponder.on('AmpsVault:VestingMinted', async ({event, context}) => {
   // Every post-genesis mint comes through here, including the AMPS a bond issues: `AmpsBonds`
-  // receives its principal by `mintVesting` (I30), so `Bond.ampsOut` is never added on top.
+  // receives its principal by `mintVesting` (I30) and the log now says so with `reason == "bond"`,
+  // so `Bond.ampsOut` describes this same mint and is never added on top.
   const supply = ((await getState(context.db, STATE.supplyEvented)) ?? 0n) + event.args.amount
   await setState(context.db, STATE.supplyEvented, supply, event.block.number)
 
@@ -233,6 +229,8 @@ ponder.on('AmpsVault:VestingMinted', async ({event, context}) => {
     txHash: event.transaction.hash,
     to: event.args.to,
     amount: event.args.amount,
+    reasonRaw: event.args.reason,
+    reason: decodeBytes32String(event.args.reason),
   })
   await updateSummary(context.db, event.block.number, event.block.timestamp, (row) => ({
     vestingMintedTotal: row.vestingMintedTotal + event.args.amount,
@@ -261,11 +259,11 @@ ponder.on('AmpsVault:BondedDeposit', async ({event, context}) => {
 
 ponder.on('AmpsVault:Placement', async ({event, context}) => {
   const id = poolKey(event.args.poolId)
-  const cellsKey = PLACEMENT_CELLS(event.transaction.hash, id)
   const liqKey = PLACEMENT_LIQ(event.transaction.hash, id)
-  const cells = (await getState(context.db, cellsKey)) ?? 0n
   const liquidity = (await getState(context.db, liqKey)) ?? 0n
-  const action = classifyAction(event.transaction.input)
+  const reason = decodeBytes32String(event.args.reason)
+  // The vault says why it placed, so the selector heuristic is only the fallback now.
+  const action = actionFromReason(reason) ?? classifyAction(event.transaction.input)
 
   await context.db.insert(schema.placement).values({
     id: eventId(event.block.number, event.log.logIndex),
@@ -277,38 +275,21 @@ ponder.on('AmpsVault:Placement', async ({event, context}) => {
     buckets: event.args.buckets,
     amount: event.args.amount,
     anchorTick: event.args.anchorTick,
+    reasonRaw: event.args.reason,
+    reason,
     action,
     caller: event.transaction.from,
-    cells: clampInt(cells),
+    lowerTick: event.args.lowerTick,
+    upperTick: event.args.upperTick,
+    // `buckets` is the cell count the placement wrote — `VaultPlacementLib` emits `result.cells`
+    // there — so the cells no longer have to be counted off the `ModifyLiquidity` logs.
+    cells: event.args.buckets,
     liquidityAdded: liquidity,
   })
 
-  await context.db.delete(schema.indexerState, {id: cellsKey})
   await context.db.delete(schema.indexerState, {id: liqKey})
 
   const pool = await context.db.find(schema.pool, {id})
-  if (action === 'rollout' && event.args.above) {
-    const withdrawnKey = `rollout.withdrawn.${event.transaction.hash}`
-    const withdrawn = (await getState(context.db, withdrawnKey)) ?? 0n
-    await context.db
-      .insert(schema.rolloutEvent)
-      .values({
-        id: eventId(event.block.number, event.log.logIndex),
-        blockNumber: event.block.number,
-        timestamp: event.block.timestamp,
-        txHash: event.transaction.hash,
-        constituentId: pool?.constituentId ?? 0,
-        caller: event.transaction.from,
-        moved: event.args.amount,
-        withdrawn,
-        toPoolId: id,
-        fromPoolIds: [],
-        bountyPaidUsd18: 0n,
-      })
-      .onConflictDoNothing()
-    await context.db.delete(schema.indexerState, {id: withdrawnKey})
-  }
-
   await recordKeeperJob({
     db: context.db,
     txHash: event.transaction.hash,
@@ -319,7 +300,49 @@ ponder.on('AmpsVault:Placement', async ({event, context}) => {
     poolId: id,
     constituentId: pool?.constituentId,
     outcome: event.args.amount > 0n ? 'ok' : 'noop',
-    detail: {amount: event.args.amount.toString(), above: event.args.above, cells: clampInt(cells)},
+    detail: {
+      amount: event.args.amount.toString(),
+      above: event.args.above,
+      reason,
+      lowerTick: event.args.lowerTick,
+      upperTick: event.args.upperTick,
+    },
+  })
+})
+
+/**
+ * `Rollout` is its own event now, carrying both halves: what left the entry pools and what the
+ * destination spoke's ladder actually committed. Nothing is reconstructed from the placements and
+ * the entry-pool withdrawals any more.
+ */
+ponder.on('AmpsVault:Rollout', async ({event, context}) => {
+  await context.db.insert(schema.rolloutEvent).values({
+    id: eventId(event.block.number, event.log.logIndex),
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    txHash: event.transaction.hash,
+    constituentId: event.args.constituentId,
+    caller: event.transaction.from,
+    movedAmps: event.args.movedAmps,
+    placedAmps: event.args.placedAmps,
+    toPoolId: poolKey(event.args.poolId),
+    bountyPaidUsd18: 0n,
+  })
+
+  await recordKeeperJob({
+    db: context.db,
+    txHash: event.transaction.hash,
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    caller: event.transaction.from,
+    job: 'rollout',
+    poolId: poolKey(event.args.poolId),
+    constituentId: event.args.constituentId,
+    outcome: event.args.placedAmps > 0n ? 'ok' : 'noop',
+    detail: {
+      movedAmps: event.args.movedAmps.toString(),
+      placedAmps: event.args.placedAmps.toString(),
+    },
   })
 })
 
@@ -500,4 +523,4 @@ ponder.on('AmpsToken:VaultChanged', async ({event, context}) => {
 })
 
 /** Scratch keys the `ModifyLiquidity` handler writes and `Placement` consumes. */
-export const placementScratch = {cells: PLACEMENT_CELLS, liquidity: PLACEMENT_LIQ, prevNav: PREV_NAV}
+export const placementScratch = {liquidity: PLACEMENT_LIQ, prevNav: PREV_NAV}

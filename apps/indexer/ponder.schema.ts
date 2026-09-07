@@ -184,15 +184,25 @@ export const burnEvent = onchainTable(
   (table) => ({byReason: index().on(table.reason), byBlock: index().on(table.blockNumber)}),
 )
 
-/** Every `VestingMinted`: the only non-bond mint after genesis. */
-export const vestingMint = onchainTable('vesting_mint', (t) => ({
-  id: t.text().primaryKey(),
-  blockNumber: t.bigint().notNull(),
-  timestamp: t.bigint().notNull(),
-  txHash: t.hex().notNull(),
-  to: t.hex().notNull(),
-  amount: t.bigint().notNull(),
-}))
+/**
+ * Every `VestingMinted`: **every** post-genesis mint, the team vest and a bond's principal alike.
+ * `reason` says which — `"bond"` for the AMPS `AmpsBonds` receives at purchase (I30) — so the
+ * accompanying `Bond` describes the same mint and must never be added to the supply on top of it.
+ */
+export const vestingMint = onchainTable(
+  'vesting_mint',
+  (t) => ({
+    id: t.text().primaryKey(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+    to: t.hex().notNull(),
+    amount: t.bigint().notNull(),
+    reasonRaw: t.hex().notNull(),
+    reason: t.text().notNull(),
+  }),
+  (table) => ({byReason: index().on(table.reason)}),
+)
 
 // -----------------------------------------------------------------------------------------------
 // Placements, ladder cells, compounds, rollouts
@@ -213,12 +223,21 @@ export const placement = onchainTable(
     /** Token amount committed: AMPS wei for an ask, counter raw units for a bid. */
     amount: t.bigint().notNull(),
     anchorTick: t.integer().notNull(),
-    /** `genesis` | `spokeSeed` | `compound` | `rollout` | `bonded` | `place` | `redeem` | `unknown`. */
+    /** The raw `bytes32` reason the vault emitted, and its decoded short string: `place` (governance,
+     *  genesis included), `spokeSeed`, `compound`, `rollout`, `bonded` or `migrate`. */
+    reasonRaw: t.hex().notNull(),
+    reason: t.text().notNull(),
+    /** The classified action. Taken from `reason` when the vault named one, from the transaction's
+     *  four-byte selector otherwise. */
     action: t.text().notNull(),
     /** The caller, from the transaction. */
     caller: t.hex().notNull(),
-    /** Cells the matching `ModifyLiquidity` logs wrote in this transaction, for this pool. */
+    /** The cell range the placement wrote, straight from the log. Both `0` when nothing was written. */
+    lowerTick: t.integer().notNull(),
+    upperTick: t.integer().notNull(),
+    /** Cells written, from the log's own `buckets`. */
     cells: t.integer().notNull(),
+    /** Position liquidity added, summed from the `ModifyLiquidity` logs of the same transaction. */
     liquidityAdded: t.bigint().notNull(),
   }),
   (table) => ({byPool: index().on(table.poolId), byAction: index().on(table.action)}),
@@ -313,7 +332,11 @@ export const compoundEvent = onchainTable(
   (table) => ({byPool: index().on(table.poolId), byBlock: index().on(table.blockNumber)}),
 )
 
-/** Every `rollout(constituentId)`: inventory moving from the entry pools into a spoke. */
+/**
+ * Every `AmpsVault.Rollout`: inventory moving from the entry pools into a spoke. Both halves come
+ * from the log, so nothing is reconstructed from the placements and the entry-pool withdrawals any
+ * more.
+ */
 export const rolloutEvent = onchainTable(
   'rollout_event',
   (t) => ({
@@ -323,12 +346,11 @@ export const rolloutEvent = onchainTable(
     txHash: t.hex().notNull(),
     constituentId: t.integer().notNull(),
     caller: t.hex().notNull(),
-    /** AMPS actually placed into the destination spoke. */
-    moved: t.bigint().notNull(),
-    /** AMPS withdrawn from the entry pools in the same transaction. */
-    withdrawn: t.bigint().notNull(),
+    /** AMPS taken out of the entry pools' unfilled ask cells. */
+    movedAmps: t.bigint().notNull(),
+    /** AMPS the destination spoke's ladder actually committed; the residue stays idle. */
+    placedAmps: t.bigint().notNull(),
     toPoolId: t.hex().notNull(),
-    fromPoolIds: t.jsonb().notNull(),
     bountyPaidUsd18: t.bigint().notNull(),
   }),
   (table) => ({byConstituent: index().on(table.constituentId)}),
@@ -389,6 +411,14 @@ export const pool = onchainTable(
     /** The `tickLower` of every cell the vault has ever opened here, so the fill can be recomputed
      *  without a query. At most `GRID_CELLS` entries by construction (I39). */
     cellTicks: t.jsonb().notNull(),
+    /** `LadderPositionValuer.amountsOf(poolId)`, i.e. what the vault's own valuer decomposes this
+     *  pool's positions into at the reference price. Sampled by the reconciliation job. */
+    valuerAmps: t.bigint().notNull(),
+    valuerCounter: t.bigint().notNull(),
+    /** Divergence between the indexer's own decomposition at that same reference price and the
+     *  valuer's, in bps. The cross-check on the `bigint` tick maths; recorded, never a breach. */
+    valuerDeltaBps: t.integer().notNull(),
+    valuerCheckedBlock: t.bigint().notNull(),
     /** Realised LVR proxy in 18-decimal USD: see `src/lib/flywheel.ts`. */
     realisedLvrUsd18: t.bigint().notNull(),
     feeRevenueUsd18: t.bigint().notNull(),
@@ -771,6 +801,7 @@ export const bondPurchase = onchainTable(
     discountBps: t.integer().notNull(),
     /** True when `qFloor` bound rather than `qMarket`: the NAV floor did the pricing. */
     floorBinding: t.boolean().notNull(),
+    vestSeconds: t.integer().notNull(),
     navBeforeX18: t.bigint().notNull(),
     navAfterX18: t.bigint().notNull(),
     /** `(navAfter - navBefore) * totalSupply / 1e18`, 18-decimal USD. I27 makes this `>= 0`. */
@@ -792,6 +823,7 @@ export const bondPosition = onchainTable(
     principal: t.bigint().notNull(),
     claimed: t.bigint().notNull(),
     start: t.bigint().notNull(),
+    /** The vest length in force at purchase, frozen for this position (I38), from the `Bond` log. */
     vestSeconds: t.integer().notNull(),
     fullyClaimed: t.boolean().notNull(),
     lastClaimAt: t.bigint(),
@@ -928,6 +960,8 @@ export const keeperJob = onchainTable(
     constituentId: t.integer(),
     /** `ok` when the job produced the events it should have, `noop` when it produced none. */
     outcome: t.text().notNull(),
+    /** What `BountyPot` measured the job to be worth, and what it actually paid. */
+    workValueUsd18: t.bigint().notNull(),
     bountyPaidUsd18: t.bigint().notNull(),
     detail: t.jsonb().notNull(),
   }),

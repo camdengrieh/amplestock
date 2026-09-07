@@ -38,6 +38,26 @@ export type VaultAction =
   | 'claim'
   | 'unknown'
 
+/**
+ * The reasons `AmpsVault.Placement` now carries, mapped onto the same vocabulary. This is the
+ * authority wherever it is present: the vault names why it placed, so the selector heuristic below
+ * is only reached for a log that predates the field or for a transaction that produced no placement.
+ */
+const ACTION_BY_REASON: Readonly<Record<string, VaultAction>> = {
+  place: 'place',
+  spokeSeed: 'spokeSeed',
+  compound: 'compound',
+  rollout: 'rollout',
+  bonded: 'bonded',
+  migrate: 'migrate',
+  genesis: 'genesis',
+}
+
+/** The action a `Placement`'s decoded `reason` names, or `undefined` when it names none we know. */
+export function actionFromReason(reason: string): VaultAction | undefined {
+  return ACTION_BY_REASON[reason]
+}
+
 const selectorsOf = (abi: Abi): Map<Hex, string> => {
   const out = new Map<Hex, string>()
   for (const item of abi) {
