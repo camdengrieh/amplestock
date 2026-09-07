@@ -721,6 +721,43 @@ library Constants {
     /// @notice Multiple of the observed gas cost the bounty may never exceed.
     uint16 internal constant KEEPER_GAS_CAP_MULTIPLE = 3;
 
+    /// @notice The basefee the keeper's gas allowance is priced at, at most: 1 gwei, a hundred times Robinhood
+    ///         Chain's 0.01 gwei Orbit floor.
+    /// @dev **Why a cap at all.** `BountyPot`'s third argument is "what this job cost to run, in USD", and the pot
+    ///      caps the payout at `gasCapMultiple` times it. Feeding it the raw `block.basefee` would let a gas spike
+    ///      raise the ceiling on every bounty in the same block, which is the one direction a cap must not move:
+    ///      the cap exists so that a cheap job cannot be paid a large tip, not so that an expensive block can be.
+    ///      Capping the basefee here — the pot's own note says "the basefee cap lives in the caller" — makes the
+    ///      allowance a function of the *work*, and a genuinely expensive block simply makes the job unprofitable
+    ///      for the keeper, which is the keeper's decision to make and not the pot's.
+    uint256 internal constant KEEPER_BASEFEE_CAP_WEI = 1 gwei;
+
+    /// @notice The basefee the keeper's gas allowance is priced at, at least: Robinhood Chain's 0.01 gwei Orbit
+    ///         floor, which is what the chain charges however little a block is asking for.
+    /// @dev The floor is what makes the allowance a number and not an accident. `block.basefee` reads zero on a
+    ///      chain that has none and on most local harnesses, and a zero allowance makes the pot's 3x cap bind at
+    ///      zero — every job unpaid, for a reason that has nothing to do with the job. Pricing a sub-floor reading
+    ///      at the floor is also the honest number: the keeper's transaction pays the floor whatever `basefee`
+    ///      says below it. The allowance is an input to a *ceiling*, not a reimbursement, so erring at the floor
+    ///      cannot overpay: the tip, the chip and the dust guard still have to be satisfied first.
+    uint256 internal constant KEEPER_BASEFEE_FLOOR_WEI = 0.01 gwei;
+
+    /// @notice Gas a bountied job costs that its own `gasleft()` delta cannot see, added to the measurement.
+    /// @dev The delta is taken between the first statement of the vault forwarder and the moment the bounty is
+    ///      priced, so it misses the 21,000-gas intrinsic transaction cost, the calldata, and the `BountyPot.pay`
+    ///      call and ERC-20 transfer that follow the measurement. 80,000 covers all three with the transfer cold.
+    ///      It is deliberately a constant and deliberately generous: it is an input to a *ceiling*, and the tip,
+    ///      the chip, the dust guard and the daily ceiling are what actually size a payment.
+    uint256 internal constant KEEPER_GAS_OVERHEAD = 80_000;
+
+    /// @notice Hard ceiling on the gas one bountied job may report, whatever it measures.
+    /// @dev `docs/phase3-state-model.md` §12 measures `compound` at 1.0-3.3M, `rollout` at 1.1-2.9M and
+    ///      `deployBonded` at 1.5-2.4M, so 8M is more than twice the worst reachable job. It is a belt on top of
+    ///      the EIP-150 correction below: the gas allowance is an input to the pot's 3x *ceiling*, and a ceiling
+    ///      that a caller could inflate by choosing a large gas limit is not a ceiling. At the capped basefee this
+    ///      bounds the allowance at 8M x 1 gwei x ETH/USD, or about $20 of gas, and the 3x cap at about $60.
+    uint256 internal constant KEEPER_GAS_MAX = 8_000_000;
+
     /// @notice Launch `dailyCeilingUsd18`: $25 a day, sized to the $5k launch book. At the launch tip and chip that
     ///         is roughly two hundred paid jobs a day with headroom, and it is governed upward with TVL alongside
     ///         the tip and the dust guard.

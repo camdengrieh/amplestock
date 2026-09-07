@@ -261,6 +261,10 @@ contract AmpsQuoter is IAmpsQuoter {
         _fillCheckpoint(quote);
         _fillMarketPrice(quote, poolId, cfg);
         _fillBond(quote, cfg.counter);
+
+        // Last, so it picks up the hook's mirror when the registry could not answer (the `!okRegistry` branch
+        // above already copied it into `cfg`).
+        quote.tickSpacing = cfg.tickSpacing;
     }
 
     /// @inheritdoc IAmpsQuoter

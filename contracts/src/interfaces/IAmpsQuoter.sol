@@ -78,6 +78,12 @@ interface IAmpsQuoter {
     /// @param observationCoverage Seconds of history the pool's observation ring covers.
     /// @param checkpointAge Age of the vault checkpoint in seconds.
     /// @param degraded The bitfield above. Zero means every sub-read succeeded.
+    /// @param tickSpacing The pool's tick spacing, from the registry, or from the hook's mirror of it when bit1 of
+    ///        `degraded`'s registry source is set. **Appended field** (`docs/phase3-state-model.md` §12.4):
+    ///        building a Universal Router `PathKey` needs `fee`, `tickSpacing` and `hooks`, and without it a
+    ///        router had to issue one `PoolRegistry.poolKey(poolId)` per routed pool on top of `quoteAll()`. `fee`
+    ///        is the dynamic-fee sentinel for every Amplestocks pool and `hooks` is the one mined hook address, so
+    ///        this is the last piece a caller could not already derive. Zero when neither source could answer.
     struct PoolQuote {
         PoolId poolId;
         PoolClass poolClass;
@@ -109,6 +115,7 @@ interface IAmpsQuoter {
         uint32 observationCoverage;
         uint32 checkpointAge;
         uint8 degraded;
+        int24 tickSpacing;
     }
 
     /// @notice The full quote for one pool.

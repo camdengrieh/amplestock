@@ -52,6 +52,9 @@ interface IAmpsBonds {
     /// @param qX18 The applied price: AMPS wei per 1e18 of `amountIn18`, i.e. per one whole collateral unit.
     /// @param discountBps The discount actually applied.
     /// @param floorBinding Whether the accretion floor, rather than the market discount, set the price.
+    /// @param vestSeconds The vest length in force at purchase, frozen for this position (I38). Appended
+    ///        (`docs/phase3-state-model.md` §12.4): a claim schedule is drawn from it, and without it in the log a
+    ///        reader had to make a lens call per position to know when the vest ends.
     event Bond(
         address indexed buyer,
         uint16 indexed marketId,
@@ -61,7 +64,8 @@ interface IAmpsBonds {
         uint256 positionId,
         uint256 qX18,
         uint16 discountBps,
-        bool floorBinding
+        bool floorBinding,
+        uint32 vestSeconds
     );
 
     /// @notice Emitted on every claim.
@@ -239,6 +243,23 @@ interface IAmpsBonds {
     /// @param owner The bonder.
     /// @return amount The total claimable.
     function claimableTotal(address owner) external view returns (uint256 amount);
+
+    /// @notice AMPS wei `owner` holds that has **not** vested yet: `sum(principal - vested)` across their
+    ///         positions, exactly.
+    /// @dev The complement of {claimableTotal} inside `Amps.balanceOf(bonds)`, which is a bonder's unvested
+    ///      principal plus whatever has vested and not been claimed. A supply split — issued vs vesting vs
+    ///      claimable — needs this number, and could previously only be bounded from above by that balance.
+    ///
+    ///      **There is deliberately no nullary `unvested()`.** Vesting is linear from each position's own `start`
+    ///      over its own frozen `vestSeconds` (I38), so an exact protocol-wide total is a sum over every position
+    ///      that exists; positions live in per-owner arrays with no global enumeration, and an aggregate
+    ///      maintained on the way in would have to be corrected again at each position's vest end — a scheduled
+    ///      write this immutable contract has nowhere to put and no one to pay for. `AmpsBondsLens.unvested` is
+    ///      the exact total over an owner list, which the indexer and the dApp both already hold; for a caller
+    ///      with no list, `Amps.balanceOf(bonds)` stays the honest upper bound.
+    /// @param owner The bonder.
+    /// @return amount The unvested AMPS wei.
+    function unvestedOf(address owner) external view returns (uint256 amount);
 
     // -------------------------------------------------------------------------------------------------------------
     // Governed parameters

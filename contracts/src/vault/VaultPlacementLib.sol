@@ -115,17 +115,6 @@ library VaultPlacementLib {
     /// @dev slot 20, `deployThresholdUsd18`.
     uint256 private constant SLOT_DEPLOY_THRESHOLD = 20;
 
-    /// @dev The keeper work value every bountied job reports, in 18-decimal USD, and the gas allowance it reports
-    ///      alongside it. Both are flat in v1, which is what the plan's keeper row asks for: `tip` $0.05 plus a
-    ///      2% chip on the work value is $0.07 a job, and `BountyPot` applies the `chost` dust guard (which is a
-    ///      floor on the *work value*, so $1 is the smallest value that can be paid for at all), the daily ceiling
-    ///      and the pot's own balance on top. The 3x gas cap is inert while both numbers are flat — 3 x $1 is far
-    ///      above $0.07 — and becomes live in Phase 4, when `apps/keeper` reports its measured gas instead.
-    uint256 private constant WORK_VALUE_USD18 = 1e18;
-
-    /// @dev The flat gas allowance reported with it. See {WORK_VALUE_USD18}.
-    uint256 private constant GAS_ALLOWANCE_USD18 = 1e18;
-
     /// @dev `keccak256("amplestocks.vault.PLACEMENT_STAGE")`, the base of the transient staging buffer. Four
     ///      words per placed cell, `Constants.GRID_CELLS` cells. See {_stage}.
     uint256 private constant STAGE_SLOT = 0x1f0c2fd9a7dcb43f4a1ee6b30a17c0ba2d3c0e8f6b5a49382716c5d4e3f2a190;
@@ -207,7 +196,16 @@ library VaultPlacementLib {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Mirrors `IAmpsVault.Placement`.
-    event Placement(PoolId indexed poolId, bool above, uint8 buckets, uint256 amount, int24 anchorTick);
+    event Placement(
+        PoolId indexed poolId,
+        bool above,
+        uint8 buckets,
+        uint256 amount,
+        int24 anchorTick,
+        bytes32 reason,
+        int24 lowerTick,
+        int24 upperTick
+    );
 
     /// @dev Mirrors `IAmpsVault.Compound`.
     event Compound(
@@ -309,6 +307,7 @@ library VaultPlacementLib {
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param amps The AMPS token.
     /// @param poolId The pool.
+    /// @param gasStart `gasleft()` as `AmpsVault.compound` was entered, for the measured gas allowance.
     /// @return ampsFees AMPS-side fees collected.
     /// @return burned AMPS burned: the `burnBps` slice plus the whole high-water buyback.
     function compound(
@@ -316,7 +315,8 @@ library VaultPlacementLib {
         mapping(PoolId => uint32) storage cooldown,
         address poolManager,
         address amps,
-        PoolId poolId
+        PoolId poolId,
+        uint256 gasStart
     ) public returns (uint256 ampsFees, uint256 burned) {
         Ctx memory ctx = _ctx();
         Pool memory pool = _gauntletEntry(ctx, cooldown, poolManager, poolId);
@@ -327,15 +327,23 @@ library VaultPlacementLib {
         (ampsFees, counter) =
             abi.decode(_unlock(poolManager, VaultRedeemLib.ACTION_COMPOUND, abi.encode(pool.key)), (uint256, uint256));
 
+        // The measured work value, accumulated as the call earns it (§12.4 ruling W). The counter side is taken
+        // here, before the burnback frees any inventory into the same claim: freed inventory is value the vault
+        // already owned and moving it is not work the keeper created.
+        uint256 workValueUsd18 = _counterValueUsd18(ctx, pool.config, counter);
+
         // 4. The buyback burn, *before* any new ask is placed, so freshly re-laddered AMPS can never be mistaken
         //    for bought-back inventory (§3.5's ordering rule).
-        (uint256 boughtBack, uint256 freedCounter) = _burnback(ladder, pool, poolManager);
-        if (boughtBack != 0) {
-            IAmps(amps).burn(address(this), boughtBack);
-            emit Burn(boughtBack, bytes32("buyback"));
-            burned = boughtBack;
+        {
+            (uint256 boughtBack, uint256 freedCounter) = _burnback(ladder, pool, poolManager);
+            if (boughtBack != 0) {
+                IAmps(amps).burn(address(this), boughtBack);
+                emit Burn(boughtBack, bytes32("buyback"));
+                burned = boughtBack;
+            }
+            counter += freedCounter;
+            workValueUsd18 += ampsValueUsd18(ampsFees + boughtBack);
         }
-        counter += freedCounter;
 
         // 5. The AMPS-side split, in order: creator, stakers, burn, and what is left is re-laddered.
         Split memory split;
@@ -384,7 +392,10 @@ library VaultPlacementLib {
         cooldown[poolId] = uint32(block.timestamp);
 
         emit Compound(poolId, ampsFees, split.creatorPaid, split.stakerPaid, burned, split.relaid);
-        _payBounty(ctx);
+
+        // A `compound` on a pool with no accrued fees and no crossed cell is worth exactly zero, so the pot's
+        // `chost` dust guard refuses it and it is paid exactly zero.
+        payBounty(workValueUsd18, gasStart);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -521,7 +532,9 @@ library VaultPlacementLib {
 
         _writeRecords(ladder, pool.key.toId(), params, result);
         placed = result.amountPlaced;
-        emit Placement(pool.key.toId(), above, result.cells, placed, anchorTick);
+        emit Placement(
+            pool.key.toId(), above, result.cells, placed, anchorTick, reason, result.lowestTick, result.highestTick
+        );
         _armSurge(ctx, pool.key.toId(), reason);
     }
 
@@ -1055,11 +1068,132 @@ library VaultPlacementLib {
         return PriceLib.fairTick(ctx.pRefX18, answerUsd8, pool.config.counterDecimals, pool.config.tickSpacing);
     }
 
-    /// @dev The flat keeper bounty. A pot that is empty, capped out or broken pays nothing and does not revert.
-    function _payBounty(Ctx memory ctx) private {
-        if (ctx.bountyPot == address(0)) return;
-        try IBountyPot(ctx.bountyPot).pay(msg.sender, WORK_VALUE_USD18, GAS_ALLOWANCE_USD18) returns (uint256) {}
+    /// @notice Pays one bountied job's keeper, with the work value the job **measured** and the gas the call
+    ///         actually burned. Shared with {VaultRolloutLib}, which links against this library already.
+    ///
+    /// @dev **Why this is measured and not flat, and what it fixes.** Until this slice both numbers were the
+    ///      hardcoded `$1`, which made two of `BountyPot`'s four guards dead letters. The `chost` dust guard is a
+    ///      floor on the *work value* and refuses when `workValueUsd18 < chostUsd18`; at the launch `chost` of $1
+    ///      a flat `$1` never satisfies `<`, so a `compound()` on a pool with **zero** accrued fees was paid the
+    ///      full tip and a spam campaign was bounded only by the 60-second cooldown and the daily ceiling. The 3x
+    ///      gas cap was equally inert: `3 x $1 = $3` sits far above the `$0.05 + 2% x $1 = $0.07` a job could
+    ///      earn, so it never bound anything. With both inputs measured, an empty `compound` earns exactly zero
+    ///      (`reason = "chost"`), and on a $5k book the cap is what sizes an ordinary payment.
+    ///
+    /// @dev **What "work value" means, per job** (`docs/phase3-state-model.md` §12.4):
+    ///      * `compound` — the AMPS-side fees collected plus the AMPS bought back, valued at `P_ref`, plus the
+    ///        counter-side fees at their feed price.
+    ///      * `rollout` — the inventory actually moved, at `P_ref`.
+    ///      * `deployBonded` — the collateral placed, at its feed price (the same number the deploy threshold is
+    ///        tested against, so the two can never disagree).
+    ///      Every one of them is a number the vault derived from its own state inside the same call. Nothing is
+    ///      taken from the caller, which is what keeps the pot un-drainable by an argument.
+    ///
+    /// @dev **What the gas allowance means.** `gasStart` is `gasleft()` at the first statement of the vault's
+    ///      forwarder; the delta to here is what the job burned, plus `Constants.KEEPER_GAS_OVERHEAD` for the
+    ///      intrinsic cost and the payment itself. It is priced at `block.basefee` clamped into
+    ///      `[KEEPER_BASEFEE_FLOOR_WEI, KEEPER_BASEFEE_CAP_WEI]` and at the ETH/USD answer the feed registry holds
+    ///      for the `AMPS/WETH` entry pool's counter — the same feed `A` values the vault's WETH bids with, so no
+    ///      new oracle, no new governance parameter and no new pointer. An ETH price the registry cannot answer
+    ///      leaves the allowance at zero, which makes the gas cap bind at zero and the job unpaid: the pot never
+    ///      pays for a job it cannot price, and an unpaid job still does its work (I21's degradation, not a stop).
+    /// @param workValueUsd18 The measured work value, 18-decimal USD.
+    /// @param gasStart `gasleft()` as the forwarder entered.
+    function payBounty(uint256 workValueUsd18, uint256 gasStart) public {
+        address pot = address(uint160(_word(SLOT_BOUNTY_POT)));
+        if (pot == address(0)) return;
+
+        // A pot that is empty, capped out or broken pays nothing and does not revert.
+        try IBountyPot(pot).pay(msg.sender, workValueUsd18, _gasCostUsd18(_gasUsed(gasStart))) returns (uint256) {}
             catch {}
+    }
+
+    /// @dev The gas this job actually burned, from `gasStart` to here, plus the fixed overhead and under the hard
+    ///      ceiling.
+    ///
+    /// @dev **The `gasleft() / 63` term is EIP-150, and leaving it out is a real overstatement.** Every message
+    ///      call forwards at most 63/64 of the caller's remaining gas, so `gasleft()` in this frame is 63/64 of
+    ///      what was available when the vault delegated into the library: the naive `gasStart - gasleft()` charges
+    ///      the job for 1/64 of the *caller's gas limit* on top of the gas it spent. That is not a rounding error
+    ///      — under Foundry's 2^30 default limit it is 16.8M gas, eight times a real `compound` — and on chain it
+    ///      would let a keeper inflate the pot's own 3x ceiling simply by sending the job with a large gas limit.
+    ///      `available = gasleft() * 64 / 63`, so adding back `gasleft() / 63` recovers the true consumption.
+    ///      `Constants.KEEPER_GAS_MAX` is the belt: the correction is exact for one hop (`compound`) and leaves
+    ///      one residual 64th for the two-hop paths that reach here through {VaultRolloutLib}, and no measurement
+    ///      of any shape may report more gas than the worst job can plausibly burn.
+    function _gasUsed(uint256 gasStart) private view returns (uint256 gasUsed) {
+        uint256 remaining = gasleft();
+        uint256 spent = gasStart > remaining ? gasStart - remaining : 0;
+        uint256 reserved = remaining / 63;
+        gasUsed = (spent > reserved ? spent - reserved : 0) + Constants.KEEPER_GAS_OVERHEAD;
+        if (gasUsed > Constants.KEEPER_GAS_MAX) gasUsed = Constants.KEEPER_GAS_MAX;
+    }
+
+    /// @dev `gasUsed x min(basefee, cap) x ETH/USD`, in 18-decimal USD, or zero when ETH cannot be priced.
+    ///      Never reverts: every read is bounded and every failure is "no allowance".
+    function _gasCostUsd18(uint256 gasUsed) private view returns (uint256 usd18) {
+        address registry = address(uint160(_word(SLOT_REGISTRY)));
+        if (registry == address(0)) return 0;
+
+        PoolId wethPool;
+        try IPoolRegistry(registry).wethPoolId() returns (PoolId poolId) {
+            wethPool = poolId;
+        } catch {
+            return 0;
+        }
+        if (PoolId.unwrap(wethPool) == bytes32(0)) return 0;
+
+        address weth;
+        try IPoolRegistry(registry).poolConfig(wethPool) returns (PoolConfig memory config) {
+            weth = config.counter;
+        } catch {
+            return 0;
+        }
+
+        uint256 ethUsd8 = _answerAt(address(uint160(_word(SLOT_FEED_REGISTRY))), weth);
+        if (ethUsd8 == 0) return 0;
+
+        uint256 basefee = block.basefee;
+        if (basefee < Constants.KEEPER_BASEFEE_FLOOR_WEI) basefee = Constants.KEEPER_BASEFEE_FLOOR_WEI;
+        if (basefee > Constants.KEEPER_BASEFEE_CAP_WEI) basefee = Constants.KEEPER_BASEFEE_CAP_WEI;
+        // `gasUsed x basefee` is at most ~3.5e16 at a 35M-gas call and the 1 gwei cap, so the product with an
+        // 8-decimal answer cannot come near overflowing a word.
+        return (gasUsed * basefee * ethUsd8) / 1e8;
+    }
+
+    /// @dev The USD value of a counter-asset amount at the feed's last accepted answer, or zero when the feed
+    ///      cannot answer or the asset's decimals are outside `PriceLib`'s domain.
+    function _counterValueUsd18(Ctx memory ctx, PoolConfig memory config, uint256 amountRaw)
+        private
+        view
+        returns (uint256 usd18)
+    {
+        if (amountRaw == 0 || config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) return 0;
+        uint256 answerUsd8 = _answer(ctx, config.counter);
+        if (answerUsd8 == 0) return 0;
+        return PriceLib.counterValueUsd18(amountRaw, config.counterDecimals, answerUsd8);
+    }
+
+    /// @notice The USD value of an amount of AMPS at the vault's checkpointed reference price.
+    /// @dev Shared with {VaultRolloutLib}. Zero when there is no reference yet, which is the safe direction: an
+    ///      unpriceable job is worth nothing to the pot rather than worth guessing at.
+    /// @param amountAmps AMPS wei.
+    /// @return usd18 The value in 18-decimal USD.
+    function ampsValueUsd18(uint256 amountAmps) public view returns (uint256 usd18) {
+        if (amountAmps == 0) return 0;
+        uint256 pRefX18 = _word(SLOT_CHECKPOINT0) >> 128;
+        if (pRefX18 == 0) return 0;
+        return FullMath.mulDiv(amountAmps, pRefX18, Constants.WAD);
+    }
+
+    /// @dev The last accepted answer for `token` from an explicit feed registry, 8 decimals, or zero.
+    function _answerAt(address feeds, address token) private view returns (uint256 answerUsd8) {
+        if (feeds == address(0) || token == address(0)) return 0;
+        try IFeedRegistry(feeds).latestAnswer(token) returns (uint256 value, uint32, bool) {
+            return value;
+        } catch {
+            return 0;
+        }
     }
 
     /// @dev The bucket weights. The *shape* is the pointer-upgradeable policy's to choose; the *bounds* are the

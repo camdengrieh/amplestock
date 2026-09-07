@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
+import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {IPositionValuer} from "../interfaces/IPositionValuer.sol";
 import {LadderLib} from "../lib/LadderLib.sol";
 import {PoolStateLib} from "../lib/PoolStateLib.sol";
+import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
 import {ZeroAddress} from "../types/Errors.sol";
 import {PoolConfig} from "../types/Types.sol";
@@ -98,6 +101,66 @@ contract LadderPositionValuer is IPositionValuer {
     ///      **I7** true, because a flash move of the pool changes no input to this function.
     function valuePool(PoolId poolId, uint160 sqrtPriceRefX96)
         external
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        return _valuePool(poolId, sqrtPriceRefX96);
+    }
+
+    /// @notice What the vault's ladder in one pool is worth **in tokens**, decomposed at the protocol's own
+    ///         reference price: AMPS on the ask side, counter asset on the bid side.
+    ///
+    /// @dev **This is the per-pool POL depth, published from the chain.** `IAmpsVault.ladderAt` reports the amount
+    ///      a cell was placed *with*, not what it holds now, and {valuePool} needs a caller who already knows
+    ///      `sqrtPrice(P_ref / P_counter)`. A front end that wants "how deep are the bids in this pool" had to
+    ///      either re-derive that price itself or take the number from an indexer. It reads it here instead.
+    ///
+    /// @dev **Same decomposition, same rounding, same price as `A`.** It resolves the reference exactly as
+    ///      `VaultNavLib` does — the vault's checkpointed `pRefX18` and the counter's last accepted answer from
+    ///      the vault's own feed registry — so `counter` is, to the wei, the term `A` credits this pool with, and
+    ///      `amps` is the inventory term I5 values at zero. It is a disclosure read and nothing on-chain consumes
+    ///      it.
+    ///
+    /// @dev **Never reverts**, like the rest of this contract: an unregistered pool, a missing checkpoint, a feed
+    ///      that cannot answer and a price outside the v4 tick range all return `(0, 0)`.
+    /// @param poolId The pool.
+    /// @return amps AMPS wei held across the pool's grid cells at the reference price.
+    /// @return counter Counter asset held across them, in the counter's own raw units.
+    function amountsOf(PoolId poolId) external view returns (uint256 amps, uint256 counter) {
+        try this.referenceSqrtPriceX96(poolId) returns (uint160 sqrtPriceRefX96) {
+            if (sqrtPriceRefX96 == 0) return (0, 0);
+            return _valuePool(poolId, sqrtPriceRefX96);
+        } catch {
+            return (0, 0);
+        }
+    }
+
+    /// @notice `sqrtPrice(P_ref / P_counter)` for one pool: the price {valuePool} must be called at to reproduce
+    ///         the vault's own valuation of that pool (I7).
+    /// @dev External rather than internal so {amountsOf} can `try` it — `PriceLib` reverts `PriceOutOfTickRange`
+    ///      for a price outside the v4 domain, and a valuer that reverts is a valuer that can freeze a front end.
+    ///      Returns 0, rather than reverting, whenever an input is simply absent.
+    /// @param poolId The pool.
+    /// @return sqrtPriceX96 The reference-implied sqrt price, or 0 when there is no usable reference.
+    function referenceSqrtPriceX96(PoolId poolId) external view returns (uint160 sqrtPriceX96) {
+        PoolConfig memory config = registry.poolConfig(poolId);
+        if (!config.registered || config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) return 0;
+
+        uint256 pRefX18 = IAmpsVault(vault).pRefX18();
+        address feeds = IAmpsVault(vault).feedRegistry();
+        if (pRefX18 == 0 || feeds == address(0)) return 0;
+
+        (uint256 answerUsd8,,) = IFeedRegistry(feeds).latestAnswer(config.counter);
+        if (answerUsd8 == 0) return 0;
+        if (pRefX18 > type(uint256).max / (10 ** uint256(config.counterDecimals))) return 0;
+        if (answerUsd8 > type(uint256).max / 1e28) return 0;
+
+        return PriceLib.ampsPerCounterToSqrtPriceX96(pRefX18, answerUsd8, config.counterDecimals);
+    }
+
+    /// @dev {valuePool}'s body, reachable without an external call.
+    function _valuePool(PoolId poolId, uint160 sqrtPriceRefX96)
+        private
         view
         returns (uint256 amount0, uint256 amount1)
     {

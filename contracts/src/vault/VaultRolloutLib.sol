@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {IBountyPot} from "../interfaces/IBountyPot.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
@@ -61,8 +60,6 @@ library VaultRolloutLib {
     uint256 private constant SLOT_PARAMS = 2;
     /// @dev slot 4, the pool registry.
     uint256 private constant SLOT_REGISTRY = 4;
-    /// @dev slot 7, the keeper bounty pot.
-    uint256 private constant SLOT_BOUNTY_POT = 7;
     /// @dev slot 9, the oracle gate.
     uint256 private constant SLOT_ORACLE_GATE = 9;
     /// @dev slot 10, the feed registry.
@@ -74,12 +71,12 @@ library VaultRolloutLib {
     /// @dev slot 20, `deployThresholdUsd18`.
     uint256 private constant SLOT_DEPLOY_THRESHOLD = 20;
 
-    /// @dev The flat keeper work value and gas allowance, matching {VaultPlacementLib}'s. See that file for why
-    ///      both are flat in v1 and what makes the pot's 3x gas cap live again in Phase 4.
-    uint256 private constant WORK_VALUE_USD18 = 1e18;
+    // -------------------------------------------------------------------------------------------------------------
+    // Events — mirrors of {IAmpsVault}'s, emitted from the vault's own address by the `DELEGATECALL`
+    // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev The flat gas allowance reported with it.
-    uint256 private constant GAS_ALLOWANCE_USD18 = 1e18;
+    /// @dev Mirrors `IAmpsVault.Rollout`.
+    event Rollout(uint16 indexed constituentId, PoolId indexed poolId, uint256 movedAmps, uint256 placedAmps);
 
     // -------------------------------------------------------------------------------------------------------------
     // Entry points
@@ -92,13 +89,15 @@ library VaultRolloutLib {
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param amps The AMPS token.
     /// @param constituentId The destination constituent.
+    /// @param gasStart `gasleft()` as `AmpsVault.rollout` was entered, for the measured gas allowance.
     /// @return moved AMPS wei actually moved.
     function rollout(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         mapping(PoolId => uint32) storage cooldown,
         address poolManager,
         address amps,
-        uint16 constituentId
+        uint16 constituentId,
+        uint256 gasStart
     ) public returns (uint256 moved) {
         address registry = _addr(SLOT_REGISTRY);
         address policy = _addr(SLOT_ROLLOUT_POLICY);
@@ -134,20 +133,16 @@ library VaultRolloutLib {
 
         // The bountied paths merge into cells that already exist and leave the remainder idle rather than
         // revert when the live-cell budget is full (§12 ruling E), which is what `strictBudget == false` says.
-        VaultPlacementLib.place(
-            ladder,
-            cooldown,
-            poolManager,
-            amps,
-            IPoolRegistry(registry).poolIdOf(constituentId),
-            true,
-            moved,
-            bytes32("rollout"),
-            false
-        );
+        PoolId destination = IPoolRegistry(registry).poolIdOf(constituentId);
+        uint256 placed =
+            VaultPlacementLib.place(ladder, cooldown, poolManager, amps, destination, true, moved, "rollout", false);
 
         _addRolloutMoved(moved);
-        _payBounty();
+        emit Rollout(constituentId, destination, moved, placed);
+
+        // The work value is the inventory this call actually moved, at the reference price (§12.4). A schedule
+        // that proposes nothing returns above, having paid nothing.
+        VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(moved), gasStart);
     }
 
     /// @notice `deployBonded(constituentId)`: places idle bonded collateral as the spoke's bid ladder, four
@@ -158,13 +153,15 @@ library VaultRolloutLib {
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param amps The AMPS token.
     /// @param constituentId The constituent.
+    /// @param gasStart `gasleft()` as `AmpsVault.deployBonded` was entered, for the measured gas allowance.
     /// @return placed The raw collateral amount committed.
     function deployBonded(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         mapping(PoolId => uint32) storage cooldown,
         address poolManager,
         address amps,
-        uint16 constituentId
+        uint16 constituentId,
+        uint256 gasStart
     ) public returns (uint256 placed) {
         address registry = _addr(SLOT_REGISTRY);
         if (registry == address(0)) return 0;
@@ -178,9 +175,8 @@ library VaultRolloutLib {
 
         uint256 answerUsd8 = _answer(constituent.token);
         if (answerUsd8 == 0 || constituent.decimals > PriceLib.MAX_COUNTER_DECIMALS) return 0;
-        if (PriceLib.counterValueUsd18(idle, constituent.decimals, answerUsd8) < _word(SLOT_DEPLOY_THRESHOLD)) {
-            return 0;
-        }
+        uint256 idleUsd18 = PriceLib.counterValueUsd18(idle, constituent.decimals, answerUsd8);
+        if (idleUsd18 < _word(SLOT_DEPLOY_THRESHOLD)) return 0;
 
         placed = VaultPlacementLib.place(
             ladder,
@@ -193,7 +189,12 @@ library VaultRolloutLib {
             bytes32("bonded"),
             false
         );
-        _payBounty();
+
+        // The work value is the collateral actually placed, at the same feed price the deploy threshold was
+        // tested against, so the guard and the bounty can never disagree about what the job was worth (§12.4).
+        VaultPlacementLib.payBounty(
+            placed == idle ? idleUsd18 : PriceLib.counterValueUsd18(placed, constituent.decimals, answerUsd8), gasStart
+        );
     }
 
     /// @notice `withdrawRetiredBids(constituentId)`: moves a retired spoke's remaining bid inventory out of its
@@ -458,13 +459,6 @@ library VaultRolloutLib {
         } catch {
             return 0;
         }
-    }
-
-    /// @dev The flat keeper bounty. A pot that is empty, capped out or broken pays nothing and does not revert.
-    function _payBounty() private {
-        address pot = _addr(SLOT_BOUNTY_POT);
-        if (pot == address(0)) return;
-        try IBountyPot(pot).pay(msg.sender, WORK_VALUE_USD18, GAS_ALLOWANCE_USD18) returns (uint256) {} catch {}
     }
 
     /// @dev One raw word of the vault's storage.

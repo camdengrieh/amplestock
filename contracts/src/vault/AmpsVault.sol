@@ -600,6 +600,11 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    function lastPlacementAt(PoolId poolId) external view returns (uint32 timestamp) {
+        return _lastPlacementAt[poolId];
+    }
+
+    /// @inheritdoc IAmpsVault
     /// @dev `docs/phase3-state-model.md` §12 ruling E. The count lives at a hashed slot in {VaultRedeemLib} and is
     ///      maintained by all four libraries on every open, merge, unwind and removal; it is what bounds the gas
     ///      of {redeemProRata}, which is the one path that must never be gated to make it fit.
@@ -768,6 +773,11 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
         // Effects before interactions: the redeemer's shares are gone before a single asset moves.
         IAmps(_AMPS).burn(msg.sender, shares);
+        // The redeemer's own shares, as a `Burn` in its own right. `Redeem.shares` already carried the number, but
+        // without this line "sum the `Burn` events" was not the supply reduction and a reader had to know it
+        // (`docs/indexer.md` §8, gap 6). Nothing here reads a gate, a price or a pointer, so I14's exemption and
+        // its storage-access proof stand: a log is not a read.
+        emit Burn(shares, bytes32("redeem"));
 
         // Phase 3: remove exactly `floor(L x shares / T)` from every record in every pool the vault has opened
         // (I23, §3.10). The counter principal lands in claims, the AMPS principal as an idle balance to burn, and
@@ -880,7 +890,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (amount == 0) revert ZeroAmount();
 
         IAmps(_AMPS).mint(to, amount);
-        emit VestingMinted(to, amount);
+        emit VestingMinted(to, amount, bytes32("bond"));
         _sweepClean();
     }
 
@@ -972,18 +982,21 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     /// @dev Permissionless and bountied. See {VaultPlacementLib-compound} for the step-by-step of §3.6.
     function compound(PoolId poolId) external locked returns (uint256 ampsFees, uint256 burned) {
+        uint256 gasStart = gasleft();
         _requireHealthy();
         uint256 navBefore = _previewNav();
-        (ampsFees, burned) = VaultPlacementLib.compound(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId);
+        (ampsFees, burned) =
+            VaultPlacementLib.compound(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, gasStart);
         _afterPlacement(navBefore);
     }
 
     /// @inheritdoc IAmpsVault
     /// @dev Permissionless and bountied. `amountAmps == 0` from the schedule is a no-op, not a revert.
     function rollout(uint16 constituentId) external locked returns (uint256 moved) {
+        uint256 gasStart = gasleft();
         _requireHealthy();
         uint256 navBefore = _previewNav();
-        moved = VaultRolloutLib.rollout(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
+        moved = VaultRolloutLib.rollout(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
     }
 
@@ -991,9 +1004,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev Permissionless and bountied, and a no-op below `deployThresholdUsd18` of idle collateral so it cannot
     ///      be used to drain the bounty pot a wei at a time (§10 ruling 15).
     function deployBonded(uint16 constituentId) external locked returns (uint256 placed) {
+        uint256 gasStart = gasleft();
         _requireHealthy();
         uint256 navBefore = _previewNav();
-        placed = VaultRolloutLib.deployBonded(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
+        placed = VaultRolloutLib.deployBonded(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
     }
 

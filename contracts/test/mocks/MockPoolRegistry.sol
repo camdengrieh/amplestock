@@ -101,7 +101,15 @@ contract MockPoolRegistry is IPoolRegistry {
         _pools[poolId] = config;
         _constituentOfPool[poolId] = config.constituentId;
         if (config.constituentId != 0) _poolIdOf[config.constituentId] = poolId;
-        emit PoolRegistered(poolId, config.counter, config.poolClass, config.constituentId);
+        emit PoolRegistered(
+            poolId,
+            config.counter,
+            config.poolClass,
+            config.constituentId,
+            config.tickSpacing,
+            config.counterDecimals,
+            config.buyFeeBps
+        );
     }
 
     /// @notice Stores the `PoolKey` a registered pool reports.

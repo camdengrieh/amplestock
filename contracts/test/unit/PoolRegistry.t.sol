@@ -276,7 +276,9 @@ contract PoolRegistryTest is PoolRegistryFixture {
         PoolId hubId = hubKey.toId();
 
         vm.expectEmit(true, true, true, true, address(registry));
-        emit IPoolRegistry.PoolRegistered(hubId, address(usdg), PoolClass.ENTRY, 0);
+        emit IPoolRegistry.PoolRegistered(
+            hubId, address(usdg), PoolClass.ENTRY, 0, hubKey.tickSpacing, 6, Constants.BUY_FEE_BPS_ENTRY_DEFAULT
+        );
 
         vm.prank(TIMELOCK);
         registry.registerEntryPool(hubKey, 6, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, address(usdgFeed));
@@ -494,7 +496,15 @@ contract PoolRegistryTest is PoolRegistryFixture {
         PoolId expectedId = _spokeKey(address(stocks[19])).toId();
 
         vm.expectEmit(true, true, true, true, address(registry));
-        emit IPoolRegistry.PoolRegistered(expectedId, address(stocks[19]), PoolClass.SPOKE_HIGH_VOL, 1);
+        emit IPoolRegistry.PoolRegistered(
+            expectedId,
+            address(stocks[19]),
+            PoolClass.SPOKE_HIGH_VOL,
+            1,
+            _spokeKey(address(stocks[19])).tickSpacing,
+            18,
+            params.buyFeeBps
+        );
         vm.expectEmit(true, true, true, true, address(registry));
         emit IPoolRegistry.ConstituentAdded(1, address(stocks[19]), expectedId, params.targetWeightBps);
 

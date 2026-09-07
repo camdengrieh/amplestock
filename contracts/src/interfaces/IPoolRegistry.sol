@@ -129,11 +129,27 @@ interface IPoolRegistry {
     event ConstituentFrozen(uint16 indexed constituentId, uint32 until);
 
     /// @notice Emitted when a pool is registered, entry pools included.
+    /// @dev The three geometry fields are appended (`docs/phase3-state-model.md` §12.4). They complete the pool's
+    ///      `PoolConfig` in the log with one exception, `gridBaseTick`, which does not exist yet when this fires:
+    ///      the record has to be written *before* the vault opens the pool, because `AmpsHook.beforeInitialize`
+    ///      reads it back mid-initialisation. The grid origin is carried by `PoolRegistry.PoolGridSet`, emitted a
+    ///      few lines later in the same transaction, so the pair is log-complete.
     /// @param poolId The pool.
     /// @param counter The pool's `currency1`.
     /// @param poolClass The fee bucket.
     /// @param constituentId The constituent id, or 0 for an entry pool.
-    event PoolRegistered(PoolId indexed poolId, address indexed counter, PoolClass poolClass, uint16 constituentId);
+    /// @param tickSpacing The pool's tick spacing.
+    /// @param counterDecimals ERC-20 decimals of `counter`.
+    /// @param buyFeeBps The pool's base buy fee.
+    event PoolRegistered(
+        PoolId indexed poolId,
+        address indexed counter,
+        PoolClass poolClass,
+        uint16 constituentId,
+        int24 tickSpacing,
+        uint8 counterDecimals,
+        uint16 buyFeeBps
+    );
 
     /// @notice Emitted when the index weight vector is replaced wholesale by the quarterly rule.
     /// @param ids The constituents re-weighted.

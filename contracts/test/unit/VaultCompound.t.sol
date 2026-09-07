@@ -2,11 +2,13 @@
 pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
+import {IBountyPot} from "../../src/interfaces/IBountyPot.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @title VaultCompoundTest
 /// @notice `docs/phase3-state-model.md` §8.1's row for this file: the creator -> staker -> burn -> re-ladder split
@@ -333,12 +335,149 @@ contract VaultCompoundTest is PlacementFixture {
     // The keeper bounty
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice `compound` is permissionless and pays the caller a flat bounty out of the segregated pot.
+    /// @notice `compound` is permissionless and pays the caller a bounty sized to the work it **measured**
+    ///         (§12.4 ruling W), inside every one of the pot's four caps.
     function test_theKeeperIsPaidFromTheBountyPot() public {
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
         uint256 before = usdg.balanceOf(KEEPER);
+        vm.recordLogs();
         vm.prank(KEEPER);
         vault.compound(hubPool);
-        assertGt(usdg.balanceOf(KEEPER), before, "the keeper was paid");
+
+        (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw, bytes32 reason) = _lastBountyPaid();
+        assertGt(workValueUsd18, 0, "the job reported the work it actually did");
+        assertGe(workValueUsd18, pot.chostUsd18(), "and it cleared the dust guard");
+        assertGt(paidRaw, 0, "so the keeper was paid");
+        assertEq(usdg.balanceOf(KEEPER) - before, paidRaw, "exactly what the pot reported");
+
+        // Never more than tip + chip on the measured work, whichever cap bound. `BountyPot` reports
+        // `bytes32(0)` whenever anything at all was payable, so a named reason here would mean a *refusal*.
+        uint256 gross = pot.tipUsd18() + (workValueUsd18 * pot.chipBps()) / Constants.BPS;
+        assertLe(paidUsd18, gross, "tip + chip is the ceiling before the caps");
+        assertEq(reason, bytes32(0), "a payment, not a refusal");
+        assertSweepClean("bounty");
+    }
+
+    /// @notice **The finding this closes.** A `compound()` on a pool with no accrued fees and no crossed cell is
+    ///         worth nothing, so it earns nothing: the pot's `chost` dust guard fires, which it structurally could
+    ///         not while the libraries reported a flat `$1` (`docs/keeper-runbook.md` §3.1).
+    function test_anEmptyCompoundEarnsNothingBecauseChostFires() public {
+        uint256 before = usdg.balanceOf(KEEPER);
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+        assertEq(ampsFees, 0, "nothing traded, so no fee accrued");
+        assertEq(burned, 0, "and nothing was bought back");
+
+        (uint256 workValueUsd18,, uint256 paidRaw, bytes32 reason) = _lastBountyPaid();
+        assertEq(workValueUsd18, 0, "the job measured zero work");
+        assertEq(reason, bytes32("chost"), "the dust guard is what refused");
+        assertEq(paidRaw, 0, "and nothing was paid");
+        assertEq(usdg.balanceOf(KEEPER), before, "the keeper's balance is untouched");
+    }
+
+    /// @notice A spam campaign of empty `compound()`s across the cooldown pays exactly zero, however many are
+    ///         submitted: the guard is on the work, not on the caller.
+    function test_aSpamCampaignOfEmptyCompoundsDrainsNothing() public {
+        uint256 potBefore = pot.balance();
+        for (uint256 i; i < 8; ++i) {
+            vm.prank(KEEPER);
+            vault.compound(hubPool);
+            warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        }
+        assertEq(pot.balance(), potBefore, "the pot is exactly where it started");
+        assertEq(usdg.balanceOf(KEEPER), 0, "and the spammer earned nothing");
+    }
+
+    /// @notice The 3x gas cap is live: with the chip governed to its band ceiling the gross outruns three times
+    ///         the measured gas cost, and the cap — not the tip, not the ceiling, not the balance — is what sets
+    ///         the payment. It could not bind at all while the libraries reported a flat `$1` of gas
+    ///         (`docs/keeper-runbook.md` §3.2), because `3 x $1` sat far above anything a job could earn.
+    function test_theGasCapBindsOnceTheChipOutrunsIt() public {
+        vm.prank(TIMELOCK);
+        pot.setChipBps(Constants.CHIP_BPS_MAX);
+
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+
+        (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw,) = _lastBountyPaid();
+        uint256 gross = pot.tipUsd18() + (workValueUsd18 * Constants.CHIP_BPS_MAX) / Constants.BPS;
+        assertGt(paidUsd18, 0, "it paid");
+        assertLt(paidUsd18, gross, "and paid strictly less than tip + chip, so a cap bound");
+
+        // Which cap: not the ceiling (the window still has room) and not the balance (the pot holds far more),
+        // so it is the gas cap by elimination.
+        assertLt(paidUsd18, Constants.DAILY_CEILING_USD18_DEFAULT, "the ceiling was not reached");
+        assertGt(pot.balance() + paidRaw, paidRaw * 100, "the pot was nowhere near empty");
+
+        // `gasCap == 3 x gasCostUsd18`, so the implied gas bill is a third of the payment: cents, not the flat
+        // $0.07 the old constants produced whatever the job actually cost.
+        uint256 impliedGasUsd18 = paidUsd18 / Constants.KEEPER_GAS_CAP_MULTIPLE;
+        assertGt(impliedGasUsd18, 0.005e18, "a compound costs more than half a cent at the floor basefee");
+        assertLt(impliedGasUsd18, 0.15e18, "and no more than 6M gas of it -- see the EIP-150 test below");
+    }
+
+    /// @notice The gas allowance measures the **job**, not the caller's gas limit.
+    /// @dev EIP-150 forwards at most 63/64 of the caller's remaining gas to every message call, so a naive
+    ///      `gasStart - gasleft()` across the vault's delegatecall into the placement library charges the job for
+    ///      1/64 of the transaction's gas limit as well as for the gas it spent — 16.8M under Foundry's 2^30
+    ///      default, and on chain a lever a keeper could pull to inflate the pot's own 3x ceiling by sending the
+    ///      job with a large limit. This reconstructs the gas figure the pot was handed, out of the payment the
+    ///      cap produced, and holds it against what the call really burned.
+    function test_theGasAllowanceMeasuresTheJobNotTheCallersGasLimit() public {
+        // Chip at its band ceiling, so the gas cap — and therefore the gas figure — is what sets the payment.
+        vm.prank(TIMELOCK);
+        pot.setChipBps(Constants.CHIP_BPS_MAX);
+
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        vm.recordLogs();
+        uint256 before = gasleft();
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+        uint256 spent = before - gasleft();
+
+        (, uint256 paidUsd18,,) = _lastBountyPaid();
+
+        // `paid == gasCapMultiple x gasUsed x basefee x ethUsd`, and Foundry's `block.basefee` is zero, so the
+        // basefee in force is the floor. Invert it to recover exactly what the vault told the pot.
+        uint256 usdPerGas = (Constants.KEEPER_BASEFEE_FLOOR_WEI * WETH_USD8) / 1e8;
+        uint256 reportedGas = paidUsd18 / Constants.KEEPER_GAS_CAP_MULTIPLE / usdPerGas;
+
+        assertLe(reportedGas, spent + Constants.KEEPER_GAS_OVERHEAD, "never more gas than the call actually burned");
+        assertGe(reportedGas, spent / 2, "and not a token figure either");
+        assertLt(reportedGas, Constants.KEEPER_GAS_MAX, "well inside the hard ceiling");
+    }
+
+    /// @notice The rolling daily ceiling still binds ahead of the pot's balance.
+    function test_theDailyCeilingBindsAheadOfTheBalance() public {
+        vm.prank(TIMELOCK);
+        pot.setDailyCeilingUsd18(0.02e18);
+
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+
+        (,, uint256 paidRaw,) = _lastBountyPaid();
+        assertEq(paidRaw, 0.02e18 / 1e12, "it paid exactly the budget that was left");
+        assertEq(pot.spentLast24h(), 0.02e18, "which is the whole window");
+        assertEq(pot.budgetLeftUsd18(), 0, "and the ceiling is now exhausted");
+
+        // The next job in the same window is refused by name, which is how a refusal reaches the keeper.
+        (uint256 payable_, bytes32 reason) = pot.quote(100e18, 10e18);
+        assertEq(payable_, 0, "nothing left to pay");
+        assertEq(reason, bytes32("dailyCeiling"), "and the ceiling is what says so");
     }
 
     /// @notice A depleted pot degrades the job to unpaid rather than reverting it (I21).
@@ -366,6 +505,21 @@ contract VaultCompoundTest is PlacementFixture {
     // -------------------------------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev The last `BountyPaid` in the recorded logs. `vm.recordLogs()` must have been armed before the call.
+    function _lastBountyPaid()
+        private
+        returns (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw, bytes32 reason)
+    {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = IBountyPot.BountyPaid.selector;
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(pot) || entry.topics.length == 0 || entry.topics[0] != topic) continue;
+            return abi.decode(entry.data, (uint256, uint256, uint256, bytes32));
+        }
+        revert("no BountyPaid");
+    }
 
     /// @dev A buy and then a sell, so the hub has collected fees on both sides: 30 bp of USDG on the way in and
     ///      500 bp of AMPS on the way out.

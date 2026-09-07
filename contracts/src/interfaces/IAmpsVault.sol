@@ -108,9 +108,15 @@ interface IAmpsVault {
     event BondedDeposit(address indexed collateral, address indexed from, uint256 amount, uint16 constituentId);
 
     /// @notice Emitted when `AmpsBonds` mints vesting AMPS.
+    /// @dev **`reason` is what tells a bond's mint from the team's vest.** The mint a bond causes and the `Bond`
+    ///      that caused it are the same AMPS and must not both be added to supply; the team's 5% is minted inside
+    ///      {genesis} and reported by `Genesis`, never here. `bytes32("bond")` is the only value the immutable
+    ///      bytecode can emit — {mintVesting} is `onlyBonds` (I10) — and it is a field rather than an inference so
+    ///      that a reader never has to cross-reference two logs to know which of the two it is looking at.
     /// @param to Always the `AmpsBonds` address.
     /// @param amount The AMPS wei minted.
-    event VestingMinted(address indexed to, uint256 amount);
+    /// @param reason Why the mint happened. `bytes32("bond")`.
+    event VestingMinted(address indexed to, uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every AMPS burn the vault performs, whatever the cause.
     /// @param amount The AMPS wei burned.
@@ -119,12 +125,40 @@ interface IAmpsVault {
     event Burn(uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every ladder placement. **Phase 3.**
+    /// @dev `reason` and the cell range are appended fields (§12.4). Before them a reader had to classify a
+    ///      placement from the transaction's four-byte selector, which is exact for a direct call and a heuristic
+    ///      for one routed through a multicall or a Safe, and had to rebuild the range from the vault's own
+    ///      `ModifyLiquidity` logs. Both are now in the log itself.
     /// @param poolId The pool.
     /// @param above True for an ask ladder, false for a bid ladder.
     /// @param buckets The bucket count placed.
     /// @param amount The token amount committed.
     /// @param anchorTick The anchor the ladder was measured from.
-    event Placement(PoolId indexed poolId, bool above, uint8 buckets, uint256 amount, int24 anchorTick);
+    /// @param reason Why the placement happened: `bytes32("place")` (governance, genesis included),
+    ///        `bytes32("spokeSeed")`, `bytes32("compound")`, `bytes32("rollout")`, `bytes32("bonded")` or
+    ///        `bytes32("migrate")`.
+    /// @param lowerTick The lowest tick written by this placement, `0` when nothing was written.
+    /// @param upperTick The highest tick written by this placement, `0` when nothing was written.
+    event Placement(
+        PoolId indexed poolId,
+        bool above,
+        uint8 buckets,
+        uint256 amount,
+        int24 anchorTick,
+        bytes32 reason,
+        int24 lowerTick,
+        int24 upperTick
+    );
+
+    /// @notice Emitted on every `rollout()` that moves inventory. **Phase 3.**
+    /// @dev The counterpart of `Placement` on the source side: without it a reader had to reconstruct a rollout
+    ///      from the destination's `Placement` plus the entry pools' negative `ModifyLiquidity` in the same
+    ///      transaction (§12.4).
+    /// @param constituentId The destination constituent.
+    /// @param poolId The destination spoke.
+    /// @param movedAmps AMPS wei harvested out of the entry pools' unfilled asks.
+    /// @param placedAmps AMPS wei the destination ladder actually committed; the remainder stays idle.
+    event Rollout(uint16 indexed constituentId, PoolId indexed poolId, uint256 movedAmps, uint256 placedAmps);
 
     /// @notice Emitted on every `compound()`. **Phase 3.**
     /// @param poolId The pool.
@@ -370,6 +404,15 @@ interface IAmpsVault {
     ///      the placement path on every open, merge, unwind and removal.
     /// @return count The live cell count.
     function liveCells() external view returns (uint32 count);
+
+    /// @notice When the vault last placed into a pool, which is what the 60-second per-pool cooldown is measured
+    ///         from (§3.8 step 6).
+    /// @dev The keeper's screening step 5. Without it a caller had to approximate the stamp from the newest
+    ///      `placedAt` across the pool's `ladderAt` records — a lower bound, because a placement that merges into
+    ///      no cell (a no-op `compound`) stamps the cooldown and moves no record.
+    /// @param poolId The pool.
+    /// @return timestamp The stamp, or 0 if the vault has never placed into that pool.
+    function lastPlacementAt(PoolId poolId) external view returns (uint32 timestamp);
 
     /// @notice How many grid cells the vault currently holds a position in, for one pool.
     /// @dev Bounded by `Constants.GRID_CELLS` (24) by construction: placements merge into the cell they belong to

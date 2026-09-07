@@ -238,9 +238,9 @@ contract OracleGateHookStateTest is OracleGateFixture {
     ///         short answer, a burnt gas allowance, a returndata flood — leaves the arm down and the token probes
     ///         deciding, which is the fallback the ruling requires.
     /// @dev The proxy is filtered to `poolState` alone, so the rest of the gate's reads stay healthy and the
-    ///      assertion is about this read and nothing else. Filtering is not cosmetic: see
-    ///      {test_wholeReferenceMisbehaving_isBoundedToRevertsOnly} for what the *unfiltered* case still cannot
-    ///      survive, and the `// BUG:` note in `OracleGate._twapTick` for why.
+    ///      assertion is about this read and nothing else.
+    ///      {test_wholeReferenceMisbehaving_isBoundedToRevertsOnly} lifts the filter and asserts the same
+    ///      property for every read the gate makes.
     function test_fallback_poolStateMisbehaves() public {
         QuoterFaultProxy proxy = new QuoterFaultProxy(address(hookRef));
         proxy.setFaultySelector(IAmpsHook.poolState.selector);
@@ -268,24 +268,64 @@ contract OracleGateHookStateTest is OracleGateFixture {
         }
     }
 
-    /// @notice A market reference whose *every* read reverts or burns its gas is survived whole: the gate reports
-    ///         `WATCHDOG` for want of a reference and the token probes still close the constituent.
-    /// @dev The three modes here are the ones Phase 2's typed `try` reads can absorb. `EMPTY`, `SHORT` and
-    ///      `WORD_SOUP` on the *whole* reference make the pre-existing `twapWindow`/`twapTick` decode raise an
-    ///      uncatchable `Panic`; that is recorded as a `// BUG:` in `OracleGate._twapTick` and is not introduced,
-    ///      touched or fixed by ruling 10, whose own read unpacks by hand and survives all six.
+    /// @notice A market reference whose *every* read misbehaves is survived whole, in **all seven** failure
+    ///         modes: nothing on the gate's read surface reverts, the gate reports `WATCHDOG` for want of a
+    ///         reference, and the token probes still close the constituent.
+    /// @dev **This is the positive assertion the `// BUG:` note used to stand in for** (§12.4 ruling AA). Until
+    ///      the gate's typed `try` reads became bounded `staticcall`s unpacked by hand, `EMPTY`, `SHORT` and
+    ///      `WORD_SOUP` on the *whole* reference made the `twapWindow`/`twapTick` decode raise a `Panic` that
+    ///      `try`/`catch` cannot catch, so `snapshot`, `state`, `isBondAllowed`, `checkBond`,
+    ///      `isPlacementAllowed` and `dynCapBps` reverted instead of degrading — and the test could only assert
+    ///      the three revert-shaped modes. Every read is exercised here, in every mode.
+    ///
+    ///      `WORD_SOUP` is the one mode that does not end at `WATCHDOG`, and deliberately: 25 words of `0xff` are
+    ///      a `poolState` claiming an initialised pool with `caArmed` set, which is read as **armed** for exactly
+    ///      the reason {test_wordSoupIsReadAsArmed} gives — garbage fails closed for a freeze, and a freeze
+    ///      outranks the watchdog. Its `twapWindow` of `0xff…ff` is still refused as a window (it is far past
+    ///      `Constants.TWAP_WINDOW_MAX`), so the reference itself is still absent.
     function test_wholeReferenceMisbehaving_isBoundedToRevertsOnly() public {
         QuoterFaultProxy proxy = new QuoterFaultProxy(address(hookRef));
         vm.prank(TIMELOCK);
         gate.setMarketReference(address(proxy));
         hookRef.setGateFlags(spokePool, CA_ARMED);
 
-        QuoterFaultProxy.Mode[3] memory modes =
-            [QuoterFaultProxy.Mode.REVERT_EMPTY, QuoterFaultProxy.Mode.REVERT_REASON, QuoterFaultProxy.Mode.OUT_OF_GAS];
+        QuoterFaultProxy.Mode[7] memory modes = [
+            QuoterFaultProxy.Mode.REVERT_EMPTY,
+            QuoterFaultProxy.Mode.REVERT_REASON,
+            QuoterFaultProxy.Mode.EMPTY,
+            QuoterFaultProxy.Mode.SHORT,
+            QuoterFaultProxy.Mode.OUT_OF_GAS,
+            QuoterFaultProxy.Mode.BOMB,
+            QuoterFaultProxy.Mode.WORD_SOUP
+        ];
         for (uint256 i = 0; i < modes.length; ++i) {
             proxy.setMode(modes[i]);
-            assertFalse(gate.snapshot(constituentId).corporateFreeze, "no arm");
-            assertEq(uint8(gate.state(constituentId)), uint8(GateState.WATCHDOG), "no reference at all");
+            bool soup = modes[i] == QuoterFaultProxy.Mode.WORD_SOUP;
+
+            // Every read answers. That is the whole point: a mis-pointed reference degrades, it does not revert.
+            GateSnapshot memory gateSnapshot = gate.snapshot(constituentId);
+            (bool bondAllowed,) = gate.isBondAllowed(constituentId);
+            (bool placementAllowed,) = gate.isPlacementAllowed(spokePool);
+            gate.dynCapBps(spokePool);
+            gate.snapshotByPool(spokePool);
+            gate.stateByPool(spokePool);
+
+            assertEq(gateSnapshot.corporateFreeze, soup, "only full-length garbage arms");
+            assertEq(
+                uint8(gate.state(constituentId)),
+                uint8(soup ? GateState.SCHEDULED_FREEZE : GateState.WATCHDOG),
+                "no reference at all"
+            );
+            assertFalse(placementAllowed, "and no placement in either case");
+
+            if (soup) {
+                assertFalse(bondAllowed, "a freeze closes the market");
+                vm.expectRevert();
+                gate.checkBond(constituentId);
+            } else {
+                assertTrue(bondAllowed, "the watchdog keeps bonds open at the session haircut");
+                gate.checkBond(constituentId);
+            }
 
             nvda.setOraclePaused(true);
             assertEq(uint8(gate.state(constituentId)), uint8(GateState.SCHEDULED_FREEZE), "the token probe decides");

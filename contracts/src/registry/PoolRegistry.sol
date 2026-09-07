@@ -97,6 +97,17 @@ contract PoolRegistry is IPoolRegistry {
     /// @param sqrtPriceX96 The price the pool was opened at.
     event PoolOpened(PoolId indexed poolId, address indexed feed, uint160 sqrtPriceX96);
 
+    /// @notice Emitted with {PoolOpened} once the pool's canonical doubling-grid origin has been mirrored from
+    ///         the hook. The last piece of `PoolConfig` that is not in a log.
+    /// @dev **A separate event and not a field on `PoolRegistered`**, because the origin does not exist yet when
+    ///      that one fires: the pool record has to be written *before* the vault opens the pool, since
+    ///      `AmpsHook.beforeInitialize` reads it back mid-initialisation. It is not a field on {PoolOpened}
+    ///      either, because `script/05_Registry.s.sol` filters that event by a hardcoded topic and an appended
+    ///      field would move it. Emitted only when there is a hook to mirror; a hookless deployment has no grid.
+    /// @param poolId The pool.
+    /// @param gridBaseTick The grid origin: the opening tick aligned upward to a whole tick spacing.
+    event PoolGridSet(PoolId indexed poolId, int24 gridBaseTick);
+
     /// @notice Emitted when the registry asks the vault to move a retired spoke's bids into idle claims.
     /// @param constituentId The retired constituent.
     /// @param moved The counter-asset amount the vault reports moved, in raw units.
@@ -735,7 +746,7 @@ contract PoolRegistry is IPoolRegistry {
         unchecked {
             _poolCount = _poolCount + 1;
         }
-        emit PoolRegistered(poolId, counter, class, constituentId);
+        emit PoolRegistered(poolId, counter, class, constituentId, key.tickSpacing, counterDecimals, buyFeeBps);
     }
 
     /// @dev Prices the pool at `P_ref / P_counter` and opens it through the vault — pool creation has to come
@@ -761,8 +772,12 @@ contract PoolRegistry is IPoolRegistry {
             PriceLib.ampsPerCounterToSqrtPriceX96(_referencePriceUsd18(), _feedAnswerUsd8(feed), counterDecimals);
         PoolId opened = IAmpsVault(_vault).initializePool(key, sqrtPriceX96);
         if (PoolId.unwrap(opened) != PoolId.unwrap(poolId)) revert InvalidPoolKey("poolIdMismatch");
+        int24 gridBase;
+        bool mirrored;
         if (_hook.code.length != 0) {
             try IAmpsHook(_hook).gridBaseTick(poolId) returns (int24 gridBaseTick) {
+                gridBase = gridBaseTick;
+                mirrored = true;
                 _pools[poolId].gridBaseTick = gridBaseTick;
             } catch {}
         }
@@ -772,6 +787,7 @@ contract PoolRegistry is IPoolRegistry {
         // be made (a mock vault, no PoolManager) falls back to the requested price.
         uint160 openedAt = _openedPrice(poolId);
         emit PoolOpened(poolId, feed, openedAt == 0 ? sqrtPriceX96 : openedAt);
+        if (mirrored) emit PoolGridSet(poolId, gridBase);
     }
 
     /// @dev `slot0.sqrtPriceX96` of a pool the vault has just opened, through one bounded `extsload` so that a vault

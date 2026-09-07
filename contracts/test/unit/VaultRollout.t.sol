@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
+import {IBountyPot} from "../../src/interfaces/IBountyPot.sol";
 import {IRolloutPolicy} from "../../src/interfaces/IRolloutPolicy.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
@@ -9,6 +11,7 @@ import {NotRegistry, RolloutLimitExceeded} from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @title VaultRolloutTest
 /// @notice `docs/phase3-state-model.md` §8.1's row for this file: `rolloutBpsPerDay` and `entryFloorBps` are
@@ -67,12 +70,55 @@ contract VaultRolloutTest is PlacementFixture {
         }
     }
 
-    /// @notice `rollout` is permissionless and pays the caller a bounty out of the segregated pot.
+    /// @notice `rollout` is permissionless and pays the caller a bounty sized to the inventory it **measured**
+    ///         itself moving, at the reference price (§12.4 ruling W).
     function test_rolloutIsPermissionlessAndBountied() public {
         uint256 before = usdg.balanceOf(KEEPER);
+        uint256 pRefBefore = vault.pRefX18();
+
+        vm.recordLogs();
         vm.prank(KEEPER);
-        assertGt(vault.rollout(constituentIds[0]), 0, "anyone may call it");
-        assertGt(usdg.balanceOf(KEEPER), before, "and it pays the caller");
+        uint256 moved = vault.rollout(constituentIds[0]);
+        assertGt(moved, 0, "anyone may call it");
+
+        (uint256 workValueUsd18,, uint256 paidRaw,) = _lastBountyPaid();
+        assertEq(workValueUsd18, (moved * pRefBefore) / 1e18, "the AMPS moved, valued at P_ref");
+        assertGt(paidRaw, 0, "and it pays the caller");
+        assertEq(usdg.balanceOf(KEEPER) - before, paidRaw, "exactly what the pot reported");
+    }
+
+    /// @notice The move is in the log: `Rollout` names the destination and both the harvested and the placed
+    ///         amounts, so an indexer no longer has to reconstruct it from a `Placement` plus the entry pools'
+    ///         negative `ModifyLiquidity` in the same transaction (§12.4 ruling Y).
+    function test_rolloutEmitsTheMove() public {
+        vm.recordLogs();
+        uint256 moved = vault.rollout(constituentIds[0]);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(vault) || logs[i].topics[0] != IAmpsVault.Rollout.selector) continue;
+            assertEq(uint256(logs[i].topics[1]), constituentIds[0], "the destination constituent");
+            assertEq(logs[i].topics[2], PoolId.unwrap(spokePools[0]), "and its pool");
+            (uint256 movedAmps, uint256 placedAmps) = abi.decode(logs[i].data, (uint256, uint256));
+            assertEq(movedAmps, moved, "the harvested amount");
+            assertGt(placedAmps, 0, "and what the destination ladder took");
+            assertLe(placedAmps, movedAmps, "never more than was moved");
+            seen = true;
+        }
+        assertTrue(seen, "Rollout was emitted");
+    }
+
+    /// @notice A rollout that moves nothing pays nothing: the schedule proposing zero returns before the pot is
+    ///         ever called, so an unpaid keeper call costs the caller gas and the protocol nothing.
+    function test_aRolloutThatMovesNothingPaysNothing() public {
+        uint256 potBefore = pot.balance();
+        vm.mockCallRevert(address(rolloutPolicy), abi.encodeWithSelector(rolloutPolicy.propose.selector), "down");
+
+        vm.prank(KEEPER);
+        assertEq(vault.rollout(constituentIds[0]), 0, "nothing moved");
+        assertEq(pot.balance(), potBefore, "and the pot is untouched");
+        assertEq(usdg.balanceOf(KEEPER), 0, "the caller earned nothing");
     }
 
     /// @notice A schedule that reverts proposes nothing, which is a no-op: an unpaid keeper call costs the caller
@@ -270,12 +316,37 @@ contract VaultRolloutTest is PlacementFixture {
         assertEq(vault.deployBonded(constituentIds[0]), 0, "below the threshold, nothing is deployed");
         assertEq(usdg.balanceOf(KEEPER), before, "and nothing is paid for it");
 
-        // Top the collateral up past $100 and the same call fires.
+        // Top the collateral up past $100 and the same call fires, reporting the collateral it placed at the
+        // same feed price the threshold was tested against (§12.4 ruling W).
         bondDeposit(address(stocks[0]), 1e18);
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        vm.recordLogs();
         vm.prank(KEEPER);
-        assertGt(vault.deployBonded(constituentIds[0]), 0, "above it, it fires");
-        assertGt(usdg.balanceOf(KEEPER), before, "and pays");
+        uint256 placed = vault.deployBonded(constituentIds[0]);
+        assertGt(placed, 0, "above it, it fires");
+
+        (uint256 workValueUsd18,, uint256 paidRaw,) = _lastBountyPaid();
+        assertEq(
+            workValueUsd18,
+            PriceLib.counterValueUsd18(placed, 18, STOCK_USD8[0]),
+            "the collateral placed, at its feed price"
+        );
+        assertGt(paidRaw, 0, "and pays");
+        assertEq(usdg.balanceOf(KEEPER) - before, paidRaw, "exactly what the pot reported");
+    }
+
+    /// @dev The last `BountyPaid` in the recorded logs. `vm.recordLogs()` must have been armed before the call.
+    function _lastBountyPaid()
+        private
+        returns (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw, bytes32 reason)
+    {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(pot) || entry.topics[0] != IBountyPot.BountyPaid.selector) continue;
+            return abi.decode(entry.data, (uint256, uint256, uint256, bytes32));
+        }
+        revert("no BountyPaid");
     }
 
     // -------------------------------------------------------------------------------------------------------------
