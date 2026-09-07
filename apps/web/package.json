@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Amplestocks dApp — Buy/Sell, Rotate, Bond, Redeem, Stake, Vault, Governance and /risk",
+  "description": "Amplestocks dApp — Landing, Auction, Buy/Sell, Rotate, Bond, Redeem, Vault, Governance, Docs and /risk",
   "type": "module",
   "scripts": {
     "dev": "next dev --port 3000",

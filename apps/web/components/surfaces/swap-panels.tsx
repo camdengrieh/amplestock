@@ -2,27 +2,18 @@
 'use client'
 
 import * as React from 'react'
+import {hexToString} from 'viem'
 
 import {DegradedNotice} from '@/components/common/degraded'
-import {FieldRow} from '@/components/common/stat'
 import {Value} from '@/components/common/value'
+import {Callout, DataRow, RowGroup} from '@/components/ledger/primitives'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
-import {Badge} from '@/components/ui/badge'
-import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
 import {NOTES} from '@/lib/copy'
+import {ampsFeeBpsOf, directFeePipsOf, pipsToBps, pipsToPercent, poolBaseFeeBpsOf} from '@/lib/fees'
 import {formatAmount, formatBps, formatPremiumX18, formatUsd18} from '@/lib/format'
-import {pipsToBps, pipsToPercent} from '@/lib/fees'
-import {gateStateName, quoteAvailability, sessionName, type PoolQuote} from '@/lib/quoter'
-import {hexToString} from 'viem'
 import {sessionLabels} from '@/lib/protocol'
+import {gateStateName, quoteAvailability, sessionName, type PoolQuote} from '@/lib/quoter'
 
-/**
- * The quote, exactly as the contracts describe it.
- *
- * Fee numbers come from `AmpsQuoter` and are exact. The output amount comes from `V4Quoter` and is
- * a curve simulation. When one is unavailable the other is still shown — that is what the degraded
- * bitfield is *for* — and neither is ever substituted for the other.
- */
 /** `bytes32("rail")` / `bytes32("uninitialized")` / `bytes32(0)` as a string. */
 function decodeReason(reason: `0x${string}`): string | null {
   if (/^0x0*$/.test(reason)) return null
@@ -33,6 +24,15 @@ function decodeReason(reason: `0x${string}`): string | null {
   }
 }
 
+/**
+ * The quote, in the design's shape: one `Quote` label, a 2px ink rule, and a run of `k / v / b` rows
+ * — a serif label, a dim gloss under it, and the figure in mono on the right. No panels, no boxes.
+ *
+ * The design shows nine rows and this shows eleven, because revision 6 splits the fee into the AMPS
+ * fee (charged both ways) and the pool base fee (pass-through only), and prints the hook's own band
+ * beside the first. Everything else is the design's row order: what you receive, what you sign for,
+ * the fee, the prices, the gate.
+ */
 export interface SwapQuoteViewProps {
   side: 'buy' | 'sell'
   quote: PoolQuote | undefined
@@ -48,6 +48,10 @@ export interface SwapQuoteViewProps {
   creditUsed?: bigint
   /** The base fee after the rotation blend, when a credit applies. */
   blendedBaseBps?: number
+  /** The hook-wide AMPS fee, when it has been read. Falls back to the quote's own field. */
+  liveAmpsFeeBps?: number
+  /** The band hardcoded in the hook, when it has been read. `null` means it has not. */
+  ampsFeeBand?: {min: number; max: number} | null
 }
 
 export function SwapQuoteView({
@@ -60,20 +64,24 @@ export function SwapQuoteView({
   amountOutSymbol,
   creditUsed,
   blendedBaseBps,
+  liveAmpsFeeBps,
+  ampsFeeBand,
 }: SwapQuoteViewProps) {
   if (!quote) {
     return (
-      <Card data-testid="swap-quote">
-        <CardHeader>
-          <CardTitle>Quote</CardTitle>
-        </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">Enter an amount to see the fee and the rail state.</CardContent>
-      </Card>
+      <div data-testid="swap-quote">
+        <p className="ledger-label mb-2">Quote</p>
+        <div className="border-t-2 border-ink pt-4 text-[15px] text-dim">
+          Enter an amount to see the fee and the rail state.
+        </div>
+      </div>
     )
   }
 
   const avail = quoteAvailability(quote.degraded)
-  const feePips = side === 'buy' ? quote.buyFeePips : quote.sellFeePips
+  const feePips = directFeePipsOf(quote, side)
+  const ampsFeeBps = liveAmpsFeeBps ?? ampsFeeBpsOf(quote)
+  const baseBps = poolBaseFeeBpsOf(quote)
   // `wouldRevert` is the hook's own verdict and carries a reason; the quote's refusal flags are the
   // same answer without one. Prefer the verdict when it is there, and never invent a refusal from a
   // degraded read — both sources fail open for display.
@@ -81,7 +89,7 @@ export function SwapQuoteView({
   const railReason = railVerdict ? decodeReason(railVerdict.reason) : null
 
   return (
-    <div className="space-y-4" data-testid="swap-quote">
+    <div className="space-y-7" data-testid="swap-quote">
       <DegradedNotice degraded={quote.degraded} />
       {refused && (avail.refusals || railVerdict) ? (
         <Alert variant="danger" data-testid="rail-warning">
@@ -99,98 +107,116 @@ export function SwapQuoteView({
           </AlertDescription>
         </Alert>
       ) : null}
-      <Card>
-        <CardHeader>
-          <CardTitle>Quote</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <FieldRow label="You receive" hint="From AmpsQuoter.quoteExactIn — a curve simulation at this instant, not a promise">
-            <Value unavailable={amountOut === undefined}>
-              {amountOut !== undefined ? `${formatAmount(amountOut, amountOutDecimals)} ${amountOutSymbol}` : null}
-            </Value>
-          </FieldRow>
-          <FieldRow label="Minimum received" hint="What the transaction signs for; below this it reverts and nothing moves">
-            <Value unavailable={amountOutMinimum === undefined}>
-              {amountOutMinimum !== undefined
-                ? `${formatAmount(amountOutMinimum, amountOutDecimals)} ${amountOutSymbol}`
-                : null}
-            </Value>
-          </FieldRow>
-          <FieldRow
-            label={side === 'buy' ? 'Buy fee' : 'Sell fee'}
-            hint={side === 'sell' ? NOTES.sellFee : 'Charged on the counter asset entering the pool'}
-          >
-            <Value unavailable={!avail.fees} reason="Hook read failed">
-              {avail.fees ? `${pipsToPercent(feePips)} (${formatBps(pipsToBps(feePips))} total)` : null}
-            </Value>
-          </FieldRow>
-          <FieldRow label="Base fee" hint={blendedBaseBps !== undefined ? 'After the rotation-credit blend' : 'Before the dynamic component'}>
-            <Value unavailable={!avail.fees}>
-              {avail.fees ? formatBps(blendedBaseBps ?? (side === 'buy' ? quote.buyFeeBps : quote.ampsFeeBps)) : null}
-            </Value>
-          </FieldRow>
-          <FieldRow label="Dynamic component" hint="Volatility, deviation, divergence, session and surge, capped by gate state">
-            <Value unavailable={!avail.fees}>{avail.fees ? `${formatBps(quote.dynBps)} of ${formatBps(quote.dynCapBps)} cap` : null}</Value>
-          </FieldRow>
-          {creditUsed !== undefined && creditUsed > 0n ? (
-            <FieldRow label="Rotation credit used" hint={NOTES.rotationCredit}>
-              <Value>{formatAmount(creditUsed, 18)} AMPS</Value>
-            </FieldRow>
-          ) : null}
-          <FieldRow label="Market price" hint="30-minute truncated TWAP, USD per AMPS">
-            <Value unavailable={!avail.marketPrice} reason="Not enough observation history yet">
-              {avail.marketPrice ? formatUsd18(quote.pMktX18, 4) : null}
-            </Value>
-          </FieldRow>
-          <FieldRow label="Reference price" hint="Never below NAV per share">
-            <Value unavailable={!avail.nav}>{avail.nav ? formatUsd18(quote.pRefX18, 4) : null}</Value>
-          </FieldRow>
-          <FieldRow label="NAV per share">
-            <Value unavailable={!avail.nav}>{avail.nav ? formatUsd18(quote.navPerShareX18, 4) : null}</Value>
-          </FieldRow>
-          <FieldRow label="Premium to NAV" hint={NOTES.premium}>
-            <Value unavailable={!avail.premium}>{avail.premium ? formatPremiumX18(quote.premiumX18) : null}</Value>
-          </FieldRow>
-          <FieldRow label="Gate" hint="Swaps are never refused for a gate reason; the fee floor rises instead">
-            <Value unavailable={!avail.gate}>
-              {avail.gate ? (
-                <span className="flex items-center gap-2">
-                  <Badge variant={quote.gateState === 0 ? 'success' : 'warning'}>{gateStateName(quote.gateState)}</Badge>
-                  <span className="text-muted-foreground">{sessionLabels[sessionName(quote.session) as keyof typeof sessionLabels] ?? '—'}</span>
-                </span>
-              ) : null}
-            </Value>
-          </FieldRow>
-        </CardContent>
-      </Card>
+
+      <RowGroup label="Quote" data-testid="fee-breakdown">
+        <DataRow
+          label="You receive"
+          note="From AmpsQuoter.quoteExactIn — a curve simulation at this instant, not a promise."
+        >
+          <Value unavailable={amountOut === undefined}>
+            {amountOut !== undefined ? `${formatAmount(amountOut, amountOutDecimals)} ${amountOutSymbol}` : null}
+          </Value>
+        </DataRow>
+        <DataRow
+          label="Minimum received"
+          note="What the transaction signs for. Below this it reverts and nothing moves."
+        >
+          <Value unavailable={amountOutMinimum === undefined}>
+            {amountOutMinimum !== undefined
+              ? `${formatAmount(amountOutMinimum, amountOutDecimals)} ${amountOutSymbol}`
+              : null}
+          </Value>
+        </DataRow>
+        <DataRow
+          label={side === 'buy' ? 'Total fee on this buy' : 'Total fee on this sell'}
+          note="What AmpsQuoter says the hook will charge, dynamic component included. This is the authority."
+        >
+          <Value unavailable={!avail.fees} reason="Hook read failed">
+            {avail.fees ? `${pipsToPercent(feePips)} (${formatBps(pipsToBps(feePips))} total)` : null}
+          </Value>
+        </DataRow>
+        <DataRow label="AMPS fee — both ways" note={NOTES.ampsFee}>
+          <Value unavailable={!avail.fees} reason="Hook read failed">
+            {avail.fees ? formatBps(ampsFeeBps) : null}
+          </Value>
+        </DataRow>
+        <DataRow label="Band hardcoded in the hook" note="Governance can move the fee inside this and no further.">
+          <Value unavailable={!ampsFeeBand} reason="The hook’s band could not be read">
+            {ampsFeeBand ? `${formatBps(ampsFeeBand.min)} – ${formatBps(ampsFeeBand.max)}` : null}
+          </Value>
+        </DataRow>
+        <DataRow label="Pool base fee — pass-through only" note={NOTES.poolBaseFee}>
+          <Value unavailable={!avail.fees}>{avail.fees ? formatBps(blendedBaseBps ?? baseBps) : null}</Value>
+        </DataRow>
+        <DataRow
+          label="Dynamic component"
+          note="Volatility, deviation, divergence, session and surge, capped by gate state."
+        >
+          <Value unavailable={!avail.fees}>
+            {avail.fees ? `${formatBps(quote.dynBps)} of ${formatBps(quote.dynCapBps)} cap` : null}
+          </Value>
+        </DataRow>
+        {creditUsed !== undefined && creditUsed > 0n ? (
+          <DataRow label="Rotation credit used" note={NOTES.rotationCredit}>
+            <Value>{formatAmount(creditUsed, 18)} AMPS</Value>
+          </DataRow>
+        ) : null}
+        <DataRow label="Market price" note="30-minute truncated TWAP, USD per AMPS.">
+          <Value unavailable={!avail.marketPrice} reason="Not enough observation history yet">
+            {avail.marketPrice ? formatUsd18(quote.pMktX18, 4) : null}
+          </Value>
+        </DataRow>
+        <DataRow label="Reference price" note="Rate-limited upward. Never below NAV per share.">
+          <Value unavailable={!avail.nav}>{avail.nav ? formatUsd18(quote.pRefX18, 4) : null}</Value>
+        </DataRow>
+        <DataRow label="NAV per share">
+          <Value unavailable={!avail.nav}>{avail.nav ? formatUsd18(quote.navPerShareX18, 4) : null}</Value>
+        </DataRow>
+        <DataRow label="Premium to NAV" note={NOTES.premium}>
+          <Value unavailable={!avail.premium}>{avail.premium ? formatPremiumX18(quote.premiumX18) : null}</Value>
+        </DataRow>
+        <DataRow label="Gate" note="Swaps are never refused for a gate reason; the fee floor rises instead.">
+          <Value unavailable={!avail.gate}>
+            {avail.gate
+              ? `${gateStateName(quote.gateState)} · ${
+                  sessionLabels[sessionName(quote.session) as keyof typeof sessionLabels] ?? '—'
+                }`
+              : null}
+          </Value>
+        </DataRow>
+      </RowGroup>
     </div>
   )
 }
 
-/** The rotation-credit rule, stated in the surface rather than buried in a tooltip. */
+/**
+ * The fee rule, in the design's left-rule callout: a 17px lead sentence and a 15px dim follow.
+ *
+ * The design's lead says the sell fee is charged on AMPS-in swaps. Revision 6 charges it in both
+ * directions, so the lead says that instead; the follow keeps the design's rotation-credit
+ * explanation and adds the sentence about why the protocol's own router is the only route.
+ */
 export function RotationCreditNote() {
   return (
-    <Alert variant="info" data-testid="rotation-credit-note">
-      <AlertTitle>How the sell fee works</AlertTitle>
-      <AlertDescription>
-        <p>{NOTES.sellFee}</p>
-        <p className="mt-2">{NOTES.rotationCredit}</p>
-      </AlertDescription>
-    </Alert>
+    <Callout
+      lead="The AMPS fee is charged on every swap that touches AMPS — buying it and selling it alike."
+      data-testid="rotation-credit-note"
+    >
+      <p>{NOTES.rotationCredit}</p>
+      <p>{NOTES.routerOnly}</p>
+    </Callout>
   )
 }
 
 /** Protocol-owned liquidity disclosure, per pool. */
-export function PolDepthNote({depth, symbol}: {depth?: bigint; symbol: string; }) {
+export function PolDepthNote({depth, symbol}: {depth?: bigint; symbol: string}) {
   return (
-    <Alert data-testid="pol-depth-note">
-      <AlertTitle>Bid depth in this pool</AlertTitle>
-      <AlertDescription>
-        <p>{NOTES.polDepth}</p>
-        <p className="mt-2">
-          <Value unavailable={depth === undefined}>{depth !== undefined ? `${formatAmount(depth, 18)} ${symbol}` : null}</Value>
-        </p>
-      </AlertDescription>
-    </Alert>
+    <Callout lead={NOTES.polDepth} data-testid="pol-depth-note">
+      <p className="font-mono tabular-nums">
+        <Value unavailable={depth === undefined} reason="Read on the Vault surface, pool by pool">
+          {depth !== undefined ? `${formatAmount(depth, 18)} ${symbol}` : null}
+        </Value>
+      </p>
+    </Callout>
   )
 }

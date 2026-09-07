@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,200;0,6..72,300;0,6..72,400;0,6..72,500;1,6..72,300&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root { --paper:#fdfdfb; --ink:#0d0d0c; --rule:#dedbd4; --hair:#efece6; --dim:#6d6a63; --fill:#0d0d0c; --onfill:#fdfdfb; }
+  [data-theme="ink"] { --paper:#0b0b0a; --ink:#f3f2ee; --rule:#2b2a27; --hair:#1c1b19; --dim:#8f8c85; --fill:#f3f2ee; --onfill:#0b0b0a; }
+  body { margin:0; background:var(--paper); }
+  a { color:var(--ink); text-decoration:none; }
+  a:hover { color:var(--dim); }
+  ::selection { background:var(--ink); color:var(--paper); }
+</style>
+</helmet>
+<div data-theme="{{ theme }}" style="background:var(--paper); color:var(--ink); font-family:Newsreader, Georgia, 'Times New Roman', serif; font-size:17px; line-height:1.55; -webkit-font-smoothing:antialiased; text-wrap:pretty; min-height:100vh;">
+
+  <header style="border-bottom:1px solid var(--ink); position:sticky; top:0; background:var(--paper); z-index:20;">
+    <div style="max-width:1400px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; row-gap:10px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim); white-space:nowrap;">Documentation</span>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:14px;">
+        <div style="display:flex; border:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase;">
+          <button onClick="{{ setPaper }}" style="border:0; background:{{ paperBg }}; color:{{ paperFg }}; padding:5px 9px; cursor:pointer; font:inherit;">Paper</button>
+          <button onClick="{{ setInk }}" style="border:0; background:{{ inkBg }}; color:{{ inkFg }}; padding:5px 9px; cursor:pointer; font:inherit;">Ink</button>
+        </div>
+        <a href="#" style="border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:8px 16px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; white-space:nowrap;">Enter app</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="max-width:1400px; margin:0 auto; display:grid; grid-template-columns:252px minmax(0,1fr) 208px;">
+
+    <aside style="border-right:1px solid var(--rule); padding:34px 24px 60px 28px;">
+      <input placeholder="Search the docs" style="width:100%; box-sizing:border-box; border:1px solid var(--rule); background:transparent; color:var(--ink); padding:9px 11px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.04em; outline:none; margin-bottom:26px;">
+      <sc-for list="{{ toc }}" as="group" hint-placeholder-count="3">
+        <div style="margin-bottom:26px;">
+          <p style="margin:0 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">{{ group.title }}</p>
+          <sc-for list="{{ group.items }}" as="item">
+            <sc-if value="{{ item.idle }}">
+              <button onClick="{{ item.go }}" style="display:block; width:100%; text-align:left; border:0; border-left:1px solid var(--rule); background:transparent; color:var(--dim); padding:6px 0 6px 13px; font-family:inherit; font-size:16px; cursor:pointer;" style-hover="color:var(--ink); border-left-color:var(--ink);">{{ item.label }}</button>
+            </sc-if>
+            <sc-if value="{{ item.active }}">
+              <button onClick="{{ item.go }}" style="display:block; width:100%; text-align:left; border:0; border-left:2px solid var(--ink); background:transparent; color:var(--ink); padding:6px 0 6px 12px; font-family:inherit; font-size:16px; cursor:pointer;">{{ item.label }}</button>
+            </sc-if>
+          </sc-for>
+        </div>
+      </sc-for>
+    </aside>
+
+    <main style="padding:48px 56px 90px; min-width:0;">
+      <p style="margin:0 0 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">{{ page.kicker }}</p>
+      <h1 style="margin:0; font-size:clamp(34px,4vw,56px); line-height:1; font-weight:300; letter-spacing:-0.035em;">{{ page.title }}</h1>
+      <p style="margin:20px 0 0; max-width:62ch; font-size:20px; line-height:1.5; color:var(--dim);">{{ page.lede }}</p>
+      <div style="height:2px; background:var(--ink); margin:36px 0 8px;"></div>
+
+      <sc-for list="{{ page.blocks }}" as="b" hint-placeholder-count="5">
+        <div style="max-width:70ch;">
+          <sc-if value="{{ b.isH }}">
+            <h2 style="margin:44px 0 14px; font-size:28px; line-height:1.15; font-weight:400; letter-spacing:-0.022em;">{{ b.text }}</h2>
+          </sc-if>
+          <sc-if value="{{ b.isP }}">
+            <p style="margin:0 0 16px; font-size:18px; line-height:1.6;">{{ b.text }}</p>
+          </sc-if>
+          <sc-if value="{{ b.isNote }}">
+            <div style="margin:24px 0; border-left:2px solid var(--ink); padding:2px 0 2px 20px;">
+              <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">{{ b.title }}</p>
+              <p style="margin:8px 0 0; font-size:17px; line-height:1.55;">{{ b.text }}</p>
+            </div>
+          </sc-if>
+          <sc-if value="{{ b.isCode }}">
+            <pre style="margin:22px 0; border-top:1px solid var(--ink); border-bottom:1px solid var(--rule); padding:16px 0; overflow-x:auto; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; line-height:1.7; color:var(--ink);">{{ b.text }}</pre>
+          </sc-if>
+          <sc-if value="{{ b.isRows }}">
+            <div style="margin:22px 0; border-top:1px solid var(--ink);">
+              <sc-for list="{{ b.rows }}" as="r">
+                <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:24px; padding:12px 0; border-bottom:1px solid var(--hair);">
+                  <div style="min-width:0;">
+                    <div style="font-size:17px;">{{ r.k }}</div>
+                    <div style="font-size:14px; line-height:1.45; color:var(--dim);">{{ r.b }}</div>
+                  </div>
+                  <div style="flex-shrink:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ r.v }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+          <sc-if value="{{ b.isTable }}">
+            <div style="margin:22px 0; width:100%; overflow-x:auto;">
+              <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                  <tr>
+                    <sc-for list="{{ b.head }}" as="h">
+                      <th style="text-align:left; padding:10px 14px 10px 0; border-bottom:1px solid var(--ink); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim); white-space:nowrap;">{{ h }}</th>
+                    </sc-for>
+                  </tr>
+                </thead>
+                <tbody>
+                  <sc-for list="{{ b.rows }}" as="row">
+                    <tr>
+                      <sc-for list="{{ row }}" as="cell">
+                        <td style="padding:10px 14px 10px 0; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ cell }}</td>
+                      </sc-for>
+                    </tr>
+                  </sc-for>
+                </tbody>
+              </table>
+            </div>
+          </sc-if>
+        </div>
+      </sc-for>
+
+      <div style="display:flex; gap:1px; background:var(--hair); margin-top:64px; border-top:1px solid var(--ink); flex-wrap:wrap;">
+        <sc-if value="{{ hasPrev }}">
+          <button onClick="{{ goPrev }}" style="flex:1; min-width:220px; text-align:left; border:0; background:var(--paper); color:var(--ink); padding:22px 24px; cursor:pointer; font-family:inherit;" style-hover="background:var(--hair);">
+            <span style="display:block; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Previous</span>
+            <span style="display:block; font-size:21px; margin-top:6px; letter-spacing:-0.02em;">{{ prevLabel }}</span>
+          </button>
+        </sc-if>
+        <sc-if value="{{ hasNext }}">
+          <button onClick="{{ goNext }}" style="flex:1; min-width:220px; text-align:right; border:0; background:var(--paper); color:var(--ink); padding:22px 24px; cursor:pointer; font-family:inherit;" style-hover="background:var(--hair);">
+            <span style="display:block; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Next</span>
+            <span style="display:block; font-size:21px; margin-top:6px; letter-spacing:-0.02em;">{{ nextLabel }}</span>
+          </button>
+        </sc-if>
+      </div>
+    </main>
+
+    <aside style="border-left:1px solid var(--rule); padding:48px 28px 60px 22px;">
+      <p style="margin:0 0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">On this page</p>
+      <sc-for list="{{ onThisPage }}" as="h">
+        <a href="#" style="display:block; padding:5px 0; font-size:15px; line-height:1.4; color:var(--dim);" style-hover="color:var(--ink);">{{ h }}</a>
+      </sc-for>
+      <div style="height:1px; background:var(--hair); margin:24px 0;"></div>
+      <p style="margin:0 0 6px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Source</p>
+      <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; line-height:1.7; color:var(--dim);">{{ page.source }}</p>
+    </aside>
+  </div>
+
+  <footer style="border-top:1px solid var(--ink);">
+    <div style="max-width:1400px; margin:0 auto; padding:30px 28px 40px; display:flex; gap:40px; justify-content:space-between; flex-wrap:wrap;">
+      <p style="margin:0; font-size:13px; line-height:1.65; color:var(--dim); max-width:76ch;">Every contract referenced in these pages is public, immutable and verifiable on the explorer. This interface reads them and builds calldata you approve yourself.</p>
+      <div style="display:flex; gap:26px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <a href="#" style="color:var(--dim);">Contracts</a>
+        <a href="#" style="color:var(--dim);">Audits</a>
+        <a href="#" style="color:var(--dim);">Changelog</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1400}}">
+/**
+ * The docs are data. To add a page, add an entry to PAGES and name it in GROUPS —
+ * the sidebar, the on-this-page rail and the prev/next pager all derive from these two.
+ * Block types: h, p, note, code, rows, table.
+ *
+ * NOTE (verbatim copy of the Claude Design file, 2026-09-07): the draft copy below predates plan
+ * revision 6 — it still describes staking, burnBps/stakerBps and the sell-only fee. The implementation
+ * in apps/web/lib/docs/ follows the protocol as built, not this draft.
+ */
+const PAGES = {
+  overview: {
+    kicker: 'Start here', title: 'What AMPS is', source: 'lib/copy.ts\nlib/surfaces.ts',
+    lede: 'One token, thirty Uniswap v4 positions in tokenised equities, and a redemption floor nothing can switch off.',
+    blocks: [
+      {type: 'p', text: 'AMPS is a single token that represents a share in a vault holding tokenised shares in thirty listed companies on Robinhood Chain. Two things set what it is worth: a floor you can always take, and a market above that floor.'},
+      {type: 'p', text: 'The holdings are not a wallet of tokens sitting still. Every constituent is held as a Uniswap v4 concentrated-liquidity position in that stock’s own AMPS pool, so the same assets that back a share are also the ones quoting a two-sided market in it and taking the fee on every trade that crosses.'},
+      {type: 'h', text: 'The floor'},
+      {type: 'p', text: 'Burn AMPS and the vault pays you a pro-rata slice of every asset it holds — every stock token, every idle balance, every position — less a 1% fee. That code path reads no price feed, consults no gate, and cannot be paused.'},
+      {type: 'h', text: 'The market'},
+      {type: 'p', text: 'Above the floor, price is set by thirty-two Uniswap v4 pools, all owned by the protocol. There is no public liquidity-provider tier and there will not be one, so the bid under AMPS is exactly the counter-assets the vault has earned and holds — published pool by pool.'},
+      {type: 'note', title: 'One rule runs through the whole interface', text: 'The quoter never reverts. A read that fails leaves its fields at zero and raises a flag, and a flagged field is shown as unavailable — never as zero. A zero rendered as data is something a person can trade on.'},
+      {type: 'h', text: 'The contract set'},
+      {type: 'table', head: ['Contract', 'Role', 'Mutability'], rows: [
+        ['AmpsToken', 'The share', 'Immutable'],
+        ['AmpsVault', 'Holdings, NAV, ladder placement', 'Immutable'],
+        ['AmpsHook', 'Fees, rails, rotation credit', 'Immutable'],
+        ['AmpsBonds', 'Discounted issuance', 'Immutable'],
+        ['AmpsStaking', 'xAMPS fee streaming', 'Immutable'],
+        ['AmpsRegistry', 'Constituent set and pools', 'Immutable'],
+        ['Pricing / shape policy', 'Ladder geometry', 'Pointer, 7-day timelock'],
+      ]},
+    ],
+  },
+  growth: {
+    kicker: 'Uniswap v4 · concentrated liquidity', title: 'How NAV grows', source: 'AmpsVault.compound\nLadderPositionValuer.amountsOf',
+    lede: 'The vault is the market maker. Every AMPS trade crosses a concentrated-liquidity range the protocol owns, and the fee it pays lands in the vault.',
+    blocks: [
+      {type: 'p', text: 'NAV per share is the vault’s own accounting of what it holds, divided by the shares outstanding. It moves for two reasons: the market value of the equities it holds, and the trading fees its own liquidity positions earn. The second one is the part the protocol controls.'},
+      {type: 'h', text: 'The ladder'},
+      {type: 'p', text: 'In each of the thirty-two pools the vault places a grid of concentrated-liquidity cells: a stack of bids below the reference price in the counter asset, and a stack of asks above it in AMPS inventory. Nothing else provides liquidity in those pools, so every swap fee is paid to a position the vault owns.'},
+      {type: 'p', text: 'Ladders are static. A cell is placed once and only ever removed by a redemption, the daily rollout, a high-water buyback burn, or a migration. Nothing is re-centred or re-widened — so the fill percentage on a cell is a real measure of what the market bought, not an artefact of a keeper moving ranges.'},
+      {type: 'h', text: 'The compound loop'},
+      {type: 'code', text: 'compound(poolId)\n  ├─ collect fees from every live cell in the pool\n  ├─ creator slice     100 bp of sell volume, decaying to 0 at day 30\n  ├─ staker slice      stakerBps of AMPS-side fees  → xAMPS stream\n  ├─ burn              burnBps of AMPS-side fees    → supply falls\n  └─ re-ladder         the remainder → depth + ask inventory'},
+      {type: 'p', text: 'Anyone may call compound(). A placement is refused within sixty seconds of the previous one in the same pool, which is the cooldown a compound has to clear before it can re-ladder anything.'},
+      {type: 'rows', rows: [
+        {k: 'Creator slice', v: '0.43%', b: 'Of sell volume, decaying to exactly zero at day 30. Immutable schedule.'},
+        {k: 'Staker slice', v: '30.00%', b: 'Of AMPS-side fees, streamed to xAMPS over 24 hours. Hard cap 50%.'},
+        {k: 'Burned', v: '10.00%', b: 'Of AMPS-side fees, at every compound. Hard cap 25%.'},
+        {k: 'Re-laddered', v: '60.00%', b: 'Back into the grid. This is the part that lifts NAV per share.'},
+      ]},
+      {type: 'h', text: 'Reading a ladder'},
+      {type: 'table', head: ['Cell', 'Tick range', 'Side', 'Placed', 'Filled', 'Proceeds'], rows: [
+        ['00', '-1200 … -1140', 'Bid', '204,000 USDG', '100%', '198,441 AMPS'],
+        ['01', '-1140 … -1080', 'Bid', '204,000 USDG', '62%', '124,802 AMPS'],
+        ['02', '-1080 … -1020', 'Bid', '204,000 USDG', '8%', '16,004 AMPS'],
+        ['03', '1020 … 1080', 'Ask', '103,668 AMPS', '41%', '43,880 USDG'],
+        ['04', '1080 … 1140', 'Ask', '103,668 AMPS', '4%', '4,208 USDG'],
+        ['05', '1140 … 1200', 'Ask', '103,668 AMPS', '0%', '—'],
+      ]},
+      {type: 'note', title: 'Ask inventory is finite', text: 'It is the genesis tranche plus the re-laddered share of AMPS collected as fees, and it is never minted. AMPS bought back by the protocol’s own bids is burned rather than re-placed.'},
+    ],
+  },
+  fees: {
+    kicker: 'The hook', title: 'Fees and the rotation credit', source: 'AmpsHook\nlib/fees.ts',
+    lede: 'Two base fees, one dynamic component on top, and a credit that only exists inside a single transaction.',
+    blocks: [
+      {type: 'p', text: 'The hook charges a buy fee on the counter asset entering a pool and a sell fee on every AMPS-in swap. Both are read live per pool and both sit inside a band hardcoded in the contract that consumes them.'},
+      {type: 'rows', rows: [
+        {k: 'sellFeeBps', v: '1.00% – 6.00%', b: 'Charged on every AMPS-in swap in all 32 pools unless a rotation credit covers it.'},
+        {k: 'buyFeeBps, entry pools', v: '0.05% – 1.00%', b: 'AMPS/WETH and AMPS/USDG.'},
+        {k: 'buyFeeBps, spokes', v: '0.01% – 0.50%', b: 'AMPS/<stock>. High-volatility names default higher inside the same band.'},
+        {k: 'Dynamic component', v: '3.00% cap', b: 'Volatility, deviation, divergence, session and surge. The cap rises to 10.00% in a degraded gate state.'},
+        {k: 'Total fee ceiling', v: '26.00%', b: 'Hardcoded in the hook. The floor is 0.03%.'},
+      ]},
+      {type: 'h', text: 'The rotation credit'},
+      {type: 'p', text: 'Buying AMPS in one pool and selling it in another inside the same transaction pays the buy fee on the credited part instead of the sell fee. The credit lives in transient storage: it never carries across transactions, and an exact-output sell does not consume it at all.'},
+      {type: 'code', text: 'SWAP_EXACT_IN\n  PathKey 1  NVDA → AMPS   buy fee   0.30%\n  PathKey 2  AMPS → AAPL   credited  0.32%   (uncredited: 1.20%)'},
+      {type: 'note', title: 'Why it has to be one transaction', text: 'Two separate swaps throw the credit away entirely. That is the whole reason the Rotate surface exists.'},
+      {type: 'h', text: 'Gates never block a swap'},
+      {type: 'p', text: 'No gate state stops a swap or a redemption. A degraded state pauses placements and compounding, raises the dynamic fee floor, and widens the bond haircut — it does not refuse you.'},
+    ],
+  },
+  redemption: {
+    kicker: 'The floor', title: 'Redemption', source: 'AmpsVault.redeemProRata\nlib/redeem.ts',
+    lede: 'Burn AMPS, receive a slice of every asset the vault holds. No oracle, no gate, no pause.',
+    blocks: [
+      {type: 'code', text: 'redeemProRata(uint256 shares, address recipient)\n  returns (address[] tokens, uint256[] amounts)'},
+      {type: 'p', text: 'The call burns your shares and transfers a pro-rata slice of every asset the vault holds, less the redemption fee. The code path contains no reference to any oracle, gate, guardian or pause flag — governance cannot add one without deploying a new vault and migrating to it.'},
+      {type: 'p', text: 'Because the holdings are v4 positions rather than loose balances, redemption withdraws your share of each position first: the grid cells are decomposed at the same reference price the vault marks them at, and you receive the stock-token side of each one. That is what bounds the gas — the live cell count, not the number of names.'},
+      {type: 'rows', rows: [
+        {k: 'Redemption fee', v: '1.00%', b: 'Kept by the vault. Hard cap 5.00%.'},
+        {k: 'Gas bound', v: '192 of 512 cells', b: 'Six live cells per pool across 32 pools. The count is hard-capped at 512, which is what bounds the gas of a redemption.'},
+        {k: 'Frozen constituents', v: 'Skipped', b: 'A blocked or paused line is simply not deliverable until the issuer lifts it; every other asset still pays out pro rata.'},
+      ]},
+      {type: 'h', text: 'What it does not do'},
+      {type: 'p', text: 'It does not pay you a price. It pays you the assets. Their market value is whatever they are worth when you sell them, which may be less than the NAV figure displayed when you redeemed.'},
+      {type: 'note', title: 'The one dependency it cannot survive', text: 'The path is structurally ungated, but the transaction still has to be included in a block. If the sequencer refuses it, or the chain stops producing blocks, no property of this contract helps you.'},
+    ],
+  },
+  bonds: {
+    kicker: 'Issuance', title: 'Bonds', source: 'AmpsBonds\nlib/bonds.ts',
+    lede: 'Deposit a stock token, receive AMPS at a discount, vesting linearly. Never dilutive.',
+    blocks: [
+      {type: 'p', text: 'A bond is a discounted issuance of AMPS against a stock token, priced at the lower of the market discount and the NAV floor. The shell recomputes that floor itself and refuses any price above it, so a hostile or buggy pricing policy can decline to quote but can never issue a dilutive bond.'},
+      {type: 'rows', rows: [
+        {k: 'Discount d', v: '0.50% – 8.00%', b: 'Clamped per market. A discount only exists while the premium exceeds it.'},
+        {k: 'Capacity per epoch', v: '250 bp of supply', b: 'Per market, per epoch.'},
+        {k: 'Vest', v: '12h 0m', b: 'Linear from purchase.'},
+      ]},
+      {type: 'note', title: 'minAmpsOut is always exactly the quote', text: 'The capacity clamp reduces the AMPS issued, never the collateral taken. A lower bound is therefore not slippage tolerance — it is consent to hand over the whole deposit for a capped issue.'},
+      {type: 'p', text: 'A bond mints AMPS at purchase, so it is in total supply from that moment and NAV per share reflects the issuance immediately. It cannot be gamed by claim timing, and it is not income.'},
+    ],
+  },
+  staking: {
+    kicker: 'xAMPS', title: 'Staking', source: 'AmpsStaking\nsurfaces/stake.tsx',
+    lede: 'A claim on trading fees the ladder has already collected, streamed linearly. Nothing is minted for stakers.',
+    blocks: [
+      {type: 'p', text: 'Deposit AMPS, receive xAMPS. Every compound sends the staker slice of AMPS-side fees into the staking contract, where it is streamed to holders linearly over twenty-four hours.'},
+      {type: 'rows', rows: [
+        {k: 'Staker share', v: '30.00%', b: 'Of AMPS-side fees. Hard cap 50%.'},
+        {k: 'Stream length', v: '24h 0m', b: 'Linear, so a deposit sandwiched around a compound earns only its time-weighted share.'},
+        {k: 'Realised APR', v: '4.62%', b: 'Computed from fees already collected over a past window.'},
+      ]},
+      {type: 'note', title: 'This is not a yield', text: 'There is no emission and no inflationary reward. The only thing that ever enters this contract is a share of fees the protocol has actually earned, and the rate shown is what was collected over a past window — not what will be collected over a future one.'},
+    ],
+  },
+  parameters: {
+    kicker: 'Reference', title: 'Parameters and hard bands', source: '@amplestocks/config launchParameters',
+    lede: 'Every governed parameter, its live value, and the band hardcoded in the contract that consumes it.',
+    blocks: [
+      {type: 'p', text: 'A parameter can be moved inside its band and can never be moved outside it. Widening a band means a new vault and a migration, which is itself a timelocked action.'},
+      {type: 'table', head: ['Parameter', 'Live', 'Hard band', 'Delay'], rows: [
+        ['redeemFeeBps', '1.00%', '0.00% – 5.00%', '48 h'],
+        ['burnBps', '10.00%', '0.00% – 25.00%', '48 h'],
+        ['stakerBps', '30.00%', '0.00% – 50.00%', '48 h'],
+        ['sellFeeBps', '5.00%', '1.00% – 6.00%', '48 h'],
+        ['buyFeeBps (entry)', '0.30%', '0.05% – 1.00%', '48 h'],
+        ['buyFeeBps (spokes)', '0.05%', '0.01% – 0.50%', '48 h'],
+        ['minAccretionBps', '0.50%', 'Hardcoded floor', '—'],
+        ['bond vest', '12h 0m', 'Per market', '48 h'],
+        ['rewardStreamSeconds', '24h 0m', 'Per contract', '—'],
+        ['refUpRateBps', '40 bp/h', '10 – 100 bp/h', '48 h'],
+      ]},
+      {type: 'note', title: 'The constituent set moves slower', text: 'Adding or retiring a name, and repointing a policy, sit behind a seven-day timelock rather than forty-eight hours. Retiring a constituent never moves assets already held.'},
+    ],
+  },
+  contracts: {
+    kicker: 'Reference', title: 'Contracts', source: 'lib/contracts.ts\nlib/deployment.ts',
+    lede: 'Addresses, roles and what each one can and cannot do.',
+    blocks: [
+      {type: 'table', head: ['Contract', 'Address', 'Mutability'], rows: [
+        ['AmpsToken', '0x4a2f…9c31', 'Immutable'],
+        ['AmpsVault', '0x81cb…20ad', 'Immutable'],
+        ['AmpsHook', '0x0f47…be12', 'Immutable'],
+        ['AmpsBonds', '0xc318…7f0e', 'Immutable'],
+        ['AmpsStaking', '0x99a4…4d55', 'Immutable'],
+        ['AmpsRegistry', '0x2b60…e881', 'Immutable'],
+        ['AmpsQuoter', '0x7d12…03cc', 'Immutable'],
+        ['Timelock', '0xe004…1a90', 'Safe 3/5 proposes'],
+      ]},
+      {type: 'note', title: 'Verify before you sign', text: 'Every address above is public and verifiable on the explorer. Nothing in this interface can move funds; it reads these contracts and builds calldata you approve yourself.'},
+    ],
+  },
+};
+
+const GROUPS = [
+  {title: 'Protocol', items: ['overview', 'growth', 'redemption']},
+  {title: 'Surfaces', items: ['fees', 'bonds', 'staking']},
+  {title: 'Reference', items: ['parameters', 'contracts']},
+];
+const ORDER = GROUPS.flatMap((g) => g.items);
+
+class Component extends DCLogic {
+  state = {theme: 'paper', page: 'growth'};
+
+  renderVals() {
+    const paper = this.state.theme !== 'ink';
+    const key = this.state.page;
+    const page = PAGES[key];
+    const i = ORDER.indexOf(key);
+    const prev = ORDER[i - 1];
+    const next = ORDER[i + 1];
+    return {
+      theme: this.state.theme,
+      paperBg: paper ? 'var(--fill)' : 'transparent',
+      paperFg: paper ? 'var(--onfill)' : 'var(--dim)',
+      inkBg: paper ? 'transparent' : 'var(--fill)',
+      inkFg: paper ? 'var(--dim)' : 'var(--onfill)',
+      setPaper: () => this.setState({theme: 'paper'}),
+      setInk: () => this.setState({theme: 'ink'}),
+
+      toc: GROUPS.map((g) => ({
+        title: g.title,
+        items: g.items.map((k) => ({
+          label: PAGES[k].title, active: k === key, idle: k !== key,
+          go: () => this.setState({page: k}),
+        })),
+      })),
+      page: {
+        kicker: page.kicker, title: page.title, lede: page.lede, source: page.source,
+        blocks: page.blocks.map((b) => ({
+          ...b,
+          isH: b.type === 'h', isP: b.type === 'p', isNote: b.type === 'note',
+          isCode: b.type === 'code', isRows: b.type === 'rows', isTable: b.type === 'table',
+        })),
+      },
+      onThisPage: page.blocks.filter((b) => b.type === 'h').map((b) => b.text),
+      hasPrev: prev !== undefined,
+      hasNext: next !== undefined,
+      prevLabel: prev ? PAGES[prev].title : '',
+      nextLabel: next ? PAGES[next].title : '',
+      goPrev: () => { if (prev) this.setState({page: prev}); },
+      goNext: () => { if (next) this.setState({page: next}); },
+    };
+  }
+}
+
+</script>
+</body>
+</html>

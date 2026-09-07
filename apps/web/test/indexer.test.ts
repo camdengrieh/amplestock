@@ -85,10 +85,14 @@ describe('IndexerClient', () => {
     expect(ENDPOINTS.ladderFill('0xabc')).toBe('/api/pools/0xabc/ladder')
     expect(ENDPOINTS.bondBoard).toBe('/api/bonds')
     expect(ENDPOINTS.bondPositions('0x1')).toBe('/api/bonds/positions/0x1')
-    expect(ENDPOINTS.stakingStats).toBe('/api/staking')
     expect(ENDPOINTS.flywheel).toBe('/api/flywheel')
     expect(ENDPOINTS.gateStatus).toBe('/api/gate')
     expect(ENDPOINTS.burnHistory).toBe('/api/burns')
+  })
+
+  it('has no staking endpoint — revision 6 removed staking', () => {
+    expect(Object.keys(ENDPOINTS)).not.toContain('stakingStats')
+    expect(JSON.stringify(ENDPOINTS)).not.toMatch(/staking/)
   })
 
   it('covers every panel the plan names for the dApp', () => {
@@ -97,7 +101,6 @@ describe('IndexerClient', () => {
       'navHistory',
       'ladderFill',
       'bondBoard',
-      'stakingStats',
       'flywheel',
       'gateStatus',
       'burnHistory',

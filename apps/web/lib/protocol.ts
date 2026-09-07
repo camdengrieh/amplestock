@@ -76,7 +76,12 @@ export const DYN_CAP_ESCALATION_BPS = 2_000
 export const F_WALL_BPS = 1_500
 export const K_DEV_BPS = 25
 
-/** Launch defaults. Governed; the live value is read from the hook through `AmpsQuoter`. */
+/**
+ * Launch defaults. Governed; the live value is read from the hook through `AmpsQuoter`.
+ *
+ * `SELL_FEE_*` is the **AMPS fee** — revision 6 charges it on buys as well as sells, and the
+ * on-chain rename is pending. Read it through `lib/fees.ts`'s accessors, never by this name.
+ */
 export const AMPS_FEE_BPS_DEFAULT = 500
 export const AMPS_FEE_BPS_BAND = {min: 100, max: 600} as const
 export const BUY_FEE_BPS_ENTRY_DEFAULT = 30
@@ -86,22 +91,22 @@ export const BUY_FEE_BPS_SPOKE_HIGH_VOL_DEFAULT = 10
 export const BUY_FEE_BPS_SPOKE_BAND = {min: 1, max: 50} as const
 export const REDEEM_FEE_BPS_DEFAULT = 100
 export const REDEEM_FEE_BPS_MAX = 500
-export const BURN_BPS_DEFAULT = 1_000
-export const BURN_BPS_MAX = 2_500
-export const STAKER_BPS_DEFAULT = 3_000
-export const STAKER_BPS_MAX = 5_000
+/**
+ * There is no `burnBps` and no `stakerBps` under revision 6. The AMPS side of every fee is burned
+ * after the creator slice — a whole share rather than a governed fraction of one — and staking is
+ * gone entirely, so neither constant exists to be mirrored.
+ */
 export const CREATOR_FEE_BPS = 100
 export const CREATOR_DECAY_SECONDS = 30 * 86_400
 
 // ---------------------------------------------------------------------------------------------
-// Bonds, staking, ladder, timing
+// Bonds, ladder, timing
 // ---------------------------------------------------------------------------------------------
 
 export const MIN_ACCRETION_BPS_DEFAULT = 50
 export const BOND_VEST_SECONDS_DEFAULT = 12 * 3_600
 export const BOND_EPOCH_SECONDS_DEFAULT = 6 * 3_600
 export const H_SESSION_BPS_DEFAULT: readonly number[] = [0, 50, 150, 300]
-export const REWARD_STREAM_SECONDS_DEFAULT = 24 * 3_600
 export const GRID_CELLS = 24
 export const GRID_MIN_M = -8
 export const MAX_LIVE_CELLS = 512

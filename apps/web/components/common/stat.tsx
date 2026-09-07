@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MIT
 import * as React from 'react'
 
+import {DataRow, StatBand, StatCell} from '@/components/ledger/primitives'
 import {cn} from '@/lib/utils'
 import {Value} from './value'
 
+/**
+ * The three shapes every surface builds its numbers from, mapped onto the design's own blocks.
+ *
+ * `StatGrid` + `Stat` are the headline band: `repeat(auto-fit, minmax(200px,1fr))` with 1px hair
+ * gaps showing through a shared ground, over a 2px ink rule. `FieldRow` is the `k / v / b` row.
+ */
 export interface StatProps {
   label: string
   value?: React.ReactNode
@@ -11,28 +18,35 @@ export interface StatProps {
   reason?: string
   hint?: string
   className?: string
+  /** The 44px headline figure. Without it the cell uses the 38px landing size. */
   emphasis?: boolean
 }
 
-export function Stat({label, value, unavailable, reason, hint, className, emphasis}: StatProps) {
+export function Stat({label, value, unavailable, reason, hint, className, emphasis = true}: StatProps) {
   return (
-    <div className={cn('flex flex-col gap-1', className)}>
-      <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
-      <dd className={cn('font-medium', emphasis ? 'text-2xl' : 'text-base')}>
-        <Value unavailable={unavailable} reason={reason}>
-          {value}
-        </Value>
-      </dd>
-      {hint ? <p className="text-xs leading-snug text-muted-foreground">{hint}</p> : null}
-    </div>
+    <StatCell
+      label={label}
+      size={emphasis ? 'stat' : 'big'}
+      {...(hint ? {note: hint} : {})}
+      {...(className ? {className} : {})}
+    >
+      <Value unavailable={unavailable} reason={reason}>
+        {value}
+      </Value>
+    </StatCell>
   )
 }
 
-export function StatGrid({children, className, ...rest}: React.HTMLAttributes<HTMLDListElement>) {
+export function StatGrid({
+  children,
+  className,
+  min,
+  ...rest
+}: React.HTMLAttributes<HTMLDivElement> & {min?: number}) {
   return (
-    <dl className={cn('grid grid-cols-2 gap-5 md:grid-cols-4', className)} {...rest}>
+    <StatBand className={cn(className)} {...(min !== undefined ? {min} : {})} {...rest}>
       {children}
-    </dl>
+    </StatBand>
   )
 }
 
@@ -41,17 +55,13 @@ export function FieldRow({
   children,
   hint,
 }: {
-  label: string
+  label: React.ReactNode
   children: React.ReactNode
-  hint?: string
+  hint?: React.ReactNode
 }) {
   return (
-    <div className="flex items-start justify-between gap-4 border-b border-border/60 py-2 last:border-0">
-      <div className="min-w-0">
-        <div className="text-sm text-muted-foreground">{label}</div>
-        {hint ? <div className="text-xs text-muted-foreground/80">{hint}</div> : null}
-      </div>
-      <div className="shrink-0 text-sm font-medium">{children}</div>
-    </div>
+    <DataRow label={label} {...(hint ? {note: hint} : {})}>
+      {children}
+    </DataRow>
   )
 }

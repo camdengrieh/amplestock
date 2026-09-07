@@ -42,3 +42,16 @@ export function isTestnet(chainId: AmpsChainId = activeChainId): boolean {
 }
 
 export const chainMeta = chainById
+
+/**
+ * Seconds per block, for turning an auction's start/end/claim block into a time.
+ *
+ * viem carries this on the chain object and `@amplestocks/config` does not — the split this module
+ * already documents, applied to one more field. A chain that publishes no block time returns
+ * `undefined`, and the surface shows block numbers with the time marked unavailable rather than
+ * assuming a rate.
+ */
+export function blockTimeSeconds(chainId: AmpsChainId = activeChainId): number | undefined {
+  const ms = viemChains[chainId].blockTime
+  return typeof ms === 'number' && ms > 0 ? ms / 1000 : undefined
+}

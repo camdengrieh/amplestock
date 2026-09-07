@@ -2,38 +2,371 @@
 @import 'tailwindcss';
 
 /*
- * One dark palette, no theme switcher. The app is a read-out of a set of contracts; the fewer
- * moving parts between a number and the person reading it, the better.
+ * Ledger.
  *
- * Fonts are system stacks on purpose: `next/font/google` fetches at build time and the production
- * build has to succeed with no network.
+ * The token values, the type scale and the rule weights below are transcribed from the design at
+ * `design/ledger/Redesign A - Ledger.dc.html` and `design/ledger/Documentation - Ledger.dc.html`.
+ * Where this file and those files disagree, those files are right and this one is a bug.
+ *
+ * Two themes, paper and ink, and one rule that shapes everything else: hairlines instead of cards
+ * and shadows. A page title sits above a 2px ink rule; a section is separated by a 1px ink rule; a
+ * row separator is the lightest hair; and the only filled things in the whole system are a primary
+ * button and the two inverted panels that carry a statement.
+ *
+ * `--fill` / `--onfill` are the inversion pair: on paper they are ink-on-paper, on ink they are
+ * paper-on-ink, so an inverted panel reads the same way in both themes without a second palette.
+ * `--onfill-rule` / `--onfill-hair` are the rules *inside* such a panel.
+ *
+ * The palette lives on `:root`, is re-declared under `[data-theme='ink']`, and is mapped into
+ * Tailwind with `@theme inline` so the utilities resolve through the live variable rather than
+ * baking a colour at build time. That is what makes the toggle a single attribute write.
+ *
+ * Fonts are the Google Fonts stylesheet, linked at runtime from `app/layout.tsx`, never
+ * `next/font/google`: that fetches at build time and the production build has to succeed with no
+ * network. Every face has a real fallback stack, and the page is legible with neither loaded.
  */
-@theme {
-  --color-background: oklch(0.16 0.012 260);
-  --color-foreground: oklch(0.95 0.005 260);
-  --color-card: oklch(0.2 0.014 260);
-  --color-card-foreground: oklch(0.95 0.005 260);
-  --color-muted: oklch(0.27 0.014 260);
-  --color-muted-foreground: oklch(0.7 0.012 260);
-  --color-primary: oklch(0.72 0.16 155);
-  --color-primary-foreground: oklch(0.15 0.02 155);
-  --color-secondary: oklch(0.3 0.02 260);
-  --color-secondary-foreground: oklch(0.95 0.005 260);
-  --color-destructive: oklch(0.55 0.2 25);
-  --color-border: oklch(0.32 0.014 260);
-  --color-ring: oklch(0.72 0.16 155);
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+:root {
+  color-scheme: light;
+
+  --paper: #fdfdfb;
+  --ink: #0d0d0c;
+  --rule: #dedbd4;
+  --hair: #efece6;
+  --dim: #6d6a63;
+  --fill: #0d0d0c;
+  --onfill: #fdfdfb;
+  --onfill-rule: rgba(255, 255, 255, 0.28);
+  --onfill-hair: rgba(255, 255, 255, 0.14);
+
+  /* State tones. Not in the design, which is monochrome; see design/ledger/ledger.md §3. */
+  --tone-ok: #2f6b3f;
+  --tone-warn: #8a6712;
+  --tone-bad: #98301f;
+
+  --serif-stack: 'Newsreader', Georgia, 'Times New Roman', serif;
+  --mono-stack: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-html,
-body {
-  background-color: var(--color-background);
-  color: var(--color-foreground);
-  font-family: var(--font-sans);
+:root[data-theme='ink'] {
+  color-scheme: dark;
+
+  --paper: #0b0b0a;
+  --ink: #f3f2ee;
+  --rule: #2b2a27;
+  --hair: #1c1b19;
+  --dim: #8f8c85;
+  --fill: #f3f2ee;
+  --onfill: #0b0b0a;
+  --onfill-rule: rgba(0, 0, 0, 0.3);
+  --onfill-hair: rgba(0, 0, 0, 0.14);
+
+  --tone-ok: #8fc79f;
+  --tone-warn: #d8b45c;
+  --tone-bad: #e2907f;
 }
 
-* {
-  border-color: var(--color-border);
+@theme inline {
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-rule: var(--rule);
+  --color-hair: var(--hair);
+  --color-dim: var(--dim);
+  --color-fill: var(--fill);
+  --color-onfill: var(--onfill);
+  --color-onfill-rule: var(--onfill-rule);
+  --color-onfill-hair: var(--onfill-hair);
+  --color-tone-ok: var(--tone-ok);
+  --color-tone-warn: var(--tone-warn);
+  --color-tone-bad: var(--tone-bad);
+
+  /* The semantic names the components speak, repointed at Ledger. */
+  --color-background: var(--paper);
+  --color-foreground: var(--ink);
+  --color-card: var(--paper);
+  --color-card-foreground: var(--ink);
+  --color-muted: var(--hair);
+  --color-muted-foreground: var(--dim);
+  --color-primary: var(--fill);
+  --color-primary-foreground: var(--onfill);
+  --color-secondary: var(--hair);
+  --color-secondary-foreground: var(--ink);
+  --color-destructive: var(--tone-bad);
+  --color-border: var(--rule);
+  --color-ring: var(--ink);
+
+  --font-sans: var(--serif-stack);
+  --font-serif: var(--serif-stack);
+  --font-mono: var(--mono-stack);
+}
+
+/*
+ * The element defaults sit in `@layer base` on purpose.
+ *
+ * Tailwind v4 orders its layers `theme, base, components, utilities`, and **unlayered CSS beats
+ * every layered rule regardless of specificity**. A bare `a { color: var(--ink) }` at the top level
+ * would therefore silently override `text-dim`, `text-onfill` and every other colour utility on
+ * every link in the app — which is exactly the kind of bug that makes an idle nav item look active
+ * and puts ink type on an ink ground.
+ */
+@layer base {
+  html {
+    background-color: var(--paper);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The design's body: Newsreader 17px / 1.55, `text-wrap: pretty`. */
+  body {
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif-stack);
+    font-size: 17px;
+    line-height: 1.55;
+    text-wrap: pretty;
+  }
+
+  * {
+    border-color: var(--rule);
+  }
+
+  a {
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  /* Every figure lines up in its column. */
+  .font-mono,
+  table,
+  input,
+  [data-unavailable],
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * The focus ring is ink, on both themes, and it is never removed. Ledger has no colour to spare for
+   * a focus state, so the ring is the ink itself at full strength with a paper gap behind it.
+   */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+    border-radius: 0;
+  }
+
+  ::selection {
+    background: var(--ink);
+    color: var(--paper);
+  }
+}
+
+
+/* -------------------------------------------------------------------------------------------
+ * The type scale, transcribed from the design. Class names name the role, not the size, so a
+ * change in the design is a change here and nowhere else.
+ * ------------------------------------------------------------------------------------------- */
+
+@layer components {
+  /* Above a title. `10px / 0.18em`. */
+  .ledger-kicker {
+    font-family: var(--mono-stack);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.18em;
+    line-height: 1.4;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* Above a column or a control. `10px / 0.16em`. */
+  .ledger-label {
+    font-family: var(--mono-stack);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.16em;
+    line-height: 1.4;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* A table head or a dense caption. `9px / 0.14em`. */
+  .ledger-micro {
+    font-family: var(--mono-stack);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.14em;
+    line-height: 1.4;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* The nav, and anything else at `10px / 0.14em`. */
+  .ledger-nav {
+    font-family: var(--mono-stack);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.14em;
+    line-height: 1.4;
+    text-transform: uppercase;
+  }
+
+  /* The wordmark. `15px / 0.16em / 500`, `19px` on the landing page. */
+  .ledger-wordmark {
+    font-family: var(--serif-stack);
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+
+  /* A landing headline. `clamp(44px, 6.2vw, 92px) / 0.94 / 300 / -0.025em`. */
+  .ledger-hero {
+    font-size: clamp(2.75rem, 6.2vw, 5.75rem);
+    font-weight: 300;
+    letter-spacing: -0.025em;
+    line-height: 0.94;
+  }
+
+  /* A surface title. `52px / 1 / 300 / -0.03em`. */
+  .ledger-title {
+    font-size: 52px;
+    font-weight: 300;
+    letter-spacing: -0.03em;
+    line-height: 1;
+  }
+
+  /* A landing section heading. `44px / 1 / 300 / -0.03em`. */
+  .ledger-section-title {
+    font-size: 44px;
+    font-weight: 300;
+    letter-spacing: -0.03em;
+    line-height: 1;
+  }
+
+  /* A block heading inside a surface. `28px / 400 / -0.02em`. */
+  .ledger-heading {
+    font-size: 28px;
+    font-weight: 400;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+  }
+
+  /* A headline figure. `44px / 0.95 / 300 / -0.035em`. */
+  .ledger-stat {
+    font-size: 44px;
+    font-weight: 300;
+    letter-spacing: -0.035em;
+    line-height: 0.95;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The hero figure. `88px / 0.9 / 200 / -0.04em`. */
+  .ledger-hero-stat {
+    font-size: 88px;
+    font-weight: 200;
+    letter-spacing: -0.04em;
+    line-height: 0.9;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A big number in a stat band. `38px / 1 / 300 / -0.03em`. */
+  .ledger-big {
+    font-size: 38px;
+    font-weight: 300;
+    letter-spacing: -0.03em;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The amount a person types. `52px / 300 / -0.03em`, borderless. */
+  .ledger-amount {
+    font-family: var(--serif-stack);
+    font-size: 52px;
+    font-weight: 300;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A mono figure in a row or a table cell. */
+  .ledger-value {
+    font-family: var(--mono-stack);
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .ledger-cell {
+    font-family: var(--mono-stack);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * The design's stat band: `repeat(auto-fit, minmax(200px,1fr))` with 1px hair gaps showing through.
+   *
+   * At 390pt the design draws it as a fixed two-up with a smaller figure rather than letting auto-fit
+   * collapse it to a single column, so the phone keeps NAV and the reference price side by side. The
+   * minimum is a custom property because a landing band and a headline band are drawn at different
+   * widths in the same file.
+   */
+  .ledger-band {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(var(--band-min, 200px), 1fr));
+  }
+
+  /*
+   * The design draws the 1px separators as `gap:1px` over a `--hair` ground. That is exact only when
+   * the cells fill every track: a band whose count does not divide by the column count leaves the
+   * ground showing as a grey block where the missing cells would be. The separators are drawn on the
+   * cells instead, which is the same hairline and the same technique the design uses for the landing
+   * holdings grid, and a short last row simply ends.
+   */
+  .ledger-band > * {
+    border-right: 1px solid var(--hair);
+    border-bottom: 1px solid var(--hair);
+  }
+
+  .ledger-band > *:last-child {
+    border-right: 0;
+  }
+
+  /* A table that must never widen the page. */
+  .ledger-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  @media (max-width: 640px) {
+    .ledger-band {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .ledger-title {
+      font-size: 38px;
+    }
+    .ledger-section-title {
+      font-size: 32px;
+    }
+    .ledger-stat {
+      font-size: 32px;
+    }
+    .ledger-hero-stat {
+      font-size: 56px;
+    }
+    .ledger-amount {
+      font-size: 48px;
+    }
+    .ledger-big {
+      font-size: 30px;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

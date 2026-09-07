@@ -29,7 +29,7 @@ export type AmpsContractKey =
   | 'quoter'
   | 'bonds'
   | 'bondsLens'
-  | 'staking'
+  | 'router'
   | 'registry'
   | 'registryLens'
   | 'hook'
@@ -53,6 +53,33 @@ export function readDeployment(env = publicEnv.addresses): Deployment {
 }
 
 export const deployment: Deployment = readDeployment()
+
+/**
+ * The genesis auctions.
+ *
+ * Two Continuous Clearing Auctions sell the entry-pool AMPS tranche: one against USDG and one
+ * against native ETH (`currency == address(0)`). They are kept out of {Deployment} because they are
+ * not part of the running protocol — they exist once, and every surface other than `/auction`
+ * should be unable to reach for them by accident. A key with no valid address is simply absent, and
+ * the surface renders the same "not deployed on this chain" state every other address gets.
+ */
+export type GenesisAuctionKey = 'usdg' | 'eth'
+export type GenesisAuctions = Readonly<Partial<Record<GenesisAuctionKey, Address>>>
+
+export function readGenesisAuctions(env = publicEnv.auctions): GenesisAuctions {
+  const out: Partial<Record<GenesisAuctionKey, Address>> = {}
+  for (const key of Object.keys(env) as GenesisAuctionKey[]) {
+    const parsed = parse(env[key] ?? '')
+    if (parsed) out[key] = parsed
+  }
+  return out
+}
+
+export const genesisAuctions: GenesisAuctions = readGenesisAuctions()
+
+export function hasAnyGenesisAuction(from: GenesisAuctions = genesisAuctions): boolean {
+  return Object.keys(from).length > 0
+}
 
 export function isDeployed(key: AmpsContractKey, from: Deployment = deployment): boolean {
   return from[key] !== undefined

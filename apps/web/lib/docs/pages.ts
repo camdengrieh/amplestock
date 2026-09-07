@@ -1,0 +1,616 @@
+// SPDX-License-Identifier: MIT
+
+/**
+ * The documentation, as data.
+ *
+ * Ten pages in three groups, each a list of blocks. Written against plan revision 6: the AMPS fee
+ * is charged both ways, a pass-through is router-only, the compound loop is creator slice then burn
+ * the AMPS side, there is no staking page and no `stakerBps`, and the redemption fee is a figure
+ * rather than a sentence.
+ *
+ * Not one number is typed into this file. Every figure is an id resolved from a live source at
+ * render time; `test/docs.test.ts` fails if a block names an id the catalogue does not have, and
+ * fails if a `rows` or `table` cell carries prose that looks like a figure.
+ */
+
+import type {Block} from './blocks'
+
+export interface DocsPage {
+  slug: string
+  title: string
+  kicker: string
+  /** One line, shown under the title and on the group index. */
+  lede: string
+  /**
+   * What this page is read from, one per line, for the rail's `Source` block.
+   *
+   * Contract functions and module paths, not prose: the point of the block is that a reader can go
+   * and check the page against the thing it claims to describe.
+   */
+  source: string
+  group: DocsGroupId
+  blocks: readonly Block[]
+}
+
+export type DocsGroupId = 'protocol' | 'surfaces' | 'reference'
+
+export interface DocsGroup {
+  id: DocsGroupId
+  label: string
+}
+
+/** The design's three groups, in the design's order. Reading order derives from them. */
+export const GROUPS: readonly DocsGroup[] = [
+  {id: 'protocol', label: 'Protocol'},
+  {id: 'surfaces', label: 'Surfaces'},
+  {id: 'reference', label: 'Reference'},
+]
+
+export const PAGES: readonly DocsPage[] = [
+  {
+    slug: 'overview',
+    title: 'What Amplestocks is',
+    kicker: 'Start here',
+    lede: 'A share in a vault of tokenized equities, with redemption as its floor and 32 protocol-owned pools above it.',
+    source: 'AmpsVault.checkpointData\nAmpsRegistry.poolCount\n@amplestocks/config',
+    group: 'protocol',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'AMPS is a share in a vault that holds tokenized equities on Robinhood Chain. The vault publishes what it holds, values it at a reference price, and lets any holder burn their shares for a pro-rata slice of every asset in it. That last path is the floor, and it is the only promise the system makes.',
+      },
+      {
+        kind: 'p',
+        text: 'Everything above the floor is a market. All of the pools are protocol-owned: there is no public liquidity-provider tier, so the bid under AMPS is exactly the counter-assets the protocol has earned and is holding. That number is published per pool on the Vault surface rather than inferred.',
+      },
+      {kind: 'h', level: 2, text: 'The system right now'},
+      {
+        kind: 'rows',
+        title: 'Live',
+        rows: [
+          {label: 'Chain', figure: 'cfgChain'},
+          {label: 'Chain id', figure: 'cfgChainId'},
+          {label: 'Vault initialised', figure: 'vaultInitialized'},
+          {label: 'NAV per share', figure: 'navPerShare'},
+          {label: 'Reference price', figure: 'pRef', hint: 'Rate-limited upward, never below NAV per share'},
+          {label: 'Market price', figure: 'pMkt', hint: '30-minute truncated TWAP of the AMPS/USDG hub'},
+          {label: 'Premium to NAV', figure: 'premium', hint: 'A signed number. Nothing on chain consumes it.'},
+          {label: 'Total assets', figure: 'totalAssets'},
+          {label: 'Total supply', figure: 'totalSupply'},
+          {label: 'Pools registered', figure: 'poolCount'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'info',
+        title: 'Every figure on this site is read, not written',
+        text: 'No percentage, address or count in this documentation is typed into the page. Each one names a source — a contract call, the deployment record, or the launch parameter file — and is resolved when you load it. A source that cannot answer renders a dash and says why, because a stale number in a document is worse than no number.',
+      },
+      {kind: 'h', level: 2, text: 'At genesis'},
+      {
+        kind: 'rows',
+        rows: [
+          {label: 'Genesis supply', figure: 'cfgS0'},
+          {label: 'NAV per share at genesis', figure: 'cfgLaunchPrice', hint: 'Fully diluted: protocol-held inventory counts'},
+          {label: 'Pools', figure: 'cfgTotalPools'},
+          {label: 'Spokes', figure: 'cfgSpokePools'},
+          {label: 'Entry pools', figure: 'cfgEntryPools'},
+          {label: 'Launch constituent set', figure: 'cfgLaunchConstituents'},
+        ],
+      },
+    ],
+  },
+
+  {
+    slug: 'auction',
+    title: 'The genesis auction',
+    kicker: 'Genesis',
+    lede: 'How the entry-pool tranche is sold, why an early bid is never punished, and what the result becomes.',
+    source: 'IContinuousClearingAuction\nlib/abi/cca.ts\nlib/auction.ts',
+    group: 'surfaces',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'Amplestocks launches through a Continuous Clearing Auction — Uniswap\u2019s CCA, v2.1.0, MIT. Two auctions sell the entry-pool AMPS tranche: one raising USDG and one raising native ether. Everything they raise becomes the entry pools\u2019 bid liquidity, and the final clearing price becomes the launch reference price the vault starts from.',
+      },
+      {kind: 'h', level: 2, text: 'One price for everybody'},
+      {
+        kind: 'p',
+        text: 'Tokens are released on a fixed per-block schedule. Bidders post a maximum price and an amount of the auction\u2019s currency, and the contract raises the clearing price only as far as resting demand supports it. Every bid that clears pays the same final price, whatever maximum it named — so a high maximum is a ceiling rather than an offer, and the difference comes back as a refund.',
+      },
+      {
+        kind: 'note',
+        tone: 'info',
+        title: 'Bidding early costs nothing',
+        text: 'A bid in the first block and a bid in the last settle at the same clearing price. There is no advantage to waiting for information and no penalty for committing first, which is the property that makes a continuous clearing auction different from an open ascending one.',
+      },
+      {
+        kind: 'p',
+        text: 'A bid whose maximum ends strictly above the clearing price fills in full. A bid exactly at it is at the margin and may fill only partly, with the remainder refunded through the partial-fill exit. A bid below it does not fill at all and the whole commitment comes back. If the auction never reaches the minimum it must raise, it does not graduate: no tokens are sold and everything is refundable.',
+      },
+      {kind: 'h', level: 2, text: 'The two auctions'},
+      {
+        kind: 'table',
+        columns: ['', 'AMPS / USDG', 'AMPS / ETH'],
+        rows: [
+          [{text: 'Address'}, {figure: 'auctionUsdgAddress'}, {figure: 'auctionEthAddress'}],
+          [{text: 'State'}, {figure: 'auctionUsdgPhase'}, {figure: 'auctionEthPhase'}],
+          [{text: 'On offer'}, {figure: 'auctionUsdgSupply'}, {figure: 'auctionEthSupply'}],
+          [{text: 'Clearing price'}, {figure: 'auctionUsdgClearing'}, {figure: 'auctionEthClearing'}],
+          [{text: 'Raised'}, {figure: 'auctionUsdgRaised'}, {figure: 'auctionEthRaised'}],
+          [{text: 'Graduated'}, {figure: 'auctionUsdgGraduated'}, {figure: 'auctionEthGraduated'}],
+        ],
+        footnote:
+          'Every read is as of the auction\u2019s last checkpoint: checkpoint() is a write rather than a view, so a price is only as fresh as the last block somebody paid to advance it to. The ETH auction\u2019s currency is address(0) — native ether, sent as the call\u2019s value rather than pulled through an allowance.',
+      },
+      {
+        kind: 'note',
+        tone: 'warning',
+        title: 'The graduation target is not readable',
+        text: 'The auction keeps the minimum it must raise as an internal immutable and exposes no getter for it. isGraduated() is the only on-chain answer, so the interface shows that and marks the target unavailable rather than printing a number it cannot see.',
+      },
+      {kind: 'h', level: 2, text: 'What the result becomes'},
+      {
+        kind: 'rows',
+        rows: [
+          {label: 'AMPS total supply', figure: 'totalSupply', hint: 'The auction sells the entry-pool tranche, not the whole supply'},
+          {label: 'Genesis supply', figure: 'cfgS0'},
+          {label: 'NAV per share at genesis', figure: 'cfgLaunchPrice'},
+          {label: 'Entry pools seeded', figure: 'cfgEntryPools'},
+          {label: 'Reference up-rate from launch', figure: 'refUpRate'},
+        ],
+      },
+      {
+        kind: 'p',
+        text: 'Because only the entry-pool tranche is sold, a buyer\u2019s clearing price is above NAV per share by exactly the ratio of total supply to tokens sold. That is arithmetic rather than a judgement, and the Auction surface publishes it as the genesis premium instead of leaving it to be discovered.',
+      },
+      {
+        kind: 'rows',
+        title: 'Contracts',
+        rows: [
+          {label: 'CCALens', figure: 'ccaLens', hint: 'The optional tick-reading helper, at the same address on every chain that has it. This interface does not need it: floorPrice, tickSpacing and nextActiveTickPrice are on the auction itself.'},
+          {label: 'AmpsVault', figure: 'addrVault', hint: 'Receives the raised currency and places it as the entry pools\u2019 ladder'},
+        ],
+      },
+    ],
+  },
+  {
+    slug: 'nav-and-redemption',
+    title: 'NAV and redemption',
+    kicker: 'The floor',
+    lede: 'How the vault values itself, and the one exit that reads no oracle and cannot be paused.',
+    source: 'AmpsVault.redeemProRata\nAmpsVault.redeemFeeBps\nlib/redeem.ts',
+    group: 'protocol',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'NAV per share is the vault’s own accounting of what it holds, divided by total supply. It is recomputed by a checkpoint, which anyone may call and which costs only gas. The reference price is NAV floored and rate-limited upward; the market price is a truncated TWAP of the hub pool. The difference between the reference and NAV is the premium, and it is disclosure rather than a target.',
+      },
+      {kind: 'h', level: 2, text: 'Redemption'},
+      {
+        kind: 'p',
+        text: 'redeemProRata burns your AMPS and pays a pro-rata slice of every asset the vault holds — every stock token, every idle balance, every ladder position — less the redemption fee. The code path reads no oracle, consults no gate, and contains no reference to the guardian, the timelock or any pause flag. It is not a price: it pays the assets, and what those are worth is whatever they are worth when you sell them.',
+      },
+      {
+        kind: 'rows',
+        title: 'Live',
+        rows: [
+          {label: 'Redemption fee', figure: 'redeemFee', hint: 'Read from the vault on every load'},
+          {label: 'Ceiling hardcoded in the vault', figure: 'redeemFeeMax', hint: 'Governance cannot widen it'},
+          {label: 'NAV per share', figure: 'navPerShare'},
+          {label: 'Assets paid out pro rata', figure: 'assetCount', hint: 'No netting, no substitution'},
+          {label: 'Live ladder cells', figure: 'liveCells', hint: 'Bounded, which is what bounds the gas of a redemption'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'warning',
+        title: 'The redemption fee moves',
+        text: 'It is governed inside the band above, and the launch value is not the value it will keep. That is exactly why it is a figure here rather than a sentence: the number you see is the number the vault will charge on the call you make next.',
+      },
+      {kind: 'h', level: 2, text: 'Why the released inventory is burned too'},
+      {
+        kind: 'p',
+        text: 'A redemption removes the redeemer’s share of every ladder position. The AMPS sitting in those positions as unfilled ask inventory is burned rather than returned to the vault’s free balance, so total supply falls by more than the shares redeemed and the redemption is accretive to everyone who stays.',
+      },
+    ],
+  },
+
+  {
+    slug: 'fees',
+    title: 'Fees',
+    kicker: 'The hook',
+    lede: 'The AMPS fee both ways, the pool base fee on pass-through only, and where the money goes.',
+    source: 'AmpsHook\nAmpsQuoter.quoteAll\nlib/fees.ts',
+    group: 'surfaces',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'There are two fees and they are charged in different circumstances. The AMPS fee is the protocol’s own, and it is taken on every swap that touches AMPS — buying it and selling it alike. The pool’s base fee is the pool’s own, and under revision 6 it is charged on top of the AMPS fee only when the swap is one leg of a pass-through.',
+      },
+      {
+        kind: 'rows',
+        title: 'Live',
+        rows: [
+          {label: 'AMPS fee', figure: 'ampsFee', hint: 'Charged on buys and on sells'},
+          {label: 'Band hardcoded in the hook', figure: 'ampsFeeBand'},
+          {label: 'Entry-pool base fee band', figure: 'entryBaseFeeBand', hint: 'AMPS/WETH and AMPS/USDG'},
+          {label: 'Spoke base fee band', figure: 'spokeBaseFeeBand', hint: 'High-volatility names default higher inside it'},
+          {label: 'Absolute ceiling on base plus dynamic', figure: 'totalFeeMax'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'default',
+        title: 'The getter is still called ampsFeeBps',
+        text: 'On chain the AMPS fee is still exposed as AmpsHook.ampsFeeBps(), from before it was charged in both directions. The interface reads it through one accessor so the rename is a single line; the value you see is the live one either way.',
+      },
+      {kind: 'h', level: 2, text: 'The dynamic component'},
+      {
+        kind: 'p',
+        text: 'On top of the base sits a dynamic component driven by volatility, deviation from the fair tick, divergence, the equity session and a surge latch. It is capped, and the cap widens when the oracle gate is degraded — a swap is never refused for a gate reason, it is only made dearer.',
+      },
+      {kind: 'h', level: 2, text: 'Where the fee goes'},
+      {
+        kind: 'p',
+        text: 'Every compound takes the creator slice first, then burns the AMPS side of the fee. The counter-asset side is not distributed: it stays in the pool as bids, which is the same thing as saying it deepens the floor. There is no staker slice and no reward stream — revision 6 removed both.',
+      },
+      {
+        kind: 'rows',
+        title: 'The creator schedule, which is immutable',
+        rows: [
+          {label: 'At genesis', figure: 'creatorFeeGenesis'},
+          {label: 'Decays linearly to zero over', figure: 'creatorDecay'},
+          {label: 'In force now', figure: 'creatorFeeNow'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'info',
+        title: 'There is no setter',
+        text: 'The creator schedule is compiled into the vault. No governance path reaches it, and it expires by itself.',
+      },
+    ],
+  },
+
+  {
+    slug: 'pass-through',
+    title: 'Pass-through and the router',
+    kicker: 'The router',
+    lede: 'Why stock-to-stock has exactly one route, and what happens if you take another.',
+    source: 'AmpsRouter.rotate\nlib/abi/router.ts',
+    group: 'surfaces',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'A pass-through is stock to stock through AMPS: buy AMPS in one pool, sell it in another, in one transaction. Its second leg pays the destination pool’s base fee instead of the AMPS fee, which is what makes rotating between constituents cheap.',
+      },
+      {
+        kind: 'note',
+        tone: 'warning',
+        title: 'Only the protocol’s own router can do it',
+        text: 'The hook fixes a hop’s fee in beforeSwap, before that hop runs. The only thing that can prove to it that the AMPS being sold was bought moments ago in the same transaction is the credit the router creates and spends inside that transaction, in EIP-1153 transient storage. A third-party router calling the PoolManager twice creates no such credit, so its AMPS-buying leg pays the AMPS fee like any other buy.',
+      },
+      {
+        kind: 'code',
+        lang: 'solidity',
+        text: `function rotate(
+    PoolId hop1,
+    PoolId hop2,
+    uint256 amountIn,
+    uint256 minOut,
+    address to,
+    bool unwrap,
+    uint256 deadline
+) external payable returns (uint256 amountOut);`,
+      },
+      {
+        kind: 'p',
+        text: 'The credit is transient by construction. It cannot cross a transaction boundary, so splitting a rotation into two transactions throws it away entirely; and an exact-output sell consumes none of it, which is why the router always builds the second leg as exact input.',
+      },
+      {
+        kind: 'rows',
+        title: 'Addresses',
+        rows: [
+          {label: 'AmpsRouter', figure: 'addrRouter'},
+          {label: 'AmpsHook', figure: 'addrHook'},
+          {label: 'PoolManager', figure: 'refPoolManager'},
+          {label: 'UniversalRouter', figure: 'refUniversalRouter', hint: 'Used for single-hop buys and sells; it cannot do a pass-through'},
+        ],
+      },
+    ],
+  },
+
+  {
+    slug: 'pools',
+    title: 'Pools and liquidity',
+    kicker: 'Uniswap v4 · concentrated liquidity',
+    lede: 'Protocol-owned ladders, what bid depth actually is, and the rollout that moves inventory into the spokes.',
+    source: 'AmpsVault.ladderLength\nLadderPositionValuer.amountsOf',
+    group: 'protocol',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'Every pool is protocol-owned. The vault places a static ladder of concentrated positions — asks above the anchor, bids below it — and never re-centres them. A cell is placed once and is only ever removed by a redemption, the rollout, the high-water buyback burn or a migration, so how full a cell is is a real measure of what the market has bought rather than an artefact of a keeper moving ranges.',
+      },
+      {
+        kind: 'note',
+        tone: 'danger',
+        title: 'Bid depth is finite and it is published',
+        text: 'There is no public liquidity-provider tier and there will not be one. The bid under AMPS in a pool is exactly the counter-asset the protocol holds there. If you want to know what would happen to the price if you sold, read the per-pool figure on the Vault surface: it is the whole answer.',
+      },
+      {kind: 'h', level: 2, text: 'Ladder shape'},
+      {
+        kind: 'rows',
+        title: 'Live',
+        rows: [
+          {label: 'Doublings', figure: 'ladderDoublings', hint: 'How far above the anchor the ask ladder reaches'},
+          {label: 'Tilt', figure: 'ladderTilt', hint: 'Each bucket holds tilt^k of the pool’s inventory'},
+          {label: 'Spoke seed share', figure: 'spokeSeed'},
+          {label: 'Live cells across all pools', figure: 'liveCells'},
+          {label: 'Protocol inventory', figure: 'inventoryAmps', hint: 'Finite and never minted'},
+        ],
+      },
+      {kind: 'h', level: 2, text: 'Rollout'},
+      {
+        kind: 'p',
+        text: 'Unfilled entry-pool inventory migrates into the spokes at a governed daily rate, subject to a floor that stops it draining the entry pools. It is a rate rather than an event, so the index reaches its target weights over days rather than at a single block anyone could front-run.',
+      },
+      {
+        kind: 'rows',
+        rows: [
+          {label: 'Rate', figure: 'rolloutRate'},
+          {label: 'Ceiling hardcoded in the vault', figure: 'rolloutRateMax'},
+          {label: 'Entry-pool floor', figure: 'entryFloor'},
+        ],
+      },
+      {kind: 'h', level: 2, text: 'Prices the pools are measured against'},
+      {
+        kind: 'rows',
+        rows: [
+          {label: 'TWAP window', figure: 'twapWindow'},
+          {label: 'Reference up-rate', figure: 'refUpRate'},
+          {label: 'Reference divergence limit', figure: 'refDivergence'},
+        ],
+      },
+    ],
+  },
+
+  {
+    slug: 'bonds',
+    title: 'Bonds',
+    kicker: 'Issuance',
+    lede: 'Discounted issuance against a stock token, priced at or above NAV plus a minimum accretion.',
+    source: 'AmpsBonds\nlib/bonds.ts',
+    group: 'surfaces',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'A bond deposits a stock token and receives AMPS at a discount, vesting linearly. The AMPS is minted at purchase and is in total supply from that moment, so NAV per share reflects the issuance at once and cannot be gamed by claim timing. The price is the lower of the market discount and the NAV floor; the floor is computed from the last confirmed feed answer, which is what makes manipulating the pool TWAP worthless — the best an attacker can do is remove their own discount.',
+      },
+      {
+        kind: 'rows',
+        title: 'Live parameters',
+        rows: [
+          {label: 'Vest', figure: 'bondVest'},
+          {label: 'Vest band', figure: 'bondVestBand'},
+          {label: 'Epoch', figure: 'bondEpoch', hint: 'Capacity is allotted per market per epoch'},
+          {label: 'Minimum accretion', figure: 'bondMinAccretion'},
+          {label: 'Discount band', figure: 'bondDiscountBand'},
+          {label: 'Daily issuance cap', figure: 'bondDailyCap', hint: 'In basis points of total supply, across every market'},
+          {label: 'Issued today', figure: 'bondIssuedToday'},
+          {label: 'Markets', figure: 'bondMarkets'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'danger',
+        title: 'minAmpsOut is always the quoted amount',
+        text: 'The capacity clamp reduces the AMPS issued and never the collateral taken: the shell settles the whole deposit and issues the capped amount. A lower bound is therefore not slippage tolerance, it is consent to hand over the entire deposit for a capped issue, and this interface refuses to build such a call.',
+      },
+      {kind: 'h', level: 2, text: 'When a market will not quote'},
+      {
+        kind: 'p',
+        text: 'quote() never reverts for a known market. It returns zero with a bytes32 reason, which is why the board can show every market including the ones that cannot be bonded. The reasons include a closed market, a corporate-action freeze, exhausted epoch or daily capacity, a stale feed, and — new in revision 6 — unconfirmedNav, which means the NAV floor would be built on a feed answer that has not been confirmed yet. It resolves by itself when the feed confirms.',
+      },
+    ],
+  },
+
+  {
+    slug: 'index',
+    title: 'The index',
+    kicker: 'The constituent set',
+    lede: 'The constituent set, target weights against realised ones, and what a freeze or a retirement does.',
+    source: 'AmpsRegistry.constituent\nAmpsRegistry.currentWeightBps',
+    group: 'protocol',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'The registry holds the constituent set and a target weight for each name. What the vault actually holds is a separate figure, priced at the reference: the rollout moves inventory on a daily cap and the market moves the assets in between, so the two differ, and the Vault surface publishes both rather than picking one.',
+      },
+      {
+        kind: 'rows',
+        title: 'Live',
+        rows: [
+          {label: 'Constituents', figure: 'constituentCount'},
+          {label: 'Active', figure: 'activeConstituentCount', hint: 'A frozen name is still an index member; a retired one is not'},
+          {label: 'Maximum the registry will hold', figure: 'maxConstituents'},
+          {label: 'Weight cap at the live count', figure: 'indexCap'},
+          {label: 'Weight floor at the live count', figure: 'indexFloor'},
+          {label: 'Pools registered', figure: 'poolCount'},
+        ],
+      },
+      {kind: 'h', level: 2, text: 'Freezes and retirements'},
+      {
+        kind: 'p',
+        text: 'A guardian freeze and a corporate-action freeze are both disable-only and both expire by themselves: they stop placements, compounding and that market’s bonds, and they stop nothing else. Retiring a constituent removes it from the index but never moves the assets already held — its pool stays open as an exit market.',
+      },
+      {
+        kind: 'note',
+        tone: 'warning',
+        title: 'The issuer can freeze the tokens themselves',
+        text: 'Robinhood Stock Tokens are Jersey-issued debt securities. The issuer can pause transfers, block an address, and change a share multiplier for a corporate action. If a constituent is blocked, redemption still pays out every other asset pro rata and the frozen line is simply not deliverable until the issuer lifts it.',
+      },
+    ],
+  },
+
+  {
+    slug: 'governance',
+    title: 'Governance',
+    kicker: 'Read-only',
+    lede: 'What can change, by whom, how fast, and the bands that cannot be widened.',
+    source: 'TimelockController\n@amplestocks/config launchParameters',
+    group: 'reference',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'A Safe proposes, a timelock executes with an open executor role, and a guardian Safe can cancel and can impose a disable-only freeze. Every governed parameter is bounded by a limit hardcoded in the contract that consumes it; widening a band is not a governance action, it is a new deployment and a migration.',
+      },
+      {
+        kind: 'rows',
+        title: 'Who and how long',
+        rows: [
+          {label: 'Proposer Safe', figure: 'cfgProposer'},
+          {label: 'Guardian Safe', figure: 'cfgGuardian'},
+          {label: 'Parameters', figure: 'cfgTimelockFast'},
+          {label: 'Constituents and policy pointers', figure: 'cfgTimelockSlow'},
+          {label: 'Standby vault', figure: 'cfgTimelockStandby'},
+          {label: 'Guardian freeze expiry', figure: 'cfgGuardianFreeze'},
+        ],
+      },
+      {kind: 'h', level: 2, text: 'The bands, live'},
+      {
+        kind: 'table',
+        columns: ['Parameter', 'Live', 'Hard band'],
+        rows: [
+          [{text: 'ampsFeeBps'}, {figure: 'ampsFee'}, {figure: 'ampsFeeBand'}],
+          [{text: 'redeemFeeBps'}, {figure: 'redeemFee'}, {figure: 'redeemFeeMax'}],
+          [{text: 'buyFeeBps (entry)'}, {text: 'per pool'}, {figure: 'entryBaseFeeBand'}],
+          [{text: 'buyFeeBps (spokes)'}, {text: 'per pool'}, {figure: 'spokeBaseFeeBand'}],
+          [{text: 'minAccretionBps'}, {figure: 'bondMinAccretion'}, {text: 'see AmpsBonds'}],
+          [{text: 'dailyCapBps'}, {figure: 'bondDailyCap'}, {text: 'see AmpsBonds'}],
+          [{text: 'vestSeconds'}, {figure: 'bondVest'}, {figure: 'bondVestBand'}],
+          [{text: 'rolloutBpsPerDay'}, {figure: 'rolloutRate'}, {figure: 'rolloutRateMax'}],
+          [{text: 'creator schedule'}, {figure: 'creatorFeeNow'}, {text: 'immutable — no setter'}],
+        ],
+        footnote:
+          'The live column and the band column are separate reads. A band shown as a single figure is a ceiling with an implicit floor of zero. There is no burnBps and no stakerBps: revision 6 removes staking, and the AMPS side of every fee is burned after the creator slice.',
+      },
+      {
+        kind: 'note',
+        tone: 'info',
+        title: 'What governance cannot do',
+        text: 'It cannot block redemption — the path contains no gate, no guardian and no pause reference. It cannot widen a hard band. It cannot move funds through a policy pointer. It cannot mint AMPS by any route other than the bond shell. It cannot touch the creator schedule.',
+      },
+    ],
+  },
+
+  {
+    slug: 'addresses',
+    title: 'Addresses',
+    kicker: 'Reference',
+    lede: 'Every contract this interface talks to, and where its address comes from.',
+    source: 'lib/contracts.ts\nlib/deployment.ts',
+    group: 'reference',
+    blocks: [
+      {
+        kind: 'p',
+        text: 'The Amplestocks contracts come from the deployment record — environment variables, absent until the deploy scripts have run, which is why an unconfigured entry shows a dash rather than a zero address. The third-party addresses come from the reference book, which the preflight script re-reads from chain before any of it is baked into a deploy.',
+      },
+      {
+        kind: 'rows',
+        title: 'Amplestocks',
+        rows: [
+          {label: 'Amps', figure: 'addrAmps'},
+          {label: 'AmpsVault', figure: 'addrVault'},
+          {label: 'AmpsHook', figure: 'addrHook'},
+          {label: 'AmpsRouter', figure: 'addrRouter'},
+          {label: 'AmpsQuoter', figure: 'addrQuoter'},
+          {label: 'AmpsBonds', figure: 'addrBonds'},
+          {label: 'AmpsBondsLens', figure: 'addrBondsLens'},
+          {label: 'PoolRegistry', figure: 'addrRegistry'},
+          {label: 'PoolRegistryLens', figure: 'addrRegistryLens'},
+          {label: 'OracleGate', figure: 'addrOracleGate'},
+          {label: 'TimelockController', figure: 'addrTimelock'},
+        ],
+      },
+      {
+        kind: 'rows',
+        title: 'Third-party',
+        rows: [
+          {label: 'PoolManager', figure: 'refPoolManager'},
+          {label: 'UniversalRouter', figure: 'refUniversalRouter'},
+          {label: 'Permit2', figure: 'refPermit2'},
+          {label: 'WETH9', figure: 'refWeth9'},
+          {label: 'USDG', figure: 'refUsdg'},
+          {label: 'USDC (bridged)', figure: 'refUsdc'},
+          {label: 'Across SpokePool', figure: 'refAcross'},
+          {label: 'Stock token beacon', figure: 'refStockBeacon'},
+        ],
+      },
+      {
+        kind: 'rows',
+        title: 'Chain',
+        rows: [
+          {label: 'Network', figure: 'cfgChain'},
+          {label: 'Chain id', figure: 'cfgChainId'},
+          {label: 'Hook permission flags', figure: 'cfgHookFlags', hint: 'The hook’s mined address ends in these bits'},
+        ],
+      },
+      {
+        kind: 'note',
+        tone: 'warning',
+        title: 'A dash here is not a zero address',
+        text: 'Where an address is missing, the contract has no configured deployment on the selected chain and the surfaces that need it render their "not deployed" state rather than reading 0x0 and showing the answers.',
+      },
+    ],
+  },
+
+  {
+    slug: 'risk',
+    title: 'Risk',
+    kicker: 'Read this first',
+    lede: 'The short version. The full disclosures are on /risk and you should read them.',
+    source: 'lib/copy.ts RISK_DISCLOSURES',
+    group: 'reference',
+    blocks: [
+      {
+        kind: 'note',
+        tone: 'danger',
+        title: 'Read /risk before you use any other page',
+        text: 'This page is a summary and the disclosures are not. Every item on /risk is a real property of the system rather than boilerplate, and the terms gate asks you to confirm you have read them.',
+      },
+      {
+        kind: 'p',
+        text: 'Bid depth is exactly the protocol’s own liquidity and nothing else. Redemption is the only floor, and it pays assets rather than cash. The premium is a number, not a promise. There is no authorised participant and no arrangement with the token issuer. Chain-level censorship is the one thing redemption cannot survive: the path is structurally ungated but still has to be included in a block by a single sequencer.',
+      },
+      {
+        kind: 'p',
+        text: 'The stock tokens can be frozen or blocked by their issuer. The contracts are immutable and the parameters are not. Nothing here is a return, a yield or an offer, and this interface is not available to residents of the United States, Canada, the United Kingdom or Switzerland.',
+      },
+    ],
+  },
+]
+
+export const PAGES_BY_SLUG: Readonly<Record<string, DocsPage>> = Object.freeze(
+  Object.fromEntries(PAGES.map((page) => [page.slug, page])),
+)
+
+export function pagesInGroup(group: DocsGroupId): DocsPage[] {
+  return PAGES.filter((page) => page.group === group)
+}
+
+/**
+ * Reading order: the groups in order, and inside each the pages in the order they are declared.
+ *
+ * The design derives its pager from exactly this — `ORDER = GROUPS.flatMap(g => g.items)` — so the
+ * sidebar and the pager can never disagree, whatever order the page list happens to be written in.
+ */
+export const READING_ORDER: readonly DocsPage[] = GROUPS.flatMap((group) => pagesInGroup(group.id))
+
+/** Previous and next in reading order, for the pager at the foot of every page. */
+export function neighbours(slug: string): {prev: DocsPage | null; next: DocsPage | null} {
+  const index = READING_ORDER.findIndex((page) => page.slug === slug)
+  if (index < 0) return {prev: null, next: null}
+  return {prev: READING_ORDER[index - 1] ?? null, next: READING_ORDER[index + 1] ?? null}
+}

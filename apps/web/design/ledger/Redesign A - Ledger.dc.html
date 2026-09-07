@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,200;0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,300&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root { --paper:#fdfdfb; --ink:#0d0d0c; --rule:#dedbd4; --hair:#efece6; --dim:#6d6a63; --fill:#0d0d0c; --onfill:#fdfdfb; --onfill-rule:rgba(255,255,255,0.28); --onfill-hair:rgba(255,255,255,0.14); }
+  [data-theme="ink"] { --paper:#0b0b0a; --ink:#f3f2ee; --rule:#2b2a27; --hair:#1c1b19; --dim:#8f8c85; --fill:#f3f2ee; --onfill:#0b0b0a; --onfill-rule:rgba(0,0,0,0.30); --onfill-hair:rgba(0,0,0,0.14); }
+  body { margin:0; background:var(--paper); }
+  a { color:var(--ink); text-decoration:none; }
+  a:hover { color:var(--dim); }
+  img[data-logo] { filter:grayscale(1) contrast(1.04); }
+  [data-theme="ink"] img[data-logo] { filter:grayscale(1) invert(1) contrast(1.04); }
+  ::selection { background:var(--ink); color:var(--paper); }
+</style>
+</helmet>
+<div data-theme="{{ theme }}" style="background:var(--paper); color:var(--ink); font-family:Newsreader, Georgia, 'Times New Roman', serif; font-size:17px; line-height:1.55; -webkit-font-smoothing:antialiased; text-wrap:pretty;">
+
+  <div data-screen-label="Landing">
+  <header style="border-bottom:1px solid var(--ink); position:sticky; top:0; background:var(--paper); z-index:20;">
+    <div style="max-width:1200px; margin:0 auto; padding:14px 28px; display:flex; align-items:baseline; gap:28px; row-gap:12px; flex-wrap:wrap;">
+      <a href="#" style="font-size:19px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">$AMPS &middot; Robinhood Chain</span>
+      <nav style="margin-left:auto; display:flex; align-items:baseline; gap:22px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <a href="#holdings" style="color:var(--dim);">Holdings</a>
+        <a href="#floor" style="color:var(--dim);">The floor</a>
+        <a href="#growth" style="color:var(--dim); white-space:nowrap;">How NAV grows</a>
+        <a href="#numbers" style="color:var(--dim);">Numbers</a>
+      </nav>
+      <div style="display:flex; align-items:center; gap:14px;">
+        <div style="display:flex; border:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase;">
+          <button onClick="{{ setPaper }}" style="border:0; background:{{ paperBg }}; color:{{ paperFg }}; padding:5px 9px; cursor:pointer; font:inherit;">Paper</button>
+          <button onClick="{{ setInk }}" style="border:0; background:{{ inkBg }}; color:{{ inkFg }}; padding:5px 9px; cursor:pointer; font:inherit;">Ink</button>
+        </div>
+        <a href="#" style="border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:8px 16px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; white-space:nowrap;" style-hover="background:var(--paper); color:var(--ink);">Enter app</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="border-bottom:1px solid var(--rule); overflow:hidden;">
+    <div style="max-width:1200px; margin:0 auto; padding:0 28px; display:grid; grid-template-columns:repeat(4, minmax(0,1fr));">
+      <sc-for list="{{ ticker }}" as="t" hint-placeholder-count="4">
+        <div style="padding:12px 18px 12px 0; border-right:1px solid var(--hair); display:flex; align-items:baseline; gap:10px;">
+          <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim); white-space:nowrap;">{{ t.k }}</span>
+          <span style="margin-left:auto; font-size:19px; font-weight:400; font-variant-numeric:tabular-nums;">{{ t.v }}</span>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+  <section style="max-width:1200px; margin:0 auto; padding:76px 28px 64px; display:grid; grid-template-columns:minmax(0,1.35fr) minmax(0,1fr); gap:64px; align-items:end;">
+    <div>
+      <p style="margin:0 0 26px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">A NAV-floored index share</p>
+      <h1 style="margin:0; font-size:clamp(44px, 6.2vw, 92px); line-height:0.94; font-weight:300; letter-spacing:-0.025em;">One share.<br>Thirty companies.<br><em style="font-style:italic; font-weight:300;">A floor you can always take.</em></h1>
+      <p style="margin:32px 0 0; max-width:54ch; font-size:20px; line-height:1.5; color:var(--ink);">AMPS is a single token that holds tokenised shares in thirty listed companies. At any moment you can burn it and take your slice of everything the vault holds — no permission, no price feed, no pause button.</p>
+      <div style="display:flex; gap:12px; margin-top:34px; flex-wrap:wrap;">
+        <a href="#" style="border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:13px 26px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase;">Buy AMPS</a>
+        <a href="#floor" style="border:1px solid var(--ink); padding:13px 26px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase;">How the floor works</a>
+      </div>
+    </div>
+    <div style="border-top:2px solid var(--ink); padding-top:18px;">
+      <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">NAV per share</p>
+      <p style="margin:6px 0 0; font-size:88px; line-height:0.9; font-weight:200; letter-spacing:-0.04em; font-variant-numeric:tabular-nums;">$1.0000</p>
+      <p style="margin:16px 0 0; font-size:16px; line-height:1.5; color:var(--dim);">The vault's own accounting of what it holds, per share. Recomputed from live balances by anyone who pays the gas.</p>
+      <div style="margin-top:22px; border-top:1px solid var(--rule);">
+        <sc-for list="{{ heroRows }}" as="r" hint-placeholder-count="3">
+          <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px; padding:9px 0; border-bottom:1px solid var(--hair);">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">{{ r.k }}</span>
+            <span style="font-size:17px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <section style="border-top:1px solid var(--ink); border-bottom:1px solid var(--rule);">
+    <div style="max-width:1200px; margin:0 auto; padding:0 28px; display:grid; grid-template-columns:repeat(3, minmax(0,1fr));">
+      <sc-for list="{{ pillars }}" as="p" hint-placeholder-count="3">
+        <div style="padding:44px 34px 48px 0; border-right:1px solid var(--hair);">
+          <p style="margin:0 0 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">{{ p.n }}</p>
+          <h2 style="margin:0 0 12px; font-size:30px; line-height:1.1; font-weight:400; letter-spacing:-0.02em;">{{ p.h }}</h2>
+          <p style="margin:0; font-size:17px; line-height:1.55; color:var(--dim);">{{ p.b }}</p>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <section id="holdings" style="max-width:1200px; margin:0 auto; padding:72px 28px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:16px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Thirty Uniswap v4 positions</p>
+        <h2 style="margin:0; font-size:44px; line-height:1; font-weight:300; letter-spacing:-0.03em;">What the vault holds</h2>
+      </div>
+      <p style="margin:0; max-width:46ch; font-size:16px; line-height:1.5; color:var(--dim);">Not a wallet of tokens sitting still. Every holding <em>is</em> a concentrated-liquidity position in that stock's own AMPS pool — quoting a two-sided market and taking the fee on every trade that crosses it.</p>
+    </div>
+    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(148px,1fr)); border-left:1px solid var(--hair); border-top:1px solid var(--hair); margin-top:28px;">
+      <sc-for list="{{ constituents }}" as="c" hint-placeholder-count="30">
+        <div style="border-right:1px solid var(--hair); border-bottom:1px solid var(--hair); padding:16px 14px 14px; display:flex; flex-direction:column; gap:12px; min-height:112px; box-sizing:border-box;" style-hover="background:var(--hair);">
+          <div style="height:30px; display:flex; align-items:center;">{{ c.mark }}</div>
+          <div style="margin-top:auto;">
+            <div style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; letter-spacing:0.06em;">{{ c.symbol }}</div>
+            <div style="font-size:17px; font-variant-numeric:tabular-nums; margin-top:2px;">{{ c.value }}</div>
+            <div style="font-size:14px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ c.weight }}</div>
+          </div>
+          <div style="height:2px; background:var(--rule);">
+            <div style="height:2px; background:var(--ink); width:{{ c.bar }};"></div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+    <p style="margin:16px 0 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.1em; text-transform:uppercase; color:var(--dim);">Value = stock tokens inside that pool's live ranges. Bar = target index weight, floor 0.20% / cap 9.60% at thirty names.</p>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.7fr) minmax(0,1.3fr); gap:56px; margin-top:56px;">
+      <div>
+        <h3 style="margin:0; font-size:30px; line-height:1.1; font-weight:300; letter-spacing:-0.025em;">What NAV is made of</h3>
+        <p style="margin:16px 0 0; font-size:16px; line-height:1.55; color:var(--dim);">Assets are marked from live balances at the reference price. The AMPS the vault is holding as ask inventory is deliberately not among them.</p>
+      </div>
+      <div style="border-top:2px solid var(--ink);">
+        <sc-for list="{{ composition }}" as="r" hint-placeholder-count="4">
+          <div style="padding:16px 0; border-bottom:1px solid var(--hair);">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px;">
+              <span style="font-size:19px;">{{ r.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+            </div>
+            <div style="font-size:15px; line-height:1.5; color:var(--dim); margin-top:4px;">{{ r.b }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <section id="floor" style="border-top:1px solid var(--ink); background:var(--fill); color:var(--onfill);">
+    <div style="max-width:1200px; margin:0 auto; padding:76px 28px; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.1fr); gap:64px;">
+      <div>
+        <p style="margin:0 0 20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; opacity:0.6;">The floor</p>
+        <h2 style="margin:0; font-size:clamp(36px,4.4vw,60px); line-height:1.02; font-weight:300; letter-spacing:-0.03em;">Redemption pays assets, not a price.</h2>
+        <p style="margin:26px 0 0; font-size:19px; line-height:1.5; opacity:0.86; max-width:46ch;">Burn your AMPS and the vault sends you a pro-rata slice of every asset it holds — every stock token, every idle balance, every position — less a 1% fee. The code path reads no price feed, consults no gate, and cannot be paused by governance, the guardian or the timelock.</p>
+        <p style="margin:20px 0 0; font-size:16px; line-height:1.55; opacity:0.6; max-width:46ch;">What it does not do is pay you a price. Their market value is whatever those assets are worth when you sell them, which may be less than the NAV shown when you redeemed.</p>
+      </div>
+      <div>
+        <div style="border-top:1px solid var(--onfill-rule); border-bottom:1px solid var(--onfill-rule); padding:6px 0;">
+          <sc-for list="{{ floorSteps }}" as="s" hint-placeholder-count="4">
+            <div style="display:grid; grid-template-columns:44px 1fr; gap:20px; padding:20px 0; border-bottom:1px solid var(--onfill-hair);">
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.08em; opacity:0.55; padding-top:5px;">{{ s.n }}</span>
+              <div>
+                <div style="font-size:21px; line-height:1.25;">{{ s.h }}</div>
+                <div style="font-size:15px; line-height:1.5; opacity:0.6; margin-top:4px;">{{ s.b }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        <p style="margin:18px 0 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.1em; text-transform:uppercase; opacity:0.5;">One dependency it cannot survive: the chain not producing blocks. Disclosed, not argued away.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="growth" style="max-width:1200px; margin:0 auto; padding:72px 28px 64px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:16px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Uniswap v4 · concentrated liquidity</p>
+        <h2 style="margin:0; font-size:44px; line-height:1; font-weight:300; letter-spacing:-0.03em;">How NAV grows</h2>
+      </div>
+      <p style="margin:0; max-width:46ch; font-size:16px; line-height:1.5; color:var(--dim);">The vault is the market maker. Every AMPS trade crosses a concentrated-liquidity range the protocol owns, and the fee it pays lands in the vault — not with an outside liquidity provider.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px,1fr)); gap:1px; background:var(--hair); margin-top:28px;">
+      <sc-for list="{{ growthStats }}" as="n" hint-placeholder-count="4">
+        <div style="background:var(--paper); padding:24px 22px;">
+          <p style="margin:0 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ n.k }}</p>
+          <p style="margin:0; font-size:38px; line-height:1; font-weight:300; letter-spacing:-0.03em; font-variant-numeric:tabular-nums;">{{ n.v }}</p>
+          <p style="margin:10px 0 0; font-size:14px; line-height:1.5; color:var(--dim);">{{ n.b }}</p>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,0.85fr); gap:56px; margin-top:52px;">
+      <div>
+        <p style="margin:0 0 4px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">The loop</p>
+        <div style="border-top:1px solid var(--ink);">
+          <sc-for list="{{ feeFlow }}" as="s" hint-placeholder-count="4">
+            <div style="display:grid; grid-template-columns:44px 1fr; gap:20px; padding:20px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.08em; color:var(--dim); padding-top:6px;">{{ s.n }}</span>
+              <div>
+                <div style="font-size:22px; line-height:1.25;">{{ s.h }}</div>
+                <div style="font-size:16px; line-height:1.5; color:var(--dim); margin-top:5px;">{{ s.b }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+      <div>
+        <p style="margin:0 0 4px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Where each fee goes</p>
+        <div style="border-top:1px solid var(--ink);">
+          <sc-for list="{{ feeSplit }}" as="r" hint-placeholder-count="4">
+            <div style="padding:16px 0; border-bottom:1px solid var(--hair);">
+              <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px;">
+                <span style="font-size:18px;">{{ r.k }}</span>
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+              </div>
+              <div style="font-size:14px; line-height:1.5; color:var(--dim); margin-top:4px;">{{ r.b }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <p style="margin:18px 0 0; font-size:15px; line-height:1.55; color:var(--dim);">Ladders are static. A cell is placed once and only ever removed by a redemption, the daily rollout, a high-water buyback burn or a migration — nothing is re-centred or re-widened, so <em>filled</em> below is a real measure of what the market bought.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:52px;">
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:24px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:14px;">
+        <h3 style="margin:0; font-size:28px; font-weight:400; letter-spacing:-0.02em;">The ladders, cell by cell</h3>
+        <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">{{ laddersShown }} · open any pool</p>
+      </div>
+      <div style="display:grid; grid-template-columns:minmax(0,1fr) 104px 92px 60px 88px 60px 66px; gap:14px; padding:12px 0 10px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">
+        <span>Pool</span>
+        <span style="text-align:right;">Value</span>
+        <span style="text-align:right;">Stock side</span>
+        <span style="text-align:right;">Cells</span>
+        <span style="text-align:right;">Fees 30d</span>
+        <span style="text-align:right;">Filled</span>
+        <span></span>
+      </div>
+      <sc-for list="{{ ladderPools }}" as="p" hint-placeholder-count="6">
+        <div style="border-bottom:1px solid var(--hair);">
+          <button onClick="{{ p.toggle }}" style="width:100%; display:grid; grid-template-columns:minmax(0,1fr) 104px 92px 60px 88px 60px 66px; gap:14px; align-items:center; text-align:left; background:transparent; border:0; padding:13px 0; cursor:pointer; color:var(--ink); font-family:inherit;" style-hover="background:var(--hair);">
+            <span style="display:flex; align-items:center; gap:12px; min-width:0;">
+              {{ p.mark }}
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.05em; white-space:nowrap;">{{ p.pool }}</span>
+              <span style="font-size:15px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ p.name }}</span>
+            </span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.value }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ p.stock }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; color:var(--dim);">{{ p.cells }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.fees }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ p.fill }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ p.cta }}</span>
+          </button>
+          <sc-if value="{{ p.open }}">
+            <div style="padding:0 0 26px; width:100%; overflow-x:auto;">
+              <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                  <tr>
+                    <th style="text-align:left; padding:8px 12px 8px 0; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Cell</th>
+                    <th style="text-align:left; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Tick range</th>
+                    <th style="text-align:left; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Side</th>
+                    <th style="text-align:right; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Placed</th>
+                    <th style="text-align:right; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Filled</th>
+                    <th style="text-align:right; padding:8px 0 8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Proceeds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <sc-for list="{{ p.cellRows }}" as="c" hint-placeholder-count="6">
+                    <tr>
+                      <td style="padding:9px 12px 9px 0; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">{{ c.cell }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; color:var(--dim);">{{ c.ticks }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">{{ c.side }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.placed }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.filled }}</td>
+                      <td style="padding:9px 0 9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.proceeds }}</td>
+                    </tr>
+                  </sc-for>
+                </tbody>
+              </table>
+            </div>
+          </sc-if>
+        </div>
+      </sc-for>
+      <button onClick="{{ toggleLadders }}" style="margin-top:18px; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:11px 22px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">{{ laddersCta }}</button>
+    </div>
+  </section>
+
+  <section id="numbers" style="max-width:1200px; margin:0 auto; padding:72px 28px;">
+    <h2 style="margin:0 0 28px; font-size:44px; line-height:1; font-weight:300; letter-spacing:-0.03em; border-bottom:2px solid var(--ink); padding-bottom:16px;">By the numbers</h2>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px,1fr)); gap:1px; background:var(--hair);">
+      <sc-for list="{{ bigNumbers }}" as="n" hint-placeholder-count="6">
+        <div style="background:var(--paper); padding:26px 22px 24px;">
+          <p style="margin:0 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ n.k }}</p>
+          <p style="margin:0; font-size:38px; line-height:1; font-weight:300; letter-spacing:-0.03em; font-variant-numeric:tabular-nums;">{{ n.v }}</p>
+          <p style="margin:10px 0 0; font-size:14px; line-height:1.5; color:var(--dim);">{{ n.b }}</p>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <footer style="border-top:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:34px 28px 44px; display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); gap:48px; align-items:start;">
+      <p style="margin:0; font-size:13px; line-height:1.65; color:var(--dim); max-width:78ch;">Thirty Uniswap v4 positions, thirty-two protocol-owned pools, and a redemption path with no oracle and no pause. Every contract is public and verifiable on the explorer.</p>
+      <div style="display:flex; gap:26px; justify-content:flex-end; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <a href="#" style="text-decoration:underline; text-underline-offset:3px;">Documentation</a>
+        <a href="#" style="color:var(--dim);">Contracts</a>
+        <a href="#" style="color:var(--dim);">Audits</a>
+      </div>
+    </div>
+  </footer>
+  </div>
+
+  <div data-screen-label="Vault" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navVault }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim);">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Disclosure page</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Vault</h1>
+      </div>
+      <p style="margin:0; max-width:52ch; font-size:16px; line-height:1.55; color:var(--dim);">Everything the protocol knows about itself. Headline first; the tables that back each number open underneath.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:1px; background:var(--hair); margin-top:32px; border-top:2px solid var(--ink);">
+      <sc-for list="{{ vaultHeadline }}" as="s" hint-placeholder-count="4">
+        <div style="background:var(--paper); padding:24px 22px 22px;">
+          <p style="margin:0 0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ s.k }}</p>
+          <p style="margin:0; font-size:44px; line-height:0.95; font-weight:300; letter-spacing:-0.035em; font-variant-numeric:tabular-nums;">{{ s.v }}</p>
+          <p style="margin:12px 0 0; font-size:13px; line-height:1.5; color:var(--dim);">{{ s.b }}</p>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="display:flex; align-items:center; gap:16px; margin-top:20px; padding:14px 0; border-bottom:1px solid var(--rule);">
+      <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; color:var(--dim); white-space:nowrap;">Last checkpoint 12m 4s ago</span>
+      <button style="margin-left:auto; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:9px 18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">checkpoint()</button>
+    </div>
+
+    <div style="margin-top:44px;">
+      <sc-for list="{{ sections }}" as="sec" hint-placeholder-count="3">
+        <div style="border-top:1px solid var(--ink);">
+          <button onClick="{{ sec.toggle }}" style="width:100%; background:transparent; border:0; padding:22px 0; display:flex; align-items:baseline; gap:20px; cursor:pointer; text-align:left; color:var(--ink); font-family:inherit;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; color:var(--dim); width:32px;">{{ sec.n }}</span>
+            <span style="font-size:28px; font-weight:400; letter-spacing:-0.02em;">{{ sec.title }}</span>
+            <span style="font-size:15px; color:var(--dim); max-width:40ch; margin-left:16px;">{{ sec.note }}</span>
+            <span style="margin-left:auto; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ sec.cta }}</span>
+          </button>
+          <sc-if value="{{ sec.open }}">
+            <div style="padding:0 0 34px 52px;">
+              <sc-for list="{{ sec.rows }}" as="r" hint-placeholder-count="4">
+                <div style="display:grid; grid-template-columns:minmax(0,1fr) auto; gap:24px; align-items:baseline; padding:11px 0; border-bottom:1px solid var(--hair);">
+                  <div>
+                    <div style="font-size:16px;">{{ r.label }}</div>
+                    <div style="font-size:13px; line-height:1.45; color:var(--dim);">{{ r.hint }}</div>
+                  </div>
+                  <div style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ r.value }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+        </div>
+      </sc-for>
+      <div style="border-top:1px solid var(--ink);"></div>
+    </div>
+
+    <div style="margin-top:52px;">
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:24px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:14px;">
+        <div>
+          <h2 style="margin:0; font-size:28px; font-weight:400; letter-spacing:-0.02em;">Holdings, position by position</h2>
+          <p style="margin:6px 0 0; font-size:15px; color:var(--dim);">Each row is one Uniswap v4 concentrated-liquidity position, decomposed into the side that counts toward NAV and the side that does not.</p>
+        </div>
+        <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim); white-space:nowrap;">192 live cells · 32 pools</p>
+      </div>
+      <div style="width:100%; overflow-x:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left; padding:12px 12px 12px 0; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Position</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Value</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Stock side</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">AMPS side</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Cells</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Fees 30d</th>
+              <th style="text-align:right; padding:12px 0 12px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Gate</th>
+            </tr>
+          </thead>
+          <tbody>
+            <sc-for list="{{ holdingsRows }}" as="h" hint-placeholder-count="8">
+              <tr style-hover="background:var(--hair);">
+                <td style="padding:11px 12px 11px 0; border-bottom:1px solid var(--hair);">
+                  <span style="display:flex; align-items:center; gap:12px;">
+                    {{ h.mark }}
+                    <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.05em; white-space:nowrap;">{{ h.pool }}</span>
+                    <span style="font-size:15px; color:var(--dim);">{{ h.name }}</span>
+                  </span>
+                </td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ h.value }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ h.stockSide }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ h.ampsSide }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ h.cells }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ h.fees30d }}</td>
+                <td style="padding:11px 0 11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.1em;">{{ h.gate }}</td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+      </div>
+      <button onClick="{{ toggleHoldings }}" style="margin-top:16px; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:10px 20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">{{ holdingsCta }}</button>
+      <p style="margin:16px 0 0; font-size:13px; line-height:1.55; color:var(--dim); max-width:88ch;">Stock side is the part of the position that counts toward NAV. AMPS side is ask inventory — finite, never minted, and not an asset. Because every pool is protocol-owned, the stock side is also the entire bid under AMPS in that pool. A position the valuer could not price is shown as unavailable, never as zero.</p>
+    </div>
+
+    <div style="margin-top:52px;">
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:24px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:14px;">
+        <div>
+          <h2 style="margin:0; font-size:28px; font-weight:400; letter-spacing:-0.02em;">Liquidity ladder</h2>
+          <p style="margin:6px 0 0; font-size:15px; color:var(--dim);">The concentrated-liquidity cells that earn the fees NAV grows on.</p>
+        </div>
+        <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">{{ laddersShown }} · static grid, placed once</p>
+      </div>
+      <div style="display:grid; grid-template-columns:minmax(0,1fr) 104px 92px 60px 88px 60px 66px; gap:14px; padding:12px 0 10px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">
+        <span>Pool</span>
+        <span style="text-align:right;">Value</span>
+        <span style="text-align:right;">Stock side</span>
+        <span style="text-align:right;">Cells</span>
+        <span style="text-align:right;">Fees 30d</span>
+        <span style="text-align:right;">Filled</span>
+        <span></span>
+      </div>
+      <sc-for list="{{ ladderPools }}" as="p" hint-placeholder-count="6">
+        <div style="border-bottom:1px solid var(--hair);">
+          <button onClick="{{ p.toggle }}" style="width:100%; display:grid; grid-template-columns:minmax(0,1fr) 104px 92px 60px 88px 60px 66px; gap:14px; align-items:center; text-align:left; background:transparent; border:0; padding:13px 0; cursor:pointer; color:var(--ink); font-family:inherit;" style-hover="background:var(--hair);">
+            <span style="display:flex; align-items:center; gap:12px; min-width:0;">
+              {{ p.mark }}
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.05em; white-space:nowrap;">{{ p.pool }}</span>
+              <span style="font-size:15px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ p.name }}</span>
+            </span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.value }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ p.stock }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; color:var(--dim);">{{ p.cells }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.fees }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums; color:var(--dim);">{{ p.fill }}</span>
+            <span style="text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ p.cta }}</span>
+          </button>
+          <sc-if value="{{ p.open }}">
+            <div style="padding:0 0 26px; width:100%; overflow-x:auto;">
+              <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                  <tr>
+                    <th style="text-align:left; padding:8px 12px 8px 0; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Cell</th>
+                    <th style="text-align:left; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Tick range</th>
+                    <th style="text-align:left; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Side</th>
+                    <th style="text-align:right; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Placed</th>
+                    <th style="text-align:right; padding:8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Filled</th>
+                    <th style="text-align:right; padding:8px 0 8px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Proceeds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <sc-for list="{{ p.cellRows }}" as="c" hint-placeholder-count="6">
+                    <tr>
+                      <td style="padding:9px 12px 9px 0; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">{{ c.cell }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; color:var(--dim);">{{ c.ticks }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">{{ c.side }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.placed }}</td>
+                      <td style="padding:9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.filled }}</td>
+                      <td style="padding:9px 0 9px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ c.proceeds }}</td>
+                    </tr>
+                  </sc-for>
+                </tbody>
+              </table>
+            </div>
+          </sc-if>
+        </div>
+      </sc-for>
+      <button onClick="{{ toggleLadders }}" style="margin-top:18px; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:11px 22px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">{{ laddersCta }}</button>
+    </div>
+  </main>
+  </div>
+
+  <div data-screen-label="Redeem" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navRedeem }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim);">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:18px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">The floor, as a transaction</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Redeem</h1>
+      </div>
+      <p style="margin:0; max-width:50ch; font-size:16px; line-height:1.55; color:var(--dim);">Burn AMPS, receive a slice of every asset the vault holds, less a 1% fee. No oracle, no gate, no pause.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.85fr) minmax(0,1.15fr); gap:56px; margin-top:44px;">
+      <div>
+        <p style="margin:0 0 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">You burn</p>
+        <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:18px 0 20px;">
+          <div style="display:flex; align-items:baseline; gap:12px;">
+            <input value="1,000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:56px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.1em;">AMPS</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:14px; margin-top:14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.06em; color:var(--dim);">
+            <span>Balance 12,481.204</span>
+            <button style="border:1px solid var(--rule); background:transparent; color:var(--dim); padding:4px 10px; font:inherit; cursor:pointer;" style-hover="border-color:var(--ink); color:var(--ink);">Max</button>
+          </div>
+        </div>
+        <div style="margin-top:6px;">
+          <sc-for list="{{ redeemMeta }}" as="m" hint-placeholder-count="4">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px; padding:11px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-size:15px; color:var(--dim);">{{ m.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ m.v }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <button style="width:100%; margin-top:26px; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;" style-hover="opacity:0.82;">Burn 1,000 AMPS</button>
+        <p style="margin:16px 0 0; font-size:14px; line-height:1.55; color:var(--dim);">This path is structurally ungated. It still has to be included in a block — if the sequencer refuses your transaction, no property of the contract helps you.</p>
+      </div>
+
+      <div>
+        <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:14px;">
+          <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">You receive, pro rata</p>
+          <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.1em; text-transform:uppercase; color:var(--dim);">30 lines &middot; 1 tx</p>
+        </div>
+        <div style="border-top:2px solid var(--ink);">
+          <sc-for list="{{ redeemLines }}" as="l" hint-placeholder-count="8">
+            <div style="display:grid; grid-template-columns:24px minmax(0,1fr) auto; gap:14px; align-items:center; padding:12px 0; border-bottom:1px solid var(--hair);">
+              {{ l.mark }}
+              <span style="display:flex; align-items:baseline; gap:10px; min-width:0;">
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.05em;">{{ l.symbol }}</span>
+                <span style="font-size:15px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ l.name }}</span>
+              </span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ l.amount }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <button onClick="{{ toggleLines }}" style="margin-top:16px; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:10px 20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">{{ linesCta }}</button>
+      </div>
+    </div>
+  </main>
+
+  <footer style="border-top:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:30px 28px 40px; display:flex; gap:36px; justify-content:space-between; flex-wrap:wrap;">
+      <p style="margin:0; font-size:13px; line-height:1.65; color:var(--dim); max-width:70ch;">Redemption reads no oracle, consults no gate and cannot be paused. Every contract is public and verifiable on the explorer.</p>
+      <div style="display:flex; gap:26px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <a href="#" style="color:var(--dim);">Documentation</a>
+        <a href="#" style="color:var(--dim);">Contracts</a>
+      </div>
+    </div>
+  </footer>
+  </div>
+
+  <div data-screen-label="Buy / Sell" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; row-gap:10px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navBuy }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim); white-space:nowrap;">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px; white-space:nowrap;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:18px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Entry pools</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Buy / Sell</h1>
+      </div>
+      <p style="margin:0; max-width:52ch; font-size:16px; line-height:1.55; color:var(--dim);">AMPS against WETH or USDG. Fees are exact and read from the hook; the output is a curve simulation at this instant.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.85fr) minmax(0,1.15fr); gap:56px; margin-top:44px;">
+      <div>
+        <div style="display:flex; border:1px solid var(--ink);">
+          <button style="flex:1; border:0; background:var(--fill); color:var(--onfill); padding:13px 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; cursor:pointer;">Buy AMPS</button>
+          <button style="flex:1; border:0; border-left:1px solid var(--ink); background:transparent; color:var(--dim); padding:13px 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; cursor:pointer;" style-hover="color:var(--ink);">Sell AMPS</button>
+        </div>
+
+        <p style="margin:26px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Pool</p>
+        <select style="width:100%; height:46px; border:1px solid var(--rule); background:transparent; color:var(--ink); padding:0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">
+          <option>AMPS / WETH</option>
+          <option>AMPS / USDG</option>
+        </select>
+
+        <p style="margin:22px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Pay (WETH)</p>
+        <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:16px 0 18px;">
+          <div style="display:flex; align-items:baseline; gap:12px;">
+            <input value="0.4000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:52px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.1em;">WETH</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:14px; margin-top:14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.06em; color:var(--dim);">
+            <span>Balance 2.8104</span>
+            <button style="border:1px solid var(--rule); background:transparent; color:var(--dim); padding:4px 10px; font:inherit; cursor:pointer;" style-hover="border-color:var(--ink); color:var(--ink);">Max</button>
+          </div>
+        </div>
+        <label style="display:flex; align-items:flex-start; gap:10px; margin-top:16px; font-size:14px; line-height:1.5; color:var(--dim);">
+          <input type="checkbox" checked style="margin-top:3px;">
+          <span>Use native ETH — the router wraps and unwraps around the WETH leg. The pool itself is AMPS/WETH.</span>
+        </label>
+        <button style="width:100%; margin-top:26px; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;" style-hover="opacity:0.82;">Buy AMPS</button>
+      </div>
+
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Quote</p>
+        <div style="border-top:2px solid var(--ink);">
+          <sc-for list="{{ buyQuote }}" as="r" hint-placeholder-count="9">
+            <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding:12px 0; border-bottom:1px solid var(--hair);">
+              <div style="min-width:0;">
+                <div style="font-size:16px;">{{ r.k }}</div>
+                <div style="font-size:13px; line-height:1.45; color:var(--dim);">{{ r.b }}</div>
+              </div>
+              <div style="flex-shrink:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ r.v }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="margin-top:26px; border-left:2px solid var(--ink); padding:2px 0 2px 20px;">
+          <p style="margin:0; font-size:17px; line-height:1.45;">The sell fee is charged on every AMPS-in swap in all 32 pools unless a rotation credit covers it.</p>
+          <p style="margin:10px 0 0; font-size:15px; line-height:1.55; color:var(--dim);">Buying AMPS in one pool and selling it in another inside the same transaction pays the buy fee on the credited part instead. The credit lives in transient storage: it never carries across transactions, and an exact-output sell does not consume it at all. That is what the Rotate surface is for.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+  </div>
+
+  <div data-screen-label="Rotate" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; row-gap:10px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navRotate }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim); white-space:nowrap;">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px; white-space:nowrap;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:18px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Stock to stock, one transaction</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Rotate</h1>
+      </div>
+      <p style="margin:0; max-width:52ch; font-size:16px; line-height:1.55; color:var(--dim);">One swap with two hops through AMPS. The AMPS the first hop buys is the credit the second hop spends — so the second hop pays close to a buy fee instead of a sell fee.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.85fr) minmax(0,1.15fr); gap:56px; margin-top:44px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Sell</p>
+        <select style="width:100%; height:46px; border:1px solid var(--rule); background:transparent; color:var(--ink); padding:0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">
+          <option>NVDA</option><option>MSFT</option><option>TSLA</option>
+        </select>
+        <p style="margin:22px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Buy</p>
+        <select style="width:100%; height:46px; border:1px solid var(--rule); background:transparent; color:var(--ink); padding:0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">
+          <option>AAPL</option><option>GOOGL</option><option>AMZN</option>
+        </select>
+        <p style="margin:22px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Amount (NVDA)</p>
+        <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:16px 0 18px;">
+          <div style="display:flex; align-items:baseline; gap:12px;">
+            <input value="4.0000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:52px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.1em;">NVDA</span>
+          </div>
+        </div>
+        <button style="width:100%; margin-top:26px; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;" style-hover="opacity:0.82;">Rotate NVDA → AAPL</button>
+        <p style="margin:16px 0 0; font-size:14px; line-height:1.55; color:var(--dim);">No external aggregator is configured, so no third-party route is quoted. The comparison is between the same two pools priced with and without the credit — not a claim about the whole market.</p>
+      </div>
+
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">One transaction, through AMPS</p>
+        <div style="border-top:2px solid var(--ink);">
+          <sc-for list="{{ rotateOneTx }}" as="r" hint-placeholder-count="3">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding:14px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-size:17px;">{{ r.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+            </div>
+          </sc-for>
+        </div>
+
+        <p style="margin:34px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">The same two swaps, separately</p>
+        <div style="border-top:1px solid var(--rule);">
+          <sc-for list="{{ rotateSeparate }}" as="r" hint-placeholder-count="3">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding:14px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-size:17px; color:var(--dim);">{{ r.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="margin-top:26px; background:var(--fill); color:var(--onfill); padding:24px 26px;">
+          <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; opacity:0.6;">Why it has to be one transaction</p>
+          <p style="margin:12px 0 0; font-size:18px; line-height:1.45;">The credit lives in transient storage. It never carries across transactions, so two separate swaps throw it away entirely.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+  </div>
+
+  <div data-screen-label="Bond" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; row-gap:10px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navBond }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim); white-space:nowrap;">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px; white-space:nowrap;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:18px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">Discounted issuance</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Bond</h1>
+      </div>
+      <p style="margin:0; max-width:52ch; font-size:16px; line-height:1.55; color:var(--dim);">Deposit a stock token, receive AMPS at a discount, vesting linearly. The price is the lower of the market discount and the NAV floor, and the collateral is always taken in full.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.85fr) minmax(0,1.15fr); gap:56px; margin-top:44px;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Market</p>
+        <select style="width:100%; height:46px; border:1px solid var(--rule); background:transparent; color:var(--ink); padding:0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">
+          <option>NVDA</option><option>AAPL</option><option>MSFT</option><option>TSLA</option><option>GME</option>
+        </select>
+        <p style="margin:22px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Deposit</p>
+        <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:16px 0 18px;">
+          <div style="display:flex; align-items:baseline; gap:12px;">
+            <input value="10.0000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:52px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.1em;">NVDA</span>
+          </div>
+        </div>
+        <button style="width:100%; margin-top:24px; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;" style-hover="opacity:0.82;">Bond 10 NVDA</button>
+        <div style="margin-top:26px; border-left:2px solid var(--ink); padding:2px 0 2px 20px;">
+          <p style="margin:0; font-size:17px; line-height:1.45;">A bond mints AMPS at purchase.</p>
+          <p style="margin:10px 0 0; font-size:15px; line-height:1.55; color:var(--dim);">It is in total supply immediately, so NAV per share reflects the issuance at once and cannot be gamed by claim timing. It is not income, and not a channel to or from the token issuer.</p>
+        </div>
+      </div>
+
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Quote</p>
+        <div style="border-top:2px solid var(--ink);">
+          <sc-for list="{{ bondQuote }}" as="r" hint-placeholder-count="6">
+            <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding:12px 0; border-bottom:1px solid var(--hair);">
+              <div style="min-width:0;">
+                <div style="font-size:16px;">{{ r.k }}</div>
+                <div style="font-size:13px; line-height:1.45; color:var(--dim);">{{ r.b }}</div>
+              </div>
+              <div style="flex-shrink:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:14px; font-variant-numeric:tabular-nums;">{{ r.v }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <p style="margin:20px 0 0; font-size:14px; line-height:1.55; color:var(--dim);">The shell recomputes the NAV floor itself and refuses any price above it, so a hostile or buggy pricing policy can decline to quote but can never issue a dilutive bond.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:56px;">
+      <h2 style="margin:0 0 0; font-size:28px; font-weight:400; letter-spacing:-0.02em; border-bottom:2px solid var(--ink); padding-bottom:14px;">Markets</h2>
+      <div style="width:100%; overflow-x:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left; padding:12px 12px 12px 0; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Collateral</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Discount</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Price q</th>
+              <th style="text-align:left; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Priced at</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Capacity left</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Vest</th>
+              <th style="text-align:right; padding:12px 0 12px 12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">State</th>
+            </tr>
+          </thead>
+          <tbody>
+            <sc-for list="{{ bondBoard }}" as="m" hint-placeholder-count="6">
+              <tr style-hover="background:var(--hair);">
+                <td style="padding:11px 12px 11px 0; border-bottom:1px solid var(--hair);">
+                  <span style="display:flex; align-items:center; gap:12px;">
+                    {{ m.mark }}
+                    <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.05em;">{{ m.symbol }}</span>
+                    <span style="font-size:15px; color:var(--dim);">{{ m.name }}</span>
+                  </span>
+                </td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ m.discount }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ m.q }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); font-size:14px; color:var(--dim);">{{ m.pricedAt }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ m.capacity }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">{{ m.vest }}</td>
+                <td style="padding:11px 0 11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">{{ m.state }}</td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+      </div>
+      <p style="margin:14px 0 0; font-size:13px; line-height:1.55; color:var(--dim); max-width:82ch;">Every market is shown, including the ones that cannot price right now — a market that is closed for a corporate action, full for the epoch, or pinned to the floor is more informative visible than hidden.</p>
+    </div>
+
+    <div style="margin-top:52px;">
+      <h2 style="margin:0; font-size:28px; font-weight:400; letter-spacing:-0.02em; border-bottom:2px solid var(--ink); padding-bottom:14px;">Your positions</h2>
+      <div style="width:100%; overflow-x:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left; padding:12px 12px 12px 0; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Market</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Purchased</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Claimed</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Claimable</th>
+              <th style="text-align:right; padding:12px; border-bottom:1px solid var(--rule); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; font-weight:400; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Vested</th>
+              <th style="padding:12px 0 12px 12px; border-bottom:1px solid var(--rule);"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <sc-for list="{{ bondPositions }}" as="p" hint-placeholder-count="2">
+              <tr>
+                <td style="padding:11px 12px 11px 0; border-bottom:1px solid var(--hair); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px;">{{ p.market }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.purchased }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.claimed }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.claimable }}</td>
+                <td style="padding:11px 12px; border-bottom:1px solid var(--hair); text-align:right; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ p.vest }}</td>
+                <td style="padding:11px 0 11px 12px; border-bottom:1px solid var(--hair); text-align:right;">
+                  <button style="border:1px solid var(--ink); background:transparent; color:var(--ink); padding:6px 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;" style-hover="background:var(--fill); color:var(--onfill);">Claim</button>
+                </td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+  </div>
+
+  <div data-screen-label="Stake" style="border-top:6px solid var(--ink);">
+  <header style="border-bottom:1px solid var(--ink);">
+    <div style="max-width:1200px; margin:0 auto; padding:12px 28px; display:flex; align-items:center; gap:26px; row-gap:10px; flex-wrap:wrap;">
+      <a href="#" style="font-size:15px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</a>
+      <nav style="display:flex; align-items:center; gap:20px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase;">
+        <sc-for list="{{ navStake }}" as="n">
+          <sc-if value="{{ n.idle }}"><a href="#" style="color:var(--dim); white-space:nowrap;">{{ n.label }}</a></sc-if>
+          <sc-if value="{{ n.active }}"><a href="#" style="border-bottom:2px solid var(--ink); padding-bottom:2px; white-space:nowrap;">{{ n.label }}</a></sc-if>
+        </sc-for>
+      </nav>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase;">
+        <span style="color:var(--dim); white-space:nowrap;">Robinhood Chain</span>
+        <span style="border:1px solid var(--rule); padding:6px 12px; white-space:nowrap;">0x4a2f…9c31</span>
+      </div>
+    </div>
+  </header>
+  <main style="max-width:1200px; margin:0 auto; padding:44px 28px 72px;">
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:32px; flex-wrap:wrap;">
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">xAMPS</p>
+        <h1 style="margin:0; font-size:52px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Stake</h1>
+      </div>
+      <p style="margin:0; max-width:52ch; font-size:16px; line-height:1.55; color:var(--dim);">Deposit AMPS, receive xAMPS. The contract pays out a share of the trading fees the ladder has already collected, streamed linearly over 24 hours. Nothing is minted for stakers.</p>
+    </div>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:1px; background:var(--hair); margin-top:32px; border-top:2px solid var(--ink);">
+      <sc-for list="{{ stakeStats }}" as="s" hint-placeholder-count="4">
+        <div style="background:var(--paper); padding:24px 22px 22px;">
+          <p style="margin:0 0 12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ s.k }}</p>
+          <p style="margin:0; font-size:44px; line-height:0.95; font-weight:300; letter-spacing:-0.035em; font-variant-numeric:tabular-nums;">{{ s.v }}</p>
+          <p style="margin:12px 0 0; font-size:13px; line-height:1.5; color:var(--dim);">{{ s.b }}</p>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="display:grid; grid-template-columns:minmax(0,0.85fr) minmax(0,1.15fr); gap:56px; margin-top:48px;">
+      <div>
+        <div style="display:flex; border:1px solid var(--ink);">
+          <button style="flex:1; border:0; background:var(--fill); color:var(--onfill); padding:13px 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; cursor:pointer;">Deposit</button>
+          <button style="flex:1; border:0; border-left:1px solid var(--ink); background:transparent; color:var(--dim); padding:13px 0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; cursor:pointer;" style-hover="color:var(--ink);">Withdraw</button>
+        </div>
+        <p style="margin:26px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">AMPS to stake</p>
+        <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:16px 0 18px;">
+          <div style="display:flex; align-items:baseline; gap:12px;">
+            <input value="12,000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:52px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; letter-spacing:0.1em;">AMPS</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:14px; margin-top:14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.06em; color:var(--dim);">
+            <span>Balance 12,481.204</span>
+            <button style="border:1px solid var(--rule); background:transparent; color:var(--dim); padding:4px 10px; font:inherit; cursor:pointer;" style-hover="border-color:var(--ink); color:var(--ink);">Max</button>
+          </div>
+        </div>
+        <button style="width:100%; margin-top:26px; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;" style-hover="opacity:0.82;">Stake 12,000 AMPS</button>
+      </div>
+
+      <div>
+        <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Your position</p>
+        <div style="border-top:2px solid var(--ink);">
+          <sc-for list="{{ stakeRows }}" as="r" hint-placeholder-count="4">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding:14px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-size:17px;">{{ r.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+            </div>
+          </sc-for>
+        </div>
+
+        <p style="margin:34px 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Where the rewards come from</p>
+        <div style="border-top:1px solid var(--rule);">
+          <sc-for list="{{ feeSplit }}" as="r" hint-placeholder-count="4">
+            <div style="padding:14px 0; border-bottom:1px solid var(--hair);">
+              <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px;">
+                <span style="font-size:17px;">{{ r.k }}</span>
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:15px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+              </div>
+              <div style="font-size:14px; line-height:1.5; color:var(--dim); margin-top:4px;">{{ r.b }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <p style="margin:18px 0 0; font-size:14px; line-height:1.55; color:var(--dim);">The stream is linear, so a deposit sandwiched around a compound earns only its time-weighted share. The APR shown is what was collected over a past window — not a projection.</p>
+      </div>
+    </div>
+  </main>
+  </div>
+
+  <div data-screen-label="Mobile" style="border-top:6px solid var(--ink); padding:44px 28px 76px;">
+    <div style="max-width:1200px; margin:0 auto 30px;">
+      <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">390 pt wide · 44 pt targets</p>
+      <h2 style="margin:0; font-size:38px; line-height:1; font-weight:300; letter-spacing:-0.03em;">Mobile</h2>
+    </div>
+    <div style="display:flex; gap:30px; flex-wrap:wrap; align-items:flex-start;">
+
+      <div style="width:390px; flex-shrink:0; border:1px solid var(--rule); background:var(--paper); display:flex; flex-direction:column;">
+        <div style="border-bottom:1px solid var(--ink); padding:15px 18px; display:flex; align-items:center; justify-content:space-between;">
+          <span style="font-size:13px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Amplestocks</span>
+          <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">Menu</span>
+        </div>
+        <div style="padding:30px 18px 26px;">
+          <p style="margin:0 0 16px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--dim);">A NAV-floored index share</p>
+          <h1 style="margin:0; font-size:42px; line-height:0.96; font-weight:300; letter-spacing:-0.03em;">One share.<br>Thirty companies.<br><em style="font-style:italic; font-weight:300;">A floor you can always take.</em></h1>
+          <p style="margin:20px 0 0; font-size:17px; line-height:1.5; color:var(--dim);">Burn it whenever you like and the vault sends you your slice of every asset it holds.</p>
+          <div style="display:flex; flex-direction:column; gap:10px; margin-top:24px;">
+            <a href="#" style="display:block; text-align:center; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:16px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase;">Buy AMPS</a>
+            <a href="#" style="display:block; text-align:center; border:1px solid var(--ink); padding:16px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.18em; text-transform:uppercase;">How the floor works</a>
+          </div>
+        </div>
+        <div style="margin:0 18px; border-top:2px solid var(--ink); padding-top:14px;">
+          <p style="margin:0; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">NAV per share</p>
+          <p style="margin:4px 0 0; font-size:56px; line-height:0.9; font-weight:200; letter-spacing:-0.04em; font-variant-numeric:tabular-nums;">$1.0000</p>
+          <sc-for list="{{ heroRows }}" as="r">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:10px 0; border-top:1px solid var(--hair);">
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">{{ r.k }}</span>
+              <span style="font-size:16px; font-variant-numeric:tabular-nums;">{{ r.v }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="margin:26px 0 0; padding:18px 18px 22px; border-top:1px solid var(--ink);">
+          <p style="margin:0 0 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">What the vault holds</p>
+          <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); border-left:1px solid var(--hair); border-top:1px solid var(--hair);">
+            <sc-for list="{{ mLogos }}" as="c">
+              <div style="border-right:1px solid var(--hair); border-bottom:1px solid var(--hair); padding:12px 8px 10px; display:flex; flex-direction:column; align-items:flex-start; gap:8px; box-sizing:border-box;">
+                {{ c.mark }}
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.04em;">{{ c.symbol }}</span>
+                <span style="font-size:13px; color:var(--dim); font-variant-numeric:tabular-nums;">{{ c.value }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <a href="#" style="display:block; text-align:center; margin-top:14px; border:1px solid var(--ink); padding:15px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase;">All thirty holdings</a>
+        </div>
+      </div>
+
+      <div style="width:390px; flex-shrink:0; border:1px solid var(--rule); background:var(--paper); display:flex; flex-direction:column;">
+        <div style="border-bottom:1px solid var(--ink); padding:15px 18px; display:flex; align-items:center; justify-content:space-between;">
+          <span style="font-size:13px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Vault</span>
+          <span style="border:1px solid var(--rule); padding:6px 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.1em;">0x4a2f…9c31</span>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:1px; background:var(--hair); border-bottom:1px solid var(--ink);">
+          <sc-for list="{{ vaultHeadline }}" as="s">
+            <div style="background:var(--paper); padding:18px 16px;">
+              <p style="margin:0 0 8px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">{{ s.k }}</p>
+              <p style="margin:0; font-size:32px; line-height:0.95; font-weight:300; letter-spacing:-0.035em; font-variant-numeric:tabular-nums;">{{ s.v }}</p>
+            </div>
+          </sc-for>
+        </div>
+        <div style="padding:20px 18px 8px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding-bottom:14px; border-bottom:1px solid var(--hair);">
+            <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; color:var(--dim);">Checkpoint 12m 4s ago</span>
+            <button style="border:1px solid var(--ink); background:transparent; color:var(--ink); padding:11px 14px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; cursor:pointer;">checkpoint()</button>
+          </div>
+          <sc-for list="{{ sections }}" as="sec">
+            <button onClick="{{ sec.toggle }}" style="width:100%; background:transparent; border:0; border-bottom:1px solid var(--hair); padding:16px 0; display:flex; align-items:center; gap:12px; cursor:pointer; text-align:left; color:var(--ink); font-family:inherit; min-height:44px;">
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.12em; color:var(--dim);">{{ sec.n }}</span>
+              <span style="font-size:20px; letter-spacing:-0.02em;">{{ sec.title }}</span>
+              <span style="margin-left:auto; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:var(--dim);">{{ sec.cta }}</span>
+            </button>
+          </sc-for>
+        </div>
+        <div style="padding:14px 18px 22px;">
+          <p style="margin:0 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">Holdings</p>
+          <div style="border-top:1px solid var(--ink);">
+            <sc-for list="{{ mHoldings }}" as="h">
+              <div style="display:flex; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid var(--hair);">
+                {{ h.mark }}
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; letter-spacing:0.05em; white-space:nowrap;">{{ h.pool }}</span>
+                <span style="margin-left:auto; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ h.value }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <div style="margin-top:auto; border-top:1px solid var(--ink); display:grid; grid-template-columns:repeat(4, minmax(0,1fr));">
+          <sc-for list="{{ mTabs }}" as="t">
+            <sc-if value="{{ t.active }}">
+              <span style="display:flex; align-items:center; justify-content:center; min-height:52px; background:var(--fill); color:var(--onfill); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase;">{{ t.label }}</span>
+            </sc-if>
+            <sc-if value="{{ t.idle }}">
+              <span style="display:flex; align-items:center; justify-content:center; min-height:52px; border-left:1px solid var(--hair); color:var(--dim); font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase;">{{ t.label }}</span>
+            </sc-if>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="width:390px; flex-shrink:0; border:1px solid var(--rule); background:var(--paper); display:flex; flex-direction:column;">
+        <div style="border-bottom:1px solid var(--ink); padding:15px 18px; display:flex; align-items:center; justify-content:space-between;">
+          <span style="font-size:13px; font-weight:500; letter-spacing:0.16em; text-transform:uppercase;">Redeem</span>
+          <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:var(--dim);">1% fee</span>
+        </div>
+        <div style="padding:24px 18px 20px;">
+          <p style="margin:0 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">You burn</p>
+          <div style="border-top:2px solid var(--ink); border-bottom:1px solid var(--rule); padding:14px 0 16px;">
+            <div style="display:flex; align-items:baseline; gap:10px;">
+              <input value="1,000" style="flex:1; min-width:0; border:0; background:transparent; color:var(--ink); font-family:Newsreader, Georgia, serif; font-size:48px; font-weight:300; letter-spacing:-0.03em; padding:0; outline:none; font-variant-numeric:tabular-nums;">
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; letter-spacing:0.1em;">AMPS</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:12px; margin-top:12px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; color:var(--dim);">
+              <span>Balance 12,481.204</span>
+              <button style="border:1px solid var(--rule); background:transparent; color:var(--dim); padding:8px 12px; font:inherit; cursor:pointer; min-height:32px;">Max</button>
+            </div>
+          </div>
+          <sc-for list="{{ redeemMeta }}" as="m">
+            <div style="display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:11px 0; border-bottom:1px solid var(--hair);">
+              <span style="font-size:15px; color:var(--dim);">{{ m.k }}</span>
+              <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ m.v }}</span>
+            </div>
+          </sc-for>
+          <p style="margin:22px 0 10px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--dim);">You receive, pro rata</p>
+          <div style="border-top:2px solid var(--ink);">
+            <sc-for list="{{ mLines }}" as="l">
+              <div style="display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hair);">
+                {{ l.mark }}
+                <span style="font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:12px; letter-spacing:0.05em;">{{ l.symbol }}</span>
+                <span style="margin-left:auto; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:13px; font-variant-numeric:tabular-nums;">{{ l.amount }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <button style="width:100%; margin-top:12px; border:1px solid var(--ink); background:transparent; color:var(--ink); padding:15px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; cursor:pointer;">All thirty lines</button>
+        </div>
+        <div style="margin-top:auto; border-top:1px solid var(--ink); padding:16px 18px 20px;">
+          <button style="width:100%; border:1px solid var(--ink); background:var(--fill); color:var(--onfill); padding:18px; font-family:'IBM Plex Mono', ui-monospace, monospace; font-size:11px; letter-spacing:0.18em; text-transform:uppercase; cursor:pointer;">Burn 1,000 AMPS</button>
+          <p style="margin:12px 0 0; font-size:13px; line-height:1.5; color:var(--dim);">No oracle, no gate, no pause — but the transaction still has to be included in a block.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440}}">
+const NAMES = {
+  AAPL:'Apple', AMD:'Advanced Micro Devices', AMZN:'Amazon', ASML:'ASML Holding', BABA:'Alibaba',
+  CLSK:'CleanSpark', COIN:'Coinbase', CRCL:'Circle', CRWV:'CoreWeave', DELL:'Dell Technologies',
+  GME:'GameStop', GOOGL:'Alphabet', INTC:'Intel', IONQ:'IonQ', META:'Meta Platforms',
+  MSFT:'Microsoft', MSTR:'Strategy', MU:'Micron', NBIS:'Nebius', NVDA:'NVIDIA',
+  ORCL:'Oracle', PLTR:'Palantir', RGTI:'Rigetti', RKLB:'Rocket Lab', SNDK:'SanDisk',
+  SPCX:'SpaceX', TSLA:'Tesla', TSM:'TSMC', USAR:'USA Rare Earth', WYFI:'Wyfi',
+};
+// CRCL and WYFI are not served by the Parqet logo CDN; they fall back to a typographic monogram.
+const NO_LOGO = ['CRCL', 'WYFI'];
+const WEIGHTS = [
+  ['NVDA',9.6],['MSFT',8.6],['AAPL',8.2],['GOOGL',7.3],['AMZN',6.8],['META',6.2],['TSLA',5.9],
+  ['TSM',5.3],['AMD',4.8],['ORCL',4.4],['PLTR',3.4],['MU',3.1],['ASML',2.9],['MSTR',2.7],
+  ['COIN',2.5],['INTC',2.2],['BABA',2.0],['DELL',1.8],['GME',1.6],['CRWV',1.5],['RKLB',1.4],
+  ['IONQ',1.3],['RGTI',1.2],['CLSK',1.1],['NBIS',1.0],['SNDK',0.9],['SPCX',0.8],['USAR',0.7],
+  ['CRCL',0.6],['WYFI',0.2],
+];
+const logoUrl = (s) => NO_LOGO.includes(s) ? null : `https://assets.parqet.com/logos/symbol/${s}?format=png&size=128`;
+const base = (s) => ({
+  symbol: s, name: NAMES[s] ?? s, logo: logoUrl(s), mono: NO_LOGO.includes(s), initials: s.slice(0, 2),
+});
+// The mark is a leaf, built here rather than in the template so no `src` hole is ever
+// emitted as a literal token during the streaming placeholder pass.
+const mark = (c, size, fs) => c.logo
+  ? React.createElement('img', {
+      'data-logo': '1', src: c.logo, alt: '', width: size, height: size,
+      style: {width: size, height: size, objectFit: 'contain', display: 'block'},
+    })
+  : React.createElement('span', {
+      style: {
+        width: size, height: size, border: '1px solid var(--rule)', display: 'flex',
+        alignItems: 'center', justifyContent: 'center', boxSizing: 'border-box',
+        fontFamily: "'IBM Plex Mono', ui-monospace, monospace", fontSize: fs,
+        letterSpacing: '0.04em', color: 'var(--dim)',
+      },
+    }, c.initials);
+// One pool is shown degraded, and it is the same pool everywhere on the page.
+const DEGRADED = 'NVDA';
+const SESSIONS = ['Regular', 'Regular', 'Regular', 'Pre-market', 'Regular', 'Regular', 'After-hours', 'Regular'];
+const NAV_ITEMS = ['Buy', 'Rotate', 'Bond', 'Redeem', 'Stake', 'Vault', 'Docs'];
+const appNav = (active) => NAV_ITEMS.map((label) => ({label, active: label === active, idle: label !== active}));
+const BOND_MARKETS = [
+  ['NVDA', '3.50%', '102.4880', 'Market discount', '48,120', '12h 0m', 'Open'],
+  ['AAPL', '2.80%', '88.1204', 'Market discount', '31,004', '12h 0m', 'Open'],
+  ['MSFT', '1.20%', '94.6610', 'NAV floor', '52,880', '12h 0m', 'Open'],
+  ['TSLA', '4.10%', '76.2044', 'Market discount', '12,440', '12h 0m', 'Open'],
+  ['COIN', '—', '—', 'NAV floor', '0', '12h 0m', 'Closed'],
+  ['GME', '5.60%', '41.8802', 'Market discount', '8,120', '12h 0m', 'Open'],
+];
+
+class Component extends DCLogic {
+  state = {
+    theme: 'paper', open: {supply: true, params: false, pol: false},
+    allHoldings: false, allLines: false, allLadders: false, openLadder: 'MSFT',
+  };
+
+  toggle(key) { this.setState((s) => ({open: {...s.open, [key]: !s.open[key]}})); }
+
+  renderVals() {
+    const paper = this.state.theme !== 'ink';
+    // Every constituent is held AS a Uniswap v4 concentrated-liquidity position in its own
+    // AMPS/<stock> pool. IN_RANGE is the stock-token value sitting inside those ranges.
+    const IN_RANGE = 4124880;
+    const AMPS_INVENTORY = 691637;
+    const usd = (n) => '$' + Math.round(n).toLocaleString('en-US');
+    const constituents = WEIGHTS.map(([s, w]) => {
+      const c = base(s);
+      return {
+        ...c, mark: mark(c, 30, 10), weight: w.toFixed(2) + '%',
+        bar: Math.round((w / 9.6) * 100) + '%',
+        value: s === DEGRADED ? '—' : usd((w / 100) * IN_RANGE),
+      };
+    });
+    const holdings = WEIGHTS.map(([s, w], i) => {
+      const c = base(s);
+      const value = (w / 100) * IN_RANGE;
+      const down = s === DEGRADED;
+      return {
+        ...c, mark: mark(c, 20, 8), pool: 'AMPS / ' + s, weight: w.toFixed(2) + '%',
+        value: down ? '—' : usd(value),
+        stockSide: down ? '—' : usd(value * (0.58 + ((i % 7) * 0.02))),
+        ampsSide: down ? '—' : Math.round((w / 100) * AMPS_INVENTORY).toLocaleString('en-US'),
+        cells: down ? '—' : '6 / 24',
+        fees30d: down ? '—' : usd(value * 0.0173),
+        gate: down ? 'DEGRADED' : 'OK',
+        session: down ? 'Closed' : SESSIONS[i % SESSIONS.length],
+      };
+    });
+    const lines = WEIGHTS.map(([s, w]) => {
+      const c = base(s);
+      return {...c, mark: mark(c, 24, 8), amount: (w * 0.2079).toFixed(4)};
+    });
+
+    // One ladder per pool: 30 constituent spokes plus the two entry pools. The grid is 24 cells;
+    // three bid cells and three ask cells are live per pool, which is what the summary counts.
+    const TICKS = ['-1200 … -1140', '-1140 … -1080', '-1080 … -1020', '1020 … 1080', '1080 … 1140', '1140 … 1200'];
+    const clampPct = (n) => Math.max(0, Math.min(100, Math.round(n)));
+    const ladderFor = ({key, label, name, logoSymbol, value, ampsSide, weight, i, down}) => {
+      const stockSide = value * (0.58 + ((i % 7) * 0.02));
+      const bidEach = stockSide / 3;
+      const askEach = ampsSide / 3;
+      const bidFills = [clampPct(100 - ((i % 3) * 8)), clampPct(62 - ((i % 5) * 6)), clampPct(8 - ((i % 4) * 2))];
+      const askFills = [clampPct(44 - ((i % 4) * 5)), clampPct(7 + ((i % 3) * 2)), 0];
+      const c = logoSymbol ? base(logoSymbol) : null;
+      const cells = [
+        ...bidFills.map((f, j) => ({
+          cell: '0' + j, ticks: TICKS[j], side: 'Bid', placed: usd(bidEach),
+          filled: f + '%', proceeds: f === 0 ? '—' : Math.round(bidEach * (f / 100)).toLocaleString('en-US') + ' AMPS',
+        })),
+        ...askFills.map((f, j) => ({
+          cell: '0' + (j + 3), ticks: TICKS[j + 3], side: 'Ask',
+          placed: Math.round(askEach).toLocaleString('en-US') + ' AMPS',
+          filled: f + '%', proceeds: f === 0 ? '—' : usd(askEach * (f / 100)),
+        })),
+      ];
+      const filled = Math.round((bidFills.concat(askFills).reduce((a, b) => a + b, 0)) / 6);
+      return {
+        key, pool: 'AMPS / ' + label, name,
+        mark: c ? mark(c, 20, 8) : null,
+        value: down ? '—' : usd(value),
+        stock: down ? '—' : usd(stockSide),
+        amps: down ? '—' : Math.round(ampsSide).toLocaleString('en-US'),
+        cells: down ? '—' : '6 / 24',
+        fees: down ? '—' : usd(value * 0.0173),
+        fill: down ? '—' : filled + '%',
+        open: this.state.openLadder === key,
+        toggle: () => this.setState((s) => ({openLadder: s.openLadder === key ? null : key})),
+        cta: this.state.openLadder === key ? 'Close' : 'Cells',
+        cellRows: cells,
+      };
+    };
+    const ladders = [
+      ...WEIGHTS.map(([s, w], i) => ladderFor({
+        key: s, label: s, name: NAMES[s] ?? s, logoSymbol: s,
+        value: (w / 100) * IN_RANGE, ampsSide: (w / 100) * AMPS_INVENTORY,
+        weight: w.toFixed(2) + '%', i, down: s === DEGRADED,
+      })),
+      ladderFor({key: 'USDG', label: 'USDG', name: 'Entry pool · settlement leg', logoSymbol: null, value: 198004, ampsSide: 96880, weight: '—', i: 30}),
+      ladderFor({key: 'WETH', label: 'WETH', name: 'Entry pool · deepest ETH liquidity', logoSymbol: null, value: 127116, ampsSide: 62004, weight: '—', i: 31}),
+    ];
+    return {
+      theme: this.state.theme,
+      paperBg: paper ? 'var(--fill)' : 'transparent',
+      paperFg: paper ? 'var(--onfill)' : 'var(--dim)',
+      inkBg: paper ? 'transparent' : 'var(--fill)',
+      inkFg: paper ? 'var(--dim)' : 'var(--onfill)',
+      setPaper: () => this.setState({theme: 'paper'}),
+      setInk: () => this.setState({theme: 'ink'}),
+
+      ticker: [
+        {k: 'NAV / share', v: '$1.0000'},
+        {k: 'Market', v: '$1.0450'},
+        {k: 'Premium', v: '+2.00%'},
+        {k: 'Vault assets', v: '$4.81M'},
+      ],
+      heroRows: [
+        {k: 'Market price', v: '$1.0450'},
+        {k: 'Premium to NAV', v: '+2.00%'},
+        {k: 'Redemption fee', v: '1.00%'},
+      ],
+      pillars: [
+        {n: '01 — The vault', h: 'Thirty v4 positions', b: 'Tokenised shares in thirty listed companies, each held as a concentrated-liquidity position in its own AMPS pool. Every position, both its sides, and its fee take are published.'},
+        {n: '02 — The floor', h: 'Redemption, always open', b: 'Burn AMPS and take your pro-rata slice of everything the vault holds, less 1%. Nothing in that code path can be switched off.'},
+        {n: '03 — The market', h: 'Liquidity the protocol owns', b: 'Above the floor, price is set by 32 pools the protocol owns outright. The bid under AMPS is exactly what it has earned — published pool by pool.'},
+      ],
+      constituents,
+      floorSteps: [
+        {n: '01', h: 'You call redeemProRata', b: 'From any address, at any time. There is no queue and no counterparty.'},
+        {n: '02', h: 'Your AMPS is burned', b: 'Supply falls, so NAV per share does not fall for anyone left holding.'},
+        {n: '03', h: 'Assets are sent to you', b: 'A slice of every line the vault holds, in proportion to your share, less a 1% fee.'},
+        {n: '04', h: 'Nothing can intervene', b: 'No oracle read, no gate check, no pause reference. Governance cannot add one without a new vault.'},
+      ],
+      bigNumbers: [
+        {k: 'Vault assets', v: '$4.81M', b: 'Marked from live balances at the reference price.'},
+        {k: 'Constituents', v: '30', b: 'Changed only through a seven-day timelock.'},
+        {k: 'Pools', v: '32', b: 'Every one of them protocol-owned.'},
+        {k: 'Redemption fee', v: '1.00%', b: 'Capped in the contract at 5%.'},
+        {k: 'AMPS supply', v: '4,812,004', b: 'Minted only by the bond shell. No other route exists.'},
+        {k: 'Public LP tier', v: 'None', b: 'And there will not be one. The vault is the only entity placing liquidity.'},
+      ],
+
+      vaultHeadline: [
+        {k: 'NAV per share', v: '$1.0000', b: 'Live balances at the reference price, per share.'},
+        {k: 'Reference price', v: '$1.0200', b: 'Rate-limited upward. Never below NAV per share.'},
+        {k: 'Market price', v: '$1.0450', b: '30-minute truncated TWAP of the AMPS/USDG hub.'},
+        {k: 'Premium to NAV', v: '+2.00%', b: 'Arithmetic. Nothing on chain consumes it.'},
+      ],
+      sections: [
+        {
+          n: '01', title: 'Supply', note: 'Where every AMPS sits right now.',
+          cta: this.state.open.supply ? 'Close' : 'Open',
+          open: this.state.open.supply, toggle: () => this.toggle('supply'),
+          rows: [
+            {label: 'Total supply', hint: 'Bonded AMPS counts from purchase, not from claim.', value: '4,812,004'},
+            {label: 'Circulating', hint: 'Total, less protocol inventory and unvested bond positions.', value: '3,104,880'},
+            {label: 'Protocol inventory', hint: 'Finite and never minted. Genesis tranche plus re-laddered fee AMPS, less sales.', value: '1,600,000'},
+            {label: 'Vesting in bonds', hint: 'An upper bound: vested-but-unclaimed AMPS is still held by the bond shell.', value: '107,124'},
+            {label: 'Staked as xAMPS', hint: '', value: '612,441'},
+          ],
+        },
+        {
+          n: '02', title: 'Parameters in force', note: 'Each one next to the cap hardcoded in the contract.',
+          cta: this.state.open.params ? 'Close' : 'Open',
+          open: this.state.open.params, toggle: () => this.toggle('params'),
+          rows: [
+            {label: 'Redemption fee', hint: 'Hard cap 5%.', value: '1.00%'},
+            {label: 'Burn share of AMPS-side fees', hint: 'Hard cap 25%.', value: '10.00%'},
+            {label: 'Staker share of AMPS-side fees', hint: 'Hard cap 50%.', value: '30.00%'},
+            {label: 'Creator fee now', hint: 'Immutable schedule: 100 bp of sell volume, decaying to exactly zero at day 30.', value: '0.43%'},
+            {label: 'Creator schedule remaining', hint: '', value: '12d 22h'},
+            {label: 'Live ladder cells', hint: 'Six per pool across 32 pools. Hard-capped at 512, which is what bounds the gas of a redemption.', value: '192'},
+          ],
+        },
+        {
+          n: '03', title: 'Protocol-owned liquidity', note: 'The entire bid under AMPS, pool by pool.',
+          cta: this.state.open.pol ? 'Close' : 'Open',
+          open: this.state.open.pol, toggle: () => this.toggle('pol'),
+          rows: [
+            {label: 'AMPS / WETH', hint: 'Entry pool. Last placement 2h 41m ago.', value: '412.8104 WETH'},
+            {label: 'AMPS / USDG', hint: 'Settlement leg. Last placement 4h 27m ago.', value: '1,204,880 USDG'},
+            {label: 'AMPS / NVDA', hint: 'The valuer could not price this pool — unavailable, not zero.', value: '—'},
+            {label: 'AMPS / AAPL', hint: 'Eligible to place now.', value: '1,884.204 AAPL'},
+            {label: 'Unfilled ask inventory, all pools', hint: 'Never minted. AMPS bought back by the protocol is burned, not re-placed.', value: '850,521'},
+          ],
+        },
+      ],
+      holdingsRows: this.state.allHoldings ? holdings : holdings.slice(0, 8),
+      holdingsCta: this.state.allHoldings ? 'Show only the top eight' : 'Show all thirty constituents',
+      toggleHoldings: () => this.setState((s) => ({allHoldings: !s.allHoldings})),
+
+      redeemMeta: [
+        {k: 'Redemption fee (1.00%)', v: '10.00 AMPS'},
+        {k: 'Shares burned', v: '990.00 AMPS'},
+        {k: 'Your share of the vault', v: '0.0206%'},
+        {k: 'Estimated value at NAV', v: '$990.00'},
+      ],
+      redeemLines: this.state.allLines ? lines : lines.slice(0, 8),
+      linesCta: this.state.allLines ? 'Collapse to the eight largest' : 'Show all thirty lines',
+      toggleLines: () => this.setState((s) => ({allLines: !s.allLines})),
+
+      composition: [
+        {k: 'Stock tokens inside v4 ranges', v: '$4,124,880', b: '85.72% of assets. Quoting a live two-sided market in thirty AMPS/<stock> pools.'},
+        {k: 'Idle stock tokens', v: '$362,004', b: '7.52%. Awaiting the next placement, or held back by a corporate-action freeze.'},
+        {k: 'Entry-pool counter assets', v: '$325,120', b: '6.76%. USDG and WETH inside the AMPS/USDG and AMPS/WETH ranges.'},
+        {k: 'AMPS ask inventory', v: '850,521 AMPS', b: 'Across all thirty-two pools. Not an asset and not counted in NAV. Finite, never minted, burned rather than re-placed when bought back.'},
+      ],
+      mLogos: constituents.slice(0, 12),
+      mHoldings: holdings.slice(0, 5),
+      mLines: lines.slice(0, 6),
+      mTabs: [
+        {label: 'Buy', active: true, idle: false},
+        {label: 'Vault', active: false, idle: true},
+        {label: 'Redeem', active: false, idle: true},
+        {label: 'Docs', active: false, idle: true},
+      ],
+      navBuy: appNav('Buy'),
+      navRotate: appNav('Rotate'),
+      navBond: appNav('Bond'),
+      navStake: appNav('Stake'),
+      navVault: appNav('Vault'),
+      navRedeem: appNav('Redeem'),
+
+      // How NAV grows: the v4 concentrated-liquidity ladder.
+      growthStats: [
+        {k: 'Pools running a ladder', v: '32', b: 'Uniswap v4, every one protocol-owned.'},
+        {k: 'Fees earned, 30 days', v: '$76,985', b: 'Swap fees paid to the vault\u2019s own positions, all 32 pools.'},
+        {k: 'Compounds, 30 days', v: '118', b: 'Each one splits the fees and re-ladders the remainder.'},
+        {k: 'NAV per share, 30 days', v: '+1.48%', b: 'From fees and asset moves. Bonds and redemptions both raise it.'},
+      ],
+      feeFlow: [
+        {n: '01', h: 'A swap crosses a live cell', b: 'Every buy and sell of AMPS routes through a protocol-owned concentrated-liquidity range. The swap fee is paid to that position — to the vault, not to an outside LP.'},
+        {n: '02', h: 'compound() collects it', b: 'Anyone may call it. Fees are pulled out of the positions and split in a fixed order, with a sixty-second cooldown per pool before that pool can place again.'},
+        {n: '03', h: 'The splits are taken', b: 'Creator slice first (100 bp of sell volume, decaying to exactly zero at day 30), then the staker slice, then the burn.'},
+        {n: '04', h: 'The remainder is re-laddered', b: 'What is left goes back into the grid as counter-asset depth and ask inventory. The assets behind each share go up; the share count does not.'},
+      ],
+      feeSplit: [
+        {k: 'Creator slice', v: '0.43%', b: 'Of sell volume, decaying to zero at day 30. Immutable schedule.'},
+        {k: 'Staker slice', v: '30.00%', b: 'Of AMPS-side fees, streamed to xAMPS over 24 hours. Hard cap 50%.'},
+        {k: 'Burned', v: '10.00%', b: 'Of AMPS-side fees, at every compound. Hard cap 25%.'},
+        {k: 'Re-laddered', v: '60.00%', b: 'Back into the grid as depth and inventory. This is the part that lifts NAV.'},
+      ],
+      ladderPools: this.state.allLadders ? ladders : ladders.slice(0, 6),
+      laddersCta: this.state.allLadders ? 'Collapse to the six largest pools' : 'Show all thirty-two pools',
+      toggleLadders: () => this.setState((s) => ({allLadders: !s.allLadders})),
+      laddersShown: this.state.allLadders ? '32 of 32 pools' : '6 of 32 pools',
+
+      // Buy / Sell
+      buyQuote: [
+        {k: 'You receive', v: '956.9384 AMPS', b: 'A curve simulation at this instant, not a promise.'},
+        {k: 'Minimum received', v: '952.1537 AMPS', b: 'What the transaction signs for. Below this it reverts and nothing moves.'},
+        {k: 'Buy fee', v: '0.30%', b: 'Charged on the counter asset entering the pool.'},
+        {k: 'Base fee', v: '0.25%', b: 'Before the dynamic component.'},
+        {k: 'Dynamic component', v: '0.42% of 3.00% cap', b: 'Volatility, deviation, divergence, session and surge.'},
+        {k: 'Market price', v: '$1.0450', b: '30-minute truncated TWAP, USD per AMPS.'},
+        {k: 'NAV per share', v: '$1.0000', b: ''},
+        {k: 'Premium to NAV', v: '+2.00%', b: 'Arithmetic. Nothing on chain consumes it.'},
+        {k: 'Gate', v: 'OK · Regular', b: 'Swaps are never refused for a gate reason; the fee floor rises instead.'},
+      ],
+
+      // Rotate
+      rotateOneTx: [
+        {k: 'You receive', v: '3.1204 AAPL'},
+        {k: 'Hop 1 — buy AMPS', v: '0.30%'},
+        {k: 'Hop 2 — sell AMPS, credited', v: '0.32%'},
+      ],
+      rotateSeparate: [
+        {k: 'Hop 1 — buy AMPS', v: '0.30%'},
+        {k: 'Hop 2 — sell AMPS, uncredited', v: '1.20%'},
+        {k: 'Difference on the second hop', v: '0.88%'},
+      ],
+
+      // Bond
+      bondBoard: BOND_MARKETS.map(([s, discount, q, pricedAt, capacity, vest, state]) => {
+        const c = base(s);
+        return {...c, mark: mark(c, 20, 8), discount, q, pricedAt, capacity, vest, state};
+      }),
+      bondQuote: [
+        {k: 'You receive', v: '1,024.8801 AMPS', b: 'Minted at purchase, vesting linearly.'},
+        {k: 'Price q', v: '102.4880', b: 'AMPS per unit of collateral.'},
+        {k: 'Discount', v: '3.50%', b: ''},
+        {k: 'Priced at', v: 'Market discount', b: 'The floor is NAV plus the minimum accretion, haircut by session.'},
+        {k: 'Capacity left this epoch', v: '48,120 AMPS', b: ''},
+        {k: 'minAmpsOut', v: '1,024.8801 AMPS', b: 'Always exactly the quote: the capacity clamp cuts the AMPS issued, never the collateral taken.'},
+      ],
+      bondPositions: [
+        {market: 'NVDA', purchased: '12.0000', claimed: '0.0000', claimable: '7.4400', vest: '62%'},
+        {market: 'AAPL', purchased: '48.8800', claimed: '20.0000', claimable: '14.2040', vest: '70%'},
+      ],
+
+      // Stake
+      stakeStats: [
+        {k: 'Staked AMPS', v: '612,441', b: ''},
+        {k: 'xAMPS supply', v: '598,204', b: ''},
+        {k: 'Streaming now', v: '1,884.04', b: '9h 12m left of a 24h stream.'},
+        {k: 'Realised APR', v: '4.62%', b: 'From fees already collected over a past window. Not a projection.'},
+      ],
+      stakeRows: [
+        {k: 'xAMPS held', v: '12,000.0000'},
+        {k: 'Reward stream length', v: '24h 0m'},
+        {k: 'Your share of the pool', v: '2.006%'},
+        {k: 'Your claim on the live stream', v: '37.7938 AMPS'},
+      ],
+    };
+  }
+}
+
+</script>
+</body>
+</html>

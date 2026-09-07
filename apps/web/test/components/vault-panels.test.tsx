@@ -40,8 +40,13 @@ describe('VaultHeadline', () => {
 
 describe('SupplyBreakdown', () => {
   it('derives circulating from total less inventory and vesting', () => {
-    render(<SupplyBreakdown totalSupply={100n * WAD} inventory={40n * WAD} vesting={10n * WAD} staked={5n * WAD} />)
+    render(<SupplyBreakdown totalSupply={100n * WAD} inventory={40n * WAD} vesting={10n * WAD} />)
     expect(screen.getByText('50')).toBeInTheDocument()
+  })
+
+  it('has no staked bucket at all — revision 6 removed staking', () => {
+    const {container} = render(<SupplyBreakdown totalSupply={100n * WAD} inventory={40n * WAD} vesting={10n * WAD} />)
+    expect(container.textContent).not.toMatch(/xAMPS|staked/i)
   })
 
   it('leaves circulating unavailable when a component is missing', () => {

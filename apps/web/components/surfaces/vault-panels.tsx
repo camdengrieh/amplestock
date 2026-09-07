@@ -2,21 +2,37 @@
 'use client'
 
 import * as React from 'react'
-
-import {FieldRow, Stat, StatGrid} from '@/components/common/stat'
-import {IndexerUnavailable} from '@/components/common/states'
-import {Value} from '@/components/common/value'
-import {Badge} from '@/components/ui/badge'
-import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
-import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
-import {NOTES} from '@/lib/copy'
-import {PLACEMENT_COOLDOWN_SECONDS} from '@/lib/protocol'
-import {formatAmount, formatBps, formatDuration, formatPremiumX18, formatTimestamp, formatUsd18} from '@/lib/format'
-import type {BurnEvent, LadderFill, NavPoint} from '@/lib/indexer/types'
-import {gateStateName, sessionName} from '@/lib/quoter'
-import {sessionLabels} from '@/lib/protocol'
 import {hexToString} from 'viem'
 
+import {FieldRow, Stat, StatGrid} from '@/components/common/stat'
+import {EmptyState, IndexerUnavailable} from '@/components/common/states'
+import {Value} from '@/components/common/value'
+import {AssetMark, DataRow, SectionHead} from '@/components/ledger/primitives'
+import {Badge} from '@/components/ui/badge'
+import {Button} from '@/components/ui/button'
+import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
+import {NOTES} from '@/lib/copy'
+import {
+  formatAmount,
+  formatBps,
+  formatDuration,
+  formatPremiumX18,
+  formatTimestamp,
+  formatUsd18,
+  shortAddress,
+} from '@/lib/format'
+import type {BurnEvent, LadderFill, NavPoint} from '@/lib/indexer/types'
+import {PLACEMENT_COOLDOWN_SECONDS, constituentStatusNames, sessionLabels} from '@/lib/protocol'
+import {gateStateName, sessionName} from '@/lib/quoter'
+
+/**
+ * The headline band the design opens Vault with: `repeat(auto-fit, minmax(200px,1fr))` over a 2px
+ * ink rule, each cell a mono label, a 44px figure and a 13px gloss.
+ *
+ * The design prints four cells; this prints six, because the two it leaves out — total assets and
+ * the age of the checkpoint the other four were read at — are the provenance of the first four and
+ * the page is a disclosure page.
+ */
 export function VaultHeadline({
   navPerShareX18,
   pRefX18,
@@ -35,31 +51,28 @@ export function VaultHeadline({
   unavailable?: boolean
 }) {
   return (
-    <StatGrid data-testid="vault-headline">
+    <StatGrid min={180} data-testid="vault-headline">
       <Stat
         label="NAV per share"
-        emphasis
         value={navPerShareX18 !== undefined ? formatUsd18(navPerShareX18, 4) : undefined}
         unavailable={unavailable || navPerShareX18 === undefined}
+        hint="Live balances at the reference price, per share."
       />
       <Stat
         label="Reference price"
-        emphasis
         value={pRefX18 !== undefined ? formatUsd18(pRefX18, 4) : undefined}
         unavailable={unavailable || pRefX18 === undefined}
-        hint="Rate-limited upward, never below NAV per share"
+        hint="Rate-limited upward. Never below NAV per share."
       />
       <Stat
         label="Market price"
-        emphasis
         value={pMktX18 !== undefined && pMktX18 !== 0n ? formatUsd18(pMktX18, 4) : undefined}
         unavailable={unavailable || pMktX18 === undefined || pMktX18 === 0n}
         reason="Not enough observation history yet"
-        hint="30-minute truncated TWAP of the AMPS/USDG hub"
+        hint="30-minute truncated TWAP of the AMPS/USDG hub."
       />
       <Stat
         label="Premium to NAV"
-        emphasis
         value={premiumX18 !== undefined ? formatPremiumX18(premiumX18) : undefined}
         unavailable={unavailable || premiumX18 === undefined}
         hint={NOTES.premium}
@@ -68,6 +81,7 @@ export function VaultHeadline({
         label="Total assets"
         value={totalAssetsUsd18 !== undefined ? formatUsd18(totalAssetsUsd18) : undefined}
         unavailable={unavailable || totalAssetsUsd18 === undefined}
+        hint="Marked from live balances at the reference price."
       />
       <Stat
         label="Checkpoint age"
@@ -79,118 +93,335 @@ export function VaultHeadline({
   )
 }
 
-/** Circulating vs inventory vs vesting vs staked. The four buckets `S0` and the bonds split into. */
+/**
+ * The design's checkpoint bar: `Last checkpoint 12m 4s ago` in mono on the left, the outline
+ * `checkpoint()` button pushed right, both sitting on a single `--rule` hairline.
+ *
+ * It is one row rather than a section because that is what it is — a fact and the button that
+ * changes it. The button is deliberately the outline variant: the fill is reserved for the thing a
+ * surface exists to do, and Vault exists to disclose, not to checkpoint.
+ */
+export function CheckpointBar({
+  ageSeconds,
+  children,
+}: {
+  ageSeconds?: number
+  /** The `TxButton`, wired by the surface. */
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      className="flex flex-wrap items-center gap-4 border-b border-rule py-3.5"
+      data-testid="checkpoint-bar"
+    >
+      <span className="font-mono text-[12px] text-dim">
+        {ageSeconds === undefined ? 'Checkpoint age unavailable' : `Last checkpoint ${formatDuration(ageSeconds)} ago`}
+      </span>
+      <span className="max-w-[62ch] text-[13px] leading-normal text-dim">{NOTES.checkpoint}</span>
+      <div className="ml-auto">{children}</div>
+    </div>
+  )
+}
+
+/**
+ * Disclosure 01 — Supply. Three buckets, not four: revision 6 removes staking, so there is no
+ * staked balance to subtract and no xAMPS to name.
+ */
 export function SupplyBreakdown({
   totalSupply,
   inventory,
   vesting,
-  staked,
 }: {
   totalSupply?: bigint
   inventory?: bigint
   vesting?: bigint
-  staked?: bigint
 }) {
   const circulating =
     totalSupply !== undefined && inventory !== undefined && vesting !== undefined
       ? totalSupply - inventory - vesting
       : undefined
   return (
-    <Card data-testid="supply-breakdown">
-      <CardHeader>
-        <CardTitle>Supply</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <FieldRow label="Total supply" hint="Bonded AMPS is in supply from purchase, not from claim">
-          <Value unavailable={totalSupply === undefined}>{totalSupply !== undefined ? formatAmount(totalSupply, 18) : null}</Value>
-        </FieldRow>
-        <FieldRow label="Circulating" hint="Total less protocol inventory and unvested bond positions">
-          <Value unavailable={circulating === undefined}>{circulating !== undefined ? formatAmount(circulating, 18) : null}</Value>
-        </FieldRow>
-        <FieldRow label="Protocol inventory" hint="Finite and never minted: the genesis tranche plus re-laddered fee AMPS, less sales">
-          <Value unavailable={inventory === undefined}>{inventory !== undefined ? formatAmount(inventory, 18) : null}</Value>
-        </FieldRow>
-        <FieldRow
-          label="Vesting in bonds (upper bound)"
-          hint="AMPS held by the bond shell. `AmpsBonds` cannot enumerate its own positions, so the exact unvested total is only knowable over a known owner set; vested-but-unclaimed AMPS is still sitting here."
-        >
-          <Value unavailable={vesting === undefined}>{vesting !== undefined ? formatAmount(vesting, 18) : null}</Value>
-        </FieldRow>
-        <FieldRow label="Staked as xAMPS">
-          <Value unavailable={staked === undefined}>{staked !== undefined ? formatAmount(staked, 18) : null}</Value>
-        </FieldRow>
-      </CardContent>
-    </Card>
-  )
-}
-
-/**
- * Ladder fill history, per pool, with proceeds per cell.
- *
- * The *live* numbers — bid depth and ask inventory right now — come from the chain through
- * `LadderPositionValuer.amountsOf` and are rendered by {PolDepthTable}. This panel is the history
- * around them: which cell was placed when, how much of it the market has taken, and what it raised.
- *
- * Ladders are static: a cell is placed once and only ever removed by redemption, rollout, the
- * high-water buyback burn or a migration. Nothing is re-centred or re-widened, so "fill" is a real
- * measure of what the market has bought rather than an artefact of a keeper moving ranges.
- */
-export function LadderFillPanel({fills, unavailable, reason}: {fills?: readonly LadderFill[]; unavailable?: boolean; reason?: string}) {
-  if (unavailable || !fills) {
-    return <IndexerUnavailable what="Ladder fill" {...(reason ? {reason} : {})} />
-  }
-  return (
-    <div className="space-y-4" data-testid="ladder-fill">
-      {fills.map((fill) => (
-        <Card key={fill.poolId}>
-          <CardHeader>
-            <CardTitle>AMPS / {fill.symbol}</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <FieldRow label="Bid depth" hint={NOTES.polDepth}>
-              <Value>{fill.bidDepth}</Value>
-            </FieldRow>
-            <FieldRow label="Unfilled ask inventory">
-              <Value>{fill.askInventory}</Value>
-            </FieldRow>
-            <FieldRow label="Rollout weight">
-              <Value>{formatBps(fill.rolloutWeightBps)}</Value>
-            </FieldRow>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Cell</TableHead>
-                  <TableHead>Ticks</TableHead>
-                  <TableHead>Side</TableHead>
-                  <TableHead>Placed</TableHead>
-                  <TableHead>Filled</TableHead>
-                  <TableHead>Proceeds</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {fill.cells.map((cell) => (
-                  <TableRow key={cell.bucketIndex}>
-                    <TableCell>{cell.bucketIndex}</TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {cell.lowerTick} … {cell.upperTick}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={cell.above ? 'muted' : 'success'}>{cell.above ? 'Ask' : 'Bid'}</Badge>
-                    </TableCell>
-                    <TableCell>{cell.amount}</TableCell>
-                    <TableCell>{Math.round(cell.filledFraction * 100)}%</TableCell>
-                    <TableCell>{cell.proceeds}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      ))}
+    <div data-testid="supply-breakdown">
+      <FieldRow label="Total supply" hint="Bonded AMPS counts from purchase, not from claim.">
+        <Value unavailable={totalSupply === undefined}>
+          {totalSupply !== undefined ? formatAmount(totalSupply, 18) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Circulating" hint="Total, less protocol inventory and unvested bond positions.">
+        <Value unavailable={circulating === undefined}>
+          {circulating !== undefined ? formatAmount(circulating, 18) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Protocol inventory"
+        hint="Finite and never minted. Genesis tranche plus re-laddered fee AMPS, less sales."
+      >
+        <Value unavailable={inventory === undefined}>
+          {inventory !== undefined ? formatAmount(inventory, 18) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Vesting in bonds"
+        hint="An upper bound: AmpsBonds cannot enumerate its own positions, so vested-but-unclaimed AMPS is still counted here."
+      >
+        <Value unavailable={vesting === undefined}>{vesting !== undefined ? formatAmount(vesting, 18) : null}</Value>
+      </FieldRow>
+      <FieldRow
+        label="Minting routes"
+        hint="AMPS is minted by the bond shell and by nothing else. There is no staking contract and no public LP tier."
+      >
+        <span className="text-dim">Bond shell only</span>
+      </FieldRow>
     </div>
   )
 }
 
+export interface HoldingRow {
+  id: number
+  symbol: string
+  status: number
+  /** What the registry says the index should hold. */
+  targetWeightBps: number
+  /** What the vault holds now, priced at the reference. `undefined` when the read failed. */
+  currentWeightBps?: number
+  /** How much of the target the rollout has migrated so far. */
+  rolloutWeightBps: number
+  freezeUntil: number
+  /** Grid cells live in this constituent's pool, from `AmpsVault.ladderLength`. */
+  ladderCells?: number
+  /** The pool's gate state, from `AmpsQuoter`. `undefined` when there is no pool for it yet. */
+  gateState?: number
+}
+
+/**
+ * "Holdings, position by position" — the design's seven-column table, over the design's section
+ * head, with the design's eight-row default and its "show all" toggle.
+ *
+ * The design's columns are Value / Stock side / AMPS side / Cells / Fees 30d / Gate. Four of those
+ * are kept as drawn; two are replaced by the pair that actually governs this index — the target
+ * weight the registry sets and the realised weight the vault holds — because publishing one number
+ * and calling it "the weight" would hide the thing that is interesting: the rollout moves inventory
+ * on a daily cap and the market moves the assets in between.
+ */
+export function HoldingsTable({
+  rows,
+  capBps,
+  floorBps,
+  liveCells,
+  poolCount,
+}: {
+  rows: readonly HoldingRow[]
+  capBps?: number
+  floorBps?: number
+  liveCells?: number
+  poolCount?: number
+}) {
+  const [all, setAll] = React.useState(false)
+  const shown = all ? rows : rows.slice(0, 8)
+  return (
+    <section className="space-y-0" data-testid="holdings">
+      <SectionHead
+        title="Holdings, position by position"
+        note="Each row is one Uniswap v4 concentrated-liquidity position in that stock’s own AMPS pool, shown against the weight the registry asks it to carry."
+        aside={
+          <>
+            <Value unavailable={liveCells === undefined}>{liveCells !== undefined ? liveCells : null}</Value> live cells
+            ·{' '}
+            <Value unavailable={poolCount === undefined}>{poolCount !== undefined ? poolCount : null}</Value> pools
+          </>
+        }
+      />
+      {rows.length === 0 ? (
+        <EmptyState title="No constituents">
+          The registry has no active constituent to read. Nothing is being hidden — there is nothing there yet.
+        </EmptyState>
+      ) : (
+        <>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Position</TableHead>
+                <TableHead align="right">Target</TableHead>
+                <TableHead align="right">Realised</TableHead>
+                <TableHead align="right">Drift</TableHead>
+                <TableHead align="right">Rolled out</TableHead>
+                <TableHead align="right">Cells</TableHead>
+                <TableHead align="right">Gate</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {shown.map((row) => {
+                const drift =
+                  row.currentWeightBps !== undefined ? row.currentWeightBps - row.targetWeightBps : undefined
+                return (
+                  <TableRow key={row.id} data-testid={`holding-${row.symbol}`}>
+                    <TableCell>
+                      <span className="flex items-center gap-3">
+                        <AssetMark symbol={row.symbol} />
+                        <span className="whitespace-nowrap font-mono text-[13px] tracking-[0.05em]">
+                          AMPS / {row.symbol}
+                        </span>
+                        <span className="text-[15px] text-dim">
+                          {constituentStatusNames[row.status] ?? 'UNKNOWN'}
+                          {row.freezeUntil > 0 ? ` · frozen until ${formatTimestamp(row.freezeUntil)}` : ''}
+                        </span>
+                      </span>
+                    </TableCell>
+                    <TableCell align="right">{formatBps(row.targetWeightBps)}</TableCell>
+                    <TableCell align="right">
+                      <Value
+                        unavailable={row.currentWeightBps === undefined}
+                        reason="The registry could not price this constituent"
+                      >
+                        {row.currentWeightBps !== undefined ? formatBps(row.currentWeightBps) : null}
+                      </Value>
+                    </TableCell>
+                    <TableCell align="right" className="text-dim">
+                      <Value unavailable={drift === undefined}>
+                        {drift !== undefined ? `${drift > 0 ? '+' : ''}${(drift / 100).toFixed(2)}%` : null}
+                      </Value>
+                    </TableCell>
+                    <TableCell align="right" className="text-dim">
+                      {formatBps(row.rolloutWeightBps)}
+                    </TableCell>
+                    <TableCell align="right" className="text-dim">
+                      <Value unavailable={row.ladderCells === undefined}>
+                        {row.ladderCells !== undefined ? String(row.ladderCells) : null}
+                      </Value>
+                    </TableCell>
+                    <TableCell align="right" className="text-[10px] tracking-[0.1em]">
+                      <Value unavailable={row.gateState === undefined} reason="No pool registered for this constituent">
+                        {row.gateState !== undefined ? gateStateName(row.gateState) : null}
+                      </Value>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+          {rows.length > 8 ? (
+            <Button variant="outline" className="mt-4" onClick={() => setAll((v) => !v)} data-testid="holdings-toggle">
+              {all ? 'Show only the top eight' : `Show all ${rows.length} constituents`}
+            </Button>
+          ) : null}
+        </>
+      )}
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        {NOTES.targetVsRealised} Index weight bounds at the live count: floor{' '}
+        <Value unavailable={floorBps === undefined}>{floorBps !== undefined ? formatBps(floorBps) : null}</Value>, cap{' '}
+        <Value unavailable={capBps === undefined}>{capBps !== undefined ? formatBps(capBps) : null}</Value>. A position
+        the valuer could not price is shown as unavailable, never as zero.
+      </p>
+    </section>
+  )
+}
+
+/**
+ * Disclosure 02, rollout half. Flat rows, not a card: the design's Vault has exactly one card-like
+ * container on the whole page and it is the stat band.
+ */
+export function RolloutPanel({
+  bpsPerDay,
+  bpsPerDayMax,
+  entryFloorBps,
+  rolledOutBps,
+  targetBps,
+}: {
+  bpsPerDay?: number
+  bpsPerDayMax?: number
+  entryFloorBps?: number
+  /** Sum of `rolloutWeightBps` over the constituent set. */
+  rolledOutBps?: number
+  /** Sum of `targetWeightBps` over the same set. */
+  targetBps?: number
+}) {
+  const progress =
+    rolledOutBps !== undefined && targetBps !== undefined && targetBps > 0
+      ? Math.min(1, rolledOutBps / targetBps)
+      : undefined
+  return (
+    <div data-testid="rollout">
+      <FieldRow label="Rollout rate" hint="Unfilled entry-pool inventory migrating into the spokes, capped per day.">
+        <Value unavailable={bpsPerDay === undefined}>
+          {bpsPerDay !== undefined ? `${formatBps(bpsPerDay)} per day` : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Rollout hard cap" hint="Hardcoded in the vault. Governance cannot widen it.">
+        <Value unavailable={bpsPerDayMax === undefined}>
+          {bpsPerDayMax !== undefined ? `${formatBps(bpsPerDayMax)} per day` : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Entry-pool floor" hint="Rollout never drains the entry pools below this share.">
+        <Value unavailable={entryFloorBps === undefined}>
+          {entryFloorBps !== undefined ? formatBps(entryFloorBps) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Migrated so far" hint="Sum of rolloutWeightBps against the sum of the target weights.">
+        <Value unavailable={progress === undefined} reason="The registry could not be read">
+          {progress !== undefined ? `${(progress * 100).toFixed(1)}%` : null}
+        </Value>
+      </FieldRow>
+    </div>
+  )
+}
+
+/**
+ * Disclosure 02, creator half: 1% of trade volume at genesis, decaying linearly to exactly zero at
+ * day 30.
+ *
+ * Immutable — there is no setter and no governance path to it — so these rows are a countdown
+ * rather than parameters. The live figure is `AmpsVault.creatorBpsAt(now)`, read rather than
+ * recomputed, so the number here is the number the contract will use.
+ */
+export function CreatorSchedulePanel({
+  creatorBpsNow,
+  creatorFeeBps,
+  decaySeconds,
+  genesisTimestamp,
+  now,
+  creator,
+}: {
+  creatorBpsNow?: number
+  creatorFeeBps?: number
+  decaySeconds?: number
+  genesisTimestamp?: number
+  now: number
+  creator?: string
+}) {
+  const secondsLeft =
+    genesisTimestamp !== undefined && decaySeconds !== undefined
+      ? Math.max(0, genesisTimestamp + decaySeconds - now)
+      : undefined
+  return (
+    <div data-testid="creator-schedule">
+      <FieldRow label="Creator fee, in force now" hint={NOTES.creatorSchedule}>
+        <Value unavailable={creatorBpsNow === undefined}>
+          {creatorBpsNow !== undefined ? formatBps(creatorBpsNow) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Creator fee at genesis" hint="The constant compiled into the vault.">
+        <Value unavailable={creatorFeeBps === undefined}>
+          {creatorFeeBps !== undefined ? formatBps(creatorFeeBps) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Creator schedule length" hint="Decays linearly to exactly zero.">
+        <Value unavailable={decaySeconds === undefined}>
+          {decaySeconds !== undefined ? formatDuration(decaySeconds) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Creator schedule remaining">
+        <Value unavailable={secondsLeft === undefined}>
+          {secondsLeft !== undefined ? formatDuration(secondsLeft) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Creator fee paid to" hint="AmpsVault.creator()">
+        <Value unavailable={!creator} className="text-[13px]" {...(creator ? {title: creator} : {})}>
+          {creator ? shortAddress(creator) : null}
+        </Value>
+      </FieldRow>
+    </div>
+  )
+}
 
 export interface PolRow {
   poolId: string
@@ -202,76 +433,78 @@ export interface PolRow {
   counter?: bigint
   /** When the pool last placed, from `AmpsVault.lastPlacementAt`. */
   lastPlacementAt?: number
+  /** How many grid cells this pool currently has live, from `AmpsVault.ladderLength`. */
+  ladderCells?: number
 }
 
 /**
- * Protocol-owned liquidity, per pool, read from the chain.
+ * Disclosure 03 — protocol-owned liquidity, pool by pool, exactly as the design lists it: one
+ * `label / hint / value` row per pool, the counter asset as the figure and the placement state as
+ * the gloss, closed by an all-pools ask-inventory total.
  *
  * The plan requires this number to be published rather than hidden: the pools are POL-only, so the
  * bid under AMPS in a pool is exactly the counter asset the protocol has earned and is holding
- * there — nothing else is bidding. `LadderPositionValuer.amountsOf` decomposes the vault's grid
- * cells at the same reference price the vault values `A` at, so the counter column is to the wei
- * the term NAV credits that pool with.
- *
- * A pool the valuer could not answer for is shown as unavailable, not as zero: `amountsOf` returns
- * `(0, 0)` both for an empty pool and for one it could not price, and those are different facts.
+ * there — nothing else is bidding. A pool the valuer could not answer for is shown as unavailable,
+ * not as zero: `amountsOf` returns `(0, 0)` both for an empty pool and for one it could not price,
+ * and those are different facts.
  */
 export function PolDepthTable({rows, now}: {rows: readonly PolRow[]; now: number}) {
+  const totalAsk = rows.every((row) => row.amps !== undefined)
+    ? rows.reduce((sum, row) => sum + (row.amps ?? 0n), 0n)
+    : undefined
   return (
-    <Card data-testid="pol-depth">
-      <CardHeader>
-        <CardTitle>Protocol-owned liquidity, per pool</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Pool</TableHead>
-              <TableHead>Bid depth (counter)</TableHead>
-              <TableHead>Ask inventory (AMPS)</TableHead>
-              <TableHead>Last placement</TableHead>
-              <TableHead>Next placement eligible</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((row) => {
-              const readyAt = row.lastPlacementAt ? row.lastPlacementAt + PLACEMENT_COOLDOWN_SECONDS : undefined
-              const waiting = readyAt !== undefined && readyAt > now
-              return (
-                <TableRow key={row.poolId} data-testid={`pol-row-${row.symbol}`}>
-                  <TableCell className="font-medium">AMPS / {row.symbol}</TableCell>
-                  <TableCell>
-                    <Value unavailable={row.counter === undefined} reason="The valuer could not price this pool">
-                      {row.counter !== undefined ? `${formatAmount(row.counter, row.counterDecimals)} ${row.symbol}` : null}
-                    </Value>
-                  </TableCell>
-                  <TableCell>
-                    <Value unavailable={row.amps === undefined} reason="The valuer could not price this pool">
-                      {row.amps !== undefined ? formatAmount(row.amps, 18) : null}
-                    </Value>
-                  </TableCell>
-                  <TableCell>
-                    <Value unavailable={!row.lastPlacementAt}>
-                      {row.lastPlacementAt ? formatTimestamp(row.lastPlacementAt) : null}
-                    </Value>
-                  </TableCell>
-                  <TableCell>
-                    <Value unavailable={readyAt === undefined}>
-                      {readyAt === undefined ? null : waiting ? `in ${formatDuration(readyAt - now)}` : 'now'}
-                    </Value>
-                  </TableCell>
-                </TableRow>
-              )
-            })}
-          </TableBody>
-        </Table>
-        <p className="mt-3 text-xs text-muted-foreground">
-          {NOTES.polDepth} A placement is refused within {formatDuration(PLACEMENT_COOLDOWN_SECONDS)} of the previous
-          one in the same pool, which is the cooldown a <code className="font-mono">compound()</code> has to clear
-          before it can re-ladder anything.
-        </p>
-      </CardContent>
-    </Card>
+    <div data-testid="pol-depth">
+      {rows.length === 0 ? (
+        <EmptyState title="No pools registered">
+          The pool registry is empty on this chain, so there is no protocol-owned liquidity to decompose.
+        </EmptyState>
+      ) : null}
+      {rows.map((row) => {
+        const readyAt = row.lastPlacementAt ? row.lastPlacementAt + PLACEMENT_COOLDOWN_SECONDS : undefined
+        const placement =
+          readyAt === undefined
+            ? 'No placement recorded.'
+            : readyAt > now
+              ? `Next placement eligible in ${formatDuration(readyAt - now)}.`
+              : 'Eligible to place now.'
+        const ask =
+          row.amps !== undefined
+            ? `Ask inventory ${formatAmount(row.amps, 18)} AMPS`
+            : 'Ask inventory unavailable'
+        const cells = row.ladderCells !== undefined ? ` · ${row.ladderCells} cells` : ''
+        return (
+          <DataRow
+            key={row.poolId}
+            data-testid={`pol-row-${row.symbol}`}
+            label={`AMPS / ${row.symbol}`}
+            note={
+              row.counter === undefined
+                ? 'The valuer could not price this pool — unavailable, not zero.'
+                : `${ask}${cells}. ${placement}`
+            }
+          >
+            <Value unavailable={row.counter === undefined} reason="The valuer could not price this pool">
+              {row.counter !== undefined ? `${formatAmount(row.counter, row.counterDecimals)} ${row.symbol}` : null}
+            </Value>
+          </DataRow>
+        )
+      })}
+      {rows.length > 0 ? (
+        <DataRow
+          label="Unfilled ask inventory, all pools"
+          note="Never minted. AMPS bought back by the protocol’s own bids is burned, not re-placed."
+        >
+          <Value unavailable={totalAsk === undefined} reason="At least one pool could not be priced">
+            {totalAsk !== undefined ? `${formatAmount(totalAsk, 18)} AMPS` : null}
+          </Value>
+        </DataRow>
+      ) : null}
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        {NOTES.polDepth} A placement is refused within {formatDuration(PLACEMENT_COOLDOWN_SECONDS)} of the previous one
+        in the same pool, which is the cooldown a <code className="font-mono">compound()</code> has to clear before it
+        can re-ladder anything.
+      </p>
+    </div>
   )
 }
 
@@ -284,51 +517,206 @@ export interface GateRow {
   corporateFreeze: boolean
 }
 
+/**
+ * Gate status, pool by pool. The design carries the gate as one column of the holdings table and
+ * has nowhere for the three facts behind it, so this keeps the design's section head and table
+ * treatment and spends a block on them.
+ */
 export function GateStatusTable({rows}: {rows: readonly GateRow[]}) {
   return (
-    <Card data-testid="gate-status">
-      <CardHeader>
-        <CardTitle>Gate status, per pool</CardTitle>
-      </CardHeader>
-      <CardContent>
+    <section data-testid="gate-status">
+      <SectionHead
+        title="Gate status, pool by pool"
+        note="What the hook thinks of each market right now, and why."
+        aside={`${rows.length} pools`}
+      />
+      {rows.length === 0 ? (
+        <EmptyState title="No pools registered">There is no pool on this chain to report a gate for.</EmptyState>
+      ) : (
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Pool</TableHead>
-              <TableHead>Gate</TableHead>
-              <TableHead>Session</TableHead>
-              <TableHead>Feed</TableHead>
-              <TableHead>Corporate action</TableHead>
+              <TableHead align="right">Gate</TableHead>
+              <TableHead align="right">Session</TableHead>
+              <TableHead align="right">Feed</TableHead>
+              <TableHead align="right">Corporate action</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
               <TableRow key={row.poolId} data-testid={`gate-row-${row.symbol}`}>
-                <TableCell className="font-medium">AMPS / {row.symbol}</TableCell>
                 <TableCell>
-                  <Badge variant={row.gateState === 0 ? 'success' : 'warning'}>{gateStateName(row.gateState)}</Badge>
+                  <span className="flex items-center gap-3">
+                    <AssetMark symbol={row.symbol} />
+                    <span className="whitespace-nowrap font-mono text-[13px] tracking-[0.05em]">
+                      AMPS / {row.symbol}
+                    </span>
+                  </span>
                 </TableCell>
-                <TableCell>{sessionLabels[sessionName(row.session) as keyof typeof sessionLabels] ?? '—'}</TableCell>
-                <TableCell>{row.feedStale ? <Badge variant="warning">Stale</Badge> : <Badge variant="muted">Fresh</Badge>}</TableCell>
-                <TableCell>{row.corporateFreeze ? <Badge variant="danger">Frozen</Badge> : <span className="text-muted-foreground">—</span>}</TableCell>
+                <TableCell align="right">
+                  <Badge variant={row.gateState === 0 ? 'default' : 'warning'}>{gateStateName(row.gateState)}</Badge>
+                </TableCell>
+                <TableCell align="right" className="text-dim">
+                  {sessionLabels[sessionName(row.session) as keyof typeof sessionLabels] ?? '—'}
+                </TableCell>
+                <TableCell align="right">
+                  <Badge variant={row.feedStale ? 'warning' : 'muted'}>{row.feedStale ? 'Stale' : 'Fresh'}</Badge>
+                </TableCell>
+                <TableCell align="right">
+                  {row.corporateFreeze ? <Badge variant="danger">Frozen</Badge> : <span className="text-dim">—</span>}
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
-        <p className="mt-3 text-xs text-muted-foreground">
-          No gate state stops a swap or a redemption. Degraded states pause placements and compounding, raise the
-          dynamic fee floor, and widen the bond haircut.
-        </p>
-      </CardContent>
-    </Card>
+      )}
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        No gate state stops a swap or a redemption. Degraded states pause placements and compounding, raise the dynamic
+        fee floor, and widen the bond haircut.
+      </p>
+    </section>
+  )
+}
+
+/** The weighted mean fill of a pool's cells, as the design's `Filled` column. */
+function meanFill(fill: LadderFill): number | undefined {
+  if (fill.cells.length === 0) return undefined
+  return fill.cells.reduce((sum, cell) => sum + cell.filledFraction, 0) / fill.cells.length
+}
+
+/**
+ * The design's "Liquidity ladder": a seven-column grid header, one clickable row per pool, and the
+ * cell table opening underneath the row it belongs to. Six pools by default, with the design's
+ * "show all" toggle.
+ *
+ * The *live* numbers — bid depth and ask inventory right now — come from the chain and are listed
+ * in disclosure 03. This is the history around them: which cell was placed when, how much of it the
+ * market has taken, and what it raised.
+ *
+ * Ladders are static: a cell is placed once and only ever removed by redemption, rollout, the
+ * high-water buyback burn or a migration. Nothing is re-centred or re-widened, so "filled" is a
+ * real measure of what the market has bought rather than an artefact of a keeper moving ranges.
+ */
+export function LadderFillPanel({
+  fills,
+  unavailable,
+  reason,
+}: {
+  fills?: readonly LadderFill[]
+  unavailable?: boolean
+  reason?: string
+}) {
+  const [open, setOpen] = React.useState<string | null>(null)
+  const [all, setAll] = React.useState(false)
+  if (unavailable || !fills) {
+    return <IndexerUnavailable what="Ladder fill" {...(reason ? {reason} : {})} />
+  }
+  const shown = all ? fills : fills.slice(0, 6)
+  return (
+    <div data-testid="ladder-fill">
+      <div className="ledger-micro hidden gap-3.5 border-b border-rule pb-2.5 pt-3 lg:grid lg:grid-cols-[minmax(0,1fr)_104px_92px_60px_88px_60px_66px]">
+        <span>Pool</span>
+        <span className="text-right">Bid depth</span>
+        <span className="text-right">Ask inventory</span>
+        <span className="text-right">Cells</span>
+        <span className="text-right">Rollout</span>
+        <span className="text-right">Filled</span>
+        <span />
+      </div>
+      {shown.map((fill) => {
+        const isOpen = open === fill.poolId
+        const mean = meanFill(fill)
+        return (
+          <div key={fill.poolId} className="border-b border-hair">
+            <button
+              type="button"
+              onClick={() => setOpen(isOpen ? null : fill.poolId)}
+              aria-expanded={isOpen}
+              aria-controls={`ladder-${fill.poolId}`}
+              className="grid w-full grid-cols-2 items-center gap-x-3.5 gap-y-1 py-3 text-left hover:bg-hair lg:grid-cols-[minmax(0,1fr)_104px_92px_60px_88px_60px_66px]"
+            >
+              <span className="col-span-2 flex min-w-0 items-center gap-3 lg:col-span-1">
+                <AssetMark symbol={fill.symbol} />
+                <span className="whitespace-nowrap font-mono text-[13px] tracking-[0.05em]">AMPS / {fill.symbol}</span>
+              </span>
+              <span className="ledger-cell text-right">
+                <span className="ledger-micro mr-2 lg:hidden">Bid</span>
+                {fill.bidDepth}
+              </span>
+              <span className="ledger-cell text-right text-dim">
+                <span className="ledger-micro mr-2 lg:hidden">Ask</span>
+                {fill.askInventory}
+              </span>
+              <span className="ledger-cell text-right text-dim">
+                <span className="ledger-micro mr-2 lg:hidden">Cells</span>
+                {fill.cells.length}
+              </span>
+              <span className="ledger-cell text-right text-dim">
+                <span className="ledger-micro mr-2 lg:hidden">Rollout</span>
+                {formatBps(fill.rolloutWeightBps)}
+              </span>
+              <span className="ledger-cell text-right">
+                <span className="ledger-micro mr-2 lg:hidden">Filled</span>
+                <Value unavailable={mean === undefined}>
+                  {mean !== undefined ? `${Math.round(mean * 100)}%` : null}
+                </Value>
+              </span>
+              <span className="ledger-micro text-right">{isOpen ? 'Close' : 'Cells'}</span>
+            </button>
+            <div id={`ladder-${fill.poolId}`} hidden={!isOpen} className="pb-[26px]">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Cell</TableHead>
+                    <TableHead>Tick range</TableHead>
+                    <TableHead>Side</TableHead>
+                    <TableHead align="right">Placed</TableHead>
+                    <TableHead align="right">Filled</TableHead>
+                    <TableHead align="right">Proceeds</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {fill.cells.map((cell) => (
+                    <TableRow key={cell.bucketIndex}>
+                      <TableCell>{cell.bucketIndex}</TableCell>
+                      <TableCell className="text-dim">
+                        {cell.lowerTick} … {cell.upperTick}
+                      </TableCell>
+                      <TableCell className="text-[10px] tracking-[0.12em] uppercase">
+                        {cell.above ? 'Ask' : 'Bid'}
+                      </TableCell>
+                      <TableCell align="right">{cell.amount}</TableCell>
+                      <TableCell align="right">{Math.round(cell.filledFraction * 100)}%</TableCell>
+                      <TableCell align="right">{cell.proceeds}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        )
+      })}
+      {fills.length > 6 ? (
+        <Button variant="outline" className="mt-[18px]" onClick={() => setAll((v) => !v)} data-testid="ladder-toggle">
+          {all ? 'Collapse to the six largest pools' : `Show all ${fills.length} pools`}
+        </Button>
+      ) : null}
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        Ladders are static. A cell is placed once and only ever removed by a redemption, the daily rollout, a high-water
+        buyback burn or a migration — nothing is re-centred or re-widened, so <em>filled</em> is a real measure of what
+        the market bought. Bid depth is the entire bid under AMPS in this pool, because every pool is protocol-owned.
+      </p>
+    </div>
   )
 }
 
 /**
  * The `Burn` event's `bytes32` reason, as a person reads it.
  *
- * `redeemProRata` now emits `Burn(shares, "redeem")`, so a redemption is a first-class row in this
- * feed rather than an inference from a supply delta.
+ * `redeemProRata` emits `Burn(shares, "redeem")`, so a redemption is a first-class row in this feed
+ * rather than an inference from a supply delta. `compound` emits the fee burn — under revision 6
+ * that is the whole AMPS side of the fee after the creator slice, not a governed share of it.
  */
 export function burnReasonLabel(reason: string): string {
   const LABELS: Readonly<Record<string, string>> = {
@@ -347,47 +735,65 @@ export function burnReasonLabel(reason: string): string {
   return LABELS[decoded] ?? decoded
 }
 
-export function BurnHistoryTable({burns, unavailable, reason}: {burns?: readonly BurnEvent[]; unavailable?: boolean; reason?: string}) {
+export function BurnHistoryTable({
+  burns,
+  unavailable,
+  reason,
+}: {
+  burns?: readonly BurnEvent[]
+  unavailable?: boolean
+  reason?: string
+}) {
   if (unavailable || !burns) return <IndexerUnavailable what="Burn history" {...(reason ? {reason} : {})} />
   return (
-    <Card data-testid="burn-history">
-      <CardHeader>
-        <CardTitle>Burns</CardTitle>
-      </CardHeader>
-      <CardContent>
+    <div data-testid="burn-history">
+      {burns.length === 0 ? (
+        <EmptyState title="No burns yet">
+          Nothing has been burned on this chain so far. The sink exists and has not been used.
+        </EmptyState>
+      ) : (
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>When</TableHead>
-              <TableHead>Amount</TableHead>
-              <TableHead>Reason</TableHead>
+              <TableHead align="right">Amount</TableHead>
+              <TableHead align="right">Reason</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {burns.map((burn) => (
               <TableRow key={burn.txHash}>
-                <TableCell>{formatTimestamp(burn.timestamp)}</TableCell>
-                <TableCell>{burn.amount}</TableCell>
-                <TableCell>
+                <TableCell className="text-dim">{formatTimestamp(burn.timestamp)}</TableCell>
+                <TableCell align="right">{burn.amount}</TableCell>
+                <TableCell align="right">
                   <Badge variant="muted">{burnReasonLabel(burn.reason)}</Badge>
                 </TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
-      </CardContent>
-    </Card>
+      )}
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">{NOTES.burnSink}</p>
+    </div>
   )
 }
 
 /**
  * NAV per share over time, as an inline sparkline.
  *
- * No chart library: three series, one axis, and a shape that has to survive a build with no
- * network. The series is the indexer's; if the indexer is unavailable the panel says so rather
- * than drawing a flat line at zero.
+ * No chart library: one series, one axis, and a shape that has to survive a build with no network.
+ * The series is the indexer's; if the indexer is unavailable the panel says so rather than drawing
+ * a flat line at zero.
  */
-export function NavHistoryPanel({points, unavailable, reason}: {points?: readonly NavPoint[]; unavailable?: boolean; reason?: string}) {
+export function NavHistoryPanel({
+  points,
+  unavailable,
+  reason,
+}: {
+  points?: readonly NavPoint[]
+  unavailable?: boolean
+  reason?: string
+}) {
   if (unavailable || !points || points.length === 0) {
     return <IndexerUnavailable what="NAV per share history" {...(reason ? {reason} : {})} />
   }
@@ -403,22 +809,23 @@ export function NavHistoryPanel({points, unavailable, reason}: {points?: readonl
     })
     .join(' ')
   return (
-    <Card data-testid="nav-history">
-      <CardHeader>
-        <CardTitle>NAV per share</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        <svg viewBox="0 0 100 32" preserveAspectRatio="none" className="h-24 w-full" role="img" aria-label="NAV per share over time">
-          <path d={path} fill="none" stroke="currentColor" strokeWidth="0.6" className="text-primary" />
-        </svg>
-        <div className="flex justify-between text-xs text-muted-foreground">
-          <span>{min.toFixed(4)}</span>
-          <span>{max.toFixed(4)}</span>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          Monotone non-decreasing except for market moves in the assets held. Bonds and redemptions both raise it.
-        </p>
-      </CardContent>
-    </Card>
+    <div className="space-y-3" data-testid="nav-history">
+      <svg
+        viewBox="0 0 100 32"
+        preserveAspectRatio="none"
+        className="h-28 w-full border-b border-rule text-ink"
+        role="img"
+        aria-label="NAV per share over time"
+      >
+        <path d={path} fill="none" stroke="currentColor" strokeWidth="0.5" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <div className="ledger-label flex justify-between">
+        <span>{min.toFixed(4)}</span>
+        <span>{max.toFixed(4)}</span>
+      </div>
+      <p className="max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        Monotone non-decreasing except for market moves in the assets held. Bonds and redemptions both raise it.
+      </p>
+    </div>
   )
 }

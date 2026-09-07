@@ -21,7 +21,6 @@ import {
   ampsBondsLensAbi,
   ampsHookAbi,
   ampsQuoterAbi,
-  ampsStakingAbi,
   ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
@@ -30,6 +29,7 @@ import {
 } from '@amplestocks/abis/generated'
 import type {Abi, Address} from 'viem'
 
+import {ampsRouterAbi} from './abi/router'
 import {deployment, type AmpsContractKey, type Deployment} from './deployment'
 
 export const abis = {
@@ -38,7 +38,11 @@ export const abis = {
   quoter: ampsQuoterAbi,
   bonds: ampsBondsAbi,
   bondsLens: ampsBondsLensAbi,
-  staking: ampsStakingAbi,
+  /**
+   * The protocol's own router. Hand-written in `lib/abi/router.ts` because the contract has no
+   * Foundry artefact yet; every other entry here is generated and cannot drift.
+   */
+  router: ampsRouterAbi,
   registry: poolRegistryAbi,
   registryLens: poolRegistryLensAbi,
   hook: ampsHookAbi,

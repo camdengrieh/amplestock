@@ -180,3 +180,52 @@ export function bpsOf(amount: bigint, bps: number): bigint {
 export function netOfBps(amount: bigint, bps: number): bigint {
   return (amount * (BPS - BigInt(bps))) / BPS
 }
+
+// ---------------------------------------------------------------------------------------------
+// The AMPS fee, behind one accessor
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The **AMPS fee** — the protocol's own fee, charged on every swap that touches AMPS, in both
+ * directions.
+ *
+ * Revision 6 changed two things about it. It is charged on buys as well as sells, and the pool's
+ * base fee is charged on top of it only for a pass-through route. What did *not* change yet is the
+ * name on chain: `AmpsHook` still exposes it as `ampsFeeBps()` / `AMPS_FEE_BPS_MIN` /
+ * `AMPS_FEE_BPS_MAX`, and `IAmpsQuoter.PoolQuote` still carries it as `ampsFeeBps`/`sellFeePips`.
+ *
+ * Everything in the app reads it through the four accessors below and nothing reads the struct
+ * field or the function name directly, so the rename — when the hook lands it — is these four
+ * lines and nothing else. `test/fees.test.ts` asserts that they agree with the fields they wrap.
+ */
+export const AMPS_FEE_FUNCTION = 'ampsFeeBps' as const
+export const AMPS_FEE_MIN_FUNCTION = 'AMPS_FEE_BPS_MIN' as const
+export const AMPS_FEE_MAX_FUNCTION = 'AMPS_FEE_BPS_MAX' as const
+
+/** The AMPS fee in bps, out of a quote. Charged on both sides of the pool. */
+export function ampsFeeBpsOf(quote: {ampsFeeBps: number}): number {
+  return quote.ampsFeeBps
+}
+
+/** The same fee in pips — the unit the pool manager's fee override speaks. */
+export function ampsFeePipsOf(quote: {sellFeePips: number}): number {
+  return quote.sellFeePips
+}
+
+/**
+ * The **pool base fee** in bps: 30 bp in an entry pool, 5–10 bp in a spoke.
+ *
+ * On chain this is `buyFeeBps`, and under revision 6 it is charged **on top of** the AMPS fee only
+ * when the swap is one leg of a pass-through. A direct buy or sell pays the AMPS fee alone.
+ */
+export function poolBaseFeeBpsOf(quote: {buyFeeBps: number}): number {
+  return quote.buyFeeBps
+}
+
+/**
+ * What a direct swap pays, in pips, in the direction given — the authority is the quoter, which
+ * has already applied the dynamic component and the clamps.
+ */
+export function directFeePipsOf(quote: {buyFeePips: number; sellFeePips: number}, side: 'buy' | 'sell'): number {
+  return side === 'buy' ? quote.buyFeePips : quote.sellFeePips
+}

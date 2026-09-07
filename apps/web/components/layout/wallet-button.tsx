@@ -11,10 +11,14 @@ import {shortAddress} from '@/lib/format'
 /**
  * Connect / disconnect.
  *
+ * The design's app header shows a connected wallet as a bare address in a `1px solid --rule` box —
+ * mono `10px / 0.12em`, `padding:6px 12px` — and its landing and docs headers show the fill
+ * `Enter app` button. This is both: the box when there is an address, the fill button when there is
+ * not.
+ *
  * Reown AppKit owns the picker when a project id is configured. With none — CI, tests, a local
  * checkout — `openWallet` reports `false` and this falls back to the first available connector,
- * which in a browser with a wallet extension is the injected one. The button never becomes a dead
- * control just because no Reown account exists.
+ * which in a browser with a wallet extension is the injected one.
  */
 export function WalletButton() {
   const {address, isConnected} = useAccount()
@@ -30,15 +34,21 @@ export function WalletButton() {
 
   if (isConnected && address) {
     return (
-      <Button variant="outline" size="sm" onClick={() => disconnect()} data-testid="wallet-disconnect">
+      <button
+        type="button"
+        onClick={() => disconnect()}
+        title="Disconnect"
+        data-testid="wallet-disconnect"
+        className="border border-rule px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-ink transition-colors hover:border-ink"
+      >
         {shortAddress(address)}
-      </Button>
+      </button>
     )
   }
 
   return (
     <Button size="sm" onClick={() => void onConnect()} disabled={isPending} data-testid="wallet-connect">
-      {isPending ? 'Connecting…' : 'Connect wallet'}
+      {isPending ? 'Connecting…' : 'Connect'}
     </Button>
   )
 }

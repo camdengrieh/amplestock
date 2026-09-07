@@ -3,37 +3,39 @@
 
 import * as React from 'react'
 import {useAccount, useSimulateContract} from 'wagmi'
-import type {Address, Hex} from 'viem'
+import type {Hex} from 'viem'
 
 import {DegradedNotice} from '@/components/common/degraded'
-import {FieldRow} from '@/components/common/stat'
 import {NotDeployed, SurfaceHeading} from '@/components/common/states'
 import {TxButton, TxError, TxSuccess} from '@/components/common/tx'
 import {Value} from '@/components/common/value'
+import {AmountField} from '@/components/ledger/amount-field'
+import {DataRow, Inverted, RowGroup} from '@/components/ledger/primitives'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
-import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
-import {Input} from '@/components/ui/input'
 import {Label} from '@/components/ui/label'
+import {Select} from '@/components/ui/select'
+import {useAmpsFee} from '@/hooks/use-hook-params'
 import {usePoolDirectory} from '@/hooks/use-pools'
 import {useRotationQuote} from '@/hooks/use-quotes'
 import {useTx} from '@/hooks/use-tx'
+import {ampsRouterAbi, routerDeadline} from '@/lib/abi/router'
 import {activeChainId} from '@/lib/chains'
 import {addressOf} from '@/lib/contracts'
 import {NOTES} from '@/lib/copy'
-import {explorerTxUrl, referenceBook} from '@/lib/deployment'
-import {blendedAmpsFeeBps, bpsToPips, pipsToPercent} from '@/lib/fees'
-import {formatAmount, parseAmount} from '@/lib/format'
-import {deadlineFromNow, encodeRotation, minOutFromSlippage, poolKeyFromQuote, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
+import {explorerTxUrl} from '@/lib/deployment'
+import {ampsFeeBpsOf, blendedAmpsFeeBps, bpsToPips, pipsToPercent, poolBaseFeeBpsOf} from '@/lib/fees'
+import {formatAmount, parseAmount, shortAddress} from '@/lib/format'
+import {minOutFromSlippage} from '@/lib/route'
 
 const DEFAULT_SLIPPAGE_BPS = 50
 
 /**
  * The comparison the Rotate surface exists to show.
  *
- * A rotation is one `SWAP_EXACT_IN` with two `PathKey`s inside one `V4_SWAP`. The AMPS that hop 1
- * buys is the credit hop 2 consumes, so hop 2's base fee blends from the sell fee down toward the
- * pool's buy fee. Doing the same two swaps as two transactions throws that away entirely: the
- * credit lives in transient storage and cannot cross a transaction boundary.
+ * A pass-through's second hop pays the destination pool's base fee instead of the AMPS fee, because
+ * the AMPS it is selling was bought by the first hop in the same transaction and the hook credits
+ * exactly that. Doing the same two swaps as two transactions throws it away: the credit lives in
+ * EIP-1153 transient storage and cannot cross a transaction boundary.
  *
  * Both columns are computed from the same fee law, so the difference is the credit and nothing else.
  */
@@ -70,6 +72,18 @@ export function compareRotation(params: {
   }
 }
 
+/**
+ * Rotate.
+ *
+ * The write goes through `AmpsRouter.rotate` and nowhere else. That is not a convenience: the hook
+ * fixes each hop's fee in `beforeSwap`, before that hop runs, so the only thing that can prove the
+ * round trip is the credit the protocol's own router creates and spends inside one transaction. A
+ * third-party router calling the PoolManager twice pays the AMPS fee on its AMPS-buying leg, and
+ * the surface says so rather than offering a route that quietly costs more.
+ *
+ * When the router has no address on this chain the surface renders the ordinary "not deployed"
+ * state — it does not fall back to a two-transaction route that would be dearer.
+ */
 export function RotateSurface() {
   const {address, isConnected} = useAccount()
   const {spokes, enabled: directoryEnabled} = usePoolDirectory()
@@ -77,16 +91,12 @@ export function RotateSurface() {
   const [toPoolId, setToPoolId] = React.useState<Hex | undefined>(undefined)
   const [amountText, setAmountText] = React.useState('')
 
-  const amps = addressOf('amps')
-  const book = referenceBook(activeChainId)
+  const routerAddress = addressOf('router')
+  const fee = useAmpsFee()
 
   const from = React.useMemo(() => spokes.find((p) => p.poolId === fromPoolId) ?? spokes[0], [spokes, fromPoolId])
   const to = React.useMemo(() => spokes.find((p) => p.poolId === toPoolId) ?? spokes[1] ?? spokes[0], [spokes, toPoolId])
   const amount = parseAmount(amountText, 18)
-  const hook = addressOf('hook')
-  // Both hop keys come out of the same `quoteAll()` the pool pickers are already rendering.
-  const fromKey = from && amps && hook ? poolKeyFromQuote(from.quote, {amps, hooks: hook}) : null
-  const toKey = to && amps && hook ? poolKeyFromQuote(to.quote, {amps, hooks: hook}) : null
 
   const rotation = useRotationQuote({
     ...(from ? {hop1: from.poolId} : {}),
@@ -97,54 +107,47 @@ export function RotateSurface() {
   const comparison = React.useMemo(() => {
     if (!from || !to) return null
     // With no on-chain answer yet, the credit equals the AMPS hop 1 buys; the fee law is the same
-    // either way, so the comparison is exact in the fee dimension even before V4Quoter answers.
+    // either way, so the comparison is exact in the fee dimension even before the quoter answers.
     const credit = rotation.rotation?.creditUsed ?? (amount ?? 0n)
     if (credit <= 0n) return null
     return compareRotation({
-      hop1BuyFeeBps: from.quote.buyFeeBps,
-      hop2BuyFeeBps: to.quote.buyFeeBps,
-      ampsFeeBps: to.quote.ampsFeeBps,
+      hop1BuyFeeBps: poolBaseFeeBpsOf(from.quote),
+      hop2BuyFeeBps: poolBaseFeeBpsOf(to.quote),
+      ampsFeeBps: fee.ampsFeeBps ?? ampsFeeBpsOf(to.quote),
       ampsFromHop1: credit,
     })
-  }, [from, to, rotation.rotation, amount])
+  }, [from, to, rotation.rotation, amount, fee.ampsFeeBps])
 
-  const route = React.useMemo(() => {
-    if (!from || !to || !amps || !fromKey || !toKey || amount === null || amount <= 0n) return null
-    return encodeRotation({
-      tokenIn: from.counter,
-      amps,
-      tokenOut: to.counter,
-      hop1: fromKey,
-      hop2: toKey,
-      amountIn: amount,
-      amountOutMinimum: minOutFromSlippage(rotation.rotation?.amountOut ?? 0n, DEFAULT_SLIPPAGE_BPS),
-    })
-  }, [from, to, amps, fromKey, toKey, amount, rotation.rotation])
+  const minOut = minOutFromSlippage(rotation.rotation?.amountOut ?? 0n, DEFAULT_SLIPPAGE_BPS)
 
-  const request = React.useMemo(() => {
-    if (!route || !book) return null
-    return routeToRequest({router: book.universalRouter, route, deadline: deadlineFromNow()})
-  }, [route, book])
+  const args = React.useMemo(() => {
+    if (!from || !to || !address || amount === null || amount <= 0n || from.poolId === to.poolId) return undefined
+    return [from.poolId, to.poolId, amount, minOut, address, false, routerDeadline()] as const
+  }, [from, to, address, amount, minOut])
 
   const simulation = useSimulateContract({
-    address: request?.address,
-    abi: universalRouterExecuteAbi,
-    functionName: 'execute',
-    args: request?.args,
-    query: {enabled: request !== null && isConnected && address !== undefined},
+    ...(routerAddress ? {address: routerAddress} : {}),
+    abi: ampsRouterAbi,
+    functionName: 'rotate',
+    ...(args ? {args} : {}),
+    query: {enabled: routerAddress !== undefined && args !== undefined && isConnected},
   })
 
   const blockedReason = !isConnected
     ? 'Connect a wallet to simulate this rotation.'
-    : !book
-      ? 'No verified reference addresses for this chain, so no router to call.'
+    : !routerAddress
+      ? 'AmpsRouter is not deployed on this chain, and a pass-through has no other route.'
       : amount === null || amount <= 0n
         ? 'Enter an amount.'
         : from?.poolId === to?.poolId
           ? 'Pick two different spokes.'
-          : !fromKey || !toKey
-            ? 'The quoter could not read one of these pools’ registry entries, so there is no route to build.'
-            : undefined
+          : from && from.quote.degraded !== 0
+            ? 'The first hop’s quote is degraded. A quote with any flag raised is not permission to trade.'
+            : to && to.quote.degraded !== 0
+              ? 'The second hop’s quote is degraded. A quote with any flag raised is not permission to trade.'
+              : rotation.rotation === undefined
+                ? 'The quoter has not priced this rotation yet.'
+                : undefined
 
   const tx = useTx({
     simulation: simulation.data,
@@ -155,90 +158,96 @@ export function RotateSurface() {
 
   if (!directoryEnabled) {
     return (
-      <div className="space-y-6">
-        <SurfaceHeading title="Rotate" lede="Stock to stock through AMPS, in one transaction." />
+      <div className="space-y-10">
+        <SurfaceHeading
+          kicker="Pass-through"
+          title="Rotate"
+          lede="Stock to stock through AMPS, in one transaction, through the protocol’s own router."
+        />
         <NotDeployed what="Rotate" />
       </div>
     )
   }
 
   return (
-    <div className="space-y-6" data-testid="rotate-surface">
+    <div className="space-y-11" data-testid="rotate-surface">
       <SurfaceHeading
+        kicker="Stock to stock, one transaction"
         title="Rotate"
-        lede="One transaction, one V4_SWAP, one SWAP_EXACT_IN with two PathKeys. The AMPS the first hop buys is the credit the second hop spends."
+        lede="One call with two hops through AMPS. The AMPS the first hop buys is the credit the second hop spends — so the second hop pays the destination pool’s base fee instead of the AMPS fee."
       />
-      <Alert variant="info">
-        <AlertTitle>Why it has to be one transaction</AlertTitle>
-        <AlertDescription>{NOTES.rotationCredit}</AlertDescription>
-      </Alert>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Rotate</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="from">Sell</Label>
-              <select
-                id="from"
-                data-testid="rotate-from"
-                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
-                value={from?.poolId ?? ''}
-                onChange={(e) => setFromPoolId(e.target.value as Hex)}
-              >
-                {spokes.map((pool) => (
-                  <option key={pool.poolId} value={pool.poolId}>
-                    {pool.symbol}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="to">Buy</Label>
-              <select
-                id="to"
-                data-testid="rotate-to"
-                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
-                value={to?.poolId ?? ''}
-                onChange={(e) => setToPoolId(e.target.value as Hex)}
-              >
-                {spokes.map((pool) => (
-                  <option key={pool.poolId} value={pool.poolId}>
-                    {pool.symbol}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="rotate-amount">Amount ({from?.symbol ?? '—'})</Label>
-              <Input
-                id="rotate-amount"
-                data-testid="rotate-amount"
-                inputMode="decimal"
-                placeholder="0.0"
-                value={amountText}
-                onChange={(e) => setAmountText(e.target.value)}
-              />
-            </div>
+      <div className="grid gap-x-14 gap-y-12 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        <div>
+          <Label htmlFor="from" className="mb-2">
+            Sell
+          </Label>
+          <Select
+            id="from"
+            data-testid="rotate-from"
+            value={from?.poolId ?? ''}
+            onChange={(e) => setFromPoolId(e.target.value as Hex)}
+          >
+            {spokes.map((pool) => (
+              <option key={pool.poolId} value={pool.poolId}>
+                {pool.symbol}
+              </option>
+            ))}
+          </Select>
+
+          <Label htmlFor="to" className="mb-2 mt-[22px]">
+            Buy
+          </Label>
+          <Select
+            id="to"
+            data-testid="rotate-to"
+            value={to?.poolId ?? ''}
+            onChange={(e) => setToPoolId(e.target.value as Hex)}
+          >
+            {spokes.map((pool) => (
+              <option key={pool.poolId} value={pool.poolId}>
+                {pool.symbol}
+              </option>
+            ))}
+          </Select>
+
+          <Label htmlFor="rotate-amount" className="mb-2 mt-[22px]">
+            Amount ({from?.symbol ?? '—'})
+          </Label>
+          <AmountField
+            id="rotate-amount"
+            data-testid="rotate-amount"
+            value={amountText}
+            onChange={setAmountText}
+            unit={from?.symbol ?? ''}
+          />
+
+          <div className="mt-[26px]">
             <TxButton
               phase={tx.phase}
-              label="Rotate"
+              label={from && to ? `Rotate ${from.symbol} → ${to.symbol}` : 'Rotate'}
               {...(tx.blockedReason ? {blockedReason: tx.blockedReason} : {})}
               onClick={() => void tx.send()}
               data-testid="rotate-submit"
             />
+          </div>
+          <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.55] text-dim" data-testid="no-aggregator-note">
+            {NOTES.noAggregator}
+          </p>
+          <div className="mt-6 space-y-6">
             <TxError error={tx.error} />
             {tx.hash ? <TxSuccess hash={tx.hash} explorerUrl={explorerTxUrl(activeChainId, tx.hash)} /> : null}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
 
         <RotationComparisonPanel
           comparison={comparison}
-          amountOut={rotation.rotation?.amountOut}
+          {...(rotation.rotation?.amountOut !== undefined ? {amountOut: rotation.rotation.amountOut} : {})}
+          {...(minOut > 0n ? {minOut} : {})}
           outSymbol={to?.symbol ?? ''}
-          degraded={from?.quote.degraded ?? 0}
+          degraded={(from?.quote.degraded ?? 0) | (to?.quote.degraded ?? 0)}
+          routerDeployed={routerAddress !== undefined}
+          {...(routerAddress ? {routerAddress} : {})}
         />
       </div>
     </div>
@@ -248,60 +257,79 @@ export function RotateSurface() {
 export function RotationComparisonPanel({
   comparison,
   amountOut,
+  minOut,
   outSymbol,
   degraded,
+  routerDeployed = true,
+  routerAddress,
 }: {
   comparison: RotationComparison | null
   amountOut?: bigint
+  minOut?: bigint
   outSymbol: string
   degraded: number
+  routerDeployed?: boolean
+  routerAddress?: string
 }) {
   return (
-    <div className="space-y-4" data-testid="rotation-comparison">
+    <div className="space-y-[26px]" data-testid="rotation-comparison">
       <DegradedNotice degraded={degraded} />
-      <Card>
-        <CardHeader>
-          <CardTitle>One transaction, through AMPS</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <FieldRow label="You receive" hint="From AmpsQuoter.quoteRotation, credit applied">
-            <Value unavailable={amountOut === undefined}>
-              {amountOut !== undefined ? `${formatAmount(amountOut, 18)} ${outSymbol}` : null}
-            </Value>
-          </FieldRow>
-          <FieldRow label="Hop 1 — buy AMPS">
-            <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
-          </FieldRow>
-          <FieldRow label="Hop 2 — sell AMPS, credited" hint="Blends down to the destination pool’s buy fee">
-            <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.rotatedHop2FeePips) : null}</Value>
-          </FieldRow>
-        </CardContent>
-      </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>The same two swaps, separately</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <FieldRow label="Hop 1 — buy AMPS">
-            <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
-          </FieldRow>
-          <FieldRow label="Hop 2 — sell AMPS, uncredited" hint="No credit survives a transaction boundary">
-            <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.separateHop2FeePips) : null}</Value>
-          </FieldRow>
-          <FieldRow label="Difference on the second hop">
-            <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.savedPips) : null}</Value>
-          </FieldRow>
-        </CardContent>
-      </Card>
+      <RowGroup label="One transaction, through AMPS">
+        <DataRow label="You receive" labelClassName="text-[17px]">
+          <Value unavailable={amountOut === undefined}>
+            {amountOut !== undefined ? `${formatAmount(amountOut, 18)} ${outSymbol}` : null}
+          </Value>
+        </DataRow>
+        <DataRow label="Minimum received" labelClassName="text-[17px]">
+          <Value unavailable={minOut === undefined}>
+            {minOut !== undefined ? `${formatAmount(minOut, 18)} ${outSymbol}` : null}
+          </Value>
+        </DataRow>
+        <DataRow label="Hop 1 — buy AMPS" labelClassName="text-[17px]">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
+        </DataRow>
+        <DataRow label="Hop 2 — sell AMPS, credited" labelClassName="text-[17px]">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.rotatedHop2FeePips) : null}</Value>
+        </DataRow>
+      </RowGroup>
 
-      <Alert>
-        <AlertTitle>External routes</AlertTitle>
-        <AlertDescription>
-          No external aggregator is configured, so no third-party route is quoted here. The comparison above is between
-          the same two pools priced with and without the rotation credit — it is not a claim about the whole market.
-        </AlertDescription>
-      </Alert>
+      <RowGroup label="The same two swaps, separately" rule="rule" className="pt-2">
+        <DataRow label="Hop 1 — buy AMPS" labelClassName="text-[17px] text-dim">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
+        </DataRow>
+        <DataRow label="Hop 2 — sell AMPS, uncredited" labelClassName="text-[17px] text-dim">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.separateHop2FeePips) : null}</Value>
+        </DataRow>
+        <DataRow label="Difference on the second hop" labelClassName="text-[17px] text-dim">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.savedPips) : null}</Value>
+        </DataRow>
+      </RowGroup>
+
+      <Inverted className="px-[26px] py-6" data-testid="router-only-note">
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] opacity-60">
+          Why it has to be one transaction, through one router
+        </p>
+        <p className="mt-3 text-[18px] leading-[1.45]">{NOTES.rotationCredit}</p>
+        <p className="mt-3 text-[16px] leading-[1.5] opacity-70">{NOTES.routerOnly}</p>
+        <p className="mt-4 font-mono text-[12px] opacity-60">
+          AmpsRouter {routerAddress ? shortAddress(routerAddress) : 'not deployed on this chain'} ·
+          rotate(hop1, hop2, amountIn, minOut, to, unwrap, deadline)
+        </p>
+      </Inverted>
+
+      {routerDeployed ? null : (
+        <Alert variant="warning" data-testid="router-missing">
+          <AlertTitle>AmpsRouter has no address on this chain</AlertTitle>
+          <AlertDescription>
+            <p>
+              The comparison above is the fee law, which is readable without the router. The rotation itself is not
+              offered: there is no second route to fall back to, and a two-transaction version would pay the AMPS fee on
+              its AMPS-buying leg.
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
     </div>
   )
 }

@@ -6,7 +6,9 @@
  * `docs/indexer.md` did not exist when this was written, so these types are the dApp's *stated
  * requirement* rather than a transcription of a published contract: they name exactly the eight
  * endpoints the plan lists for the front end (vault summary, NAV history, ladder fill per pool,
- * bond board, staking APR, flywheel metrics, gate status, burn history) and nothing else.
+ * bond board, flywheel metrics, gate status, burn history) and nothing else. There is no staking
+ * endpoint: revision 6 removed staking, and an endpoint nothing can consume is a claim that it
+ * still exists.
  *
  * Two consequences, both deliberate:
  *
@@ -102,19 +104,6 @@ export interface BondBoardRow {
   hSessionBps: number
 }
 
-export interface StakingStats {
-  totalAssets: NumericString
-  totalSupply: NumericString
-  sharePriceX18: NumericString
-  pendingRewards: NumericString
-  streamEnd: number
-  rewardStreamSeconds: number
-  /** Realised: fees actually collected and streamed over the trailing window. Not a projection. */
-  realisedAprBps: number
-  windowSeconds: number
-  windowRewards: NumericString
-}
-
 export interface FlywheelMetrics {
   windowSeconds: number
   sellFeeAmps: NumericString
@@ -123,7 +112,6 @@ export interface FlywheelMetrics {
   bondAccretionUsd18: NumericString
   burnedAmps: NumericString
   creatorPaidAmps: NumericString
-  stakerPaidAmps: NumericString
   netSupplyChange: NumericString
   perPool: readonly {poolId: Hex; symbol: string; feeAprBps: number; realisedLvrBps: number}[]
 }

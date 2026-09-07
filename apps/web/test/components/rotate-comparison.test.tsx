@@ -3,6 +3,7 @@ import {render, screen} from '@testing-library/react'
 import {describe, expect, it} from 'vitest'
 
 import {RotationComparisonPanel, compareRotation} from '@/components/surfaces/rotate'
+import {NOTES} from '@/lib/copy'
 import {bpsToPips} from '@/lib/fees'
 
 const WAD = 10n ** 18n
@@ -33,8 +34,12 @@ describe('RotationComparisonPanel', () => {
   })
 
   it('is explicit that no external aggregator was consulted', () => {
-    render(<RotationComparisonPanel comparison={comparison} outSymbol="AAPL" degraded={0} />)
-    expect(screen.getByText(/not a claim about the whole market/i)).toBeInTheDocument()
+    // The design puts that sentence under the submit button in the left column rather than inside
+    // the comparison, so the claim is tested where it lives — and the panel itself is tested for
+    // never implying more than the two pools it actually priced.
+    expect(NOTES.noAggregator).toMatch(/not a claim about the whole market/i)
+    const {container} = render(<RotationComparisonPanel comparison={comparison} outSymbol="AAPL" degraded={0} />)
+    expect(container.textContent).not.toMatch(/best (price|route)|aggregat/i)
   })
 
   it('renders unavailable rather than zero before an amount is entered', () => {

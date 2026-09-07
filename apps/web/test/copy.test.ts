@@ -20,7 +20,7 @@ const FORBIDDEN: readonly {pattern: RegExp; why: string}[] = [
   {pattern: /\bauthoris[sz]?ed[- ]participant\s+channel\b/i, why: 'there is no creation/redemption arrangement with the issuer'},
   {pattern: /\bguaranteed?\s+(returns?|profits?|yields?|income|price|value)\b/i, why: 'nothing here is guaranteed'},
   {pattern: /\brisk[- ]free\b/i, why: 'nothing here is risk-free'},
-  {pattern: /\bAPY\b/, why: 'staking pays realised fees, not a compounding yield'},
+  {pattern: /\bAPY\b/, why: 'nothing here compounds a yield; fees are burned'},
   {pattern: /\bpassive income\b/i, why: 'fees already collected are not income'},
   {pattern: /\bprice target\b/i, why: 'no price forecasts'},
   {pattern: /\bwill (increase|rise|go up|appreciate|moon)\b/i, why: 'no price forecasts'},

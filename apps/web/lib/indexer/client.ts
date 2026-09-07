@@ -23,7 +23,6 @@ import type {
   IndexerHealth,
   LadderFill,
   NavPoint,
-  StakingStats,
   VaultSummary,
 } from './types'
 
@@ -37,7 +36,6 @@ export const ENDPOINTS = {
   ladderFill: (poolId: string) => `/api/pools/${poolId}/ladder`,
   bondBoard: '/api/bonds',
   bondPositions: (owner: string) => `/api/bonds/positions/${owner}`,
-  stakingStats: '/api/staking',
   flywheel: '/api/flywheel',
   gateStatus: '/api/gate',
   burnHistory: '/api/burns',
@@ -119,10 +117,6 @@ export class IndexerClient {
 
   bondBoard(): Promise<IndexerResult<BondBoardRow[]>> {
     return this.get<BondBoardRow[]>(ENDPOINTS.bondBoard)
-  }
-
-  stakingStats(): Promise<IndexerResult<StakingStats>> {
-    return this.get<StakingStats>(ENDPOINTS.stakingStats)
   }
 
   flywheel(params: {days?: number} = {}): Promise<IndexerResult<FlywheelMetrics>> {
