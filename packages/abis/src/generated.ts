@@ -1167,6 +1167,7 @@ export const ampsBondsAbi = [
     inputs: [{ name: 'tick', internalType: 'int24', type: 'int24' }],
     name: 'TickOutOfRange',
   },
+  { type: 'error', inputs: [], name: 'UnconfirmedNav' },
   {
     type: 'error',
     inputs: [{ name: 'marketId', internalType: 'uint16', type: 'uint16' }],
@@ -4026,6 +4027,13 @@ export const ampsVaultAbi = [
   {
     type: 'function',
     inputs: [],
+    name: 'navUnconfirmed',
+    outputs: [{ name: 'held', internalType: 'bool', type: 'bool' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
     name: 'oracleGate',
     outputs: [
       { name: 'gateAddress', internalType: 'address', type: 'address' },
@@ -4288,6 +4296,13 @@ export const ampsVaultAbi = [
     inputs: [],
     name: 'spokeSeedBps',
     outputs: [{ name: 'value', internalType: 'uint16', type: 'uint16' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [{ name: 'constituentId', internalType: 'uint16', type: 'uint16' }],
+    name: 'spokeWeightBps',
+    outputs: [{ name: 'weightBps', internalType: 'uint16', type: 'uint16' }],
     stateMutability: 'view',
   },
   {

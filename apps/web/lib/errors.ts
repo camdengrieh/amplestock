@@ -77,6 +77,18 @@ const CATALOGUE: Readonly<Record<string, Omit<SurfacedError, 'name' | 'args'>>> 
     detail: 'The NAV checkpoint this path prices against is older than the maximum age it accepts.',
     action: 'Call checkpoint() from the Vault page — it is free and anyone may call it — then retry.',
   },
+  UnconfirmedNav: {
+    title: 'NAV is built on an unconfirmed answer',
+    detail:
+      'The vault’s last checkpoint valued at least one asset from a stale or held-back oracle answer, which understates NAV per share — the denominator of every bond floor. Bonds refuse to price against it.',
+    action: 'Wait for the feed to confirm (a keeper refresh or the next round), call checkpoint() from the Vault page, then retry. Redemption is unaffected.',
+  },
+  HighWaterResetFailed: {
+    title: 'High-water reset failed',
+    detail:
+      'An ask placement could not reset the pool’s high-water mark on the hook, which is what keeps freshly placed asks out of the buyback burn. The placement reverted rather than leave a stale mark standing.',
+    action: 'This is a wiring fault on the market reference, not a timing one. Nothing to retry; the operator has to look.',
+  },
   ConstituentFrozen: {
     title: 'Constituent frozen',
     detail: 'A guardian freeze or a corporate action covers this constituent. The freeze is disable-only and expires by itself.',
