@@ -57,9 +57,10 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      real swap to the wei, up to two documented limits: it is bounded at {MAX_SWAP_STEPS} tick words, and it is
 ///      a *view* of state that any transaction landing before the caller's can move.
 ///
-/// @dev **The rotation credit is simulated, never read.** `IAmpsHook.rotationCredit()` is EIP-1153 transient
-///      storage and is therefore zero in every fresh `eth_call`; consulting it would understate hop 2's credit by
-///      exactly the amount that matters. {quoteRotation} models the credit the caller's own hop 1 will create, and
+/// @dev **The rotation credit is simulated, never read.** `IAmpsHook.rotationCredit(address)` is EIP-1153
+///      transient storage keyed by the swap's `sender`, and is therefore zero in every fresh `eth_call` and zero
+///      for this contract at any time; consulting it would understate hop 2's credit by exactly the amount that
+///      matters. {quoteRotation} models the credit the caller's own hop 1 will create, and
 ///      takes the sell base from `IAmpsHook.sellFeeBps()` rather than from `quoteFee`'s `baseBps`, so a quoter
 ///      called from inside a transaction that already holds a credit cannot double-count it.
 contract AmpsQuoter is IAmpsQuoter {

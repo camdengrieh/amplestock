@@ -241,7 +241,8 @@ contract QuoterHookStub is IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function rotationCredit() external pure returns (uint256 credit) {
+    /// @dev The stub holds no transient state, so nobody ever has a credit.
+    function rotationCredit(address) external pure returns (uint256 credit) {
         return 0;
     }
 
@@ -327,5 +328,12 @@ contract QuoterHookStub is IAmpsHook {
     function setFeePolicy(address newPolicy) external {
         emit FeePolicyChanged(feePolicy, newPolicy);
         feePolicy = newPolicy;
+    }
+
+    /// @inheritdoc IAmpsHook
+    /// @dev Unguarded here: the stub exists to be steered by a test, not to enforce the production check.
+    function setVault(address newVault) external {
+        emit VaultChanged(vault, newVault);
+        vault = newVault;
     }
 }

@@ -786,4 +786,16 @@ library Constants {
     ///         no floor, because setting the ceiling to zero is the governance path for pausing paid keeping
     ///         without pausing the jobs themselves.
     uint256 internal constant DAILY_CEILING_USD18_MAX = 100_000e18;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Transient slots the vault derives (not governed; part of the layout, see `docs/phase2-state-model.md` §1.1)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Base of `VaultPlacementLib`'s transient staging buffer: four words per placed cell, {GRID_CELLS}
+    ///         cells, so the buffer occupies `[slot, slot + 4 x GRID_CELLS)`.
+    /// @dev Declared here for the same reason `ROTATION_CREDIT_SLOT` is: the library used to carry a hand-written
+    ///      literal whose comment claimed it was this hash and which in fact was not, so nothing tied the buffer
+    ///      to the namespace every other vault slot is derived from. `test/unit/VaultPlacement.t.sol` pins both
+    ///      the string and the value, exactly as `test/unit/RotationCredit.t.sol` does for the hook.
+    bytes32 internal constant PLACEMENT_STAGE_SLOT = keccak256("amplestocks.vault.PLACEMENT_STAGE");
 }

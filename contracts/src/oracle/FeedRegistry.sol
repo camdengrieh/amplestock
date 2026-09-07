@@ -32,16 +32,41 @@ import {FeedConfig, FeedStatus, Session} from "../types/Types.sol";
 ///           held back for ever by an aggregator that stops publishing.
 ///
 ///      The rule is armed only when the two answers are within one `heartbeat` of each other. Two rounds a day
-///      apart are not "a single-round move", and treating them as one would hold back ordinary drift after a
-///      quiet weekend. While a jump is pending, {latestAnswer} returns the *accepted* answer and its *accepted*
-///      `updatedAt`, so the ordinary freshness bound is what decides whether the caller degrades — an
-///      unconfirmed feed becomes stale on schedule instead of pretending to be current.
+///      apart are not "a single-round move" *against the latch*, and treating them as one would hold back ordinary
+///      drift after a quiet weekend.
+///
+/// @dev **The stateless path, for the deployment nobody refreshes.** `accepted` is only advanced by {refresh}, and
+///      no production keeper calls it, so in the default deployment the latch is older than one heartbeat almost
+///      always and the paragraph above would disarm the rule entirely — every candidate adopted unchecked. So when
+///      the latch is stale relative to the candidate the single-round move is measured against the **aggregator's
+///      own previous round** instead: `getRoundData(roundId - 1)` through the same bounded probe as
+///      {latestRoundData}. A failed or invalid probe, a phase boundary (`uint64(roundId) < 2`, so `roundId - 1`
+///      belongs to a different aggregator series) or a zero answer all read as "no previous round", i.e. *not* a
+///      jump — the conservative reading is the one that never blocks a price on a feed the protocol cannot see
+///      behind. When there is a previous round and the two are more than `ANSWER_JUMP_BPS` apart inside one
+///      heartbeat, the candidate is a jump, and it is confirmed when either
+///
+///        1. `confirmSeconds` have elapsed since the *candidate's own* `updatedAt` — the jump has stood unrevised;
+///           or
+///        2. round `roundId - 2` agrees with it, so the round in between was the single outlier.
+///
+///      Nothing is written on this path: it reads three rounds and decides, which is exactly what makes it work
+///      with no keeper at all. {refresh} therefore records no `Pending` for it either.
+///
+/// @dev **A held-back answer is conservative, not optimistic.** While a jump is held, every read reports
+///      `min(heldLevel, candidate)` — the accepted answer or, on the stateless path, the previous round — stamped
+///      with the *candidate's* `updatedAt` and flagged `unconfirmed`. Reporting the pre-jump level as if nothing
+///      had happened would price collateral that just crashed at its pre-crash price; taking the minimum makes the
+///      hold-back protocol-favouring in NAV, in the bond accretion floor and in the gate's fair tick alike, and
+///      `unconfirmed` lets `OracleGate` treat it as staleness (which widens the bond haircut) rather than as a
+///      current price.
 ///
 /// @dev **Where the latch is written.** Reads are `view` and cannot latch, so `accepted`/`pending` are advanced by
 ///      {refresh} (permissionless and unpaid, like `OracleGate.poke()`) and seeded by {setFeed}. Until a feed has
 ///      ever been latched there is nothing to jump *from*, and the live candidate is returned directly. The rule
-///      therefore never blocks bootstrapping and never depends on a keeper for correctness: the worst a missing
-///      {refresh} can do is hold a jump behind the accepted answer until `confirmSeconds` elapse.
+///      therefore never blocks bootstrapping and never depends on a keeper for correctness: with a keeper the
+///      latch path decides, without one the stateless path does, and the worst either can do is hold a jump behind
+///      the more conservative of the two levels until `confirmSeconds` elapse.
 ///
 /// @dev **SVR proxies are rejected by construction.** Chainlink publishes a second, "smart value recapture" proxy
 ///      for many tickers: the same number, different liveness guarantees, and an MEV-recapture path in between.
@@ -330,13 +355,13 @@ contract FeedRegistry is IFeedRegistry {
         (ProbeResult result, uint80 roundId,, uint256 candidateUsd8, uint32 candidateUpdatedAt) = _probe(config);
         if (result == ProbeResult.OK) {
             Accepted memory accepted = _accepted[token];
-            if (
-                accepted.answerUsd8 != 0 && roundId != accepted.roundId
-                    && _isJump(config.heartbeat, accepted, candidateUsd8, candidateUpdatedAt)
-                    && !_jumpConfirmed(_pending[token], roundId, candidateUsd8)
-            ) {
+            (bool holdBack,, bool againstLatch) =
+                _evaluate(token, config, accepted, roundId, candidateUsd8, candidateUpdatedAt);
+            if (holdBack) {
+                // Only the latch path carries state. The stateless path confirms off the candidate's own
+                // `updatedAt`, so a `Pending` record for it would be a write that decides nothing.
                 Pending memory pending = _pending[token];
-                if (pending.roundId != roundId) {
+                if (againstLatch && pending.roundId != roundId) {
                     _pending[token] = Pending({
                         answerUsd8: uint128(candidateUsd8), seenAt: uint32(block.timestamp), roundId: roundId
                     });
@@ -511,18 +536,18 @@ contract FeedRegistry is IFeedRegistry {
             status.roundId = accepted.roundId;
         } else {
             status.live = true;
-            bool holdBack = accepted.answerUsd8 != 0 && roundId != accepted.roundId
-                && _isJump(config.heartbeat, accepted, candidateUsd8, candidateUpdatedAt)
-                && !_jumpConfirmed(_pending[token], roundId, candidateUsd8);
+            (bool holdBack, uint256 heldUsd8,) =
+                _evaluate(token, config, accepted, roundId, candidateUsd8, candidateUpdatedAt);
+            // The candidate's own round is what the read describes either way: what a hold-back changes is the
+            // *number*, not which round the caller is looking at.
+            status.updatedAt = candidateUpdatedAt;
+            status.roundId = roundId;
             if (holdBack) {
+                // Conservative on both sides of the move: a crash is believed immediately, a spike is not.
                 status.unconfirmed = true;
-                status.answerUsd8 = accepted.answerUsd8;
-                status.updatedAt = accepted.updatedAt;
-                status.roundId = accepted.roundId;
+                status.answerUsd8 = heldUsd8 < candidateUsd8 ? heldUsd8 : candidateUsd8;
             } else {
                 status.answerUsd8 = candidateUsd8;
-                status.updatedAt = candidateUpdatedAt;
-                status.roundId = roundId;
             }
         }
 
@@ -592,32 +617,111 @@ contract FeedRegistry is IFeedRegistry {
         return scaled >= type(uint32).max ? type(uint32).max : uint32(scaled);
     }
 
-    /// @dev Whether a candidate is a single-round move above `ANSWER_JUMP_BPS` against the accepted answer.
-    ///      Rounds published more than one heartbeat apart are not a single-round move and are never jumps.
-    function _isJump(uint32 heartbeat, Accepted memory accepted, uint256 candidateUsd8, uint32 candidateUpdatedAt)
-        internal
-        pure
-        returns (bool isJump)
-    {
-        if (candidateUpdatedAt < accepted.updatedAt) return false;
-        if (uint256(candidateUpdatedAt) - uint256(accepted.updatedAt) > uint256(heartbeat)) return false;
-        uint256 previous = accepted.answerUsd8;
-        uint256 diff = candidateUsd8 > previous ? candidateUsd8 - previous : previous - candidateUsd8;
-        return diff * Constants.BPS > uint256(Constants.ANSWER_JUMP_BPS) * previous;
+    /// @dev The whole two-confirmation rule for one candidate round, both paths.
+    ///
+    ///      **Latch path**, taken while `accepted` is within one `heartbeat` of the candidate: the move is measured
+    ///      against the accepted answer and confirmed through {_jumpConfirmed}, i.e. by a later agreeing round or
+    ///      by `confirmSeconds` since the pending record was stamped.
+    ///
+    ///      **Stateless path**, taken when the latch is older than one heartbeat — which is every read in a
+    ///      deployment where nobody calls {refresh}. The move is measured against the aggregator's own previous
+    ///      round, and confirmed by `confirmSeconds` since the candidate's `updatedAt` or by agreement with round
+    ///      `roundId - 2`. Any probe that cannot answer reads as "no previous round", i.e. not a jump.
+    ///
+    /// @param token The asset.
+    /// @param config Its feed record.
+    /// @param accepted The latched answer.
+    /// @param roundId The candidate round.
+    /// @param candidateUsd8 The candidate answer, 8 decimals.
+    /// @param candidateUpdatedAt The candidate's publication timestamp.
+    /// @return holdBack True while the candidate is a jump nothing has confirmed yet.
+    /// @return heldUsd8 The pre-jump level the hold-back is measured against: the accepted answer on the latch
+    ///         path, the previous round's answer on the stateless one. Zero when `holdBack` is false.
+    /// @return againstLatch Whether the verdict came from the latch path, i.e. whether {refresh} should record a
+    ///         `Pending`. Meaningful only while `holdBack` is true.
+    function _evaluate(
+        address token,
+        FeedConfig memory config,
+        Accepted memory accepted,
+        uint80 roundId,
+        uint256 candidateUsd8,
+        uint32 candidateUpdatedAt
+    ) internal view returns (bool holdBack, uint256 heldUsd8, bool againstLatch) {
+        if (accepted.answerUsd8 == 0 || roundId == accepted.roundId) return (false, 0, false);
+
+        if (
+            candidateUpdatedAt >= accepted.updatedAt
+                && uint256(candidateUpdatedAt) - uint256(accepted.updatedAt) <= uint256(config.heartbeat)
+        ) {
+            if (_agrees(accepted.answerUsd8, candidateUsd8)) return (false, 0, true);
+            if (_jumpConfirmed(_pending[token], roundId, candidateUsd8)) return (false, 0, true);
+            return (true, accepted.answerUsd8, true);
+        }
+
+        // `roundId` is `phaseId << 64 | aggregatorRoundId` on a Chainlink proxy, so a low half below 2 means
+        // `roundId - 1` is not this series' previous round at all. No previous round is not a jump.
+        if (uint64(roundId) < 2) return (false, 0, false);
+        (bool ok, uint256 previousUsd8, uint32 previousUpdatedAt) = _probeRound(config, roundId - 1);
+        if (!ok) return (false, 0, false);
+        if (
+            candidateUpdatedAt < previousUpdatedAt
+                || uint256(candidateUpdatedAt) - uint256(previousUpdatedAt) > uint256(config.heartbeat)
+        ) return (false, 0, false);
+        if (_agrees(previousUsd8, candidateUsd8)) return (false, 0, false);
+        if (block.timestamp >= uint256(candidateUpdatedAt) + uint256(_confirmSeconds)) return (false, 0, false);
+        if (uint64(roundId) >= 3) {
+            (bool earlierOk, uint256 earlierUsd8,) = _probeRound(config, roundId - 2);
+            if (earlierOk && _agrees(earlierUsd8, candidateUsd8)) return (false, 0, false);
+        }
+        return (true, previousUsd8, false);
     }
 
-    /// @dev Whether a pending jump has been confirmed, by a later agreeing round or by `confirmSeconds`.
+    /// @dev Whether two answers are within `ANSWER_JUMP_BPS` of `base`. A zero base agrees with nothing.
+    function _agrees(uint256 base, uint256 candidateUsd8) internal pure returns (bool agrees) {
+        if (base == 0) return false;
+        uint256 diff = candidateUsd8 > base ? candidateUsd8 - base : base - candidateUsd8;
+        return diff * Constants.BPS <= uint256(Constants.ANSWER_JUMP_BPS) * base;
+    }
+
+    /// @dev Whether a pending jump has been confirmed: by a later round, or by `confirmSeconds` since the pending
+    ///      answer was first seen — and, on **both** branches, only by a candidate that agrees with the level the
+    ///      pending record actually holds. Without that second half one aged pending record would confirm any
+    ///      later round of any size, which is the opposite of what the escape is for: the escape exists so a real
+    ///      move is not held for ever, not so an unrelated one is waved through behind it.
     function _jumpConfirmed(Pending memory pending, uint80 roundId, uint256 candidateUsd8)
         internal
         view
         returns (bool confirmed)
     {
         if (pending.roundId == 0) return false;
-        if (block.timestamp >= uint256(pending.seenAt) + uint256(_confirmSeconds)) return true;
-        if (roundId <= pending.roundId) return false;
-        uint256 held = pending.answerUsd8;
-        uint256 diff = candidateUsd8 > held ? candidateUsd8 - held : held - candidateUsd8;
-        return diff * Constants.BPS <= uint256(Constants.ANSWER_JUMP_BPS) * held;
+        if (roundId <= pending.roundId && block.timestamp < uint256(pending.seenAt) + uint256(_confirmSeconds)) {
+            return false;
+        }
+        return _agrees(pending.answerUsd8, candidateUsd8);
+    }
+
+    /// @dev One bounded probe of `getRoundData(roundId)`, shaped exactly like {_probe}: a codeless aggregator, a
+    ///      revert, an out-of-gas, a non-positive or future-dated answer, an answer outside the per-ticker bounds
+    ///      and an answer that rescales to zero are all "no such round", never a value.
+    function _probeRound(FeedConfig memory config, uint80 roundId)
+        internal
+        view
+        returns (bool ok, uint256 answerUsd8, uint32 updatedAt)
+    {
+        address aggregator = config.aggregator;
+        if (aggregator == address(0) || aggregator.code.length == 0) return (false, 0, 0);
+
+        try IAggregatorV3(aggregator).getRoundData{gas: FEED_PROBE_GAS}(roundId) returns (
+            uint80, int256 answer_, uint256, uint256 updatedAt_, uint80
+        ) {
+            if (answer_ <= 0 || updatedAt_ == 0 || updatedAt_ > block.timestamp) return (false, 0, 0);
+            if (uint256(answer_) > type(uint128).max) return (false, 0, 0);
+            uint256 scaled = _toUsd8(uint256(answer_), config.decimals);
+            if (scaled == 0 || scaled < config.minAnswerUsd8 || scaled > config.maxAnswerUsd8) return (false, 0, 0);
+            return (true, scaled, uint32(updatedAt_));
+        } catch {
+            return (false, 0, 0);
+        }
     }
 
     /// @dev Writes the accepted answer and clears any jump held against the old one.

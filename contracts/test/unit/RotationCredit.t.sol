@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {HookTestFixture} from "../mocks/HookTestFixture.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
@@ -21,6 +22,13 @@ import {Vm} from "forge-std/Vm.sol";
 contract RotationCreditTest is HookTestFixture {
     uint256 internal constant USDG_IN = 10_000e6;
     uint256 internal constant STOCK_IN = 50e18;
+
+    /// @dev Two unrelated parties whose swaps the PoolManager reports under two different `sender`s.
+    address internal constant BUYER = address(0xB0B);
+    address internal constant FILLER = address(0xF111E5);
+
+    /// @dev The AMPS the buyer's leg realises, and therefore the credit it earns.
+    uint256 internal constant CREDITED_AMPS = 1000e18;
 
     function setUp() public {
         _deployFixture();
@@ -52,7 +60,7 @@ contract RotationCreditTest is HookTestFixture {
     }
 
     function test_theCreditIsZeroInAFreshTransaction() public view {
-        assertEq(hook.rotationCredit(), 0, "nothing carries in");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "nothing carries in");
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -74,9 +82,9 @@ contract RotationCreditTest is HookTestFixture {
     /// @notice Self-call entry point: the whole rotation inside one transaction's transient storage.
     function rotationEntry(uint256 amountIn) external returns (uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
-        assertEq(hook.rotationCredit(), 0, "the credit starts at zero");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "the credit starts at zero");
         _rotate(address(stock), USDG_ADDRESS, amountIn);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
     /// @notice A rotation really is worth more than the same two legs taken in separate transactions, and the
@@ -99,6 +107,81 @@ contract RotationCreditTest is HookTestFixture {
     function rotationOutEntry(uint256 amountIn) external returns (uint256 usdgOut) {
         require(msg.sender == address(this), "self-call only");
         usdgOut = _rotate(address(stock), USDG_ADDRESS, amountIn);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // Attribution: the credit belongs to the swap's `sender` (audit finding)
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @notice A buy by one party does not discount another party's sell in the same transaction.
+    ///
+    /// @dev The credit used to live in one transaction-global transient slot, with the `sender` the PoolManager
+    ///      hands both callbacks discarded. A filler or solver settling a victim's buy alongside its own exit
+    ///      therefore paid the 30 bp buy fee on that exit instead of the 500 bp sell fee, and a credit earned in
+    ///      the deep hub discounted a sell into a thin spoke. Keyed by `sender`, the two are separate accounts.
+    function test_oneSendersBuyDoesNotDiscountAnothersSell() public {
+        (uint256 buyerCredit, uint256 fillerCredit, uint24 fillerFee, uint24 buyerFee) = this.twoSendersEntry();
+
+        assertEq(buyerCredit, CREDITED_AMPS, "the credit is the buyer's");
+        assertEq(fillerCredit, 0, "and the filler holds none of it");
+        assertEq(
+            fillerFee,
+            (uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS) | LPFeeLibrary.OVERRIDE_FEE_FLAG,
+            "so the filler's own exit pays the sell fee in full"
+        );
+        assertEq(
+            buyerFee,
+            (uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS) | LPFeeLibrary.OVERRIDE_FEE_FLAG,
+            "while the buyer's own covered sell is a rotation, as before"
+        );
+    }
+
+    /// @notice Self-call entry point: BUYER's buy and FILLER's sell inside one transaction's transient storage.
+    /// @dev Driven through the callbacks directly, because the fixture has exactly one router and two parties
+    ///      settled in one transaction is precisely the shape that needs two `sender`s.
+    function twoSendersEntry()
+        external
+        returns (uint256 buyerCredit, uint256 fillerCredit, uint24 fillerFee, uint24 buyerFee)
+    {
+        require(msg.sender == address(this), "self-call only");
+
+        SwapParams memory buy = SwapParams({zeroForOne: false, amountSpecified: -1, sqrtPriceLimitX96: 0});
+        vm.prank(address(poolManager));
+        hook.afterSwap(BUYER, usdgKey, buy, toBalanceDelta(int128(uint128(CREDITED_AMPS)), int128(-1)), "");
+
+        buyerCredit = hook.rotationCredit(BUYER);
+        fillerCredit = hook.rotationCredit(FILLER);
+
+        // The filler's own exit, for exactly the amount the buy credited. It is not the filler's credit.
+        SwapParams memory sell =
+            SwapParams({zeroForOne: true, amountSpecified: -int256(CREDITED_AMPS), sqrtPriceLimitX96: 0});
+        vm.prank(address(poolManager));
+        (,, fillerFee) = hook.beforeSwap(FILLER, usdgKey, sell, "");
+
+        // The buyer's own sell, same size, same transaction: fully covered, so it is a rotation.
+        vm.prank(address(poolManager));
+        (,, buyerFee) = hook.beforeSwap(BUYER, usdgKey, sell, "");
+    }
+
+    /// @notice The credit a rotation creates is booked to the router both hops report, which is what keeps a
+    ///         same-transaction rotation blending after the key changed.
+    function test_theCreditIsBookedToTheRouterBothHopsShare() public {
+        (uint256 routerCredit, uint256 callerCredit, uint256 boughtAmps) = this.creditOwnerEntry(USDG_IN);
+
+        assertGt(boughtAmps, 0, "the buy happened");
+        assertEq(routerCredit, boughtAmps, "the router holds the credit, to the wei");
+        assertEq(callerCredit, 0, "the account that called the router holds none");
+    }
+
+    /// @notice Self-call entry point: one buy through the router, and who its credit belongs to.
+    function creditOwnerEntry(uint256 amountIn)
+        external
+        returns (uint256 routerCredit, uint256 callerCredit, uint256 boughtAmps)
+    {
+        require(msg.sender == address(this), "self-call only");
+        boughtAmps = _buy(usdgKey, amountIn);
+        routerCredit = hook.rotationCredit(address(swapRouter));
+        callerCredit = hook.rotationCredit(address(this));
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -127,12 +210,12 @@ contract RotationCreditTest is HookTestFixture {
     function buyThenLargerSellEntry() external returns (uint256 creditBefore, uint256 amountIn, uint256 after_) {
         require(msg.sender == address(this), "self-call only");
         uint256 ampsOut = _buy(usdgKey, USDG_IN);
-        creditBefore = hook.rotationCredit();
+        creditBefore = hook.rotationCredit(address(swapRouter));
         assertEq(creditBefore, ampsOut, "credited by the realised delta, to the wei");
 
         amountIn = ampsOut * 2;
         _sell(usdgKey, amountIn);
-        after_ = hook.rotationCredit();
+        after_ = hook.rotationCredit(address(swapRouter));
     }
 
     /// @notice I26: the credit falls by exactly what the sell consumed, never by more.
@@ -159,10 +242,10 @@ contract RotationCreditTest is HookTestFixture {
     function partialSellEntry() external returns (uint256 creditBefore, uint256 sold, uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
         _buy(usdgKey, USDG_IN);
-        creditBefore = hook.rotationCredit();
+        creditBefore = hook.rotationCredit(address(swapRouter));
         sold = creditBefore / 3;
         _sell(usdgKey, sold);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -185,9 +268,9 @@ contract RotationCreditTest is HookTestFixture {
     function exactOutputSellEntry() external returns (uint256 creditBefore, uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
         _buy(usdgKey, USDG_IN);
-        creditBefore = hook.rotationCredit();
+        creditBefore = hook.rotationCredit(address(swapRouter));
         _sellExactOut(usdgKey, 100e6);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
     /// @notice A one-wei buy unlocks one wei of credit and nothing more, so a large credited sell still pays
@@ -208,9 +291,10 @@ contract RotationCreditTest is HookTestFixture {
         require(msg.sender == address(this), "self-call only");
 
         SwapParams memory buy = SwapParams({zeroForOne: false, amountSpecified: -1, sqrtPriceLimitX96: 0});
+        // Credited to the router, because that is the `sender` the sell below will arrive under.
         vm.prank(address(poolManager));
-        hook.afterSwap(address(this), usdgKey, buy, toBalanceDelta(int128(1), int128(-1)), "");
-        credit = hook.rotationCredit();
+        hook.afterSwap(address(swapRouter), usdgKey, buy, toBalanceDelta(int128(1), int128(-1)), "");
+        credit = hook.rotationCredit(address(swapRouter));
 
         vm.recordLogs();
         _sell(usdgKey, 1000e18);
@@ -221,7 +305,7 @@ contract RotationCreditTest is HookTestFixture {
     function test_noCreditCrossesATransactionBoundary() public {
         uint256 ampsOut = _buy(usdgKey, USDG_IN);
         assertGt(ampsOut, 0, "the buy happened");
-        assertEq(hook.rotationCredit(), 0, "and left nothing behind");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and left nothing behind");
 
         vm.recordLogs();
         _sell(usdgKey, ampsOut);

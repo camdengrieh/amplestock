@@ -156,6 +156,19 @@ interface IPoolRegistry {
     /// @param weightsBps The new weights, parallel to `ids`.
     event IndexWeightsSet(uint16[] ids, uint16[] weightsBps);
 
+    /// @notice Emitted by {setVault} when the vault role moves to the standby during an emergency migration.
+    /// @param previousVault The vault that handed the role on: the only address that could.
+    /// @param newVault The standby vault.
+    event VaultChanged(address indexed previousVault, address indexed newVault);
+
+    /// @notice Emitted by {retireConstituent} and {reinstateConstituent} when the constituent's bond market is no
+    ///         longer attached to it on `AmpsBonds`, so the open/closed flag was not touched.
+    /// @dev `AmpsBonds.removeCollateral` detaches a market from its collateral, after which `setMarketOpen` refuses
+    ///      it forever. Skipping the call rather than making it is what keeps a reinstatement possible.
+    /// @param constituentId The constituent.
+    /// @param marketId The market id the registry still records for it.
+    event BondMarketDetached(uint16 indexed constituentId, uint16 marketId);
+
     /// @notice The constituent set is full.
     /// @param max `MAX_CONSTITUENTS`.
     error ConstituentSetFull(uint16 max);
@@ -357,4 +370,13 @@ interface IPoolRegistry {
     ///         paid out by redemption. **Only timelock (7 d).**
     /// @param constituentId The retired constituent.
     function withdrawRetiredBids(uint16 constituentId) external;
+
+    /// @notice Hands the vault role to `newVault`. **Only the current vault**, and therefore only from inside
+    ///         `AmpsVault.emergencyMigrate` — no governance path reaches it.
+    /// @dev The registry names a vault in three places that matter: it is the address it asks to open a pool, the
+    ///      address it reads `pRefX18` and `bonds` from, and the address the hook is told to accept. Leaving it
+    ///      pointing at an evacuated shell would mean the standby could never register a pool, which is why the
+    ///      migration moves it alongside AMPS, `AmpsBonds`, `AmpsStaking`, `BountyPot` and the hook.
+    /// @param newVault The standby vault. Must be non-zero.
+    function setVault(address newVault) external;
 }

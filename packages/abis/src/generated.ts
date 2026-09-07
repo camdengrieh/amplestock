@@ -935,6 +935,25 @@ export const ampsBondsAbi = [
     anonymous: false,
     inputs: [
       {
+        name: 'collateral',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'amount',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'CollateralForwarded',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
         name: 'marketId',
         internalType: 'uint16',
         type: 'uint16',
@@ -1142,14 +1161,6 @@ export const ampsBondsAbi = [
       { name: 'maxAge', internalType: 'uint32', type: 'uint32' },
     ],
     name: 'StaleCheckpoint',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'balance', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'SweepDirty',
   },
   {
     type: 'error',
@@ -1915,7 +1926,7 @@ export const ampsHookAbi = [
   },
   {
     type: 'function',
-    inputs: [],
+    inputs: [{ name: 'sender', internalType: 'address', type: 'address' }],
     name: 'rotationCredit',
     outputs: [{ name: 'credit', internalType: 'uint256', type: 'uint256' }],
     stateMutability: 'view',
@@ -1965,6 +1976,13 @@ export const ampsHookAbi = [
     type: 'function',
     inputs: [{ name: 'value', internalType: 'uint16', type: 'uint16' }],
     name: 'setSellFeeBps',
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    inputs: [{ name: 'newVault', internalType: 'address', type: 'address' }],
+    name: 'setVault',
     outputs: [],
     stateMutability: 'nonpayable',
   },
@@ -2244,6 +2262,25 @@ export const ampsHookAbi = [
       },
     ],
     name: 'SurgeArmed',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'previousVault',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'newVault',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+    ],
+    name: 'VaultChanged',
   },
   { type: 'error', inputs: [], name: 'AlreadyInitialized' },
   {
@@ -4714,6 +4751,25 @@ export const ampsVaultAbi = [
     anonymous: false,
     inputs: [
       {
+        name: 'token',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'balance',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'SweepResidue',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
         name: 'parameter',
         internalType: 'bytes32',
         type: 'bytes32',
@@ -4798,6 +4854,7 @@ export const ampsVaultAbi = [
     inputs: [{ name: 'caller', internalType: 'address', type: 'address' }],
     name: 'NotGuardian',
   },
+  { type: 'error', inputs: [], name: 'NotInitialized' },
   {
     type: 'error',
     inputs: [{ name: 'caller', internalType: 'address', type: 'address' }],
@@ -4832,14 +4889,6 @@ export const ampsVaultAbi = [
     name: 'OutOfBand',
   },
   { type: 'error', inputs: [], name: 'Phase3NotImplemented' },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'balance', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'SweepDirty',
-  },
   {
     type: 'error',
     inputs: [{ name: 'slot', internalType: 'bytes32', type: 'bytes32' }],
@@ -8311,6 +8360,13 @@ export const poolRegistryAbi = [
   },
   {
     type: 'function',
+    inputs: [{ name: 'newVault', internalType: 'address', type: 'address' }],
+    name: 'setVault',
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
     inputs: [],
     name: 'vault',
     outputs: [
@@ -8343,6 +8399,25 @@ export const poolRegistryAbi = [
     name: 'withdrawRetiredBids',
     outputs: [],
     stateMutability: 'nonpayable',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'constituentId',
+        internalType: 'uint16',
+        type: 'uint16',
+        indexed: true,
+      },
+      {
+        name: 'marketId',
+        internalType: 'uint16',
+        type: 'uint16',
+        indexed: false,
+      },
+    ],
+    name: 'BondMarketDetached',
   },
   {
     type: 'event',
@@ -8584,6 +8659,25 @@ export const poolRegistryAbi = [
     ],
     name: 'RetiredBidsWithdrawn',
   },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'previousVault',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'newVault',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+    ],
+    name: 'VaultChanged',
+  },
   { type: 'error', inputs: [], name: 'AlreadyInitialized' },
   {
     type: 'error',
@@ -8642,6 +8736,11 @@ export const poolRegistryAbi = [
     type: 'error',
     inputs: [{ name: 'caller', internalType: 'address', type: 'address' }],
     name: 'NotTimelock',
+  },
+  {
+    type: 'error',
+    inputs: [{ name: 'caller', internalType: 'address', type: 'address' }],
+    name: 'NotVault',
   },
   {
     type: 'error',

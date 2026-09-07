@@ -287,6 +287,67 @@ contract AmpsHookObservationsTest is HookTestFixture {
         return HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_CA_ARMED);
     }
 
+    // -----------------------------------------------------------------------------------------------------------
+    // The saturating cast (audit finding: the detector compared a saturated cache against an un-saturated read)
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @notice A `uiMultiplier()` past `type(uint64).max` arms its step **once**, not on every refresh forever.
+    ///
+    /// @dev `Armed.uiMultiplierX18` is 64 bits, so the hook stores a *saturating* cast of what it read. Measuring
+    ///      the step against the raw reading rather than against that stored value made every later refresh
+    ///      recompute the same phantom jump: `FLAG_CA_ARMED` latched for good — and with it the escalation cap and
+    ///      `OracleGate`'s freeze of the constituent's bonds and placements — because {_clearCorporateAction} only
+    ///      runs when the measured step is small. Compared like with like, a saturated reading is a step of zero.
+    function test_aMultiplierBeyondUint64ArmsItsStepOnceAndResolves() public {
+        stock.setUIMultiplier(uint256(type(uint64).max) + 1e18); // ~18.45e18, past the packed field
+        _refreshGate(stockKey);
+
+        assertEq(hook.poolState(stockId).uiMultiplierX18, type(uint64).max, "the cache saturates");
+        assertTrue(_caArmed(), "the jump from 1.0 really is a corporate action");
+        assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "escalation cap");
+
+        // Nothing at the token moves. The next refresh must therefore see no step at all — and, seeing none, be
+        // free to resolve the corporate action it armed.
+        vm.recordLogs();
+        _refreshGate(stockKey);
+
+        assertFalse(_sawMultiplierStep(vm.getRecordedLogs()), "no phantom step on the second refresh");
+        assertFalse(_caArmed(), "so the flag comes back down");
+        assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_NORMAL_BPS, "and the cap with it");
+        assertEq(hook.poolState(stockId).captureFeeBps, 0, "and nothing was armed in its place");
+    }
+
+    /// @notice A rise that happens entirely above the saturation point arms nothing, refresh after refresh.
+    /// @dev The other half of the same bug: a `+1%` step above `type(uint64).max` is invisible to a saturated
+    ///      cache, and measuring it against the raw reading re-armed a capture fee and a surge on *every* gate
+    ///      cache refresh, permanently. A saturated read is "unknown", and "unknown" arms nothing.
+    function test_aRiseAboveTheSaturationPointArmsNothingOnAnyRefresh() public {
+        stock.setUIMultiplier(uint256(type(uint64).max) + 1e18);
+        _refreshGate(stockKey);
+        _refreshGate(stockKey); // resolves the corporate action the jump itself armed
+        assertFalse(_caArmed(), "resolved");
+
+        stock.setUIMultiplier(((uint256(type(uint64).max) + 1e18) * 101) / 100); // +1%, still off the top
+
+        for (uint256 i; i < 3; ++i) {
+            vm.recordLogs();
+            _refreshGate(stockKey);
+            assertFalse(_sawMultiplierStep(vm.getRecordedLogs()), "a step the cache cannot see is not a step");
+            assertEq(hook.poolState(stockId).captureFeeBps, 0, "so no capture fee is armed");
+            assertFalse(_caArmed(), "and no corporate action is armed");
+            assertEq(hook.poolState(stockId).uiMultiplierX18, type(uint64).max, "the cache stays saturated");
+        }
+    }
+
+    /// @dev Whether the hook reported a `uiMultiplier()` step in this batch of logs.
+    function _sawMultiplierStep(Vm.Log[] memory logs) private pure returns (bool seen) {
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == IAmpsHook.MultiplierStepDetected.selector) {
+                return true;
+            }
+        }
+    }
+
     function test_aMultiplierThatFallsIsIgnored() public {
         stock.setUIMultiplier(0.5e18);
         _refreshGate(stockKey);

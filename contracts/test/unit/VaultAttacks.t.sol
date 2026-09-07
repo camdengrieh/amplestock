@@ -102,14 +102,20 @@ contract VaultAttackTest is AmpsVaultFixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice A Stock Token that calls back into the vault mid-transfer is refused on every locked selector.
-    /// @dev The redemption is the trigger because it is the one path that pays a Stock Token out to an arbitrary
-    ///      address, and it is also the path with no gate to hide behind: if the lock did not hold, this is where it
-    ///      would show.
+    ///
+    /// @dev **The trigger is the deposit, not the redemption, and that is deliberate.** A deposit that cannot move
+    ///      the collateral *must* fail, so its `safeTransferFrom` still bubbles whatever the token's callback
+    ///      reverted with — which makes it the path that can assert the exact error the lock produced. The
+    ///      redemption deliberately no longer bubbles: every transfer on the payout and sweep legs is best effort,
+    ///      because §7 says the floor cannot be stopped by a constituent. That the reentry is still *refused*
+    ///      there is asserted by {test_aReentrantStockTokenCannotStopTheFloorAndGainsNothing} below, on the
+    ///      observable outcome rather than on a revert.
     function test_reentrantStockTokenIsRefusedOnEverySelector() public {
         runGenesis();
         giveShares(ALICE, 500e18);
-        stock.mint(address(this), 10e18);
-        bondDeposit(address(stock), address(this), 10e18);
+        stock.mint(BOB, 100e18);
+        vm.prank(BOB);
+        stock.approve(address(vault), type(uint256).max);
 
         attacker = new Reenterer(address(vault));
         stock.setReentrancy(1, address(attacker), abi.encodeCall(Reenterer.reenter, ()));
@@ -117,11 +123,11 @@ contract VaultAttackTest is AmpsVaultFixture {
         bytes[] memory payloads = _lockedSelectorPayloads();
         for (uint256 i; i < payloads.length; ++i) {
             attacker.arm(payloads[i]);
-            vm.prank(ALICE);
+            vm.prank(BONDS);
             (bool ok, bytes memory returndata) =
-                address(vault).call(abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE)));
-            assertFalse(ok, "the reentrant call must take the redemption down with it");
-            // v4-core's `CurrencyLibrary.transfer` wraps a failing token call, so the lock's error arrives nested.
+                address(vault).call(abi.encodeCall(IAmpsVault.depositBonded, (1, address(stock), BOB, 1e18)));
+            assertFalse(ok, "the reentrant call must take the deposit down with it");
+            // v4-core's `CurrencyLibrary` and OZ's `SafeERC20` both wrap the token call, so the error arrives nested.
             assertTrue(_contains(returndata, Reentrancy.selector), "the transient lock refused the reentry");
         }
     }
@@ -130,19 +136,62 @@ contract VaultAttackTest is AmpsVaultFixture {
     ///         PoolManager, and a reentrant token is not the PoolManager.
     function test_reentrantStockTokenCannotDriveTheUnlockCallback() public {
         runGenesis();
+        stock.mint(BOB, 100e18);
+        vm.prank(BOB);
+        stock.approve(address(vault), type(uint256).max);
+
+        attacker = new Reenterer(address(vault));
+        stock.setReentrancy(1, address(attacker), abi.encodeCall(Reenterer.reenter, ()));
+        attacker.arm(abi.encodeWithSignature("unlockCallback(bytes)", ""));
+
+        vm.prank(BONDS);
+        (bool ok, bytes memory returndata) =
+            address(vault).call(abi.encodeCall(IAmpsVault.depositBonded, (1, address(stock), BOB, 1e18)));
+        assertFalse(ok, "refused");
+        assertTrue(_contains(returndata, NotPoolManager.selector), "refused by caller identity, not by the lock");
+    }
+
+    /// @notice **And the redemption floor is not what pays for the refusal.** A reentrant Stock Token on the
+    ///         payout leg makes the PoolManager's `take` revert; the redeemer is handed the ERC-6909 claim instead
+    ///         and the redemption completes. The attacker gets nothing out of it: the re-entry itself still
+    ///         reverted, so no extra shares were burned and no governed parameter moved.
+    ///
+    /// @dev The claim rather than the ERC-20 *is* the proof that the token's `transfer` reverted — a successful
+    ///      transfer would have taken the `try` branch and paid in tokens. Before this the whole redemption
+    ///      reverted instead, which meant any constituent could stop the one path §7 says cannot be stopped, by
+    ///      calling back into a contract that was always going to refuse it.
+    function test_aReentrantStockTokenCannotStopTheFloorAndGainsNothing() public {
+        runGenesis();
         giveShares(ALICE, 500e18);
         stock.mint(address(this), 10e18);
         bondDeposit(address(stock), address(this), 10e18);
 
         attacker = new Reenterer(address(vault));
         stock.setReentrancy(1, address(attacker), abi.encodeCall(Reenterer.reenter, ()));
-        attacker.arm(abi.encodeWithSignature("unlockCallback(bytes)", ""));
+        attacker.arm(abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE)));
+
+        uint256 supplyBefore = amps.totalSupply();
+        uint16 feeBefore = vault.redeemFeeBps();
 
         vm.prank(ALICE);
-        (bool ok, bytes memory returndata) =
-            address(vault).call(abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE)));
-        assertFalse(ok, "refused");
-        assertTrue(_contains(returndata, NotPoolManager.selector), "refused by caller identity, not by the lock");
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(1e18, ALICE);
+
+        uint256 stockIndex = type(uint256).max;
+        for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == address(stock)) stockIndex = i;
+        }
+        assertLt(stockIndex, tokens.length, "the reentrant token is in the payout");
+        assertGt(amounts[stockIndex], 0, "and it was paid");
+        assertEq(stock.balanceOf(ALICE), 0, "the reentrant transfer never landed");
+        assertEq(
+            poolManager.balanceOf(ALICE, uint256(uint160(address(stock)))),
+            amounts[stockIndex],
+            "so the redeemer was paid the claim, which the token cannot interfere with"
+        );
+
+        // The re-entry gained nothing: exactly one redemption's worth of supply left, and no setter ran.
+        assertLt(supplyBefore - amps.totalSupply(), 2e18, "only the one redemption burned shares");
+        assertEq(vault.redeemFeeBps(), feeBefore, "and no governed parameter moved");
     }
 
     /// @notice With the callback disarmed the same redemption succeeds, so the tests above are not passing by
@@ -168,11 +217,13 @@ contract VaultAttackTest is AmpsVaultFixture {
     /// @notice There is no first depositor to be. `S0` is minted once behind a latch and no other mint path exists,
     ///         so the classic share-inflation grief has nothing to attach to.
     function test_firstDepositorInflationIsImpossible() public {
-        // Before genesis the denominator is `VIRTUAL_SHARES` alone and NAV/share is finite (I22).
+        // Before genesis there are no shares, so NAV/share is reported as zero rather than as the
+        // `1e18 / VIRTUAL_SHARES` = $0.001 the formula degenerates to. The virtual-share guard is still what makes
+        // the denominator non-zero for every state that *has* shares (I22); this is the state that has none, and
+        // $0.001 there is an artefact `PoolRegistry` would take for a real reference price.
         assertEq(amps.totalSupply(), 0, "no supply yet");
-        assertEq(
-            vault.previewNavPerShareX18(), (0 + 1) * 1e18 / Constants.VIRTUAL_SHARES, "finite, not a division by zero"
-        );
+        assertEq(vault.previewNavPerShareX18(), 0, "no shares, no NAV per share, and no division by zero either");
+        assertEq(vault.pRefX18(), 0, "and nothing has been checkpointed into the reference price");
 
         // A donation before genesis is the classic setup. It is invisible until genesis registers the asset list,
         // and it buys the donor nothing even then.
@@ -192,6 +243,11 @@ contract VaultAttackTest is AmpsVaultFixture {
     }
 
     /// @notice The virtual-share guard keeps NAV/share finite even with every share redeemed.
+    /// @dev I22 is that `T + VIRTUAL_SHARES` is never zero, so no read on any path can divide by zero. That still
+    ///      holds. What an empty vault *reports* changed: NAV/share is zero rather than the `1e18 / VIRTUAL_SHARES`
+    ///      = $0.001 the formula degenerates to, because with no shares outstanding there is nothing for `A` to be
+    ///      per — and `PoolRegistry` reads a zero `pRefX18` as "no checkpoint yet, anchor at $1.00", which is the
+    ///      right answer for a supply-less vault and the wrong one for a $0.001 artefact.
     function test_virtualSharesKeepNavFiniteAtZeroSupply() public {
         runGenesis();
         giveShares(ALICE, Constants.POL_SHARES);
@@ -203,7 +259,8 @@ contract VaultAttackTest is AmpsVaultFixture {
 
         assertEq(amps.totalSupply(), 0, "supply is zero");
         vault.checkpoint();
-        assertGt(vault.navPerShareX18(), 0, "and NAV/share is still a number");
+        assertEq(vault.navPerShareX18(), 0, "no shares, no NAV per share, and no division by zero");
+        assertEq(vault.pRefX18(), 0, "and no reference price a registry could anchor a new pool at");
     }
 
     // -------------------------------------------------------------------------------------------------------------

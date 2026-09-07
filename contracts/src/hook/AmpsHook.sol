@@ -64,10 +64,19 @@ contract AmpsHook is BaseHook, IAmpsHook {
     // Constants
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev EIP-1153 slot carrying the same-transaction rotation credit, in AMPS wei:
+    /// @dev Domain separator of the EIP-1153 slots carrying the same-transaction rotation credit, in AMPS wei:
     ///      `uint256(Constants.ROTATION_CREDIT_SLOT)` = `keccak256("amplestocks.hook.ROTATION_CREDIT")`.
     ///      Spelled as a literal because inline assembly accepts only direct number constants; the two are
     ///      asserted equal in `test/unit/RotationCredit.t.sol`, which is what keeps them from drifting (I26).
+    ///
+    /// @dev **The credit is per `sender`, not per transaction.** The slot actually written is
+    ///      `keccak256(abi.encode(ROTATION_CREDIT_SLOT, sender))` — see {_creditSlot}. One transaction-global slot
+    ///      would let AMPS bought by one party discount an unrelated party's sell in the same transaction: a
+    ///      filler settling a victim's buy alongside its own exit would pay the buy fee instead of the 500 bp sell
+    ///      fee, and a credit earned in the deep hub would discount a sell into a thin spoke. The `sender` the
+    ///      PoolManager hands both callbacks is the account that unlocked it — the router — so the same-transaction
+    ///      rotation the credit exists for (hop 1 buy, hop 2 sell, one router call) still sees one credit, while
+    ///      two parties routing through the same transaction never share one.
     uint256 private constant ROTATION_CREDIT_SLOT = 0x28ef4cf38086db5318537797461c68e4f15873dbd0e73f3e45f6b1f32032b976;
 
     /// @dev Gas ceiling on the gate snapshot. Generous — the gate reads a feed, a TWAP and the registry — but
@@ -104,9 +113,6 @@ contract AmpsHook is BaseHook, IAmpsHook {
     address public immutable amps;
 
     /// @inheritdoc IAmpsHook
-    address public immutable vault;
-
-    /// @inheritdoc IAmpsHook
     address public immutable registry;
 
     /// @inheritdoc IAmpsHook
@@ -120,6 +126,14 @@ contract AmpsHook is BaseHook, IAmpsHook {
     uint16 private _sellFee;
     address private _policy;
     uint32 private _gateCache;
+
+    /// @inheritdoc IAmpsHook
+    /// @dev **Storage, not immutable.** Every vault-only check in this contract — `beforeInitialize`,
+    ///      `beforeAddLiquidity`, {resetHighWater}, {armSurge} — and the gate pointer {_gateAddress} reads are all
+    ///      against this address, so a hook that froze it would make `AmpsVault.emergencyMigrate` a one-way door:
+    ///      the standby vault could never initialise a pool, add liquidity or arm a surge. Its own slot, so the
+    ///      packed word above is untouched. Moved only by {setVault}, and only by the vault itself.
+    address public vault;
 
     /// @dev Per pool: the CONFIG word (§1.2), written at `afterInitialize` and thereafter only by governance.
     mapping(PoolId poolId => uint256 word) private _cfg;
@@ -304,7 +318,10 @@ contract AmpsHook is BaseHook, IAmpsHook {
 
     /// @dev §1.4, in order: three cold `SLOAD`s, the base fee and the rotation blend, the start-of-swap rail
     ///      check, the dynamic components through the policy pointer, the clamp, the override flag.
-    function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    ///
+    /// @dev `sender` is the account that unlocked the PoolManager, and it is what the rotation credit is keyed by:
+    ///      a swapper may only spend a credit its own earlier hop in this transaction created.
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -317,7 +334,13 @@ contract AmpsHook is BaseHook, IAmpsHook {
         ctx.sell = params.zeroForOne;
         ctx.exactInput = params.amountSpecified < 0;
         if (ctx.exactInput) ctx.amountIn = uint256(-params.amountSpecified);
-        if (ctx.sell && ctx.exactInput && ctx.amountIn != 0) ctx.credit = _rotationCredit();
+
+        // Hashed once, on the only path that can spend a credit, and reused by the write below.
+        uint256 slot;
+        if (ctx.sell && ctx.exactInput && ctx.amountIn != 0) {
+            slot = _creditSlot(sender);
+            ctx.credit = _tload(slot);
+        }
 
         Quote memory q = _quote(
             HookStateLib.unpackConfig(cfgWord),
@@ -329,10 +352,11 @@ contract AmpsHook is BaseHook, IAmpsHook {
         // The one deliberate revert, on the start-of-swap tick and direction (§10 ruling 2).
         if (q.refuse) revert BeyondRail(PoolId.unwrap(id), q.devTicks, q.railTicks);
 
+        // `creditConsumed != 0` implies `ctx.credit != 0`, which implies `slot` was computed above.
         if (q.creditConsumed != 0) {
             uint256 remaining = ctx.credit - q.creditConsumed;
             assembly ("memory-safe") {
-                tstore(ROTATION_CREDIT_SLOT, remaining)
+                tstore(slot, remaining)
             }
             emit RotationCreditConsumed(id, q.creditConsumed, q.baseBps);
         }
@@ -351,11 +375,16 @@ contract AmpsHook is BaseHook, IAmpsHook {
     /// @dev §1.5. Every external read below is bounded and manually decoded, so no downstream failure — a
     ///      reverting gate, a policy that runs out of gas, a token that returns garbage — can reach the swapper.
     ///      The post-swap rail check at the end is the single deliberate exception (§10 ruling 2).
-    function _afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
-        internal
-        override
-        returns (bytes4, int128)
-    {
+    ///
+    /// @dev `sender` is carried rather than discarded for the same reason `beforeSwap` carries it: the rotation
+    ///      credit belongs to the account that earned it (see {ROTATION_CREDIT_SLOT}).
+    function _afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) internal override returns (bytes4, int128) {
         PoolId id = key.toId();
         // A pool the hook never initialised cannot be one of ours; there is nothing to record and nothing to
         // refuse, and reverting here would be a revert for a non-rail reason.
@@ -374,8 +403,9 @@ contract AmpsHook is BaseHook, IAmpsHook {
         // 3. EWMA realised variance on the raw tick delta, and the pre-computed `f_vol`.
         _updateVariance(d, a, tick);
 
-        // 4. The rotation credit, from the realised delta and never the requested amount (I26).
-        if (!params.zeroForOne) _credit(delta);
+        // 4. The rotation credit, from the realised delta and never the requested amount (I26), and to the buyer
+        //    and no one else.
+        if (!params.zeroForOne) _credit(sender, delta);
 
         // 5. Surge and capture are decayed at quote time; this only clears them once they are worth nothing.
         _clearDecayed(a);
@@ -423,13 +453,17 @@ contract AmpsHook is BaseHook, IAmpsHook {
         if (truncated > previousHighWater) emit HighWaterAdvanced(id, truncated);
     }
 
-    /// @dev Step 4 of §1.5: credit the AMPS a buyer actually received, never the amount they asked for (I26).
-    function _credit(BalanceDelta delta) private {
+    /// @dev Step 4 of §1.5: credit the AMPS a buyer actually received, never the amount they asked for (I26), to
+    ///      the account that received it and to no one else.
+    /// @param sender The account the PoolManager attributes the swap to; the credit's owner.
+    /// @param delta The realised balance delta.
+    function _credit(address sender, BalanceDelta delta) private {
         int128 ampsOut = delta.amount0();
         if (ampsOut <= 0) return;
         uint256 gained = uint256(uint128(ampsOut));
+        uint256 slot = _creditSlot(sender);
         assembly ("memory-safe") {
-            tstore(ROTATION_CREDIT_SLOT, add(tload(ROTATION_CREDIT_SLOT), gained))
+            tstore(slot, add(tload(slot), gained))
         }
     }
 
@@ -774,11 +808,19 @@ contract AmpsHook is BaseHook, IAmpsHook {
         uint256 m = _probeMultiplier(token);
         if (m == 0) return true;
 
+        // Compare like with like. `uiMultiplierX18` is the **saturated** cast of the last reading, so measuring
+        // the step against the un-saturated `m` would recompute the same phantom step on every single refresh once
+        // a token's `uiMultiplier()` passed `type(uint64).max`: `FLAG_CA_ARMED` would latch for good (a step above
+        // `DIVIDEND_STEP_BPS_MAX`) or a capture fee and a surge would be re-armed forever (a step below it), and
+        // {_clearCorporateAction} — which only runs when the measured step is small — would never be reached
+        // again. Measured against the stored value, a saturated reading yields `deltaBps == 0`, which is this
+        // detector's "nothing observed".
         uint256 previous = a.uiMultiplierX18;
-        a.uiMultiplierX18 = _toUint64(m);
+        uint256 current = _toUint64(m);
+        a.uiMultiplierX18 = uint64(current);
 
         uint256 deltaBps;
-        if (previous != 0 && m > previous) deltaBps = ((m - previous) * Constants.BPS) / previous;
+        if (previous != 0 && current > previous) deltaBps = ((current - previous) * Constants.BPS) / previous;
 
         if (
             deltaBps <= Constants.DIVIDEND_STEP_BPS_MAX && HookStateLib.hasFlag(d.gateFlags, HookStateLib.FLAG_CA_ARMED)
@@ -921,11 +963,24 @@ contract AmpsHook is BaseHook, IAmpsHook {
         out = value > type(uint64).max ? type(uint64).max : uint64(value);
     }
 
-    /// @dev The transient rotation credit. `TLOAD` is not a state read, so this is legal in a `view`.
-    function _rotationCredit() private view returns (uint256 credit) {
+    /// @dev The transient slot holding one account's rotation credit: `keccak256(ROTATION_CREDIT_SLOT, sender)`.
+    ///      One keccak of two words, computed at most once per callback.
+    /// @param sender The credit's owner, as the PoolManager reports it.
+    /// @return slot The transient slot.
+    function _creditSlot(address sender) private pure returns (uint256 slot) {
+        slot = uint256(keccak256(abi.encode(ROTATION_CREDIT_SLOT, sender)));
+    }
+
+    /// @dev One `TLOAD`. Not a state read, so this is legal in a `view`.
+    function _tload(uint256 slot) private view returns (uint256 value) {
         assembly ("memory-safe") {
-            credit := tload(ROTATION_CREDIT_SLOT)
+            value := tload(slot)
         }
+    }
+
+    /// @dev The transient rotation credit `sender` holds right now.
+    function _rotationCredit(address sender) private view returns (uint256 credit) {
+        credit = _tload(_creditSlot(sender));
     }
 
     /// @dev Arms a surge in the memory copy of the ARMED word and emits the event; the caller writes the word.
@@ -1056,12 +1111,18 @@ contract AmpsHook is BaseHook, IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function rotationCredit() external view returns (uint256 credit) {
-        credit = _rotationCredit();
+    function rotationCredit(address sender) external view returns (uint256 credit) {
+        credit = _rotationCredit(sender);
     }
 
     /// @inheritdoc IAmpsHook
     /// @dev Never reverts. An unknown pool reports `refuse == true`, which is what a swap through it would do.
+    /// @dev **The credit it applies is the caller's own.** The rotation credit is keyed by the `sender` the
+    ///      PoolManager reports, so the only credit this view can honestly price a sell against is `msg.sender`'s
+    ///      — which is zero in every fresh `eth_call`, and is the router's own credit when a router asks
+    ///      mid-transaction what its next hop will cost. A quoter contract standing between the two therefore
+    ///      cannot double-count a credit it does not hold; `AmpsQuoter.quoteSellWithCredit` takes the credit as an
+    ///      argument for exactly that reason.
     function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
         external
         view
@@ -1072,7 +1133,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
             sell: zeroForOne,
             exactInput: exactInput,
             amountIn: exactInput ? amountIn : 0,
-            credit: (zeroForOne && exactInput && amountIn != 0) ? _rotationCredit() : 0
+            credit: (zeroForOne && exactInput && amountIn != 0) ? _rotationCredit(msg.sender) : 0
         });
         Quote memory q = _quote(
             HookStateLib.unpackConfig(_cfg[poolId]),
@@ -1163,6 +1224,22 @@ contract AmpsHook is BaseHook, IAmpsHook {
         HookStateLib.Dynamic memory d = HookStateLib.unpackDynamic(_dyn[poolId]);
         d.gateAttemptedAt = 0;
         _dyn[poolId] = HookStateLib.packDynamic(d);
+    }
+
+    /// @inheritdoc IAmpsHook
+    /// @dev **The only writer is the vault itself**, which is what makes this safe to expose: handing the hook
+    ///      over is one leg of `AmpsVault.emergencyMigrate`, and a vault that is being migrated away from is the
+    ///      one contract entitled to name its successor. There is no timelock leg and no governance leg, because
+    ///      a migration is not a governed parameter change — the vault's own migration path already carries the
+    ///      guardian and timelock checks, and a second gate here would strand the hook whenever that path is used
+    ///      in anger. The old vault loses every vault-only entry point in this contract the moment this returns.
+    function setVault(address newVault) external {
+        if (msg.sender != vault) revert NotVault(msg.sender);
+        if (newVault == address(0)) revert ZeroAddress();
+
+        address previous = vault;
+        vault = newVault;
+        emit VaultChanged(previous, newVault);
     }
 
     // -------------------------------------------------------------------------------------------------------------

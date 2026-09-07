@@ -11,6 +11,7 @@ import {
     NotBonds,
     NotCreator,
     NotGuardian,
+    NotInitialized,
     NotPoolManager,
     NotRegistry,
     NotTimelock,
@@ -127,34 +128,39 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice `genesis` freezes the wiring: the four set-once pointers refuse afterwards, the upgradeable ones do not.
+    /// @dev Every replacement here is a *contract* address, and has to be: `setPolicyPointer` refuses a codeless
+    ///      pointer before it looks at the slot at all. That guard is what stops one mistyped `oracleGate` write
+    ///      from bricking the only call that could undo it — see `unit/VaultGateResilience.t.sol`.
     function test_genesis_freezesWiring() public {
         runGenesis();
+        address replacement = address(new MockStockToken("Replacement", "REPL"));
 
         vm.startPrank(TIMELOCK);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("registry"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("registry"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("bonds"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("bonds"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("staking"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("staking"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("bountyPot"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("bountyPot"), replacement);
 
         // Pointer-upgradeable slots stay open; `marketReference` is re-pointed once, to the hook, in Phase 3.
         vault.setPolicyPointer(bytes32("oracleGate"), address(gate));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));
         vault.setPolicyPointer(bytes32("positionValuer"), address(valuer));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));
-        vault.setPolicyPointer(bytes32("ladderPolicy"), address(0x1ADDE5));
-        vault.setPolicyPointer(bytes32("rolloutPolicy"), address(0x2011));
+        vault.setPolicyPointer(bytes32("ladderPolicy"), replacement);
+        vault.setPolicyPointer(bytes32("rolloutPolicy"), replacement);
         vm.stopPrank();
     }
 
     /// @notice An unknown pointer name is rejected rather than silently ignored.
+    /// @dev With a contract address, so that the codeless-pointer guard does not answer first.
     function test_setPolicyPointer_rejectsUnknownSlot() public {
         vm.prank(TIMELOCK);
         vm.expectRevert(abi.encodeWithSelector(IAmpsVault.UnknownPointerSlot.selector, bytes32("nope")));
-        vault.setPolicyPointer(bytes32("nope"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("nope"), address(feeds));
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -474,6 +480,13 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice Redeeming everything drains the vault to dust and leaves NAV/share finite (I22).
+    /// @notice Redeeming the entire supply leaves the vault empty and every read still finite: I22 is about the
+    ///         denominator never being zero, and `VIRTUAL_SHARES` still guarantees that.
+    /// @dev What an empty vault *reports* changed: NAV/share is now zero rather than `1e18 / VIRTUAL_SHARES`.
+    ///      $0.001 is an artefact of the virtual-share guard, not a price — there are no shares for `A` to be per
+    ///      — and `PoolRegistry` reads `pRefX18() == 0` as "no checkpoint yet, anchor at $1.00", which is the
+    ///      behaviour a supply-less vault should have. The property under test is that nothing reverts or divides
+    ///      by zero, and it still holds.
     function test_redeem_fullSupplyLeavesNavFinite() public {
         runGenesis();
         giveShares(ALICE, Constants.POL_SHARES);
@@ -484,7 +497,9 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.redeemProRata(Constants.S0, ALICE);
 
         assertEq(amps.totalSupply(), 0, "every share is gone");
-        assertGt(vault.previewNavPerShareX18(), 0, "NAV/share is still finite and non-zero");
+        assertEq(vault.previewNavPerShareX18(), 0, "no shares, no NAV per share, and no division by zero");
+        (address[] memory tokens, uint256[] memory amounts,) = vault.previewRedeem(1e18);
+        assertEq(tokens.length, amounts.length, "and the preview still answers rather than reverting");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1008,12 +1023,21 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice With no gate wired the vault is healthy by default, which is how it is reachable before the gate
-    ///         pointer is set at deployment.
+    ///         pointer is set at deployment. The two permissionless upkeep selectors still refuse, but for the
+    ///         *other* reason — there is nothing to keep alive before {genesis} — and not because of the gate.
+    /// @dev A bare vault also reports a NAV/share of **zero** rather than `1e18 / VIRTUAL_SHARES`: with no shares
+    ///      outstanding there is nothing for `A` to be per, and $0.001 is an artefact of the virtual-share guard
+    ///      that `PoolRegistry` would take for a real reference price.
     function test_unwiredGateIsTreatedAsHealthy() public {
         AmpsVault bare = new AmpsVault(address(amps), address(poolManager), TIMELOCK, GUARDIAN);
+
+        vm.expectRevert(NotInitialized.selector);
         bare.touch();
+        vm.expectRevert(NotInitialized.selector);
         bare.checkpoint();
-        assertEq(bare.previewNavPerShareX18(), (0 + 1) * 1e18 / Constants.VIRTUAL_SHARES, "empty but finite");
+
+        assertEq(bare.previewNavPerShareX18(), 0, "no shares, no NAV per share");
+        assertEq(bare.pRefX18(), 0, "and no reference price for the registry to anchor at");
     }
 
     /// @notice A collateral the registry has never heard of still gets valued, through the ERC-20 `decimals()`

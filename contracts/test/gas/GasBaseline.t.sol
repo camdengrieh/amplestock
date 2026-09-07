@@ -716,13 +716,17 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         afterSwapWithGateRefresh = start - gasleft();
 
         // The credited sell comes last: it is the only measurement that leaves transient state behind.
-        uint256 creditBefore = ampsHook.rotationCredit();
+        uint256 creditBefore = ampsHook.rotationCredit(address(swapRouter));
         _coolReal();
         vm.prank(address(poolManager));
         start = gasleft();
         hookLocal.beforeSwap(routerLocal, key, sell, "");
         beforeSwapCreditedSell = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), creditBefore - AMPS_IN, "a credited sell consumes exactly amountIn");
+        assertEq(
+            ampsHook.rotationCredit(address(swapRouter)),
+            creditBefore - AMPS_IN,
+            "a credited sell consumes exactly amountIn"
+        );
     }
 
     /// @notice Self-call entry point: one exact-input buy through the router.
@@ -735,7 +739,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     /// @notice Self-call entry point: one exact-input sell through the router, with no credit to spend.
     function oneHopSellEntryReal() external returns (uint256 gasUsed) {
         require(msg.sender == address(this), "self-call only");
-        assertEq(ampsHook.rotationCredit(), 0, "a lone sell starts with no credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "a lone sell starts with no credit");
         _coolReal();
         gasUsed = _sellRealUsdg(AMPS_IN);
     }
@@ -747,7 +751,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         uint256 start = gasleft();
         _rotateRealStockToUsdg(amountIn);
         gasUsed = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), 0, "hop 2 must consume the whole credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "hop 2 must consume the whole credit");
     }
 
     /// @notice Self-call entry point: the same-transaction buy-then-sell round trip.
@@ -760,7 +764,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         uint256 ampsOut = amps.balanceOf(address(this)) - balanceBefore;
         swapRouter.swapExactTokensForTokens(ampsOut, 0, true, usdgKeyReal, "", address(this), type(uint256).max);
         gasUsed = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), 0, "the round trip consumes the whole credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "the round trip consumes the whole credit");
     }
 
     function _buyRealUsdg(uint256 amountIn) private returns (uint256 gasUsed) {

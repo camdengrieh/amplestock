@@ -19,7 +19,6 @@ import {
     Reentrancy,
     SlippageExceeded,
     StaleCheckpoint,
-    SweepDirty,
     UnknownMarket,
     UnknownPool,
     ZeroAddress,
@@ -51,14 +50,18 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      under MIT: Olympus v2 and Bond Protocol are AGPL-3.0 and were neither imported, copied nor ported.
 ///
 /// @dev **The shell never trusts the policy.** It recomputes `qFloor` itself, with the same rounding directions,
-///      after `IBondPolicy.quote` returns, and reverts with {AccretionFloorViolated} on any `q` above it. A
-///      hostile or buggy policy pointer can therefore refuse to price a bond, but can never issue a dilutive one.
+///      after `IBondPolicy.quote` returns, and reverts with {AccretionFloorViolated} on any `q` above it — and
+///      then recomputes `ampsOut = amountIn18 x q / 1e18` from the `q` it has just bounded, discarding the
+///      policy's own product. Bounding `q` and copying the multiplication would have left the whole issuance
+///      unbounded behind a bounded price: `qX18 = 0, ampsOut = 2**200` clears the floor check trivially. A hostile
+///      or buggy policy pointer can therefore refuse to price a bond, but can never issue a dilutive one.
 ///
 /// @dev **Custody never rests here.** `bond` calls `AmpsVault.depositBonded`, which moves the collateral from the
-///      bonder straight into the PoolManager inside one `unlock`; the bonder approves the **vault**. The
-///      `sweepClean` invariant (I12) is asserted at the end of `bond` against the market's own collateral. AMPS
-///      held for vesting is the one balance this contract carries, and I30 makes it part of `totalSupply` from the
-///      moment of purchase.
+///      bonder straight into the PoolManager inside one `unlock`; the bonder approves the **vault**. Any residual
+///      balance of the market's collateral — a donation, never a flow of this contract's own — is forwarded to the
+///      vault at the end of `bond`, which is `sweepClean` (I12) as a step rather than as an assertion nobody can
+///      keep. AMPS held for vesting is the one balance this contract carries, and I30 makes it part of
+///      `totalSupply` from the moment of purchase.
 ///
 /// @dev **`claim` is structurally ungated** (I38, state model §7). Its code path touches the position array and
 ///      the immutable AMPS address, and nothing else: no gate, no guardian, no pause flag, no registry, no feed,
@@ -368,7 +371,8 @@ contract AmpsBonds is IAmpsBonds {
 
         // 1. The gate. Only a corporate-action freeze, a guardian freeze or the divergence breaker refuse; a stale
         //    feed or a closed session widen the haircut instead (Decision 10).
-        uint16 haircutBps = IOracleGate(IAmpsVault(vault).oracleGate()).checkBond(stored.constituentId);
+        address gate = IAmpsVault(vault).oracleGate();
+        uint16 haircutBps = IOracleGate(gate).checkBond(stored.constituentId);
 
         // 2. Roll the market's capacity epoch and the global daily window before anything reads them.
         _rollEpoch(marketId, stored);
@@ -383,7 +387,7 @@ contract AmpsBonds is IAmpsBonds {
         if (settled != amountIn) revert DepositMismatch(settled, amountIn);
 
         // 4. Price it: the same-block checkpoint, `m`, `P_i`, the policy, and the shell's own accretion floor.
-        _Priced memory priced = _price(stored, amountIn, haircutBps);
+        _Priced memory priced = _price(stored, amountIn, haircutBps, gate);
 
         // 5. Capacity: per market per epoch, then globally per day. A clamp to zero closes the market until the
         //    epoch rolls; a partial clamp is disclosed by {quote} and bounded by the caller's `minAmpsOut`. The
@@ -418,8 +422,17 @@ contract AmpsBonds is IAmpsBonds {
     }
 
     /// @dev Everything `bond` does after its effects are written: the AMPS is minted to this contract and is in
-    ///      `totalSupply` from this instant (I30), and I12 is asserted against the market's own collateral, which
-    ///      moved bonder -> PoolManager in step 3 without ever resting here.
+    ///      `totalSupply` from this instant (I30), and any residual balance of the market's own collateral is
+    ///      forwarded to the vault, which is what keeps I12 (`sweepClean`) true without letting anybody assert it.
+    ///
+    /// @dev **Why forwarding and not `revert SweepDirty`.** The collateral moves bonder -> PoolManager in step 3
+    ///      and never rests here, so this balance is zero in every honest flow — but "zero" is not something this
+    ///      contract can enforce, because anybody may `transfer` one wei to it at any time. Asserting it turned a
+    ///      1-wei donation into a permanent denial of service on that market: this contract has no sweep, and the
+    ///      vault's `bonds` pointer is set once, so there was no way back. Forwarding is the same invariant with
+    ///      no such edge: the dust leaves, the vault's own sweep absorbs it as a claim, and a collateral whose
+    ///      `transfer` reverts or lies simply leaves its dust here rather than closing the market. The call's
+    ///      outcome is therefore never a revert reason, only whether {CollateralForwarded} is emitted.
     function _issue(
         uint16 marketId,
         address collateral,
@@ -445,7 +458,12 @@ contract AmpsBonds is IAmpsBonds {
         );
 
         uint256 dust = IERC20(collateral).balanceOf(address(this));
-        if (dust != 0) revert SweepDirty(collateral, dust);
+        if (dust != 0) {
+            (bool ok, bytes memory returned) = collateral.call(abi.encodeCall(IERC20.transfer, (vault, dust)));
+            if (ok && (returned.length == 0 || (returned.length >= 32 && abi.decode(returned, (bool))))) {
+                emit CollateralForwarded(collateral, dust);
+            }
+        }
     }
 
     /// @dev The reverting half of the pricing path: the checkpoint staleness bound, `m` from the spoke's own
@@ -454,7 +472,21 @@ contract AmpsBonds is IAmpsBonds {
     ///      pointer safe: a hostile policy can refuse to price, never issue a dilutive bond. Inside {bond} the
     ///      checkpoint is always this block's, written by `depositBonded` a moment earlier; the staleness bound
     ///      is what {quote} enforces and what a vault that did not refresh would trip.
-    function _price(BondMarket storage record, uint256 amountIn, uint16 haircutBps)
+    ///
+    /// @dev **`ampsOut` is the shell's number, not the policy's.** The floor re-check bounds `q`, and `q` is the
+    ///      whole of the pricing law — but the policy also returns the `amountIn18 x q / 1e18` product, and
+    ///      nothing forced the two to agree. A policy answering `qX18 = 0` with a colossal `ampsOut` passed the
+    ///      floor check with room to spare and minted to the capacity clamp against one wei. So the shell
+    ///      recomputes the product from the `q` it has just bounded and discards the policy's field: §6's
+    ///      `ampsOut = amountIn18 * q / 1e18`, rounding down, out of the same `FullMath` the policy uses. The
+    ///      policy still owns `q`; it no longer owns the multiplication.
+    ///
+    /// @dev **The haircut may be wider than the gate's.** `hSessionBps` arrives from `checkBond`, but the shell
+    ///      re-derives its own floor by design, so it also re-derives the input: an answer layer C reports as not
+    ///      fresh is priced at no less than the gate's `CLOSED` haircut (see {_haircutFor}). The same widened
+    ///      value goes into the policy input *and* into {_qFloorX18}, so the two stay consistent and a stale feed
+    ///      widens the floor instead of tripping {AccretionFloorViolated}.
+    function _price(BondMarket storage record, uint256 amountIn, uint16 haircutBps, address gate)
         internal
         view
         returns (_Priced memory priced)
@@ -465,22 +497,24 @@ contract AmpsBonds is IAmpsBonds {
         if (age > Constants.CHECKPOINT_MAX_AGE) revert StaleCheckpoint(age, Constants.CHECKPOINT_MAX_AGE);
         if (checkpoint.navPerShareX18 == 0) revert NotInitialized();
 
+        (uint256 collateralPriceUsd18, bool feedFresh) = _collateralPriceUsd18(record);
+
         IBondPolicy.QuoteInput memory input;
         input.mX18 = _marketPriceX18(record);
         input.navPerShareX18 = checkpoint.navPerShareX18;
-        input.collateralPriceUsd18 = _collateralPriceUsd18(record);
+        input.collateralPriceUsd18 = collateralPriceUsd18;
         input.amountIn18 = _amountIn18(record.decimals, amountIn);
-        input.hSessionBps = haircutBps;
+        input.hSessionBps = _haircutFor(gate, haircutBps, feedFresh);
         _applyMarketParams(record, input);
 
         IBondPolicy.QuoteOutput memory output = IBondPolicy(policy).quote(input);
 
         uint256 floorX18 =
-            _qFloorX18(input.collateralPriceUsd18, input.navPerShareX18, haircutBps, input.minAccretionBps);
+            _qFloorX18(input.collateralPriceUsd18, input.navPerShareX18, input.hSessionBps, input.minAccretionBps);
         if (output.qX18 > floorX18) revert AccretionFloorViolated(output.qX18, floorX18);
 
         priced = _Priced({
-            ampsOut: output.ampsOut,
+            ampsOut: FullMath.mulDiv(input.amountIn18, output.qX18, Constants.WAD),
             qX18: output.qX18,
             discountBps: output.discountBps,
             floorBinding: output.floorBinding
@@ -777,6 +811,15 @@ contract AmpsBonds is IAmpsBonds {
             return result;
         }
 
+        // `amountIn18` is a plain multiplication, so a caller-supplied `amountIn` near `type(uint256).max`
+        // overflows it. {quote} is the non-reverting half of this contract and a `Panic` is still a revert, so
+        // the overflow is a `reason` like every other refusal.
+        (bool amountOk, uint256 amountIn18) = _tryAmountIn18(record.decimals, amountIn);
+        if (!amountOk) {
+            result.reason = "amountTooLarge";
+            return result;
+        }
+
         _Context memory context = _collect(record);
         if (context.reason != bytes32(0)) {
             result.reason = context.reason;
@@ -787,12 +830,11 @@ contract AmpsBonds is IAmpsBonds {
         input.mX18 = context.mX18;
         input.navPerShareX18 = context.navPerShareX18;
         input.collateralPriceUsd18 = context.collateralPriceUsd18;
-        input.amountIn18 = _amountIn18(record.decimals, amountIn);
+        input.amountIn18 = amountIn18;
         input.hSessionBps = context.haircutBps;
         _applyMarketParams(record, input);
 
         try IBondPolicy(policy).quote(input) returns (IBondPolicy.QuoteOutput memory output) {
-            result.ampsOut = output.ampsOut;
             result.qX18 = output.qX18;
             result.discountBps = output.discountBps;
             result.floorBinding = output.floorBinding;
@@ -805,10 +847,18 @@ contract AmpsBonds is IAmpsBonds {
             result.qX18
                 > _qFloorX18(input.collateralPriceUsd18, input.navPerShareX18, input.hSessionBps, input.minAccretionBps)
         ) {
-            result.ampsOut = 0;
             result.reason = "floorViolated";
             return result;
         }
+
+        // The same recomputation {_price} does, for the same reason: the policy owns `q`, never the product. The
+        // divide guards the multiplication the way {_tryAmountIn18} guards the scale: `q` is bounded by the floor
+        // but the product is not, and this half of the contract answers with a `reason` rather than a `Panic`.
+        if (result.qX18 != 0 && input.amountIn18 > type(uint256).max / result.qX18) {
+            result.reason = "amountTooLarge";
+            return result;
+        }
+        result.ampsOut = FullMath.mulDiv(input.amountIn18, result.qX18, Constants.WAD);
 
         if (result.capacityLeft == 0) {
             result.ampsOut = 0;
@@ -871,13 +921,16 @@ contract AmpsBonds is IAmpsBonds {
             return context;
         }
 
-        try IFeedRegistry(context.feed).latestAnswer(record.collateral) returns (uint256 answerUsd8, uint32, bool) {
+        try IFeedRegistry(context.feed).latestAnswer(record.collateral) returns (
+            uint256 answerUsd8, uint32, bool feedFresh
+        ) {
             if (answerUsd8 == 0) {
                 context.reason = "noPrice";
                 return context;
             }
             context.collateralPriceUsd18 =
                 PriceLib.counterValueUsd18(10 ** record.decimals, record.decimals, answerUsd8);
+            context.haircutBps = _haircutFor(context.gate, context.haircutBps, feedFresh);
         } catch {
             context.reason = "noPrice";
             return context;
@@ -940,18 +993,58 @@ contract AmpsBonds is IAmpsBonds {
         mX18 = _ampsPerCollateralX18(meanTick, record.decimals);
     }
 
-    /// @dev The collateral's last Chainlink answer as 18-decimal USD per whole token. Staleness is allowed: the
-    ///      haircut, not a revert, is what bounds a stale answer (Decision 10).
-    function _collateralPriceUsd18(BondMarket storage record) internal view returns (uint256 price18) {
-        (uint256 answerUsd8,,) = IFeedRegistry(IAmpsVault(vault).feedRegistry()).latestAnswer(record.collateral);
+    /// @dev The collateral's last Chainlink answer as 18-decimal USD per whole token, and whether layer C stands
+    ///      behind it. Staleness is allowed: the haircut, not a revert, is what bounds a stale answer
+    ///      (Decision 10) — but the caller has to *apply* one, which is what the second return value is for. A
+    ///      registry that reports `fresh == false` is reporting an answer past its session-scaled bound or an
+    ///      unresolved jump, and either is a reason to price the collateral more conservatively.
+    /// @return price18 The answer, 18-decimal USD per whole token.
+    /// @return fresh What `IFeedRegistry.latestAnswer` reported alongside it.
+    function _collateralPriceUsd18(BondMarket storage record) internal view returns (uint256 price18, bool fresh) {
+        (uint256 answerUsd8,, bool feedFresh) =
+            IFeedRegistry(IAmpsVault(vault).feedRegistry()).latestAnswer(record.collateral);
         if (answerUsd8 == 0) revert IBondPolicy.InvalidQuoteInput("collateralPriceUsd18");
         price18 = PriceLib.counterValueUsd18(10 ** record.decimals, record.decimals, answerUsd8);
+        fresh = feedFresh;
+    }
+
+    /// @dev The haircut a quote is actually priced at: the gate's, or the gate's `CLOSED` haircut when it is
+    ///      wider and layer C did not report the collateral's answer as fresh.
+    ///
+    ///      `OracleGate` already raises its own answer the same way (`feedStale` folds in `unconfirmed`), so in a
+    ///      correctly wired deployment this floor is a no-op and the two layers agree to the basis point. It is
+    ///      here because the shell re-derives the accretion floor independently by design: a gate that handed
+    ///      back 0 bp on a feed the shell can see is not fresh would otherwise price a bond against a number
+    ///      nobody stands behind, with no haircut at all. The probe into the gate is bounded and falls back to
+    ///      the launch default, because a gate that cannot answer must not be able to close a bond market.
+    /// @param gate The oracle gate this quote was gated by.
+    /// @param haircutBps What it reported.
+    /// @param fresh Whether layer C stands behind the collateral's answer.
+    /// @return effectiveBps The haircut to price with.
+    function _haircutFor(address gate, uint16 haircutBps, bool fresh) internal view returns (uint16 effectiveBps) {
+        if (fresh) return haircutBps;
+        uint16 floorBps = Constants.H_SESSION_CLOSED_BPS_DEFAULT;
+        try IOracleGate(gate).hSessionBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}(Session.CLOSED) returns (
+            uint16 closedBps
+        ) {
+            if (closedBps <= Constants.H_SESSION_BPS_MAX) floorBps = closedBps;
+        } catch {}
+        return haircutBps >= floorBps ? haircutBps : floorBps;
     }
 
     /// @dev The deposit normalised to 18 decimals, so USDG's 6 decimals are scaled up once, in the shell, before
-    ///      the policy sees anything (§6).
+    ///      the policy sees anything (§6). Reverts (arithmetic panic) on an `amountIn` too large to normalise,
+    ///      which no reachable deposit is: {bond} has already settled the collateral by the time it gets here.
     function _amountIn18(uint8 decimals, uint256 amountIn) internal pure returns (uint256 amountIn18) {
         amountIn18 = amountIn * (10 ** (PriceLib.MAX_COUNTER_DECIMALS - decimals));
+    }
+
+    /// @dev {_amountIn18} for the non-reverting path: an `amountIn` that would overflow the 18-decimal scale is
+    ///      `ok == false` rather than a panic, so {quote} answers `"amountTooLarge"` for it.
+    function _tryAmountIn18(uint8 decimals, uint256 amountIn) internal pure returns (bool ok, uint256 amountIn18) {
+        uint256 scale = 10 ** (PriceLib.MAX_COUNTER_DECIMALS - decimals);
+        if (amountIn > type(uint256).max / scale) return (false, 0);
+        return (true, amountIn * scale);
     }
 
     /// @dev `deficit = clamp((w_target - w_current) / w_target, 0, 1)`, rounded **down**: a smaller deficit widens

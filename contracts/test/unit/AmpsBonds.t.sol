@@ -774,10 +774,81 @@ contract AmpsBondsTest is BondsFixture {
         (uint256 ampsOut,) = _bond(alice, 0.05e18);
         assertEq(ampsOut, FullMath.mulDiv(0.05e18, expectedFloor, 1e18), "priced at the haircut floor");
 
-        // The same bond in the Regular session buys strictly more: the haircut is the whole weekend-gap bound.
+        // The same bond in the Regular session, with the feed answering fresh again, buys strictly more: the
+        // haircut is the whole weekend-gap bound.
         gate.setSession(Session.REGULAR);
+        feeds.setFresh(address(stock), true);
         (uint256 regularOut,) = _bond(bob, 0.05e18);
         assertGt(regularOut, ampsOut, "the closed-session haircut costs the bonder 300 bp");
+    }
+
+    /// @notice **A stale feed is never priced at a 0 bp haircut**, whatever session the gate reports. The shell
+    ///         reads the `fresh` flag layer C returns alongside the answer and raises its own haircut floor to the
+    ///         gate's `CLOSED` value, because the collateral valuation the accretion floor is built on is exactly
+    ///         the number layer C has just disowned. A stale feed in the Regular session used to price with the
+    ///         calendar haircut alone, which for the Regular session is zero.
+    function test_staleFeedIsNeverPricedAtAZeroHaircut() public {
+        gate.setSession(Session.REGULAR);
+        assertEq(gate.hSessionBps(Session.REGULAR), 0, "the regular session has no calendar haircut");
+
+        (, uint256 freshQ,,,, bytes32 reason) = bonds.quote(marketId, 0.05e18);
+        assertEq(reason, bytes32(0), "priced");
+        assertEq(
+            freshQ,
+            _qFloor(STOCK_PRICE_USD8 * 1e10, NAV_X18, 0, Constants.MIN_ACCRETION_BPS_DEFAULT),
+            "a fresh feed prices at the bare floor"
+        );
+
+        feeds.setFresh(address(stock), false);
+        uint256 expectedFloor = _qFloor(
+            STOCK_PRICE_USD8 * 1e10,
+            NAV_X18,
+            Constants.H_SESSION_CLOSED_BPS_DEFAULT,
+            Constants.MIN_ACCRETION_BPS_DEFAULT
+        );
+
+        (uint256 quotedOut, uint256 staleQ,,,, bytes32 staleReason) = bonds.quote(marketId, 0.05e18);
+        assertEq(staleReason, bytes32(0), "the market stays open through a stale feed (Decision 10)");
+        assertEq(staleQ, expectedFloor, "and prices at the CLOSED haircut floor");
+        assertLt(staleQ, freshQ, "which is strictly worse for the bonder");
+
+        (uint256 ampsOut,) = _bond(alice, 0.05e18);
+        assertEq(ampsOut, quotedOut, "and `bond` agrees with `quote`");
+        assertEq(ampsOut, FullMath.mulDiv(0.05e18, expectedFloor, 1e18), "priced at the raised floor");
+    }
+
+    /// @notice The gate's `CLOSED` haircut is the floor, not the launch constant: governance moving the table
+    ///         moves the shell's floor with it, so the two layers cannot drift apart.
+    function test_staleFeedHaircutFloorFollowsTheGatesTable() public {
+        gate.setHSessionBps(Session.CLOSED, 700);
+        feeds.setFresh(address(stock), false);
+
+        (, uint256 qX18,,,,) = bonds.quote(marketId, 0.05e18);
+        assertEq(
+            qX18,
+            _qFloor(STOCK_PRICE_USD8 * 1e10, NAV_X18, 700, Constants.MIN_ACCRETION_BPS_DEFAULT),
+            "the shell reads the gate's own CLOSED haircut"
+        );
+    }
+
+    /// @notice The registry-side hold-back, seen from the bond shell: while `FeedRegistry` holds an unconfirmed
+    ///         jump it reports `min(oldAnswer, newAnswer)` with `fresh == false` (`OracleGate` folds `unconfirmed`
+    ///         into staleness), and the bond is priced on both — the crashed price *and* the widened haircut.
+    ///         `FeedRegistryTest` covers how the registry reaches that state; this is what the shell does with it.
+    function test_heldBackJumpPricesAtTheMinimumWithTheWiderHaircut() public {
+        uint256 crashedUsd8 = STOCK_PRICE_USD8 / 2; // the collateral halves; the jump is not yet confirmed
+        feeds.setAnswerFull(address(stock), uint128(crashedUsd8), uint32(block.timestamp), false);
+
+        uint256 expectedFloor = _qFloor(
+            crashedUsd8 * 1e10, NAV_X18, Constants.H_SESSION_CLOSED_BPS_DEFAULT, Constants.MIN_ACCRETION_BPS_DEFAULT
+        );
+
+        (uint256 ampsOut,) = _bond(alice, 0.05e18);
+        assertEq(ampsOut, FullMath.mulDiv(0.05e18, expectedFloor, 1e18), "min(old, new) at the widened haircut");
+
+        // What the old behaviour would have paid: the pre-crash answer with no haircut at all.
+        uint256 preCrashFloor = _qFloor(STOCK_PRICE_USD8 * 1e10, NAV_X18, 0, Constants.MIN_ACCRETION_BPS_DEFAULT);
+        assertLt(ampsOut, FullMath.mulDiv(0.05e18, preCrashFloor, 1e18), "strictly less than the pre-crash price");
     }
 
     /// @notice The pricing table end to end: premium x session x feed freshness, always `q <= qFloor`.
@@ -792,6 +863,13 @@ contract AmpsBondsTest is BondsFixture {
             for (uint256 p; p < premiumsBps.length; ++p) {
                 for (uint256 f; f < 2; ++f) {
                     feeds.setFresh(address(stock), f == 0);
+                    // A feed the registry does not stand behind is priced at no less than the CLOSED haircut,
+                    // whatever the calendar says: that is the shell's own floor, independent of the gate's.
+                    uint16 effectiveHaircut = f == 0
+                        ? haircut
+                        : (haircut < Constants.H_SESSION_CLOSED_BPS_DEFAULT
+                                ? Constants.H_SESSION_CLOSED_BPS_DEFAULT
+                                : haircut);
                     uint256 ampsPrice = uint256(int256(NAV_X18) + int256(NAV_X18) * premiumsBps[p] / 10_000);
                     _setSpokePriceUsd18(ampsPrice);
 
@@ -799,14 +877,15 @@ contract AmpsBondsTest is BondsFixture {
                         bonds.quote(marketId, 0.01e18);
                     assertEq(reason, bytes32(0), "the market is open in every cell of the table");
 
-                    uint256 floorX18 =
-                        _qFloor(STOCK_PRICE_USD8 * 1e10, NAV_X18, haircut, Constants.MIN_ACCRETION_BPS_DEFAULT);
+                    uint256 floorX18 = _qFloor(
+                        STOCK_PRICE_USD8 * 1e10, NAV_X18, effectiveHaircut, Constants.MIN_ACCRETION_BPS_DEFAULT
+                    );
                     assertLe(qX18, floorX18, "q <= qFloor (I27)");
                     assertEq(floorBinding, qX18 == floorX18, "floorBinding");
 
                     // The discount only bites above the crossover premium.
                     uint256 crossoverBps = (10_000 + uint256(Constants.MIN_ACCRETION_BPS_DEFAULT)) * 10_000 * 10_000
-                        / ((10_000 - 1250) * (10_000 - uint256(haircut))) - 10_000;
+                        / ((10_000 - 1250) * (10_000 - uint256(effectiveHaircut))) - 10_000;
                     if (premiumsBps[p] > 0 && uint256(premiumsBps[p]) > crossoverBps + 20) {
                         assertFalse(floorBinding, "above the crossover the discount binds");
                     } else if (premiumsBps[p] < int256(crossoverBps)) {
@@ -818,7 +897,9 @@ contract AmpsBondsTest is BondsFixture {
                         FullMath.mulDiv(
                             ampsOut, NAV_X18 * (10_000 + uint256(Constants.MIN_ACCRETION_BPS_DEFAULT)), 10_000
                         ),
-                        FullMath.mulDiv(0.01e18, STOCK_PRICE_USD8 * 1e10 * (10_000 - uint256(haircut)), 10_000),
+                        FullMath.mulDiv(
+                            0.01e18, STOCK_PRICE_USD8 * 1e10 * (10_000 - uint256(effectiveHaircut)), 10_000
+                        ),
                         "the bond is accretive"
                     );
                 }
@@ -1101,6 +1182,92 @@ contract AmpsBondsTest is BondsFixture {
         vm.expectPartialRevert(IAmpsBonds.AccretionFloorViolated.selector);
         vm.prank(alice);
         bonds.bond(marketId, 0.05e18, 0, alice);
+    }
+
+    /// @notice **The shell mints its own product, never the policy's.** The floor check bounds `q`, and a policy
+    ///         that answers `qX18 = 0` clears it with room to spare — so a colossal `ampsOut` alongside it used to
+    ///         be copied verbatim and minted to the capacity clamp against a single wei of collateral. The shell
+    ///         recomputes `amountIn18 x q / 1e18` from the `q` it has just bounded and discards the field.
+    function test_policyCannotInflateAmpsOutBehindABoundedPrice() public {
+        address zeroPrice = address(new ZeroPriceLyingPolicy());
+        vm.prank(timelock);
+        bonds.setPolicy(zeroPrice);
+
+        // `qX18 = 0` with a huge `ampsOut`: the old shell minted the capacity clamp for one wei.
+        (uint256 quotedOut,,,,, bytes32 reason) = bonds.quote(marketId, 1);
+        assertEq(quotedOut, 0, "the quote reports the recomputed product, which is zero");
+        assertEq(reason, bytes32("zeroAmount"));
+
+        vm.expectRevert(ZeroAmount.selector);
+        vm.prank(alice);
+        bonds.bond(marketId, 1, 0, alice);
+
+        assertEq(amps.totalSupply(), GENESIS_SUPPLY, "not one wei of AMPS was minted");
+        assertEq(bonds.capacityRemaining(marketId), _epochCapacity(), "and no capacity was consumed");
+
+        // The same lie at a legitimate price: the price is honoured, the inflated product is not.
+        address inflated = address(new InflatedOutputPolicy());
+        vm.prank(timelock);
+        bonds.setPolicy(inflated);
+        uint256 amountIn = 0.05e18;
+        uint256 expectedFloor = _qFloor(STOCK_PRICE_USD8 * 1e10, NAV_X18, 0, Constants.MIN_ACCRETION_BPS_DEFAULT);
+        uint256 expectedOut = FullMath.mulDiv(amountIn, expectedFloor, 1e18);
+
+        (uint256 ampsOut,) = _bond(alice, amountIn);
+        assertEq(ampsOut, expectedOut, "amountIn18 x q / 1e18, out of the shell's own arithmetic");
+        assertLt(ampsOut, type(uint128).max, "and nothing like the policy's answer");
+    }
+
+    /// @notice A 1-wei donation of the market's collateral must not be able to close the market. The shell used to
+    ///         assert a zero balance at the end of every bond, and nothing stops anybody transferring one wei to
+    ///         it: with no sweep here and a set-once `bonds` pointer on the vault, that assertion was a permanent
+    ///         denial of service on the market for the price of one wei. The dust is forwarded to the vault
+    ///         instead, where the vault's own sweep absorbs it as a claim.
+    function test_collateralDonationCannotBrickTheMarket() public {
+        stock.mint(address(bonds), 1);
+        assertEq(stock.balanceOf(address(bonds)), 1, "donated");
+
+        uint256 vaultBefore = stock.balanceOf(address(vaultMock));
+        uint256 amountIn = 0.05e18;
+
+        vm.expectEmit(true, false, false, true, address(bonds));
+        emit IAmpsBonds.CollateralForwarded(address(stock), 1);
+        (uint256 ampsOut,) = _bond(alice, amountIn);
+
+        assertGt(ampsOut, 0, "the bond still prices and settles");
+        assertEq(stock.balanceOf(address(bonds)), 0, "the shell is clean again (I12)");
+        assertEq(stock.balanceOf(address(vaultMock)), vaultBefore + amountIn + 1, "the dust went to the vault");
+
+        // And it is not a one-shot: donate again, bond again.
+        stock.mint(address(bonds), 5);
+        _bond(bob, amountIn);
+        assertEq(stock.balanceOf(address(bonds)), 0, "still clean");
+    }
+
+    /// @notice `quote` is the non-reverting half of this contract, and an arithmetic panic is still a revert: an
+    ///         `amountIn` too large to normalise to 18 decimals is a `reason`, not a `Panic(0x11)`.
+    function test_quoteRefusesAnAmountItCannotNormalise() public {
+        vm.prank(timelock);
+        bonds.setMarketOpen(entryMarketId, true); // USDG: 6 decimals, so `amountIn18` scales by 1e12
+
+        (uint256 ampsOut, uint256 qX18,,,, bytes32 reason) = bonds.quote(entryMarketId, type(uint256).max);
+        assertEq(reason, bytes32("amountTooLarge"), "reported, not thrown");
+        assertEq(ampsOut, 0, "with no output");
+        assertEq(qX18, 0, "and no price");
+
+        // The product `amountIn18 x q` is guarded the same way, so an amount that normalises but would overflow
+        // the multiplication is reported rather than thrown.
+        (,,,,, bytes32 productReason) = bonds.quote(entryMarketId, type(uint256).max / 1e12);
+        assertEq(productReason, bytes32("amountTooLarge"), "the product overflows even though the scale does not");
+
+        // An amount far larger than any capacity still quotes: the bound is an overflow bound, not a size limit.
+        (uint256 hugeOut,,,, uint256 capacityLeft, bytes32 okReason) = bonds.quote(entryMarketId, 1e24);
+        assertEq(okReason, bytes32(0), "a large but representable amount still quotes");
+        assertEq(hugeOut, capacityLeft, "clamped to the capacity, as any over-capacity quote is");
+
+        // An 18-decimal market scales by 1, so no `amountIn` can overflow the *scale*.
+        (,,,,, bytes32 stockReason) = bonds.quote(marketId, 1e30);
+        assertEq(stockReason, bytes32(0), "an 18-decimal market never overflows the scale");
     }
 
     /// @notice A policy swap re-prices new bonds only; positions already vesting are untouched.
@@ -1580,6 +1747,68 @@ contract HalfFloorPolicy is IBondPolicy {
 
     function version() external pure returns (bytes32) {
         return "half-floor";
+    }
+}
+
+/// @notice A policy that quotes a price of **zero** and claims a colossal `ampsOut` anyway. `q = 0` clears the
+///         shell's accretion floor with room to spare, so copying the policy's product meant minting to the
+///         capacity clamp against a single wei of collateral. This is the policy that separates "bounds the
+///         price" from "bounds the issuance".
+contract ZeroPriceLyingPolicy is IBondPolicy {
+    /// @inheritdoc IBondPolicy
+    function quote(QuoteInput calldata input) external pure returns (QuoteOutput memory output) {
+        output.qFloorX18 = 0;
+        output.qMarketX18 = 0;
+        output.qX18 = 0;
+        output.floorBinding = true;
+        output.discountBps = input.dBaseBps;
+        output.ampsOut = type(uint128).max;
+    }
+
+    /// @inheritdoc IBondPolicy
+    function discountBps(uint16 dBaseBps, uint16, uint16, uint64, uint64, uint64, uint64)
+        external
+        pure
+        returns (uint16)
+    {
+        return dBaseBps;
+    }
+
+    /// @inheritdoc IBondPolicy
+    function version() external pure returns (bytes32) {
+        return "zero-price-lying";
+    }
+}
+
+/// @notice A policy whose *price* is the honest accretion floor and whose *product* is a lie. The floor check
+///         passes, so only the shell's own recomputation stands between the lie and the mint.
+contract InflatedOutputPolicy is IBondPolicy {
+    /// @inheritdoc IBondPolicy
+    function quote(QuoteInput calldata input) external pure returns (QuoteOutput memory output) {
+        uint256 numerator = FullMath.mulDiv(input.collateralPriceUsd18, 10_000 - uint256(input.hSessionBps), 10_000);
+        uint256 denominator =
+            FullMath.mulDivRoundingUp(input.navPerShareX18, 10_000 + uint256(input.minAccretionBps), 10_000);
+
+        output.qFloorX18 = FullMath.mulDiv(numerator, 1e18, denominator);
+        output.qMarketX18 = output.qFloorX18;
+        output.qX18 = output.qFloorX18;
+        output.floorBinding = true;
+        output.discountBps = input.dBaseBps;
+        output.ampsOut = type(uint128).max;
+    }
+
+    /// @inheritdoc IBondPolicy
+    function discountBps(uint16 dBaseBps, uint16, uint16, uint64, uint64, uint64, uint64)
+        external
+        pure
+        returns (uint16)
+    {
+        return dBaseBps;
+    }
+
+    /// @inheritdoc IBondPolicy
+    function version() external pure returns (bytes32) {
+        return "inflated-output";
     }
 }
 

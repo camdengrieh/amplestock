@@ -44,7 +44,7 @@ contract Phase3InvariantTest is Phase3Fixture {
         // One shared ghost book, two handlers. The action space of §8.2 is unchanged; it is split across two
         // contracts because a single handler carrying all of it plus the bookkeeping was 31,203 B of runtime,
         // past EIP-170 - which `forge build --sizes` gates and Medusa's geth enforces at deploy time.
-        ghosts = new Phase3Ghosts(vault, amps, hook, quoter, poolManager, allPools());
+        ghosts = new Phase3Ghosts(vault, amps, hook, quoter, poolManager, address(swapRouter), allPools());
         handler = new Phase3Handler(_wiring(), ghosts);
         vaultHandler = new Phase3VaultHandler(vault, amps, ghosts, KEEPER, constituentIds, allPools());
         ghosts.authorize(address(handler));
@@ -249,7 +249,7 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I26: the rotation credit is zero at the start of every transaction, structurally.
     function invariant_I26_rotationCreditIsZeroAtEveryBoundary() public view {
         assertFalse(ghosts.creditEverLeaked(), "no credit ever survived a transaction boundary");
-        assertEq(hook.rotationCredit(), 0, "and it is zero now");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and it is zero now");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -395,7 +395,7 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I26.
     /// @return ok Whether the rotation credit ever survived a transaction boundary.
     function medusa_rotationCreditIsTransient() public view returns (bool ok) {
-        return !ghosts.creditEverLeaked() && hook.rotationCredit() == 0;
+        return !ghosts.creditEverLeaked() && hook.rotationCredit(address(swapRouter)) == 0;
     }
 
     /// @notice I31.

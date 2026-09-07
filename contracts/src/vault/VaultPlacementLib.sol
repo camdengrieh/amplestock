@@ -117,7 +117,13 @@ library VaultPlacementLib {
 
     /// @dev `keccak256("amplestocks.vault.PLACEMENT_STAGE")`, the base of the transient staging buffer. Four
     ///      words per placed cell, `Constants.GRID_CELLS` cells. See {_stage}.
-    uint256 private constant STAGE_SLOT = 0x1f0c2fd9a7dcb43f4a1ee6b30a17c0ba2d3c0e8f6b5a49382716c5d4e3f2a190;
+    ///
+    ///      **Derived, not transcribed.** The literal that stood here was not the hash of the string the comment
+    ///      names — it was an invented constant, so nothing tied the buffer's base to the namespace the rest of
+    ///      the vault's transient slots are derived from, and the next slot anyone derived from that string would
+    ///      silently have landed somewhere else. Taking it from `Constants` makes the two impossible to drift,
+    ///      exactly as `VaultRedeemLib.LIVE_CELLS_SLOT` does; `test/unit/VaultPlacement.t.sol` pins the value.
+    uint256 private constant STAGE_SLOT = uint256(Constants.PLACEMENT_STAGE_SLOT);
 
     // -------------------------------------------------------------------------------------------------------------
     // Types
@@ -354,6 +360,12 @@ library VaultPlacementLib {
 
         // 6. Re-ladder as asks strictly above the current tick, and 7. re-add the counter side as bids strictly
         //    below it. Both merge into the grid by cell.
+        //
+        //    The ask anchor is `tickOf(P_ref / P_counter)`, exactly as `place`, `rollout` and `deployBonded` use:
+        //    I32 says no ask is ever placed below `P_ref`, and a `compound` anchored at the live tick breaks that
+        //    the moment the pool trades below the reference — it would re-lay the fees as asks *under* the
+        //    protocol's own backing and undersell it. {_cells} takes `max(fromAnchor, fromTick)`, so the asks
+        //    still start strictly above the live tick when the pool is above the reference instead.
         if (split.relaid != 0) {
             _placeLadder(
                 ladder,
@@ -363,7 +375,7 @@ library VaultPlacementLib {
                 amps,
                 true,
                 split.relaid,
-                pool.tick,
+                _referenceTick(ctx, pool),
                 ctx.ladderDoublings,
                 "compound",
                 false
@@ -386,10 +398,21 @@ library VaultPlacementLib {
         }
 
         // 8. Reset the mark and arm the surge, then the exit half of the divergence check.
-        _resetHighWater(ctx, poolId);
-        _armSurge(ctx, poolId, "compound");
+        //
+        //    All three side effects are gated on the call having *done* something. A `compound` that collected no
+        //    fee, bought nothing back and re-laid nothing changed no position, so there is nothing to protect from
+        //    a sandwich and nothing to date: arming the maximum surge would let anyone tax the pool at
+        //    `SURGE_MAX_BPS` for free once a minute, resetting the mark would erase an excursion the *next*
+        //    compound needs in order to recognise its own bought-back inventory, and taking the 60-second cooldown
+        //    would let the same call deny a real `compound` (or a governance `place`) on that pool. The exit
+        //    divergence check is **not** gated: it costs the caller nothing and is what proves the pool was not
+        //    left mid-manipulation.
+        if (burned != 0 || split.relaid != 0 || counter != 0) {
+            _resetHighWater(ctx, poolId);
+            _armSurge(ctx, poolId, "compound");
+            cooldown[poolId] = uint32(block.timestamp);
+        }
         _requireConverged(ctx, poolManager, poolId, pool.config);
-        cooldown[poolId] = uint32(block.timestamp);
 
         emit Compound(poolId, ampsFees, split.creatorPaid, split.stakerPaid, burned, split.relaid);
 
@@ -492,6 +515,13 @@ library VaultPlacementLib {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Builds one ladder on the pool's canonical grid, hands it to the unlock and records what came back.
+    ///
+    /// @dev **Every ask placement resets the high-water mark** (§3.5's ordering rule, in the one place that can
+    ///      enforce it). The mark is what {_burnback} calls "this cell was sold as an ask"; an ask placed while a
+    ///      stale excursion's mark still stands would satisfy `upper <= highWater` from the moment it is opened
+    ///      and be burned as bought-back inventory on the next `compound`, having never been sold. Doing it here
+    ///      rather than only at the end of `compound` covers `place` and `rollout` too, which is what makes the
+    ///      rule unconditional: *no* ask exists under a mark older than itself.
     function _placeLadder(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         Ctx memory ctx,
@@ -535,6 +565,7 @@ library VaultPlacementLib {
         emit Placement(
             pool.key.toId(), above, result.cells, placed, anchorTick, reason, result.lowestTick, result.highestTick
         );
+        if (above) _resetHighWater(ctx, pool.key.toId());
         _armSurge(ctx, pool.key.toId(), reason);
     }
 
@@ -586,8 +617,12 @@ library VaultPlacementLib {
 
             owed0 += delta0;
             owed1 += delta1;
+            // Both bounds are *seeded* by the first cell rather than grown from zero: every Amplestocks tick is
+            // negative (AMPS is currency0 and one AMPS is worth far less than one counter unit), so a
+            // `highestTick` left at its zero value would be reported by `Placement` as the ladder's top for every
+            // placement, and no comparison against it would ever be true.
             if (result.cells == 0 || lower < result.lowestTick) result.lowestTick = lower;
-            if (lower + width > result.highestTick) result.highestTick = lower + width;
+            if (result.cells == 0 || lower + width > result.highestTick) result.highestTick = lower + width;
             _stage(result.cells, lower, lower + width, liquidity, amount);
             result.cells += 1;
             result.liquidityAdded += liquidity;
@@ -844,19 +879,42 @@ library VaultPlacementLib {
 
     /// @dev §3.5, the buyback burn. A cell whose upper bound the hook's high-water mark has crossed since the last
     ///      reset was fully sold as an ask, so AMPS sitting in it now is inventory the vault bought back on the way
-    ///      down and must burn (I33). The current tick decides how much:
+    ///      down and must burn (I33). A cell qualifies only when **both** are true:
     ///
-    ///      * `tick >= upper` — pure counter, nothing was bought back, nothing to do;
-    ///      * `tick <  upper` — the cell holds AMPS. It is withdrawn whole: the AMPS is burned and never
-    ///        re-placed, and the counter side (if the cell is straddled) comes back as an ERC-6909 claim.
+    ///      * `upper <= highWater` — the mark crossed the whole cell, so it really was sold as an ask; and
+    ///      * `tick <= lower` — the price has come **all the way back through** it, so what the cell holds now is
+    ///        AMPS and nothing else (a position whose lower bound is at or above `slot0.tick` is a pure-`amount0`
+    ///        range in v4's own decomposition), and `freedCounter` is therefore accrued fees rather than
+    ///        somebody's proceeds.
     ///
-    ///      **Deviation from ruling 8, deliberate.** The ruling re-places the counter side over
-    ///      `[lower, alignDown(tick)]`, which is *not* a cell of the canonical grid — it is a fraction of one. That
-    ///      range would be invisible to `LadderPositionValuer`, which enumerates whole cells (§4), so `A` would
-    ///      drop by its whole value and the R1 post-condition would revert the very `compound` that created it, and
-    ///      it would break I39. The counter is therefore held as a claim — §3.5's own fallback for a degenerate
-    ///      range — and re-enters the ladder in step 7 of the same `compound`, as a proper grid bid ladder below
-    ///      the tick. Nothing leaves the pool's economy; only the prices it bids at are re-derived.
+    ///      Everything else is left alone: `tick >= upper` is pure counter and nothing was bought back, and
+    ///      `lower < tick < upper` is a cell the price has only *partly* re-crossed.
+    ///
+    ///      **Why the second condition is `tick <= lower` and not `tick < upper`** (the finding this closes). The
+    ///      old predicate skipped only `tick >= upper`, so it took two kinds of cell it had no business taking:
+    ///
+    ///        1. *Every bid this library places.* Step 7 lays bids strictly **below** the tick and step 8 only then
+    ///           resets the mark, so a fresh bid cell satisfies `upper <= highWater` from birth. One tick of
+    ///           downward drift into the top bid cell made it "crossed", and the next permissionless `compound`
+    ///           withdrew the whole cell, burned its AMPS and re-laid the counter a full doubling lower — a
+    ///           one-way ratchet of the bid ladder available once every `PLACEMENT_COOLDOWN_SECONDS`.
+    ///        2. *A partially bought-back ask.* A cell the price has re-entered but not re-crossed still holds the
+    ///           counter a real trade paid for it; removing it whole re-prices that trade's proceeds.
+    ///
+    ///      The companion half of the fix is in {_placeLadder}: the mark is reset after **every** ask placement,
+    ///      not only at the end of `compound`, so no ask can inherit a stale excursion's high-water mark and be
+    ///      burned as inventory it never was.
+    ///
+    ///      **Deviation from ruling 8 and from §3.5's `lower < tick < upper` row, deliberate.** The ruling removes
+    ///      the straddled cell too and re-places its counter side over `[lower, alignDown(tick)]`, which is *not* a
+    ///      cell of the canonical grid — it is a fraction of one. That range would be invisible to
+    ///      `LadderPositionValuer`, which enumerates whole cells (§4), so `A` would drop by its whole value and the
+    ///      R1 post-condition would revert the very `compound` that created it, and it would break I39. Straddled
+    ///      cells are therefore not touched at all; they are burned by a later `compound`, once the price has
+    ///      finished coming back through them. Whatever counter the burn *does* free (fees, and the last tick's
+    ///      worth of a cell the price sits exactly on the floor of) is held as a claim — §3.5's own fallback for a
+    ///      degenerate range — and re-enters the ladder in step 7 of the same `compound` as a proper grid bid.
+    ///      Nothing leaves the pool's economy; only the prices it bids at are re-derived.
     function _burnback(mapping(PoolId => PlacementRecord[]) storage ladder, Pool memory pool, address poolManager)
         private
         returns (uint256 burnedAmps, uint256 freedCounter)
@@ -873,7 +931,7 @@ library VaultPlacementLib {
         uint32 closed;
         for (uint256 i; i < n; ++i) {
             PlacementRecord storage record = records[i];
-            if (record.liquidity == 0 || record.upperTick > highWater || pool.tick >= record.upperTick) continue;
+            if (record.liquidity == 0 || record.upperTick > highWater || pool.tick > record.lowerTick) continue;
             removals[i] = record.liquidity;
             record.liquidity = 0;
             record.above = false;
@@ -928,8 +986,27 @@ library VaultPlacementLib {
     /// @dev §3.6 step 5, in order and to the wei: creator, then stakers, then the burn, and what is left is
     ///      re-laddered. The creator slice is the only transfer of protocol-held AMPS to a non-pool address (I31)
     ///      and is zero for good from `genesis + CREATOR_DECAY_SECONDS`.
+    ///
+    /// @dev **What the divisor is, and why it has a floor.** `creatorCut = ampsFees x creatorBps / sellFeeBps`
+    ///      reads the collected fee as "`sellFeeBps` of the AMPS that crossed the pool" and hands the creator the
+    ///      `creatorBps` points of it that are theirs. Neither half of that reading is exactly true, and the two
+    ///      errors point in opposite directions:
+    ///
+    ///        * The hook charges **base + dynamic**, so `ampsFees` was collected at more than `sellFeeBps` and the
+    ///          quotient over-states the creator's points. The over-statement is bounded by
+    ///          `(base + dynCap) / base` — 1.6x under GREEN at the launch base (`SELL_FEE_BPS_DEFAULT` 500 and
+    ///          `DYN_CAP_NORMAL_BPS` 300), i.e. at most 160 bp of the AMPS-side fees at the genesis
+    ///          `CREATOR_FEE_BPS` rather than 100 — and it decays to nothing with the schedule.
+    ///        * Governance may cut the base fee, and *that* is what the floor is for. `SELL_FEE_BPS_MIN` and
+    ///          `CREATOR_FEE_BPS` are both 100, so an entirely in-band `setSellFeeBps(100)` made the ratio
+    ///          `creatorBps / sellFeeBps` equal to one and routed **every wei** of the AMPS-side fees to the
+    ///          creator, leaving the stakers, the burn and the ladder nothing. Flooring the divisor at
+    ///          `SELL_FEE_BPS_DEFAULT` decouples the slice from the live fee entirely: a fee cut can never enlarge
+    ///          it past `CREATOR_FEE_BPS / SELL_FEE_BPS_DEFAULT` — one fifth of the AMPS-side fees — however low
+    ///          the base goes, and a fee *rise* still shrinks it, which is the direction that costs no one.
     function _split(Ctx memory ctx, address amps, uint256 ampsFees) private returns (Split memory split) {
         uint256 sellFeeBps = _sellFeeBps(ctx);
+        if (sellFeeBps < Constants.SELL_FEE_BPS_DEFAULT) sellFeeBps = Constants.SELL_FEE_BPS_DEFAULT;
         uint256 creatorBps = _creatorBps(ctx);
         if (creatorBps > sellFeeBps) creatorBps = sellFeeBps;
 
@@ -1028,7 +1105,8 @@ library VaultPlacementLib {
     }
 
     /// @dev The live sell fee, from the hook. The launch value stands in when the hook cannot answer, so the
-    ///      creator's share of the fees is never divided by zero.
+    ///      creator's share of the fees is never divided by zero. {_split}, its only caller, floors it at
+    ///      `SELL_FEE_BPS_DEFAULT` before dividing — see there for why.
     function _sellFeeBps(Ctx memory ctx) private view returns (uint256 bps) {
         if (ctx.marketReference != address(0)) {
             try IAmpsHook(ctx.marketReference).sellFeeBps() returns (uint16 value) {

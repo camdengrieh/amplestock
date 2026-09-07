@@ -464,6 +464,97 @@ contract OracleGateTest is OracleGateFixture {
         assertTrue(allowed, "bonds continue");
     }
 
+    /// @notice A stale feed is never a 0 bp bond haircut. Bonds continue (Decision 10) but at no less than the
+    ///         `CLOSED` haircut: a feed that stopped answering carries the same exposure as a market that stopped
+    ///         trading, and the Regular session's calendar haircut is zero.
+    function test_degraded_staleFeedRaisesTheBondHaircut() public {
+        (, uint16 freshHaircut) = gate.isBondAllowed(constituentId);
+        assertEq(freshHaircut, Constants.H_SESSION_REGULAR_BPS_DEFAULT, "0 bp with a fresh feed");
+
+        vm.prank(TIMELOCK);
+        feeds.configureFeed(address(nvda), 300, 50, 1, type(uint128).max);
+        vm.warp(block.timestamp + 451);
+        gate.poke();
+
+        GateSnapshot memory gate_ = gate.snapshot(constituentId);
+        assertTrue(gate_.feedStale, "stale");
+        assertEq(uint8(gate_.session), uint8(Session.REGULAR), "in the regular session");
+        assertEq(gate_.hSessionBps, Constants.H_SESSION_CLOSED_BPS_DEFAULT, "priced at the weekend haircut");
+
+        (bool allowed, uint16 haircut) = gate.isBondAllowed(constituentId);
+        assertTrue(allowed, "the market stays open");
+        assertEq(haircut, Constants.H_SESSION_CLOSED_BPS_DEFAULT, "at the raised haircut");
+        assertEq(gate.checkBond(constituentId), haircut, "and checkBond agrees");
+    }
+
+    /// @notice The floor applies to a per-constituent override too — it is the one thing that overrides one. An
+    ///         override exists to widen a haircut for a specific name, never to price a disowned feed at zero.
+    function test_degraded_staleFeedFloorsAnOverrideToo() public {
+        registry.setHSessionOverride(constituentId, 10, true);
+        (, uint16 haircut) = gate.isBondAllowed(constituentId);
+        assertEq(haircut, 10, "the override stands while the feed is fresh");
+
+        vm.prank(TIMELOCK);
+        feeds.configureFeed(address(nvda), 300, 50, 1, type(uint128).max);
+        vm.warp(block.timestamp + 451);
+        gate.poke();
+
+        (, haircut) = gate.isBondAllowed(constituentId);
+        assertEq(haircut, Constants.H_SESSION_CLOSED_BPS_DEFAULT, "and is floored once the feed goes stale");
+    }
+
+    /// @notice An answer the feed registry is holding behind an unconfirmed jump is *staleness* to this contract,
+    ///         not a current price: the gate reads `feedStatusIn`, folds `unconfirmed` into `feedStale`, degrades,
+    ///         and raises the bond haircut. Reading only `latestAnswerIn` reported a held-back jump as perfectly
+    ///         fresh, which is how a bond could price collateral mid-crash with no haircut at all.
+    function test_degraded_unconfirmedAnswerIsTreatedAsStale() public {
+        GateSnapshot memory before = gate.snapshot(constituentId);
+        assertEq(uint8(before.state), uint8(GateState.GREEN), "green");
+        assertEq(before.answerUsd8, 180e8, "the latched answer");
+
+        // The feed halves in a single round: `FeedRegistry` holds the jump and reports the conservative side.
+        vm.warp(block.timestamp + 60);
+        nvdaFeed.setAnswer(90e8);
+        gate.poke();
+        assertTrue(feeds.feedStatus(address(nvda)).unconfirmed, "layer C is holding the jump");
+
+        GateSnapshot memory gate_ = gate.snapshot(constituentId);
+        assertEq(gate_.answerUsd8, 90e8, "min(held, candidate): the crash is believed at once");
+        assertTrue(gate_.feedStale, "and the unconfirmed reading is staleness");
+        assertEq(uint8(gate_.state), uint8(GateState.DEGRADED), "so the gate degrades");
+        // The fair tick moved with the answer while the pool did not, so this halving also puts the pool beyond
+        // the inner band: the cap is the escalation one, and in any case never the normal 300 bp.
+        assertEq(gate_.dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "the hook's cap widens");
+
+        (bool allowed, uint16 haircut) = gate.isBondAllowed(constituentId);
+        assertTrue(allowed, "bonds still run, as they do through every degraded state");
+        assertEq(haircut, Constants.H_SESSION_CLOSED_BPS_DEFAULT, "at no less than the weekend haircut");
+        assertEq(gate.checkBond(constituentId), haircut, "checkBond agrees");
+
+        (bool placementAllowed,) = gate.isPlacementAllowed(spokePool);
+        assertFalse(placementAllowed, "and placements pause, as under any other staleness");
+    }
+
+    /// @notice Once the jump is confirmed the gate is green again with the new level: the hold-back is a delay,
+    ///         never a latch that has to be cleared by hand.
+    function test_degraded_unconfirmedClearsOnConfirmation() public {
+        vm.warp(block.timestamp + 60);
+        nvdaFeed.setAnswer(90e8);
+        assertTrue(gate.snapshot(constituentId).feedStale, "held back");
+
+        // The escape window runs from the pending record a keeper stamps; `refresh` is permissionless.
+        feeds.refresh(address(nvda));
+        vm.warp(block.timestamp + feeds.confirmSeconds());
+        vm.roll(block.number + 1);
+        gate.poke();
+
+        GateSnapshot memory gate_ = gate.snapshot(constituentId);
+        assertFalse(gate_.feedStale, "confirmed by elapse");
+        assertEq(gate_.answerUsd8, 90e8, "at the new level");
+        (, uint16 haircut) = gate.isBondAllowed(constituentId);
+        assertEq(haircut, Constants.H_SESSION_REGULAR_BPS_DEFAULT, "and the haircut falls back to the calendar");
+    }
+
     /// @notice A closed session is degraded even with a perfectly fresh feed, and the bond haircut is the closed
     ///         one: the weekend-gap bound the 24/7 bond market is priced against.
     function test_degraded_closedSession() public {

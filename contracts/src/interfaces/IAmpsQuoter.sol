@@ -133,7 +133,7 @@ interface IAmpsQuoter {
     /// @notice Prices a rotation — stock -> AMPS -> stock, or any two-hop path through an Amplestocks pool — with
     ///         the same-transaction rotation credit applied exactly as the hook would apply it.
     ///
-    /// @dev **The credit is simulated, never read.** `IAmpsHook.rotationCredit()` lives in EIP-1153 transient
+    /// @dev **The credit is simulated, never read.** `IAmpsHook.rotationCredit(sender)` lives in EIP-1153 transient
     ///      storage and is therefore always zero when read from a fresh `eth_call`; consulting it would make every
     ///      quote wrong in exactly the direction that matters. What this function does instead is model the credit
     ///      the caller's *own* hop 1 will create:

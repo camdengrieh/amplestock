@@ -19,8 +19,11 @@ import {FeedConfig, FeedStatus, Session} from "../types/Types.sol";
 ///        3. **Per-ticker bounds.** `minAnswerUsd8 <= answer <= maxAnswerUsd8`, recorded per feed. This is the
 ///           check that survives an aggregator returning its own circuit-breaker floor.
 ///        4. **Two-confirmation rule on jumps.** A single-round move above `Constants.ANSWER_JUMP_BPS` (10%) is
-///           not accepted until a second round confirms it; until then the previous answer stands and the feed is
-///           reported as unconfirmed rather than stale.
+///           not accepted until a second round confirms it, and while it is held every read reports
+///           `min(previousAnswer, candidate)` with the candidate's `updatedAt` and `unconfirmed == true`. The
+///           minimum is what makes the hold-back safe for *every* consumer: a crash is believed at once, a spike
+///           is not, so NAV, the bond accretion floor and the gate's fair tick all read the protocol-favouring
+///           side of an unresolved move. `OracleGate` folds `unconfirmed` into `feedStale`.
 ///        5. **Never multiplied by `uiMultiplier()`.** A Stock Token's display multiplier and its Chainlink answer
 ///           are already in the same units. See `IStockToken`.
 ///
@@ -158,6 +161,10 @@ interface IFeedRegistry {
     /// @dev The non-reverting read every gate-aware path uses: it reports `fresh` so the caller can apply its own
     ///      per-path policy, and it applies the positivity, bounds and two-confirmation rules before returning.
     ///      Returns `answerUsd8 == 0` only when no usable answer exists at all.
+    /// @dev **While a jump is held back this is `min(heldLevel, candidate)`, stamped with the candidate's
+    ///      `updatedAt`** — the conservative half of an unresolved move, not the pre-jump level. `fresh` is still
+    ///      only the freshness bound; a caller that must also know the answer is unconfirmed reads {feedStatus}
+    ///      (which is what `OracleGate` does, and why a held-back feed widens the bond haircut).
     /// @param token The asset.
     /// @return answerUsd8 The answer, 8 decimals.
     /// @return updatedAt When the answer was published.
@@ -201,6 +208,11 @@ interface IFeedRegistry {
     ///         degraded dApp falls back to.
     /// @dev Returns an all-zero struct with `configured == false` for a token with no feed, and never reverts for
     ///      any input, any aggregator behaviour or any session.
+    /// @dev `status.unconfirmed` marks a held-back jump, and `status.answerUsd8` is then the conservative
+    ///      `min(heldLevel, candidate)` described on {latestAnswer}, stamped with the candidate's `updatedAt`.
+    ///      `unconfirmed` and `fresh` are independent: a held-back answer can be perfectly recent and must still
+    ///      not be treated as the current price, which is why `OracleGate` reports `!fresh || unconfirmed` as a
+    ///      stale feed.
     /// @param token The asset.
     /// @return status Everything known about the feed right now.
     function feedStatus(address token) external view returns (FeedStatus memory status);

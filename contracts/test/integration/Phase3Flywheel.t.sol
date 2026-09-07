@@ -320,7 +320,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
     ///         for a sell in the next.
     function test_rotationCredit_noCreditSurvivesTheTransaction() public {
         buyAmps(hubPool, ALICE, 1e6);
-        assertEq(hook.rotationCredit(), 0, "the credit is zero at every transaction boundary");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "the credit is zero at every transaction boundary");
         (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18);
         assertEq(baseBps, hook.sellFeeBps(), "so the next transaction's sell pays the sell fee in full");
     }
@@ -345,10 +345,15 @@ contract Phase3FlywheelTest is Phase3Fixture {
         require(msg.sender == address(this), "self-call only");
         (, base1,,) = hook.quoteFee(spokePools[0], false, true, 0.01e18);
         uint256 ampsOut = buyAmps(spokePools[0], ALICE, 0.01e18);
-        assertEq(hook.rotationCredit(), ampsOut, "the credit is exactly the AMPS the buy realised (I26)");
+        assertEq(
+            hook.rotationCredit(address(swapRouter)), ampsOut, "the credit is exactly the AMPS the buy realised (I26)"
+        );
+        // Asked as the router: the credit is keyed by the `sender` the PoolManager reports, and both hops of a
+        // rotation report the router.
+        vm.prank(address(swapRouter));
         (, base2,,) = hook.quoteFee(spokePools[1], true, true, ampsOut);
         sellAmps(spokePools[1], ALICE, ampsOut);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
     /// @notice One transaction: buy AMPS in the hub, then sell four times as much back into it.
@@ -359,13 +364,14 @@ contract Phase3FlywheelTest is Phase3Fixture {
         require(msg.sender == address(this), "self-call only");
         giveShares(ALICE, 20e18);
         uint256 ampsOut = buyAmps(hubPool, ALICE, 1e6);
-        creditUsed = hook.rotationCredit();
+        creditUsed = hook.rotationCredit(address(swapRouter));
         assertEq(creditUsed, ampsOut, "the credit is the realised AMPS");
 
         amountIn = ampsOut * 4;
+        vm.prank(address(swapRouter));
         (, baseBlended,,) = hook.quoteFee(hubPool, true, true, amountIn);
         sellAmps(hubPool, ALICE, amountIn);
-        assertEq(hook.rotationCredit(), 0, "the larger sell consumed the whole credit");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "the larger sell consumed the whole credit");
     }
 
     /// @notice One transaction: buy AMPS in the hub, then take an exact amount of USDG back out.
@@ -375,10 +381,10 @@ contract Phase3FlywheelTest is Phase3Fixture {
     function exactOutputSellEntry() external returns (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1e6);
-        creditBefore = hook.rotationCredit();
+        creditBefore = hook.rotationCredit(address(swapRouter));
         (, baseBps,,) = hook.quoteFee(hubPool, true, false, 0);
         sellAmpsExactOut(hubPool, ALICE, 0.2e6);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
     /// @notice One transaction: a 1-wei buy, then the fee a whole-AMPS sell would pay.
@@ -387,7 +393,8 @@ contract Phase3FlywheelTest is Phase3Fixture {
     function dustBuyEntry() external returns (uint256 credit, uint16 baseBps) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1);
-        credit = hook.rotationCredit();
+        credit = hook.rotationCredit(address(swapRouter));
+        vm.prank(address(swapRouter));
         (, baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18);
     }
 
@@ -464,8 +471,10 @@ contract Phase3FlywheelTest is Phase3Fixture {
         wethFeed.setRevert(true);
         usdgFeed.setRevert(true);
         stocks[0].setOraclePaused(true);
-        vm.prank(TIMELOCK);
-        vault.setPolicyPointer(bytes32("oracleGate"), address(0xDEAD));
+        // The gate pointer is *forced* into §1.1 slot 9 rather than set: `setPolicyPointer` now refuses a
+        // codeless replacement, so "the gate has gone away entirely" is only reachable by writing the slot. The
+        // state being modelled is unchanged, and it is the one the assertions below are about.
+        vm.store(address(vault), bytes32(uint256(9)), bytes32(uint256(uint160(address(0xDEAD)))));
         warpBy(3 days);
 
         // Every leg still swaps, in both directions, with every downstream read broken.
@@ -499,7 +508,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // 3. Rotate spoke 0 into spoke 1 in one transaction.
         uint256 rotated = rotate(spokePools[0], spokePools[1], BOB, 0.01e18);
         assertGt(rotated, 0, "the rotation delivered the other stock");
-        assertEq(hook.rotationCredit(), 0, "and left no credit behind");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and left no credit behind");
 
         // 4. Bond, then claim over the vesting window.
         uint256 supplyBeforeBond = amps.totalSupply();

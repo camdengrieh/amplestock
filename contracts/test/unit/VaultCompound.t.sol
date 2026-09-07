@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {IBountyPot} from "../../src/interfaces/IBountyPot.sol";
+import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
@@ -209,45 +210,160 @@ contract VaultCompoundTest is PlacementFixture {
         assertEq(supplyBefore - amps.totalSupply(), burned, "and the supply agrees");
     }
 
-    /// @notice `lower < tick < upper`: the straddled cell holds both. The AMPS half is bought-back inventory and
-    ///         is burned; the counter half is not destroyed — it comes back as a claim and is re-laddered as a bid
-    ///         below the market inside the same `compound`.
-    /// @dev **The deviation from §10 ruling 8, in the one test that shows why.** The ruling re-places the counter
-    ///      side over `[lower, alignDown(tick)]`, which is a *fraction* of a grid cell. `LadderPositionValuer`
-    ///      enumerates whole cells, so such a position is invisible to `A`: the placement that created it would
-    ///      lose its whole value from the NAV numerator and R1 would revert the `compound`. The counter is
-    ///      therefore held as an ERC-6909 claim — §3.5's own fallback for a degenerate range — and re-enters the
-    ///      ladder as a proper grid bid in step 7. Nothing leaves the pool's economy.
-    function test_i33_burnbackOfAStraddledCellBurnsTheAmpsAndKeepsTheCounter() public {
+    /// @notice `lower < tick < upper`: the straddled cell is a cell the price has re-entered but **not** re-crossed,
+    ///         so it is left exactly where it is. What sits in it is partly the counter asset a real trade paid
+    ///         for; a whole-cell withdrawal would burn the AMPS half and re-price that trade's proceeds a doubling
+    ///         lower. It is burned by a later `compound`, once the price has finished coming back through it.
+    ///
+    /// @dev **The finding this closes, and the deviation from §10 ruling 8 it makes deliberate.** The old
+    ///      predicate skipped only `tick >= upper`, so *any* cell holding AMPS under a crossed mark was taken
+    ///      whole. The ruling's remedy for the straddled case — re-place the counter side over
+    ///      `[lower, alignDown(tick)]` — is not open to us either: that range is a *fraction* of a grid cell, and
+    ///      `LadderPositionValuer` enumerates whole cells, so the position would be invisible to `A`, the
+    ///      placement would lose its whole value from the NAV numerator and R1 would revert the `compound` that
+    ///      created it (I39 too). Leaving the cell alone is the resolution: nothing is destroyed, nothing is
+    ///      re-priced, and the burn happens when the price says the whole cell really is bought-back inventory.
+    function test_i33_burnbackLeavesAPartiallyBoughtBackCellAlone() public {
         buyAmps(hubPool, address(usdg), 60e6);
         int24 tick = tickOf(hubPool);
 
         PlacementRecord[] memory records = ladderOf(hubPool);
-        bool straddled;
+        int24 straddledLower;
+        uint128 straddledLiquidity;
         for (uint256 i; i < records.length; ++i) {
             if (records[i].liquidity != 0 && records[i].lowerTick < tick && tick < records[i].upperTick) {
-                straddled = true;
+                straddledLower = records[i].lowerTick;
+                straddledLiquidity = records[i].liquidity;
+                // The mark crossed this cell's top, so the only thing standing between it and the burn is the
+                // "has the price come all the way back?" half of the predicate.
                 hook.setHighWaterTick(hubPool, records[i].upperTick);
                 break;
             }
         }
-        assertTrue(straddled, "the price sits inside a cell");
+        assertGt(straddledLiquidity, 0, "the price sits inside a cell");
 
         syncMarket();
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
-        uint256 usdgBefore = heldBalance(address(usdg));
         uint256 poolUsdg = usdg.balanceOf(address(poolManager));
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(KEEPER);
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
 
+        assertEq(burned, _expectedBurnCut(ampsFees), "nothing was burned but the fee split");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "and the supply agrees");
+        assertGe(_liquidityAt(hubPool, straddledLower), straddledLiquidity, "the straddled cell is untouched");
+        assertEq(usdg.balanceOf(address(poolManager)), poolUsdg, "and no USDG left the PoolManager");
+        assertSweepClean("straddled cell");
+    }
+
+    /// @notice The case the burn is *for*: an ask the market bought end to end on the way up and sold back to the
+    ///         vault end to end on the way down. The cell is pure AMPS the vault paid its own counter asset for,
+    ///         so it is withdrawn whole and burned (I33).
+    function test_i33_anAskFullySoldAndFullyBoughtBackIsBurned() public {
+        int24 base = gridBaseOf(hubPool);
+        int24 width = cellWidth();
+        uint128 cell0 = _liquidityAt(hubPool, base);
+        uint128 cell1 = _liquidityAt(hubPool, base + width);
+        assertGt(cell0, 0, "the first ask cell is live");
+
+        // Up: the market takes the whole of cell 0 and stops inside cell 1. The hook's mark records the excursion,
+        // so cell 0's top is crossed and cell 1's is not.
+        buyAmps(hubPool, address(usdg), 150e6);
+        assertGt(tickOf(hubPool), base + width, "cell 0 was consumed end to end");
+        assertLt(tickOf(hubPool), base + 2 * width, "and cell 1 only partly");
+        assertGe(hook.highWaterTick(hubPool), base + width, "so the mark crossed cell 0's top");
+        assertLt(hook.highWaterTick(hubPool), base + 2 * width, "and not cell 1's");
+
+        // Down, past where it started: cell 0 is the vault's own inventory again, bought back with the counter
+        // asset the way up raised.
+        giveShares(BOB, 300e18);
+        sellAmps(hubPool, amps.balanceOf(BOB));
+        assertLt(tickOf(hubPool), base, "the price has come all the way back through cell 0");
+        assertGt(tickOf(hubPool), base - width, "but not through the bid below it");
+
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        uint256 supplyBefore = amps.totalSupply();
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+
         assertGt(burned, _expectedBurnCut(ampsFees), "more was burned than the fee split alone");
         assertEq(supplyBefore - amps.totalSupply(), burned, "and every wei of it left the supply");
-        assertEq(usdg.balanceOf(address(poolManager)), poolUsdg, "no USDG left the PoolManager");
-        usdgBefore;
-        assertSweepClean("straddled burnback");
+        // The cell was emptied by the burn; what stands in it now is only the fee remainder step 6 re-laddered,
+        // which is a fraction of the inventory that was there.
+        assertLt(_liquidityAt(hubPool, base), cell0, "the bought-back inventory is gone from the cell");
+
+        // Cell 1 was only ever *partly* crossed by the mark, so it is not inventory the market gave back and is
+        // left alone — the two halves of the predicate, in one assertion.
+        assertGe(_liquidityAt(hubPool, base + width), cell1, "the partly-crossed cell above is untouched");
+        assertSweepClean("round-trip burnback");
+    }
+
+    /// @notice **The ratchet this closes.** Step 7 lays bids strictly *below* the tick and step 8 only then resets
+    ///         the mark, so every bid `compound` places satisfies "the mark crossed my top" from the moment it is
+    ///         opened. Under the old predicate one tick of drift into the top bid cell was enough for the next
+    ///         permissionless `compound` — 61 seconds later, by anyone — to withdraw that cell whole, burn the
+    ///         AMPS it had just bought and re-lay the counter a full doubling lower: a one-way ratchet of the bid
+    ///         ladder, once a minute, for a bounty.
+    function test_i33_bidsLaidByCompoundSurviveASmallDowntick() public {
+        // A buy pays its fee in USDG, which step 7 lays into the bid ladder.
+        buyAmps(hubPool, address(usdg), 30e6);
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        (int24 lower, int24 upper,) = _topBid();
+        uint128 before = _liquidityAt(hubPool, lower);
+
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+        uint128 laid = _liquidityAt(hubPool, lower);
+        assertGt(laid, before, "compound laid the counter-side fees into the top bid cell");
+
+        // One small downtick, into that cell and nowhere near through it, under a mark that stands above it —
+        // which is where a reset plus a downtick always leaves a bid.
+        giveShares(BOB, 60e18);
+        sellAmps(hubPool, amps.balanceOf(BOB));
+        hook.setHighWaterTick(hubPool, upper);
+        syncMarket();
+        assertLt(tickOf(hubPool), upper, "the price is inside the top bid cell");
+        assertGt(tickOf(hubPool), lower, "and has not crossed it");
+
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+
+        assertGe(_liquidityAt(hubPool, lower), laid, "the bid the last compound laid is still there");
+        assertEq(burned, _expectedBurnCut(ampsFees), "and nothing was burned but the fee split");
+        assertSweepClean("bid under the mark");
+    }
+
+    /// @notice And the stale-mark half of the same fix: an ask placed by `rollout` into a pool whose mark is left
+    ///         over from an old excursion is not burned by the next `compound`, because **every** ask placement
+    ///         resets the mark. Without that, a spoke that had once run up would burn every ask rolled into it.
+    function test_i33_aRolloutPlacedAskUnderAStaleMarkIsNotBurned() public {
+        PoolId spoke = spokePools[0];
+        int24 stale = tickOf(spoke) + 20 * cellWidth();
+        hook.setHighWaterTick(spoke, stale);
+
+        assertGt(vault.rollout(constituentIds[0]), 0, "the rollout moved inventory into the spoke");
+        assertEq(hook.highWaterTick(spoke), tickOf(spoke), "the ask placement reset the stale mark");
+
+        PlacementRecord[] memory records = ladderOf(spoke);
+        for (uint256 i; i < records.length; ++i) {
+            if (!records[i].above || records[i].liquidity == 0) continue;
+            assertGt(records[i].upperTick, hook.highWaterTick(spoke), "no fresh ask sits under the mark");
+        }
+
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        syncMarket();
+        uint256 supplyBefore = amps.totalSupply();
+        vm.prank(KEEPER);
+        (, uint256 burned) = vault.compound(spoke);
+        assertEq(burned, 0, "and the compound burned nothing back");
+        assertEq(amps.totalSupply(), supplyBefore, "the supply is untouched");
     }
 
     /// @notice The ordering rule of §3.5: the burn runs *before* the re-ladder and the mark is reset *after*, so
@@ -258,10 +374,13 @@ contract VaultCompoundTest is PlacementFixture {
         hook.setHighWaterTick(hubPool, _highestAskUpper());
 
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        uint32 resetsBefore = hook.highWaterResetCount(hubPool);
         vm.prank(KEEPER);
         (uint256 fees1, uint256 burned1) = vault.compound(hubPool);
         assertGt(burned1, _expectedBurnCut(fees1), "the first compound bought back and burned");
-        assertEq(hook.highWaterResetCount(hubPool), 1, "and reset the mark exactly once");
+        // Twice, not once: the re-ladder of step 6 resets the mark for the asks it has just placed, and step 8
+        // resets it again for the call as a whole. Both are after the burn, which is the ordering that matters.
+        assertEq(hook.highWaterResetCount(hubPool) - resetsBefore, 2, "and reset the mark, after the burn");
 
         // The mark now sits at the live tick, so the AMPS just re-laddered above it is not "crossed".
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
@@ -270,13 +389,65 @@ contract VaultCompoundTest is PlacementFixture {
         assertEq(burned2, _expectedBurnCut(fees2), "the second compound burned only the fee split");
     }
 
-    /// @notice The surge is armed on every `compound`, so a compound cannot be sandwiched at the pre-compound fee.
-    function test_theSurgeIsArmedOnEveryCompound() public {
+    // -------------------------------------------------------------------------------------------------------------
+    // §3.6 step 8 — the side effects, and what a zero-work call may not do
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice A `compound` that moves something arms the surge, resets the mark and dates the pool, so it cannot
+    ///         be sandwiched at the pre-compound fee and the next call takes the cooldown.
+    function test_aCompoundThatDoesWorkArmsTheSurgeResetsTheMarkAndTakesTheCooldown() public {
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
         uint32 armed = hook.surgeArmedCount(hubPool);
+        uint32 reset = hook.highWaterResetCount(hubPool);
+
         vm.prank(KEEPER);
-        vault.compound(hubPool);
+        (uint256 ampsFees,) = vault.compound(hubPool);
+        assertGt(ampsFees, 0, "the call had work to do");
+
         assertGt(hook.surgeArmedCount(hubPool), armed, "armed");
         assertEq(hook.lastSurgeReason(hubPool), bytes32("compound"), "with the compound's reason");
+        assertGt(hook.highWaterResetCount(hubPool), reset, "the mark was reset");
+        assertEq(vault.lastPlacementAt(hubPool), uint32(block.timestamp), "and the pool was dated");
+    }
+
+    /// @notice **The finding this closes.** A `compound` on a pool with nothing to do changed no position, so it
+    ///         may not take any of step 8's side effects. Arming `SURGE_MAX_BPS` would let anyone tax the pool at
+    ///         the maximum surge once a minute for free; resetting the mark would erase the excursion the *next*
+    ///         compound needs to recognise its own bought-back inventory; and taking the 60-second cooldown would
+    ///         let the same free call deny a real `compound` — or a governance `place` — on that pool.
+    function test_aZeroWorkCompoundLeavesTheSurgeTheMarkAndTheCooldownAlone() public {
+        // A mark at the live tick crosses no ask, and every bid it does cross the price has not come back
+        // through, so there is nothing to burn and nothing has accrued.
+        int24 mark = tickOf(hubPool);
+        hook.setHighWaterTick(hubPool, mark);
+
+        uint32 armed = hook.surgeArmedCount(hubPool);
+        uint32 reset = hook.highWaterResetCount(hubPool);
+        uint32 dated = vault.lastPlacementAt(hubPool);
+
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+        assertEq(ampsFees, 0, "nothing traded, so no fee accrued");
+        assertEq(burned, 0, "and nothing was bought back");
+
+        assertEq(hook.surgeArmedCount(hubPool), armed, "no surge was armed");
+        assertEq(hook.highWaterResetCount(hubPool), reset, "the mark was not reset");
+        assertEq(hook.highWaterTick(hubPool), mark, "and still stands where the excursion left it");
+        assertEq(vault.lastPlacementAt(hubPool), dated, "and the pool was not dated");
+    }
+
+    /// @notice And the denial that follows from it: an empty `compound` no longer holds the pool's 60-second
+    ///         cooldown against the placement that has something to do.
+    function test_aZeroWorkCompoundCannotDenyTheNextPlacement() public {
+        hook.setHighWaterTick(hubPool, tickOf(hubPool));
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+
+        // Same block, same pool: a governance placement is not refused by a call that did nothing.
+        vm.prank(TIMELOCK);
+        assertGt(vault.place(hubPool, true, 10e18), 0, "the timelock still places");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -493,18 +664,135 @@ contract VaultCompoundTest is PlacementFixture {
         assertEq(usdg.balanceOf(KEEPER), before, "unpaid, but the work still happened");
     }
 
-    /// @notice `compound` takes the same 60-second cooldown as every other placement.
+    /// @notice A `compound` that does work takes the same 60-second cooldown as every other placement.
     function test_compoundTakesThePlacementCooldown() public {
+        _tradeForAmpsFees();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
         vm.prank(KEEPER);
-        vault.compound(hubPool);
+        (uint256 ampsFees,) = vault.compound(hubPool);
+        assertGt(ampsFees, 0, "the call had work to do, so it dated the pool");
+
         vm.prank(KEEPER);
         vm.expectPartialRevert(bytes4(keccak256("PlacementCooldown(bytes32,uint32)")));
         vault.compound(hubPool);
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // I32 — the re-laid ask ladder is anchored at `P_ref`, like every other ask
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The finding this closes.** `place`, `rollout` and `deployBonded` all anchor an ask ladder at
+    ///         `tickOf(P_ref / P_counter)` — I32's "a rolled-out ask is never placed below `P_ref`" — but
+    ///         `compound` anchored its re-ladder at the *live tick*. A pool trading below the reference therefore
+    ///         re-laid its own fees as asks under the protocol's own backing and undersold it, once a minute, on a
+    ///         permissionless call. `_cells` takes `max(fromAnchor, fromTick)`, so anchoring at the reference
+    ///         still keeps every ask strictly above the live tick when the pool is *above* the reference instead.
+    function test_i32_compoundAnchorsTheRelaidAskLadderAtTheReferenceNotTheTick() public {
+        _tradeForAmpsFees();
+
+        // A drawdown, so the reference and the live tick are not the same number and the assertion has content.
+        giveShares(BOB, 80e18);
+        sellAmps(hubPool, amps.balanceOf(BOB));
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        int24 refTick = PriceLib.fairTick(vault.pRefX18(), USDG_USD8, 6, TICK_SPACING);
+        assertLt(tickOf(hubPool), refTick, "the pool is trading below P_ref");
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        vault.compound(hubPool);
+
+        (int24 anchorTick, int24 lowestTick,) = _lastAskPlacement(hubPool);
+        assertEq(anchorTick, refTick, "the re-ladder is anchored at tickOf(P_ref / P_counter)");
+        assertGe(lowestTick, refTick, "so its first cell sits at or above the reference cell");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // §3.6 step 5 — the creator slice cannot be enlarged by cutting the sell fee
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The finding this closes.** `creatorCut = ampsFees x creatorBps / sellFeeBps` reads the collected
+    ///         fee as "`sellFeeBps` of what crossed the pool". `SELL_FEE_BPS_MIN` and `CREATOR_FEE_BPS` are both
+    ///         100, so an entirely in-band `setSellFeeBps(100)` made that ratio **one** and routed every wei of
+    ///         the AMPS-side fees to the creator — no staker stream, no burn, no re-ladder. Flooring the divisor
+    ///         at `SELL_FEE_BPS_DEFAULT` caps the slice at one fifth of the AMPS-side fees however low the live
+    ///         fee goes.
+    function test_theCreatorSliceIsCappedWhenTheSellFeeIsCutToItsFloor() public {
+        _tradeForAmpsFees();
+        hook.setHighWaterTick(hubPool, tickOf(hubPool));
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        // The whole attack: cut the base fee to its floor immediately before the permissionless call.
+        hook.setSellFeeBps(Constants.SELL_FEE_BPS_MIN);
+        assertEq(uint256(hook.sellFeeBps()), uint256(Constants.CREATOR_FEE_BPS), "the ratio the bug turned into 1");
+
+        uint256 creatorBefore = amps.balanceOf(CREATOR);
+        uint256 stakingBefore = amps.balanceOf(address(staking));
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
+        assertGt(ampsFees, 0, "there were fees to split");
+
+        uint256 creatorPaid = amps.balanceOf(CREATOR) - creatorBefore;
+        assertLe(creatorPaid, ampsFees / 5, "never more than CREATOR_FEE_BPS / SELL_FEE_BPS_DEFAULT of the fees");
+        assertGt(amps.balanceOf(address(staking)) - stakingBefore, 0, "the stakers were still paid");
+        assertGt(burned, 0, "the burn still happened");
+        assertGt(_lastCompoundRelaid(), 0, "and something was still re-laddered");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev The liquidity a pool's record for the cell starting at `lower` holds, or zero when there is none.
+    function _liquidityAt(PoolId poolId, int24 lower) private view returns (uint128 liquidity) {
+        PlacementRecord[] memory records = ladderOf(poolId);
+        for (uint256 i; i < records.length; ++i) {
+            if (records[i].lowerTick == lower) return records[i].liquidity;
+        }
+        return 0;
+    }
+
+    /// @dev The hub's highest live bid cell: the one the next tick down falls into.
+    function _topBid() private view returns (int24 lower, int24 upper, uint128 liquidity) {
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        for (uint256 i; i < records.length; ++i) {
+            if (records[i].above || records[i].liquidity == 0) continue;
+            if (liquidity != 0 && records[i].upperTick <= upper) continue;
+            (lower, upper, liquidity) = (records[i].lowerTick, records[i].upperTick, records[i].liquidity);
+        }
+    }
+
+    /// @dev The last ask-side `Placement` for `poolId` in the recorded logs. `vm.recordLogs()` must have been
+    ///      armed before the call.
+    function _lastAskPlacement(PoolId poolId) private returns (int24 anchorTick, int24 lowestTick, int24 highestTick) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Placement.selector) continue;
+            if (entry.topics[1] != PoolId.unwrap(poolId)) continue;
+            (bool above,,, int24 anchor,, int24 lower, int24 upper) =
+                abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
+            if (!above) continue;
+            return (anchor, lower, upper);
+        }
+        revert("no ask Placement");
+    }
+
+    /// @dev The `relaid` field of the last `Compound` in the recorded logs.
+    function _lastCompoundRelaid() private returns (uint256 relaid) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Compound.selector) continue;
+            (,,,, relaid) = abi.decode(entry.data, (uint256, uint256, uint256, uint256, uint256));
+            return relaid;
+        }
+        revert("no Compound");
+    }
 
     /// @dev The last `BountyPaid` in the recorded logs. `vm.recordLogs()` must have been armed before the call.
     function _lastBountyPaid()

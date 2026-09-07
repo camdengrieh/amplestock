@@ -36,6 +36,10 @@ contract Phase3Ghosts {
     AmpsQuoter internal immutable QUOTER;
     IPoolManager internal immutable POOL_MANAGER;
 
+    /// @dev The v4 swap router every handler action trades through, and therefore the `sender` the hook keys the
+    ///      rotation credit by. I26 is a claim about *that* account's credit, so the ghost has to name it.
+    address internal immutable ROUTER;
+
     /// @dev The account that deployed this contract and may name its writers, once each.
     address internal immutable DEPLOYER;
 
@@ -105,6 +109,7 @@ contract Phase3Ghosts {
     /// @param hook_ The real `AmpsHook`.
     /// @param quoter_ The periphery quoter.
     /// @param poolManager_ The v4 PoolManager.
+    /// @param router_ The v4 swap router the handlers trade through.
     /// @param pools_ Every pool the campaign drives, hub first.
     constructor(
         AmpsVault vault_,
@@ -112,6 +117,7 @@ contract Phase3Ghosts {
         AmpsHook hook_,
         AmpsQuoter quoter_,
         IPoolManager poolManager_,
+        address router_,
         PoolId[] memory pools_
     ) {
         VAULT = vault_;
@@ -119,6 +125,7 @@ contract Phase3Ghosts {
         HOOK = hook_;
         QUOTER = quoter_;
         POOL_MANAGER = poolManager_;
+        ROUTER = router_;
         DEPLOYER = msg.sender;
         for (uint256 i; i < pools_.length; ++i) {
             pools.push(pools_[i]);
@@ -144,7 +151,7 @@ contract Phase3Ghosts {
         actionCount[name] += 1;
         supplyAtOpen = AMPS.totalSupply();
         // I26: the rotation credit is transient, so it is zero at the start of every transaction, always.
-        if (HOOK.rotationCredit() != 0) creditEverLeaked = true;
+        if (HOOK.rotationCredit(ROUTER) != 0) creditEverLeaked = true;
         // I13: the hook holds nothing, ever.
         if (AMPS.balanceOf(address(HOOK)) != 0) hookEverHeldValue = true;
         if (POOL_MANAGER.balanceOf(address(HOOK), uint256(uint160(address(AMPS)))) != 0) hookEverHeldValue = true;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {GateState, PlacementRecord} from "../../src/types/Types.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
@@ -314,6 +315,103 @@ contract VaultRedeemTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // The floor against a hostile constituent (§7, I12, I14)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // "Structurally ungated" has to mean ungated by the *constituents* too, not only by the protocol's own
+    // switches. A Stock Token is an issuer-controlled contract that can be paused or can denylist an address at
+    // will, and the payout walks every registered asset inside one `unlock`, so before these fixes a single
+    // hostile token was a global kill switch for the floor:
+    //
+    //   * `sweepClean` read `balanceOf` unguarded, absorbed with `safeTransfer` and reverted `SweepDirty` on any
+    //     residue — so one wei of a paused token, donated by anybody, bricked **every** entry point; and
+    //   * `_payOut` took every asset out as an ERC-20, so one paused constituent refused 100% of every redemption.
+    //
+    // The three cases below are the three shapes an issuer's refusal takes. In all of them the redemption must
+    // complete and the other assets must be paid in full.
+
+    /// @notice A **paused** constituent: the `take` reverts, so the redeemer is handed the ERC-6909 claim instead
+    ///         and can `take` it whenever the issuer relents. Every other asset is paid as ERC-20, as always.
+    function test_aPausedConstituentDoesNotStopTheFloor() public {
+        bondDeposit(address(stocks[0]), 20e18);
+        assertGt(claimOf(address(stocks[0])), 0, "the vault holds the hostile token as a claim");
+
+        stocks[0].pause();
+
+        vm.prank(ALICE);
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(500e18, ALICE);
+
+        uint256 pausedIndex = _indexOf(tokens, address(stocks[0]));
+        assertGt(amounts[pausedIndex], 0, "the paused token was still part of the payout");
+        assertEq(
+            poolManager.balanceOf(ALICE, uint256(uint160(address(stocks[0])))),
+            amounts[pausedIndex],
+            "and the redeemer holds a claim on exactly that amount"
+        );
+
+        _assertTheHealthyAssetsWerePaid(tokens, amounts, address(stocks[0]));
+    }
+
+    /// @notice A constituent that **denylists the vault**: the vault can no longer move it at all, so `sweepClean`
+    ///         cannot fold a donated wei into claims. It reports the residue and carries on; nothing reverts.
+    function test_aConstituentThatDenylistsTheVaultDoesNotStopTheFloor() public {
+        bondDeposit(address(stocks[0]), 20e18);
+
+        // A one-wei donation, which is all the old `SweepDirty` needed, and then the denylisting that pins it.
+        stocks[0].mint(address(vault), 1);
+        address[] memory blocked = new address[](1);
+        blocked[0] = address(vault);
+        stocks[0].blockAccounts(blocked);
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit IAmpsVault.SweepResidue(address(stocks[0]), 1);
+
+        vm.prank(ALICE);
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(500e18, ALICE);
+
+        assertEq(stocks[0].balanceOf(address(vault)), 1, "the frozen wei is still backing, on the vault");
+        _assertTheHealthyAssetsWerePaid(tokens, amounts, address(stocks[0]));
+    }
+
+    /// @notice A constituent whose **`balanceOf` reverts**: unreadable is not fatal. It contributes nothing to the
+    ///         idle side of the pro-rata base and is skipped by the sweep, and the floor pays everything else.
+    function test_aConstituentWhoseBalanceOfRevertsDoesNotStopTheFloor() public {
+        bondDeposit(address(stocks[0]), 20e18);
+        stocks[0].setBalanceOfReverts(true);
+
+        // The preview shares the arithmetic, so it must survive the same token.
+        (address[] memory previewTokens, uint256[] memory preview,) = vault.previewRedeem(500e18);
+
+        vm.prank(ALICE);
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(500e18, ALICE);
+
+        for (uint256 i; i < tokens.length; ++i) {
+            assertEq(tokens[i], previewTokens[i], "the same asset list");
+            assertEq(amounts[i], preview[i], "preview == payout, to the wei, with a view that reverts");
+        }
+        _assertTheHealthyAssetsWerePaid(tokens, amounts, address(stocks[0]));
+
+        // And the claim side of the hostile token was still paid: `take` never asks a token for a balance.
+        stocks[0].setBalanceOfReverts(false);
+        assertGt(stocks[0].balanceOf(ALICE), 0, "the redeemer was paid the unreadable token too");
+    }
+
+    /// @notice The griefing case in its purest form: a donated wei of a token nobody can move must not stop the
+    ///         *other* entry points either. `checkpoint()` is the permissionless one, so it is the canary.
+    function test_aDonatedWeiOfAFrozenTokenDoesNotBrickTheOtherEntryPoints() public {
+        stocks[0].mint(address(vault), 1);
+        address[] memory blocked = new address[](1);
+        blocked[0] = address(vault);
+        stocks[0].blockAccounts(blocked);
+
+        vault.checkpoint();
+        vault.touch();
+
+        vm.prank(ALICE);
+        vault.redeemProRata(1e18, ALICE);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Gas — the worst reachable redemption (§10 ruling 7)
     // -------------------------------------------------------------------------------------------------------------
 
@@ -410,5 +508,28 @@ contract VaultRedeemTest is PlacementFixture {
     function _assertNotAPointerSlot(bytes32 slot) private view {
         uint256 value = uint256(slot);
         assertFalse(value == 4 || (value >= 8 && value <= 14), "the redemption read a pointer slot");
+    }
+
+    /// @dev The index of `token` in `tokens`.
+    function _indexOf(address[] memory tokens, address token) private pure returns (uint256) {
+        for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == token) return i;
+        }
+        revert("token not in the payout");
+    }
+
+    /// @dev Every asset but `hostile` reached the redeemer as a real ERC-20, in the reported amount, and at least
+    ///      one of them was non-zero — the point being that one refusing constituent costs only itself.
+    function _assertTheHealthyAssetsWerePaid(address[] memory tokens, uint256[] memory amounts, address hostile)
+        private
+        view
+    {
+        uint256 paid;
+        for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == hostile) continue;
+            assertEq(IERC20(tokens[i]).balanceOf(ALICE), amounts[i], "a healthy asset was paid in full");
+            paid += amounts[i];
+        }
+        assertGt(paid, 0, "and the floor really did pay");
     }
 }

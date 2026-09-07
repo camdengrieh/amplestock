@@ -13,6 +13,7 @@ import {
     AlreadyInitialized,
     LengthMismatch,
     NotTimelock,
+    NotVault,
     OutOfBand,
     UnknownConstituent,
     UnknownPool,
@@ -40,11 +41,14 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 ///         weighs, and what fee bucket its pool sits in. Immutable bytecode, 7-day-timelock-governed state
 ///         (Decision 19, plan §"Pool set, index and allowlist", state model §1.4/§2/§3).
 ///
-/// @dev **Wiring.** `vault` and `hook` are written once, in the constructor, into the slots the state model
-///      reserves for them (§1.4 slot 0 and slot 1); there is no setter for either, so the pair is set-once in the
-///      strongest sense. `timelock`, `amps`, `weth9` and `usdg` are immutables, which is why they do not appear in
-///      the documented storage layout: they live in code. They are passed explicitly rather than read back from
-///      the vault so that the registry's constructor makes no assumption about how far the vault's own
+/// @dev **Wiring.** `vault` and `hook` are written in the constructor, into the slots the state model reserves for
+///      them (§1.4 slot 0 and slot 1). `hook` has no setter at all. `vault` has exactly one, {setVault}, and its
+///      only caller is the vault itself: it exists so that `AmpsVault.emergencyMigrate` can hand the registry on
+///      to the standby in the same transaction as AMPS, `AmpsBonds`, `AmpsStaking`, `BountyPot` and the hook. No
+///      governance path — not even the 7-day timelock — reaches it, so from every direction but an evacuation the
+///      pair is still set-once. `timelock`, `amps`, `weth9` and `usdg` are immutables, which is why they do not
+///      appear in the documented storage layout: they live in code. They are passed explicitly rather than read
+///      back from the vault so that the registry's constructor makes no assumption about how far the vault's own
 ///      initialisation has progressed — the AMPS address is CREATE2-mined and the hook address is flag-mined, so
 ///      both are known before either contract is deployed.
 ///
@@ -133,7 +137,8 @@ contract PoolRegistry is IPoolRegistry {
     // Storage — the layout of state model §1.4, slot for slot
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev slot 0 [0..159]. Set-once in the constructor.
+    /// @dev slot 0 [0..159]. Written in the constructor; movable afterwards only by {setVault}, whose sole caller
+    ///      is the address stored here.
     address private _vault;
 
     /// @dev slot 0 [160..175]. Ids ever issued; ids are never reused.
@@ -340,8 +345,7 @@ contract PoolRegistry is IPoolRegistry {
 
         // The unfilled asks return to the entry pools and the bids stay as an exit market: both are the vault's
         // work in Phase 3. What the registry owns here is the flag, the weight and the bond market.
-        uint16 marketId = config.marketId;
-        if (marketId != 0) IAmpsBonds(_bonds()).setMarketOpen(marketId, false);
+        _setMarketOpen(constituentId, config, false);
     }
 
     /// @inheritdoc IPoolRegistry
@@ -362,8 +366,7 @@ contract PoolRegistry is IPoolRegistry {
 
         emit ConstituentReinstated(constituentId, rolloutWeightBps);
 
-        uint16 marketId = config.marketId;
-        if (marketId != 0) IAmpsBonds(_bonds()).setMarketOpen(marketId, true);
+        _setMarketOpen(constituentId, config, true);
     }
 
     /// @inheritdoc IPoolRegistry
@@ -574,6 +577,15 @@ contract PoolRegistry is IPoolRegistry {
     /// @inheritdoc IPoolRegistry
     function isRegistered(PoolId poolId) external view returns (bool registered) {
         registered = _pools[poolId].registered;
+    }
+
+    /// @inheritdoc IPoolRegistry
+    function setVault(address newVault) external {
+        address previous = _vault;
+        if (msg.sender != previous) revert NotVault(msg.sender);
+        if (newVault == address(0)) revert ZeroAddress();
+        _vault = newVault;
+        emit VaultChanged(previous, newVault);
     }
 
     /// @inheritdoc IPoolRegistry
@@ -814,6 +826,30 @@ contract PoolRegistry is IPoolRegistry {
     function _referencePriceUsd18() private view returns (uint256 pRefUsd18) {
         pRefUsd18 = IAmpsVault(_vault).pRefX18();
         if (pRefUsd18 == 0) pRefUsd18 = Constants.WAD;
+    }
+
+    /// @dev Opens or closes a constituent's bond market, **only while `AmpsBonds` still attributes that market to
+    ///      this constituent's token**.
+    ///
+    ///      `AmpsBonds.removeCollateral` detaches a market from its collateral and `setMarketOpen` refuses a
+    ///      detached market forever, so an unconditional call here would make {reinstateConstituent} revert for
+    ///      the rest of the registry's life once governance had removed the collateral — the constituent could be
+    ///      retired but never brought back. The registry's own record (`config.marketId`) is what it wrote when
+    ///      the constituent was added and is never cleared, so it is not evidence that the market is still
+    ///      attached; `AmpsBonds.marketIdOf(token)` is. When the two disagree the flag is not the registry's to
+    ///      set, and it says so in a log instead of reverting.
+    /// @param constituentId The constituent, for the log.
+    /// @param config Its record.
+    /// @param open Whether the market should accept new bonds.
+    function _setMarketOpen(uint16 constituentId, ConstituentConfig storage config, bool open) private {
+        uint16 marketId = config.marketId;
+        if (marketId == 0) return;
+        address bonds = _bonds();
+        if (IAmpsBonds(bonds).marketIdOf(config.token) != marketId) {
+            emit BondMarketDetached(constituentId, marketId);
+            return;
+        }
+        IAmpsBonds(bonds).setMarketOpen(marketId, open);
     }
 
     /// @dev `AmpsBonds`, read from the vault rather than stored: the vault is the system of record for every

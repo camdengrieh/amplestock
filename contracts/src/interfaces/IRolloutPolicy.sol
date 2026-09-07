@@ -34,7 +34,10 @@ interface IRolloutPolicy {
     /// @param rolloutWeightBps The destination constituent's share of the daily budget. Zero when retired or frozen.
     /// @param spokeHasDepth True when the spoke already has counter-asset depth from bonds or buys. A spoke with no
     ///        stock at all can still receive asks — that is how it gets a market — but a spoke with depth is
-    ///        preferred by the schedule.
+    ///        preferred by the schedule. The vault derives it from its own placement records: true iff the
+    ///        destination pool holds at least one **live bid** cell (`liquidity != 0 && !above`), which is what a
+    ///        rolled-out ask will actually trade against. Bonded stock still sitting as an ERC-6909 claim is not
+    ///        depth until `deployBonded` has laddered it.
     struct RolloutRequest {
         uint256 polTrancheAmps;
         uint256 entryInventoryAmps;

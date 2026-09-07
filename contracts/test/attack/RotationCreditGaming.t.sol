@@ -70,7 +70,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
     function test_noCreditSurvivesToTheNextTransaction() public {
         uint256 bought = buyAmps(hubPool, ALICE, 2e6);
         assertGt(bought, 0, "the buy happened");
-        assertEq(hook.rotationCredit(), 0, "and left nothing behind");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and left nothing behind");
 
         (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, bought);
         assertEq(baseBps, hook.sellFeeBps(), "so the next transaction's exit pays the sell fee in full");
@@ -87,7 +87,10 @@ contract RotationCreditGamingTest is Phase3Fixture {
     function dustBuyEntry() external returns (uint256 credit, uint16 baseBps, uint256 exitOut) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1);
-        credit = hook.rotationCredit();
+        credit = hook.rotationCredit(address(swapRouter));
+        // Asked as the router, because the credit belongs to the router: this is the most favourable quote the
+        // attacker can obtain, and it is still the full sell fee.
+        vm.prank(address(swapRouter));
         (, baseBps,,) = hook.quoteFee(hubPool, true, true, 10e18);
         exitOut = sellAmps(hubPool, ALICE, 10e18);
     }
@@ -100,6 +103,8 @@ contract RotationCreditGamingTest is Phase3Fixture {
         require(msg.sender == address(this), "self-call only");
         uint256 spent = 1e6;
         buyAmps(hubPool, ALICE, spent);
+        // As the router, so the quote carries the credit the manufacturing buy just created.
+        vm.prank(address(swapRouter));
         (, blendedBase,,) = hook.quoteFee(hubPool, true, true, ampsOut);
         uint256 received = sellAmps(hubPool, ALICE, ampsOut);
         net = int256(received) - int256(spent);
@@ -110,7 +115,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
     /// @return received USDG realised.
     function honestExitEntry(uint256 ampsOut) external returns (uint256 received) {
         require(msg.sender == address(this), "self-call only");
-        assertEq(hook.rotationCredit(), 0, "the control starts with no credit");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "the control starts with no credit");
         received = sellAmps(hubPool, ALICE, ampsOut);
     }
 
@@ -121,9 +126,9 @@ contract RotationCreditGamingTest is Phase3Fixture {
     function exactOutputEntry() external returns (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 2e6);
-        creditBefore = hook.rotationCredit();
+        creditBefore = hook.rotationCredit(address(swapRouter));
         (, baseBps,,) = hook.quoteFee(hubPool, true, false, 0);
         sellAmpsExactOut(hubPool, ALICE, 0.5e6);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 }

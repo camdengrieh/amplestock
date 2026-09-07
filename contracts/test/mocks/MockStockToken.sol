@@ -38,6 +38,13 @@ contract MockStockToken is ERC20, Ownable, Pausable {
     /// @notice Denylist membership, mirroring the beacon-level `isBlocked(address)` view.
     mapping(address account => bool blocked) public isBlocked;
 
+    /// @notice TEST ONLY. While true, {balanceOf} reverts for everybody.
+    /// @dev The third shape a hostile constituent takes, alongside the pause and the denylist: a token whose view
+    ///      is unavailable rather than unfavourable. It is what an issuer-side beacon looks like from the outside
+    ///      once it has been switched off, and it is the case a `balanceOf` on a redemption path must survive —
+    ///      `sweepClean` and the pro-rata payout probe balances precisely because of it.
+    bool public balanceOfReverts;
+
     /// @notice Reentrancy phase: 0 none, 1 before balances move, 2 after balances move.
     uint8 public reentrancyMode;
 
@@ -57,6 +64,9 @@ contract MockStockToken is ERC20, Ownable, Pausable {
     event AccountsUnblocked(address[] accounts);
 
     error AccountBlocked(address account);
+
+    /// @notice Thrown by {balanceOf} while {balanceOfReverts} is armed.
+    error BalanceUnavailable();
 
     constructor(string memory name_, string memory symbol_) ERC20(name_, symbol_) Ownable(msg.sender) {}
 
@@ -121,6 +131,19 @@ contract MockStockToken is ERC20, Ownable, Pausable {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @notice TEST ONLY. Arms or disarms the reverting {balanceOf}.
+    /// @param value Whether `balanceOf` should revert.
+    function setBalanceOfReverts(bool value) external {
+        balanceOfReverts = value;
+    }
+
+    /// @inheritdoc ERC20
+    /// @dev Reverts wholesale while {balanceOfReverts} is armed; otherwise the plain ERC-20 answer.
+    function balanceOf(address account) public view override returns (uint256) {
+        if (balanceOfReverts) revert BalanceUnavailable();
+        return super.balanceOf(account);
     }
 
     /// @notice Open mint: tests fund accounts freely.

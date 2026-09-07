@@ -16,7 +16,7 @@ import {
     UnknownConstituent,
     UnknownPool
 } from "../types/Errors.sol";
-import {ConstituentConfig, PlacementRecord, PoolConfig} from "../types/Types.sol";
+import {ConstituentConfig, ConstituentStatus, PlacementRecord, PoolConfig} from "../types/Types.sol";
 import {VaultPlacementLib} from "./VaultPlacementLib.sol";
 import {VaultRedeemLib} from "./VaultRedeemLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -106,6 +106,7 @@ library VaultRolloutLib {
         ConstituentConfig memory constituent = IPoolRegistry(registry).constituent(constituentId);
         if (constituent.token == address(0)) revert UnknownConstituent(constituentId);
 
+        PoolId destination = IPoolRegistry(registry).poolIdOf(constituentId);
         PoolId[2] memory entries = [IPoolRegistry(registry).hubPoolId(), IPoolRegistry(registry).wethPoolId()];
         uint256 entryInventory =
             _askInventory(ladder, poolManager, entries[0]) + _askInventory(ladder, poolManager, entries[1]);
@@ -114,7 +115,15 @@ library VaultRolloutLib {
         uint16 entryFloorBps = uint16(_word(SLOT_PARAMS) >> 232);
         uint256 budget = _rollWindow(rolloutBpsPerDay);
         uint256 amount = _propose(
-            policy, registry, constituent, constituentId, entryInventory, budget, rolloutBpsPerDay, entryFloorBps
+            policy,
+            registry,
+            constituent,
+            constituentId,
+            entryInventory,
+            budget,
+            rolloutBpsPerDay,
+            entryFloorBps,
+            _hasBidDepth(ladder[destination])
         );
         if (amount == 0) return 0;
 
@@ -133,21 +142,40 @@ library VaultRolloutLib {
 
         // The bountied paths merge into cells that already exist and leave the remainder idle rather than
         // revert when the live-cell budget is full (§12 ruling E), which is what `strictBudget == false` says.
-        PoolId destination = IPoolRegistry(registry).poolIdOf(constituentId);
         uint256 placed =
             VaultPlacementLib.place(ladder, cooldown, poolManager, amps, destination, true, moved, "rollout", false);
 
-        _addRolloutMoved(moved);
+        // **The window and the bounty are charged on `placed`, not on `moved`** — the two differ exactly when
+        // `strictBudget == false` let the destination take less than the entry pools gave up. Charging `moved`
+        // billed the daily budget for inventory that never reached a spoke and paid the keeper for placing it,
+        // which made a full live-cell budget into a way to burn the day's rollout allowance for a bounty.
+        //
+        // The unplaced remainder `moved - placed` stays where the harvest left it: idle AMPS in the vault, which
+        // `A` still values (I5) and which the next `compound` or `place` on any pool re-ladders. Leaving it idle
+        // rather than re-placing it into the entry pools' asks in the same call is deliberate — a second
+        // placement would take the entry pools' 60-second cooldown a second time in one transaction and could
+        // itself be partial, so the gap is *reported* instead: `Rollout` carries both numbers and their
+        // difference is the idle remainder.
+        if (placed != 0) _addRolloutMoved(placed);
         emit Rollout(constituentId, destination, moved, placed);
 
-        // The work value is the inventory this call actually moved, at the reference price (§12.4). A schedule
+        // The work value is the inventory this call actually placed, at the reference price (§12.4). A schedule
         // that proposes nothing returns above, having paid nothing.
-        VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(moved), gasStart);
+        VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(placed), gasStart);
     }
 
     /// @notice `deployBonded(constituentId)`: places idle bonded collateral as the spoke's bid ladder, four
     ///         halvings below the current price and weighted toward the tick. A no-op below the deploy threshold,
     ///         so it cannot be used to drain the bounty pot a wei at a time (§10 ruling 15).
+    ///
+    /// @dev **Only an `ACTIVE` constituent is deployed into.** Any other status is a silent no-op, matching the
+    ///      "nothing is due" convention the rest of this file uses rather than reverting a permissionless call.
+    ///      Without the check, `retireConstituent` followed by `withdrawRetiredBids` — which is precisely the pair
+    ///      that empties a retired spoke's bids into claims — left that stock idle and deployable, so anyone could
+    ///      call `deployBonded` and re-place the whole book as bids in the retired pool, for a bounty, as often as
+    ///      the registry withdrew it. `IPoolRegistry.constituent` overlays `FROZEN` on a name whose guardian
+    ///      freeze is still running, so the same line refuses a frozen name for the length of its freeze (§3.8's
+    ///      "no bonds, no rollout, no placements") and lets it deploy again once the freeze lapses.
     /// @param ladder The vault's placement records.
     /// @param cooldown The vault's per-pool placement timestamps.
     /// @param poolManager The Uniswap v4 PoolManager.
@@ -168,6 +196,7 @@ library VaultRolloutLib {
 
         ConstituentConfig memory constituent = IPoolRegistry(registry).constituent(constituentId);
         if (constituent.token == address(0)) revert UnknownConstituent(constituentId);
+        if (constituent.status != ConstituentStatus.ACTIVE) return 0;
 
         uint256 idle = IPoolManager(poolManager).balanceOf(address(this), Currency.wrap(constituent.token).toId())
             + IERC20(constituent.token).balanceOf(address(this));
@@ -371,6 +400,7 @@ library VaultRolloutLib {
 
     /// @dev Asks the schedule how much is due. A policy that reverts proposes nothing, which is a no-op rather
     ///      than a revert: an unpaid keeper call then costs the caller gas and nothing else.
+    /// @param spokeHasDepth Whether the destination already has stock-side depth, from {_hasBidDepth}.
     function _propose(
         address policy,
         address registry,
@@ -379,7 +409,8 @@ library VaultRolloutLib {
         uint256 entryInventory,
         uint256 budget,
         uint16 rolloutBpsPerDay,
-        uint16 entryFloorBps
+        uint16 entryFloorBps,
+        bool spokeHasDepth
     ) private view returns (uint256 amount) {
         uint16 currentWeightBps;
         try IPoolRegistry(registry).currentWeightBps(constituentId) returns (uint16 weight) {
@@ -396,13 +427,32 @@ library VaultRolloutLib {
             targetWeightBps: constituent.targetWeightBps,
             currentWeightBps: currentWeightBps,
             rolloutWeightBps: constituent.rolloutWeightBps,
-            spokeHasDepth: false
+            spokeHasDepth: spokeHasDepth
         });
 
         try IRolloutPolicy(policy).propose(request) returns (IRolloutPolicy.RolloutDecision memory decision) {
             amount = decision.amountAmps;
         } catch {}
         if (amount > entryInventory) amount = entryInventory;
+    }
+
+    /// @dev Whether the destination spoke already has counter-asset depth, which is the last field of
+    ///      `IRolloutPolicy.RolloutRequest` and the one the schedule halves a spoke's share for when it is false.
+    ///      It was hard-coded `false`, so **every** spoke was permanently treated as depthless and the whole
+    ///      `DEPTHLESS_DISCOUNT_X18` branch of the launch schedule was unreachable: rollout ran at half rate into
+    ///      spokes that bonds and buys had already given a bid side, which is exactly the case §5 prefers.
+    ///
+    ///      Depth is read from the vault's own records rather than from a balance, because a bid *record* with
+    ///      liquidity is what a rolled-out ask will actually trade against: a live cell (`liquidity != 0`) placed
+    ///      on the counter side (`!above`). Bonded stock still sitting as an ERC-6909 claim is not depth until
+    ///      `deployBonded` has laddered it, and a bid the burnback has emptied stops counting the moment it does,
+    ///      because that path zeroes the liquidity.
+    function _hasBidDepth(PlacementRecord[] storage records) private view returns (bool hasDepth) {
+        uint256 n = records.length;
+        for (uint256 i; i < n; ++i) {
+            if (records[i].liquidity != 0 && !records[i].above) return true;
+        }
+        return false;
     }
 
     /// @dev The rolling 24-hour rollout window (slot 15), rolled forward here and charged in {_addRolloutMoved}.

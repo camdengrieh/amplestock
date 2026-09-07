@@ -116,6 +116,16 @@ interface IAmpsBonds {
     /// @param newPolicy The new policy.
     event PolicyChanged(address indexed previousPolicy, address indexed newPolicy);
 
+    /// @notice Emitted when a residual balance of a market's collateral is forwarded to the vault at the end of a
+    ///         bond, which is how the shell keeps `sweepClean` (I12) without asserting it.
+    /// @dev Collateral moves bonder -> PoolManager inside `depositBonded` and never rests in the bond shell, so
+    ///      any balance seen here arrived by donation. Forwarding it hands it to the vault's own sweep as a claim;
+    ///      the event is emitted only when the transfer actually reported success, so a token whose `transfer`
+    ///      reverts or answers `false` leaves its dust behind silently rather than closing the market.
+    /// @param collateral The token forwarded.
+    /// @param amount The amount forwarded, in the collateral's own decimals.
+    event CollateralForwarded(address indexed collateral, uint256 amount);
+
     /// @notice Emitted when the vault role is handed on during a migration.
     /// @param previousVault The old vault.
     /// @param newVault The new vault.

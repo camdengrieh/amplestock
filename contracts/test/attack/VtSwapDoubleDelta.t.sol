@@ -32,8 +32,10 @@ contract VtSwapDoubleDeltaTest is Phase3Fixture {
         stockFeeds[0].setRevert(true);
         usdgFeed.setRevert(true);
         wethFeed.setRevert(true);
-        vm.prank(TIMELOCK);
-        vault.setPolicyPointer(bytes32("oracleGate"), address(0xDEAD));
+        // The gate pointer is *forced* into §1.1 slot 9 rather than set: `setPolicyPointer` now refuses a
+        // codeless replacement, so "the gate has gone away entirely" is only reachable by writing the slot. The
+        // state being modelled is unchanged, and it is the one the assertions below are about.
+        vm.store(address(vault), bytes32(uint256(9)), bytes32(uint256(uint160(address(0xDEAD)))));
         warpBy(3 days);
         _assertZeroDeltas("every dependency broken");
     }

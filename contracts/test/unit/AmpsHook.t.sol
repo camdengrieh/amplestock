@@ -27,6 +27,9 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 contract AmpsHookTest is HookTestFixture {
     using PoolIdLibrary for PoolKey;
 
+    /// @dev The standby vault `AmpsVault.emergencyMigrate` hands the hook to.
+    address internal constant STANDBY_VAULT = address(0x57A11D8);
+
     function setUp() public {
         _deployFixture();
     }
@@ -478,7 +481,76 @@ contract AmpsHookTest is HookTestFixture {
         hook.resetHighWater(PoolId.wrap(keccak256("nothing")));
     }
 
-    function test_theImmutablePointers() public view {
+    // -----------------------------------------------------------------------------------------------------------
+    // Handing the hook to a standby vault (audit finding: `vault` was immutable)
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @notice {setVault} is the current vault's alone, and rejects the zero address.
+    function test_setVaultIsTheVaultsAloneAndRefusesZero() public {
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, STRANGER));
+        hook.setVault(STANDBY_VAULT);
+
+        vm.prank(TIMELOCK);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, TIMELOCK));
+        hook.setVault(STANDBY_VAULT);
+
+        // The fixture is the vault.
+        vm.expectRevert(ZeroAddress.selector);
+        hook.setVault(address(0));
+
+        assertEq(hook.vault(), address(this), "and nothing moved");
+    }
+
+    /// @notice `emergencyMigrate` has to be able to hand the hook over: every vault-only entry point — the two
+    ///         initialise callbacks, the liquidity guard, {resetHighWater} and {armSurge} — is a check against
+    ///         `vault`, so a standby vault the hook had never heard of could not run the protocol at all.
+    function test_setVaultMovesEveryVaultOnlyEntryPoint() public {
+        address previous = address(this);
+
+        vm.expectEmit(true, true, false, false, address(hook));
+        emit IAmpsHook.VaultChanged(previous, STANDBY_VAULT);
+        hook.setVault(STANDBY_VAULT);
+        assertEq(hook.vault(), STANDBY_VAULT, "the standby vault now holds the hook");
+
+        // The old vault is a stranger from here on.
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, previous));
+        hook.armSurge(usdgId, 100, "placement");
+
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, previous));
+        hook.resetHighWater(usdgId);
+
+        vm.prank(address(poolManager));
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, previous));
+        hook.beforeAddLiquidity(previous, usdgKey, _anyLiquidity(), "");
+
+        // And the standby vault holds all of them.
+        vm.prank(STANDBY_VAULT);
+        hook.armSurge(usdgId, Constants.SURGE_MAX_BPS, "placement");
+        assertEq(hook.poolState(usdgId).surgeBps, Constants.SURGE_MAX_BPS, "the standby vault can arm a surge");
+
+        vm.prank(STANDBY_VAULT);
+        hook.resetHighWater(usdgId);
+
+        vm.prank(address(poolManager));
+        bytes4 selector = hook.beforeAddLiquidity(STANDBY_VAULT, usdgKey, _anyLiquidity(), "");
+        assertEq(selector, IHooks.beforeAddLiquidity.selector, "and it can add liquidity");
+
+        // Handing it on again is the standby vault's call, not the old vault's.
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, previous));
+        hook.setVault(previous);
+
+        vm.prank(STANDBY_VAULT);
+        hook.setVault(previous);
+        assertEq(hook.vault(), previous, "and it hands back");
+    }
+
+    /// @dev Any well-formed liquidity range; `beforeAddLiquidity` only ever looks at the sender.
+    function _anyLiquidity() private pure returns (ModifyLiquidityParams memory) {
+        return ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1, salt: bytes32(0)});
+    }
+
+    function test_thePointers() public view {
         assertEq(hook.amps(), AMPS_ADDRESS, "amps");
         assertEq(hook.vault(), address(this), "vault");
         assertEq(hook.registry(), address(registry), "registry");

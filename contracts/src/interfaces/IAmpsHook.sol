@@ -29,6 +29,10 @@ import {IMarketReference} from "./IMarketReference.sol";
 ///      actually received, and consumed in `beforeSwap` by an exact-input sell, blended and rounded **up**. A 1-wei
 ///      buy therefore unlocks a 1-wei credit and nothing more; a buy-then-sell round trip inside one transaction
 ///      pays a buy fee plus a sell fee on the uncredited excess and nets the swapper nothing.
+///
+/// @dev **And it is keyed by the swap's `sender`**, not held in one transaction-global slot: see
+///      {rotationCredit}. A rotation is one router call, so both hops report the same `sender` and the credit
+///      still blends; two parties settled in one transaction never share one.
 interface IAmpsHook is IMarketReference {
     /// @notice Emitted by `afterSwap` when a pool's high-water tick advances.
     /// @param poolId The pool.
@@ -109,6 +113,11 @@ interface IAmpsHook is IMarketReference {
     /// @param newPolicy The policy installed.
     event FeePolicyChanged(address indexed previousPolicy, address indexed newPolicy);
 
+    /// @notice Emitted when the hook is handed from one vault to another by {setVault}.
+    /// @param previousVault The vault that gave the hook up.
+    /// @param newVault The vault that now holds every vault-only entry point.
+    event VaultChanged(address indexed previousVault, address indexed newVault);
+
     /// @notice `currency0` of the pool being initialised is not AMPS. Hard requirement: it fixes the sign of every
     ///         fee direction and every one-sided placement in the protocol.
     error Currency0NotAmps();
@@ -148,6 +157,8 @@ interface IAmpsHook is IMarketReference {
     function amps() external view returns (address ampsAddress);
 
     /// @notice The vault: the only address allowed to initialise a pool, add liquidity or reset a high-water mark.
+    /// @dev Storage rather than an immutable, so `AmpsVault.emergencyMigrate` can hand the hook to the standby
+    ///      vault; see {setVault}.
     /// @return vaultAddress The vault address.
     function vault() external view returns (address vaultAddress);
 
@@ -188,11 +199,17 @@ interface IAmpsHook is IMarketReference {
     /// @return state The state, excluding the observation ring (read that through {IMarketReference}).
     function poolState(PoolId poolId) external view returns (HookPoolState memory state);
 
-    /// @notice The live same-transaction rotation credit, in AMPS wei.
+    /// @notice The live same-transaction rotation credit one account holds, in AMPS wei.
     /// @dev Reads EIP-1153 transient storage, so it is always zero when read from a fresh transaction — which is
     ///      exactly what makes it useless to an off-chain observer and safe to expose.
+    /// @dev **The credit is per `sender`, not per transaction.** It is credited to, and spendable only by, the
+    ///      account the PoolManager reports as the swap's `sender` — the router that unlocked it. One
+    ///      transaction-global credit would let AMPS bought by one party discount an unrelated party's sell in the
+    ///      same transaction, so a filler settling someone else's buy alongside its own exit would pay the buy fee
+    ///      instead of the sell fee.
+    /// @param sender The account whose credit to read; for a swap through a router, the router.
     /// @return credit The credit.
-    function rotationCredit() external view returns (uint256 credit);
+    function rotationCredit(address sender) external view returns (uint256 credit);
 
     /// @notice The fee the hook would charge for a swap right now, without simulating one.
     /// @dev The quoter's entry point. Never reverts: a swap that would be refused returns `refuse == true`.
@@ -298,4 +315,12 @@ interface IAmpsHook is IMarketReference {
     /// @notice Replaces the fee policy pointer. **Only timelock (7 d).**
     /// @param newPolicy The new `IFeePolicy`.
     function setFeePolicy(address newPolicy) external;
+
+    /// @notice Hands the hook to a new vault. **Only the current vault.**
+    /// @dev The migration leg of {vault}. `AmpsVault.emergencyMigrate` calls this best-effort while moving the
+    ///      protocol to its standby vault; without it the standby could never `initializePool`, add liquidity or
+    ///      {armSurge}, because every one of those checks is against {vault}. Reverts on the zero address, and
+    ///      emits {VaultChanged}.
+    /// @param newVault The vault that takes over every vault-only entry point.
+    function setVault(address newVault) external;
 }

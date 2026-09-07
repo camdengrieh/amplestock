@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmps} from "../interfaces/IAmps.sol";
+import {IAmpsBonds} from "../interfaces/IAmpsBonds.sol";
+import {IAmpsStaking} from "../interfaces/IAmpsStaking.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
+import {IBountyPot} from "../interfaces/IBountyPot.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../interfaces/IMarketReference.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
@@ -14,7 +18,6 @@ import {AlreadyInitialized} from "../types/Errors.sol";
 import {ConstituentConfig, GateSnapshot, GateState, PoolConfig} from "../types/Types.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -41,7 +44,6 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      also rounds down.
 library VaultNavLib {
     using CurrencyLibrary for Currency;
-    using SafeERC20 for IERC20;
 
     /// @notice Everything the read side needs from the vault, gathered into one argument so the ABI of these
     ///         functions does not change when a pointer is added.
@@ -161,7 +163,12 @@ library VaultNavLib {
     /// @param pMktX18 The market price just computed.
     /// @return overridden Whether `P_ref` must equal `navPerShareX18`.
     function referenceOverridden(Sources memory src, uint256 pMktX18) public view returns (bool overridden) {
-        if (src.oracleGate != address(0) && src.registry != address(0)) {
+        // `code.length`, not `!= address(0)`: a `try` catches a callee that *reverts*, but a **codeless** pointer
+        // answers the call with success and zero bytes and the ABI decode of that empty buffer then reverts in
+        // this frame, where the `catch` cannot reach it. `AmpsVault.setPolicyPointer` refuses a codeless pointer,
+        // so this is the second lock on the same door — and it is the door `checkpoint()` walks through, which is
+        // permissionless and must not be brickable by a pointer.
+        if (src.oracleGate.code.length != 0 && src.registry != address(0)) {
             try IOracleGate(src.oracleGate).snapshotByPool(IPoolRegistry(src.registry).hubPoolId()) returns (
                 GateSnapshot memory snap
             ) {
@@ -244,6 +251,13 @@ library VaultNavLib {
     ///      probe against the vault's habitual zero balance (I12) would fail for insufficient balance on *every*
     ///      healthy token and make the predicate vacuous.
     /// @dev Not `view`: the probe is a real call, made by the vault itself through this library's `DELEGATECALL`.
+    /// @dev **Nothing here is a typed `try` and nothing here is an `abi.decode`.** Solidity decodes a *successful*
+    ///      call's returndata in the caller's frame, so a Stock Token that answers `isBlocked` or `transfer` with a
+    ///      non-canonical bool — the word `2`, say — would raise a `Panic` in the vault's own frame that no
+    ///      `try`/`catch` could catch, and one such token would brick `emergencyMigrate`: the very contract this
+    ///      predicate exists to escape from would be the thing that made the escape impossible. Every answer is
+    ///      therefore read as a whole word out of the returndata and treated as `true` when non-zero, which is
+    ///      what {_firstWord} does and cannot fail.
     /// @param registry The pool registry, for the constituent set.
     /// @param vault The vault being evacuated.
     /// @return met Whether the guardian may migrate.
@@ -258,7 +272,7 @@ library VaultNavLib {
 
             (bool ok, bytes memory returndata) =
                 token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IStockToken.isBlocked, (vault)));
-            if (ok && returndata.length >= 32 && abi.decode(returndata, (bool))) return true;
+            if (ok && returndata.length >= 32 && _firstWord(returndata) != 0) return true;
 
             if (!_selfTransferProbe(token, vault)) {
                 unchecked {
@@ -271,12 +285,13 @@ library VaultNavLib {
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // Two write helpers that do not fit in the vault
+    // Three write helpers that do not fit in the vault
     // -------------------------------------------------------------------------------------------------------------
     //
-    // This library is the read side, and these two are not reads. They are here because `AmpsVault` is at the
-    // EIP-170 ceiling and because both are cold paths — a governance pointer move and an evacuation — where one
-    // extra `DELEGATECALL` costs nothing that matters. Neither can be reached from `redeemProRata`.
+    // This library is the read side, and these three are not reads. They are here because `AmpsVault` is at the
+    // EIP-170 ceiling and because all three are cold paths — a governance pointer move, an evacuation and the
+    // migration's role handover — where one extra `DELEGATECALL` costs nothing that matters. None of them can be
+    // reached from `redeemProRata`.
 
     /// @notice The pointer set, written by slot. Backs `AmpsVault.setPolicyPointer`.
     /// @dev The slot numbers are `docs/phase2-state-model.md` §1.1's, pinned field-for-field by
@@ -324,7 +339,12 @@ library VaultNavLib {
     /// @notice Moves every claim and every idle balance the vault holds to the standby. Backs the asset half of
     ///         `AmpsVault.emergencyMigrate`.
     /// @dev Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the
-    ///      evacuation. An idle ERC-20 balance is transferred as a best effort; by I12 there should not be one.
+    ///      evacuation. **The idle ERC-20 leg is best effort and cannot revert.** It is the one leg a hostile
+    ///      token can block, and the token that blocks it is precisely the token that triggered the migration: a
+    ///      `safeTransfer` here would mean an issuer could stop the evacuation by denylisting the vault and
+    ///      leaving one wei on it. Each leg is therefore a bounded low-level call whose failure is ignored — an
+    ///      unmovable idle balance stays behind on the old vault, which by I12 is dust and is in any case
+    ///      unreachable *wherever* it sits, since the token itself is what refuses to move it.
     /// @param assets The vault's registered non-AMPS assets.
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param ampsToken The AMPS token, evacuated alongside them.
@@ -336,14 +356,88 @@ library VaultNavLib {
             address token = assets[i];
             uint256 claim = pm.balanceOf(address(this), Currency.wrap(token).toId());
             if (claim != 0) pm.transfer(standby, Currency.wrap(token).toId(), claim);
-            uint256 idle = IERC20(token).balanceOf(address(this));
-            if (idle != 0) IERC20(token).safeTransfer(standby, idle);
+            _tryMoveIdle(token, standby);
         }
 
         uint256 ampsClaim = pm.balanceOf(address(this), Currency.wrap(ampsToken).toId());
         if (ampsClaim != 0) pm.transfer(standby, Currency.wrap(ampsToken).toId(), ampsClaim);
-        uint256 ampsIdle = IERC20(ampsToken).balanceOf(address(this));
-        if (ampsIdle != 0) IERC20(ampsToken).safeTransfer(standby, ampsIdle);
+        _tryMoveIdle(ampsToken, standby);
+    }
+
+    /// @notice The six `onlyVault` role handovers `AmpsVault.emergencyMigrate` performs, in one place.
+    ///
+    /// @dev **Why the whole set and not four of them.** Before this existed the migration moved AMPS, `AmpsBonds`,
+    ///      `AmpsStaking` and `BountyPot` and left `PoolRegistry._vault` and `AmpsHook.vault` pointing at the
+    ///      evacuated shell, so the standby could not open a pool and the hook still trusted a vault that no
+    ///      longer held the estate. The registry and the hook are the other two contracts that name a vault.
+    ///
+    /// @dev **Why it lives here.** `AmpsVault` is at the EIP-170 ceiling and six external calls do not fit; the
+    ///      migration is a cold path where one extra `DELEGATECALL` costs nothing. Nothing here is reachable from
+    ///      `redeemProRata`.
+    ///
+    /// @dev **Why the hook leg is best effort and the other five are not.** The five named contracts are deployed
+    ///      by this protocol and all five implement `setVault`; a failure there is a wiring bug the guardian must
+    ///      see. The hook address comes back from the registry and is flag-mined and immutable, so a deployment
+    ///      whose hook predates `setVault(address)` is representable — and a hook that cannot hand its pointer on
+    ///      must not be able to trap the estate in a denylisted vault. Its call is therefore gas-bounded and its
+    ///      failure ignored, exactly like the idle leg of {evacuate}. The registry read is bounded for the same
+    ///      reason.
+    ///
+    /// @param registry The pool registry, which both holds a vault pointer and names the hook.
+    /// @param amps The AMPS token.
+    /// @param bonds `AmpsBonds`, or zero when unwired.
+    /// @param staking `AmpsStaking`, or zero when unwired.
+    /// @param bountyPot `BountyPot`, or zero when unwired.
+    /// @param standby The pre-registered standby vault, the new holder of every role.
+    function handover(
+        address registry,
+        address amps,
+        address bonds,
+        address staking,
+        address bountyPot,
+        address standby
+    ) public {
+        IAmps(amps).setVault(standby);
+        if (bonds != address(0)) IAmpsBonds(bonds).setVault(standby);
+        if (staking != address(0)) IAmpsStaking(staking).setVault(standby);
+        if (bountyPot != address(0)) IBountyPot(bountyPot).setVault(standby);
+        if (registry == address(0)) return;
+
+        IPoolRegistry(registry).setVault(standby);
+
+        (bool ok, bytes memory returndata) =
+            registry.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IPoolRegistry.hook, ()));
+        if (!ok || returndata.length < 32) return;
+        address hookAddress = address(uint160(_firstWord(returndata)));
+        if (hookAddress == address(0)) return;
+        // The return value is deliberately discarded: see the note above. `setVault(address)` is spelled out
+        // rather than taken from `IAmpsHook` so that this library carries no dependency on the hook's ABI.
+        _tryCall(hookAddress, abi.encodeWithSignature("setVault(address)", standby));
+    }
+
+    /// @dev One best-effort idle-balance move. Reads the balance through a bounded `staticcall` so a token whose
+    ///      `balanceOf` reverts is skipped rather than fatal, and moves it with a low-level `transfer` whose
+    ///      failure — a pause, a denylist, an explicit `false` — is ignored.
+    /// @param token The asset.
+    /// @param to The standby vault.
+    /// @return moved Whether the transfer went through. Callers ignore it; it is a return value so that
+    ///         discarding it is explicit rather than an unused local.
+    function _tryMoveIdle(address token, address to) private returns (bool moved) {
+        (bool ok, bytes memory returndata) =
+            token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        if (!ok || returndata.length < 32) return false;
+        uint256 idle = _firstWord(returndata);
+        if (idle == 0) return false;
+
+        (moved,) = token.call(abi.encodeCall(IERC20.transfer, (to, idle)));
+    }
+
+    /// @dev One gas-bounded low-level call whose failure is the caller's business rather than a revert.
+    /// @param target The callee.
+    /// @param payload The ABI-encoded call.
+    /// @return ok Whether it succeeded.
+    function _tryCall(address target, bytes memory payload) private returns (bool ok) {
+        (ok,) = target.call{gas: Constants.STOCK_TOKEN_PROBE_GAS}(payload);
     }
 
     /// @notice The last accepted answer for `token`, 8 decimals, or zero when none exists.
@@ -353,7 +447,9 @@ library VaultNavLib {
     /// @param token The asset.
     /// @return answerUsd8 The answer, or zero.
     function answer(address feeds, address token) public view returns (uint256 answerUsd8) {
-        if (feeds == address(0)) return 0;
+        // A codeless pointer would answer with zero bytes and make the decode below revert here rather than in
+        // the `catch`; see {referenceOverridden} for the full note.
+        if (feeds.code.length == 0) return 0;
         try IFeedRegistry(feeds).latestAnswer(token) returns (uint256 value, uint32, bool) {
             return value;
         } catch {
@@ -418,6 +514,9 @@ library VaultNavLib {
         view
         returns (uint256 price, bool usable)
     {
+        // Same reason as {referenceOverridden}: a codeless market reference is "no observation", not a revert.
+        if (src.marketReference.code.length == 0) return (0, false);
+
         try IMarketReference(src.marketReference).observationCoverage(poolId) returns (uint32 covered) {
             if (covered < src.twapWindow) return (0, false);
         } catch {
@@ -469,17 +568,30 @@ library VaultNavLib {
 
     /// @dev One bounded self-transfer probe. False when the balance read or the transfer fails, or when the token
     ///      returns an explicit `false`.
+    /// @dev The `transfer` answer is read with {_firstWord} rather than `abi.decode(..., (bool))`: a token that
+    ///      returns a non-canonical bool would otherwise `Panic` in the vault's frame and brick the migration.
     function _selfTransferProbe(address token, address vault) private returns (bool ok) {
         (bool balanceOk, bytes memory balanceData) =
             token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (vault)));
         if (!balanceOk || balanceData.length < 32) return false;
-        uint256 amount = abi.decode(balanceData, (uint256)) >= 1 ? 1 : 0;
+        uint256 amount = _firstWord(balanceData) >= 1 ? 1 : 0;
 
         (bool transferOk, bytes memory transferData) =
             token.call{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.transfer, (vault, amount)));
         if (!transferOk) return false;
         if (transferData.length == 0) return true;
         if (transferData.length < 32) return false;
-        return abi.decode(transferData, (bool));
+        return _firstWord(transferData) != 0;
+    }
+
+    /// @dev The first whole word of a returndata buffer whose length the caller has already checked. This is the
+    ///      hand-decode that replaces every `abi.decode` on an *untrusted* answer in this file: a word is a word,
+    ///      so it cannot `Panic`, whereas `abi.decode(rd, (bool))` reverts on any word that is not 0 or 1.
+    /// @param data The buffer; must hold at least 32 bytes.
+    /// @return word The first word.
+    function _firstWord(bytes memory data) private pure returns (uint256 word) {
+        assembly ("memory-safe") {
+            word := mload(add(data, 0x20))
+        }
     }
 }

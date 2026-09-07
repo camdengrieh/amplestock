@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
@@ -14,11 +15,13 @@ import {
 } from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {VaultPlacementLib} from "../../src/vault/VaultPlacementLib.sol";
+import {VaultRedeemLib} from "../../src/vault/VaultRedeemLib.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @title VaultPlacementTest
 /// @notice `docs/phase3-state-model.md` §8.1's row for this file: the genesis ladders of §3.3 to the wei,
@@ -562,6 +565,91 @@ contract VaultPlacementTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // The `Placement` log
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The finding this closes.** `Placed.highestTick` was grown from its zero value
+    ///         (`if (lower + width > highestTick)`) while every tick an Amplestocks pool ever places at is
+    ///         **negative** — AMPS is `currency0` and one AMPS buys far less than one unit of any counter asset —
+    ///         so no cell ever compared greater and every `Placement` reported a top of tick 0: an indexer reading
+    ///         the log saw a ladder running from its real floor up to $18 quadrillion. Both bounds are seeded by
+    ///         the first cell instead.
+    function test_thePlacementLogCarriesTheLaddersRealTopAndBottom() public {
+        vm.recordLogs();
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+
+        (uint8 buckets, int24 lowerTick, int24 upperTick) = _lastPlacement(hubPool);
+        int24 width = cellWidth();
+
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        assertEq(uint256(buckets), records.length, "one bucket per record");
+        assertLt(lowerTick, 0, "every Amplestocks tick is negative, which is what broke the old comparison");
+        assertLt(upperTick, 0, "the top included");
+        assertEq(lowerTick, records[0].lowerTick, "the log's floor is the lowest cell's floor");
+        assertEq(upperTick, lowerTick + int24(uint24(buckets)) * width, "and its top is the highest cell's top");
+
+        // And it really is the maximum over the cells, not merely the last one written.
+        for (uint256 i; i < records.length; ++i) {
+            assertGe(upperTick, records[i].upperTick, "no cell reaches above the reported top");
+            assertLe(lowerTick, records[i].lowerTick, "and none below the reported floor");
+        }
+    }
+
+    /// @notice The same for a bid ladder, which runs *down* from the anchor: the floor is the last cell placed and
+    ///         the top the first, so a seeded `lowestTick` matters as much as a seeded `highestTick`.
+    function test_thePlacementLogCarriesBothBoundsForABidLadderToo() public {
+        vm.recordLogs();
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, false, SEED_USDG);
+
+        (uint8 buckets, int24 lowerTick, int24 upperTick) = _lastPlacement(hubPool);
+        assertEq(upperTick, lowerTick + int24(uint24(buckets)) * cellWidth(), "contiguous, floor to top");
+        assertLe(upperTick, PriceLib.alignTick(tickOf(hubPool), TICK_SPACING, false), "I9: the whole ladder is a bid");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The transient staging buffer
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The transient slot `VaultPlacementLib` stages placed cells in is the one `Constants` declares, and
+    ///         that constant really is the hash of the string it names.
+    /// @dev **The finding this closes.** The library carried a hand-written literal
+    ///      (`0x1f0c2fd9…a190`) whose comment claimed it was `keccak256("amplestocks.vault.PLACEMENT_STAGE")`. It
+    ///      was not that hash at all — it was an invented number — so the buffer sat outside the namespace every
+    ///      other vault slot is derived from and the next slot anyone derived from that string would have landed
+    ///      somewhere else entirely. This is the drift guard on the replacement, and it mirrors
+    ///      `test/unit/RotationCredit.t.sol`'s guard on the hook's `ROTATION_CREDIT_SLOT`.
+    function test_theStagingBufferSlotIsTheHashItClaimsToBe() public pure {
+        assertEq(
+            uint256(Constants.PLACEMENT_STAGE_SLOT),
+            0xc6581d9946980dd7ee72e915a5cc531936e37fb4d55c38fe9dc446b32f47d8d7,
+            "the value VaultPlacementLib.STAGE_SLOT resolves to"
+        );
+        assertEq(
+            Constants.PLACEMENT_STAGE_SLOT,
+            keccak256("amplestocks.vault.PLACEMENT_STAGE"),
+            "and the string it is derived from"
+        );
+    }
+
+    /// @notice And the buffer — four words a cell, `GRID_CELLS` cells — does not overlap any other transient or
+    ///         hashed slot the vault uses.
+    function test_theStagingBufferDoesNotCollideWithTheVaultsOtherSlots() public pure {
+        uint256 base = uint256(Constants.PLACEMENT_STAGE_SLOT);
+        uint256 span = 4 * uint256(Constants.GRID_CELLS);
+        uint256[4] memory others = [
+            VaultRedeemLib.REENTRANCY_LOCK,
+            VaultRedeemLib.UNLOCK_ACTION,
+            VaultRedeemLib.NAV_BEFORE,
+            VaultRedeemLib.LIVE_CELLS_SLOT
+        ];
+        for (uint256 i; i < others.length; ++i) {
+            assertTrue(others[i] < base || others[i] >= base + span, "outside the staging buffer");
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Gas
     // -------------------------------------------------------------------------------------------------------------
 
@@ -588,5 +676,23 @@ contract VaultPlacementTest is PlacementFixture {
         uint256 used = before - gasleft();
         emit log_named_uint("place: ten merged ask cells", used);
         assertLt(used, 3_000_000, "a merge is cheaper than a fresh ladder");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev The last `Placement` for `poolId` in the recorded logs. `vm.recordLogs()` must have been armed first.
+    function _lastPlacement(PoolId poolId) private returns (uint8 buckets, int24 lowerTick, int24 upperTick) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Placement.selector) continue;
+            if (entry.topics[1] != PoolId.unwrap(poolId)) continue;
+            (, uint8 cells,,,, int24 lower, int24 upper) =
+                abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
+            return (cells, lower, upper);
+        }
+        revert("no Placement");
     }
 }
