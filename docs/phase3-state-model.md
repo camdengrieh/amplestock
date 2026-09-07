@@ -186,7 +186,9 @@ highWaterTick(poolId)        -> _obs[poolId].highWaterTick
 twapWindow()                 -> TruncatedOracleLib.TWAP_WINDOW (1800), protocol-wide
 maxTickMovePerBlock(poolId)  -> _cfg[poolId].maxTickMovePerBlock
 
-resetHighWater(poolId)             onlyVault  returns the consumed mark, then _obs[poolId].resetHighWater()
+resetHighWater(poolId)             onlyVault  returns the mark it armed: _obs[poolId].resetHighWater(lastTick) stores
+                                              min(lastTruncatedTick, rawTick) — floored at the raw post-swap tick
+                                              (re-audit finding 10, see §3.5)
 armSurge(poolId, bps, reason)      onlyVault  require(bps <= SURGE_MAX_BPS); writes _arm; forces a gate refresh
 setSellFeeBps / setBuyFeeBps / setMaxTickMovePerBlock  onlyTimelock 48 h, `_band`-checked against Constants
 setFeePolicy                                          onlyTimelock 7 d
@@ -211,6 +213,16 @@ half-lives.
 **`beforeSwap` reads nothing outside the hook except the pure fee policy.** That is the whole strategy: the gate,
 the registry, the feeds and the hub TWAP are pulled in `afterSwap` at most once per pool per `_gateCacheSeconds`,
 and a refresh failure is a flag, never a revert.
+
+**Probe budgets (re-audit finding 9, 2026-09-07).** The gate snapshot runs under `GATE_PROBE_GAS` = 1,000,000
+(measured 239–252k in-fixture, 330–390k estimated against live Chainlink proxies once `feedStatusIn` and the
+previous-round probes are counted; a budget-exhausted refresh would pin every pool on the conservative substitute
+past `GATE_CACHE_MAX_AGE` with no way back). `IOracleGate.closedHours` is read under the same budget, not the 60k
+`POINTER_PROBE_GAS`: it is a DST-table scan plus a 16-day holiday walk (51,005 gas on the 2032 holiday weekend,
+77,390 in the worst case, `HookGateProbeBudget.t.sol`), not a pointer read. `IAmpsVault.oracleGate` and the Stock
+Token's `oraclePaused`/`effectiveAt` keep the 60k cap. When the snapshot fails, a non-entry pool's `fairTick` falls
+back to its own `twap30m` once the ring covers the window and otherwise keeps its last fair tick; a snapshot that
+answers still owns a spoke's fair tick.
 
 **Gas.** Baseline (`gas/baseline.json`, `StubAmpsHook`, cold): `beforeSwap` 12,735, `afterSwap` 33,776,
 `swapOneHopBuy` 132,058, `swapOneHopSell` 132,055, `swapTwoHopRotation` 175,208, `swapBuyThenSell` 164,908.
@@ -411,6 +423,17 @@ satisfy `upperTick <= highWater` off a stale excursion: `collect -> burn crossed
 -> resetHighWater -> armSurge`. A `compound` that collected nothing, burned nothing and placed nothing resets no
 mark, arms no surge and takes no cooldown (audit fix 5).
 
+**The mark is floored at the raw tick (re-audit finding 10).** `highWaterTick` is a *truncated* tick, which lags the
+pool by up to `maxTickMovePerBlock` per block after a fast move; a reset that wrote the lagging truncated tick under
+asks just laid at the raw tick would let the next `compound` burn never-sold inventory. `resetHighWater` therefore
+stores `min(lastTruncatedTick, rawTick)`: asks are laid strictly above the raw tick, so a fresh ask can never satisfy
+`upperTick <= highWater`, and the floor can only lower the mark, so the burn never gets more aggressive.
+
+**A reset that fails on an ask placement reverts (re-audit lead).** `_resetHighWater` is a bounded hand-decoded
+call; when it fails or answers silently under a placement that lays asks, the placement reverts
+`HighWaterResetFailed(poolId)` — one wasted keeper call is cheap, burning unsold POL is not. Bid-only placements keep
+the best-effort behaviour because a bid is never a burn candidate under the first half of the rule.
+
 ### 3.6 `compound(poolId)`, step by step
 
 Permissionless, paid from `BountyPot`.
@@ -439,9 +462,11 @@ Permissionless, paid from `BountyPot`.
    below `P_ref` (I32; audit fix 16) — via `ILadderPolicy.propose` with the anchor snapped to the grid; merge into
    existing records by `m`.
 7. **Re-add counter-side fees** as bids across cells strictly below `alignDown(slot0.tick)`, same shape.
-8. Only if the call did work (`burned != 0 || relaid != 0 || counterFees != 0`): `resetHighWater(poolId)` (also
-   performed inside every ask placement), `armSurge(poolId, SURGE_MAX_BPS, "compound")` and the cooldown write; a
-   zero-work compound leaves all three untouched (audit fix 5).
+8. Only on an AMPS-side event (`burned != 0 || relaid != 0`): `resetHighWater(poolId)` (also performed inside every
+   ask placement) and `armSurge(poolId, SURGE_MAX_BPS, "compound")`; the cooldown follows what was actually
+   placed. A zero-work compound leaves all three untouched (audit fix 5), and one wei of counter-side fee is not
+   work (re-audit finding 11; the bid re-ladder's own placement surge still arms on any counter amount, a design
+   property recorded as a lead).
 9. Divergence at exit; `_checkpoint()`; **R1**: `navAfter >= NAV_BEFORE * (BPS - 2) / BPS` else revert
    `NavBleedExceeded` (I11); `_lastPlacementAt[poolId] = now`; `BountyPot.pay(...)`; `_sweepClean()`; emit
    `Compound(poolId, ampsFees, creatorPaid, stakerPaid, burned, relaid)`.
@@ -454,14 +479,25 @@ Permissionless, paid from `BountyPot`.
   after the move `>= entryFloorBps * polTranche / BPS`; every destination cell's `lowerTick >= tickOf(P_ref /
   P_stock)`, so a rolled-out ask is never placed below `P_ref`. Only **unfilled** ask cells move (`above == true`
   and `lowerTick > slot0.tick` in the source), so no counter-asset is touched. Both pools pay the full gauntlet.
+  The 24 h window is charged on what the harvest removed (`moved`) and the bounty is paid on what was placed; when
+  the destination places less than moved (the live-cell budget is full), the remainder is re-placed into the entry
+  pools it came from (`reason = "rollback"`) and the source cooldown is written once, after that re-placement
+  (re-audit finding 6: charging `placed` let a saturated budget drain the entry pools one full daily allowance per
+  minute). `latestAnswer` and `currentWeightBps` on this path are read under `COMPOSITE_READ_GAS` (400k): a failed
+  read skips `_requireConverged` and drops the anchor to the live tick, so a tight cap would trade liveness for
+  safety.
 * **`deployBonded(constituentId)`** — permissionless, bountied. Places the idle ERC-6909 claim of that
   constituent's stock as `bondBidHalvings = 4` cells strictly below `alignDown(slot0.tick)`, weights running with
-  price (largest nearest the tick). No-op below `DEPLOY_THRESHOLD_USD18` (decision 15).
+  price (largest nearest the tick). No-op below `DEPLOY_THRESHOLD_USD18` (decision 15). Reads the constituent's
+  balance through a bounded hand-decoded probe (unreadable ⇒ zero), like `_placeLadder` (re-audit finding 2).
 * **`withdrawRetiredBids(constituentId)`** — registry-only, 7 d. Removes every bid record in a `RETIRED` spoke and
   `take`s the counter into ERC-6909 claims, where `A` still values it and `redeemProRata` still pays it. Ask cells
   were already returned to the entry pools by `retireConstituent`.
 * **`place(poolId, above, amount)`** — timelock, or the registry inside `addConstituent` for the `spokeSeedBps`
-  seed ask (decision 11). Genesis placement runs through it.
+  seed ask (decision 11). Genesis placement runs through it. Every `place` first collects the fees accrued in the
+  cells it will merge into and routes the AMPS side through the §3.6 split (`_collectAndSplit`), so a merge settles
+  principal only (re-audit lead), and it writes the pool cooldown only when something was placed (re-audit finding
+  12: a zero-work `rollout`/`deployBonded` could otherwise deny a real placement for 60 s).
 
 ### 3.8 The gauntlet — every guard on every placement
 
@@ -1062,4 +1098,14 @@ The twelve-agent `solidity-auditor` review of `89e451d` (`docs/audits/amplestock
 | AM | **Every gate read from the vault is a bounded hand-decoded staticcall** and `setPolicyPointer` refuses a codeless target (finding 18). |
 | AN | **The feed registry's jump rule is stateless when the latch is stale**: it measures a candidate against the aggregator's previous round, confirms by `confirmSeconds` since the candidate or by agreement with the round before, and while held reports `min(held, candidate)` with `unconfirmed = true`; the aged-pending escape requires agreement with the pending level; the gate treats `unconfirmed` as stale and floors the bond haircut at the `CLOSED` value; the bonds shell recomputes `ampsOut` from `q` and consumes the freshness flag (findings 9, 13, 14, 15). |
 | AO | **The hook's multiplier-step detector compares the saturated cache with a saturated reading** (finding 19); `Placed.highestTick` is seeded (finding 20); `STAGE_SLOT` is the hash its comment claims (`Constants.PLACEMENT_STAGE_SLOT`). |
-| AP | **Accepted, not changed** (leads): weekend `CLOSED ⇒ DEGRADED` suspends upkeep and vault governance setters (design: placements pause when equities are closed; the timelock keeps `OracleGate`'s own setters and can batch `unfreezeProtocol`); the layer-A restamp inside `checkpoint()` (design: a checkpoint is what clears a passed outage); `pokePool`/`refresh` liveness rests on the keeper (§3.5 of the keeper runbook); third-party growth of a bonder's position array (griefing of `claimAll` only, per-id `claim` unaffected); the reference-basis valuation of straddled cells (bounded by one cell, disclosed as `premium`). |
+| AP | **Accepted, not changed** (first-wave leads): weekend `CLOSED ⇒ DEGRADED` suspends upkeep and vault governance setters (design: placements pause when equities are closed; the timelock keeps `OracleGate`'s own setters and can batch `unfreezeProtocol`); the layer-A restamp inside `checkpoint()` (design: a checkpoint is what clears a passed outage); `pokePool`/`refresh` liveness rests on the keeper (§3.5 of the keeper runbook); third-party growth of a bonder's position array (griefing of `claimAll` only, per-id `claim` unaffected); the reference-basis valuation of straddled cells (bounded by one cell, disclosed as `premium`). |
+| AQ | **Second wave (re-audit 2026-09-07 13:30). No token call on the ungated path forwards unbounded gas**: `take`, `transfer`, `settle` and the evacuation's idle leg carry `STOCK_TOKEN_PROBE_GAS x 4` stipends; the sweep absorbs per token with `sync` + `transfer` outside any unlock and a `try`-wrapped per-token unlock for `settle` + `mint`; the payout tries the ERC-20 unlock under `gasleft() - REDEEM_PAYOUT_RESERVE_GAS` and falls back to a claims-only unlock; idle parts are paid after the unlock, best-effort (findings 1, 3, 5). |
+| AR | **The NAV numerator never reads a token with a typed call**: `totalAssetsUsd18`, `inventoryAmps`, `_placeLadder` and `deployBonded` use the bounded hand-decoded balance probe, unreadable ⇒ zero; `referenceOverridden`, `_poolPriceUsd18` and `answer` are bounded hand-decoded reads (finding 2; the `VaultNavLib` half of the typed-`try` lead). |
+| AS | **The checkpoint records `navUnconfirmed`** when any priced asset was `!fresh \|\| unconfirmed` (slot 21), `fresh` is false while an answer is held back, and the bond shell refuses to price against an unconfirmed NAV (`UnconfirmedNav`; `quote` reason `unconfirmedNav`) through a bounded probe that fails open (findings 7, 8). |
+| AT | **`_issue`'s dust forward is a bounded probe, a bounded transfer and a first-word decode**; codeless pointers read as absent throughout the bond shell's quote surface; the quote's overflow guard mirrors `mulDiv` (finding 4 and two leads). |
+| AU | **Rollout charges the window on `moved`, rolls the unplaced remainder back into the entry pools and writes the source cooldown once**; `place` takes no cooldown on zero work; `compound` arms the surge and resets the mark only on an AMPS-side event (findings 6, 11, 12). |
+| AV | **The high-water mark is floored at the raw tick** and a failed reset on an ask placement reverts `HighWaterResetFailed` (finding 10 and its lead). |
+| AW | **Hook probe budgets**: `GATE_PROBE_GAS` = 1,000,000 with the measurement documented; `closedHours` reads under it; a spoke's `fairTick` falls back to its TWAP when the snapshot fails (finding 9). |
+| AX | **The placement anchor stays aligned down** (the lead "anchor aligns down while the grid ceils" is accepted): the grid origin is the opening tick, so the reference sits inside cell 0 by construction; aligning the anchor up would leave no protocol ask between `P_ref` and `2 x P_ref`, and snapping the origin up instead makes a straddled bid whose AMPS half `A` writes off (an R1 revert on the seed). §3.7's I32 uses the aligned-down `fairTick`; the residue is bounded to under one tick spacing on the first cell (`test_i32_theStraddleOfTheFirstAskCellIsBoundedByOneTickSpacing`). `PriceLib.fairTick(…, roundUp)` exists for a future ruling. |
+| AY | **The registry answers the realised index weight when it can** (`VaultNavLib.spokeWeightBps`, measured against the last checkpointed `A` so the read costs ~200k gas at any pool count, through a 2M-gas bounded probe with the target weight as fallback); both the rollout schedule and the bond shell read it under `COMPOSITE_READ_GAS`, so the deficit term is live in both (`docs/phase2-state-model.md` §5). `setStandbyVault` refuses a codeless target; `_requireWiringOpen` is gone; `reinstateConstituent` clears `retiredAt`; `_setMarketOpen` adopts the live `marketIdOf` (retiring with no `bonds` pointer now reverts `ZeroAddress`). |
+| AZ | **Accepted, not changed** (second-wave leads): the credit shared within one settlement contract (rotation-equivalent flow; superseded by plan revision 6's router-only pass-through); a fully crossed bid burned as a buyback (it holds bought-back AMPS); the migration's single-transaction fit at a full constituent set (part of the user-owned cap decision); the bid re-ladder's placement surge on a dust counter fee; `rollout`'s harvest realising accrued AMPS fees without the split (needs a public collect entry point; moot once revision 6 burns the AMPS side); the absorb residual where a token accepts the transfer and then refuses `balanceOf` inside `settle` (its own dust stays uncredited); the `Migrated` event not naming a failed hook leg; `_writeRecords` overwriting `record.above` on a side flip; the bounty's two-hop over-count. |

@@ -303,6 +303,14 @@ won the race, or the gate changed. It costs gas and pays nothing. One is noise; 
 interval is too long for the pool's activity, or two of your own instances are racing each other. Point both at
 the same relayer, or stagger the scan intervals.
 
+Two reverts are not races (second remediation wave, 2026-09-07). `HighWaterResetFailed(poolId)` means an ask
+placement (`compound` with fee AMPS to re-lay, `rollout`, `deployBonded` never) could not reset the hook's
+high-water mark: the vault's market reference does not answer, or answers malformed. That is a wiring fault, not
+a timing one — page the operator; do not retry. And a `rollout` that lands less than it harvested is not a
+failure: the window is charged on what left the entry pools, the remainder is re-placed into them in the same call
+(`Placed` with `reason = "rollback"`), and the bounty is paid on what was placed, which the `chost` guard may round
+to zero when the destination's live-cell budget is full.
+
 ### The pot is empty
 
 Jobs degrade to unpaid, they do not stop (`BountyPot.pay` returns what it could transfer and emits `BountyPaid`

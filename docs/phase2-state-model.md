@@ -305,7 +305,12 @@ redeem  (structurally ungated)
     for each pool (Phase 3): remove floor(L_p * shares / T) from every PlacementRecord
     for each asset j != AMPS: pay floor(b_j * shares / T) * (BPS - redeemFeeBps) / BPS
     burn the AMPS released from the vault's own inventory   -> T falls by MORE than `shares`
-    emit Redeem, Burn("redeemInventory"); sweepClean (best effort: bounded balance probes, per-token absorb,
+    payout (VaultRedeemLib.payout): try the ERC-20 unlock under gasleft() - REDEEM_PAYOUT_RESERVE_GAS, per asset
+      take{gas: 4 x STOCK_TOKEN_PROBE_GAS} -> claim on refusal; on ANY failure (a hostile transfer opening a
+      foreign delta included) a second claims-only unlock pays every claim part; idle ERC-20 parts after the
+      unlock, best-effort and capped (an unmovable idle wei is not paid)
+    emit Redeem, Burn("redeemInventory"); sweepClean (per token: sync + capped transfer outside any unlock, then
+                                                          a try-wrapped per-token unlock for settle + mint;
                                                           `SweepResidue` instead of a revert)
     -- no _requireHealthy, no gate, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
        as an ERC-6909 claim the redeemer takes later, so one issuer can never block the floor (audit fixes 2, 3)
@@ -396,10 +401,12 @@ deficit   = clamp( (w_target - w_current) * 1e18 / w_target, 0, 1e18 )          
 fill      = clamp( issuedThisEpoch * 1e18 / capacity, 0, 1e18 )                             UP
 d         = clamp( dBase + kWeight*deficit/1e18 - kFill*fill/1e18, dMin, dMax )              DOWN
 qMarket   = m * BPS / (BPS - d)                                                             DOWN
-hEff      = fresh ? hSessionBps : max(hSessionBps, hSession[CLOSED])   -- stale or unconfirmed answer
+hEff      = fresh ? hSessionBps : max(hSessionBps, hSession[CLOSED])   -- `fresh` is false while an answer is
+                                                                        -- stale OR held back (unconfirmed)
 qFloorNum = collateralPriceUsd18 * (BPS - hEff) / BPS                                      DOWN
 qFloorDen = navPerShareX18 * (BPS + minAccretionBps) / BPS                                  UP
 qFloor    = qFloorNum * 1e18 / qFloorDen                                                    DOWN
+-- precondition: !vault.navUnconfirmed(), else revert UnconfirmedNav (quote: reason "unconfirmedNav")
 q         = min(qMarket, qFloor)
 ampsOut   = amountIn18 * q / 1e18                                                           DOWN (recomputed by the shell)
 ```
@@ -414,9 +421,20 @@ registry answers the target weight**, so the deficit is exactly zero on every ma
 vault's valuation of that spoke's position divided by the whole index, and Phase 2 ships `ZeroPositionValuer`, so
 there is no position to value and any other answer would be invented. Zero is also the protocol-favourable reading —
 a smaller deficit is a smaller discount and less AMPS issued for the same collateral — so an input that is unknowable
-in Phase 2 cannot dilute anyone. Phase 3 sources the numerator from the vault's valuation with no ABI change and no
-new bond bytecode. A registry that cannot answer must never be able to close a bond market, which is why the read is
-a bounded probe and not a plain call.
+in Phase 2 cannot dilute anyone. **The registry now answers the realised weight when it can** (second remediation wave): `PoolRegistry.currentWeightBps`
+reads `AmpsVault.spokeWeightBps(constituentId)` — the spoke's counter-side position valued at the reference price plus
+its idle and claim balances, over the **last checkpointed** `A` (`navPerShareX18 x (T + VIRTUAL_SHARES)`; a live walk
+would cost ~150k gas per valued pool and fail every probe budget at 32 pools while passing in a small fixture) —
+through a bounded 2M-gas probe and falls back to the target weight on any failure. The read costs one spoke's
+valuation plus a feed answer (~200k gas), so the rollout schedule's deficit boost is live (`VaultRolloutLib` reads it
+under `COMPOSITE_READ_GAS`, 400k). The bond shell probes the registry under the same `COMPOSITE_READ_GAS` budget
+(`AmpsBonds._tryCurrentWeightBps`): under the old 50k token-probe cap the read sat at the budget edge and `quote()`
+and `bond()` could see different deficits depending on warm storage, so the budget is the one that makes the read
+succeed whenever it is readable at all. **The `k_w` under-weight preference is therefore live**: a name held below its
+target weight gets a wider discount, exactly as the formula says, and a registry that cannot answer still prices
+`deficit == 0`. The ABI and the bond bytecode do not change when it lands. A registry
+that cannot answer must never be able to close a bond market, which is why the read is a bounded probe and not a
+plain call.
 
 `qFloor` is computed from the **last Chainlink answer**, never from the pool: that caps what TWAP manipulation can
 buy (the best a spoke-dumper can do is remove their own discount) and bounds weekend-gap exposure to `hSessionBps`
@@ -430,6 +448,14 @@ dApp must always pass the quoted amount as `minAmpsOut`; the protocol side of an
 accretion, never a loss. The shell recomputes `qFloor` itself, rejects any `q` above it with
 `AccretionFloorViolated`, and derives `ampsOut` from `q` itself rather than minting the policy's quantity, so a
 hostile or buggy `BondPolicy` pointer can refuse to price but can never issue a dilutive bond (audit fix 15).
+**The floor's denominator must itself be confirmed (re-audit finding 7).** The registry reports the *lower* of a
+held-back jump's two levels, which is conservative for the collateral numerator but understates `A` — and so
+`navPerShareX18`, the denominator of every market's floor — whenever the held-back asset is one the vault holds.
+The checkpoint therefore records `navUnconfirmed` (any priced asset `!fresh || unconfirmed`), `_price` reverts
+`UnconfirmedNav()` and `quote()` reports `reason == "unconfirmedNav"` while it is set. The shell reads the flag
+through a bounded probe that fails open: a vault that cannot answer prices as before, so no single failing read can
+halt bonds protocol-wide.
+
 `collateralPriceUsd18` is the registry's answer with its freshness flag consumed: a stale or unconfirmed answer
 widens the haircut to the `CLOSED` value in both the shell and the gate (audit fix 9), and the registry itself
 reports the *lower* of a held-back jump's two levels (`FeedRegistry` NatSpec, audit fixes 13–14).
@@ -463,8 +489,12 @@ Exactly two external state-changing functions are exempt from `_requireHealthy`:
 transient reentrancy lock — a lock nobody else can hold, released in the same transaction, is not a gate. The
 redemption path does call every registered token (balances, the payout, the exit sweep), and each of those calls
 is bounded and best-effort: an unreadable balance is skipped, a refused payout becomes an ERC-6909 claim for the
-redeemer, a refused absorb is left as `SweepResidue`. A third party can degrade a redemption; nothing can revert
-it (audit fixes 2, 3).
+redeemer, a refused absorb is left as `SweepResidue`, and every call carries a gas stipend so a token that burns gas
+instead of reverting cannot starve what follows it (measured: one gas-burning constituent plus a 1-wei donation
+costs a redemption 732k gas against 351k clean, two stipends' worth). The sweep runs each token's `transfer` outside
+any unlock, so a token that re-enters the PoolManager hits `ManagerLocked` instead of opening a foreign delta inside
+the vault's own unlock, and the payout falls back to a claims-only unlock if the ERC-20 unlock fails for any reason.
+A third party can degrade a redemption; nothing can revert it (audit fixes 2, 3; re-audit findings 1, 3, 5).
 
 ### 7.1 The vault has two gate policies, not one
 
@@ -517,14 +547,17 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
 ## 8. Migration surface
 
-* **Standby vault.** `setStandbyVault(address)` — timelock, 14 days. Registering it moves nothing.
+* **Standby vault.** `setStandbyVault(address)` — timelock, 14 days. Registering it moves nothing; a codeless
+  address is refused (re-audit lead).
 * **Predicate.** `emergencyMigrate(standby)` is guardian-callable with no delay, and reverts with
   `MigrationPredicateNotMet` unless, checked on-chain at call time: `IStockToken(token).isBlocked(vault) == true`
   for at least one registered constituent, **or** a bounded 1-wei self-transfer probe reverts for at least two
   constituents. Every probe is a `staticcall`/`call` capped at `Constants.STOCK_TOKEN_PROBE_GAS`.
 * **What moves.** Per pool, inside one `unlock`: remove liquidity -> `take` as ERC-6909 claims -> transfer the
   claims PoolManager-internally to the standby vault -> the standby re-adds at the same ticks. The R1 bleed cap is
-  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call.
+  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call. The idle ERC-20 leg of `evacuate`
+  is a gas-capped best-effort transfer (re-audit finding 5), so a gas-burning constituent cannot starve the roles
+  handed over after it.
 * **What follows in the same transaction.** `VaultNavLib.handover`: `Amps.setVault`, `AmpsBonds.setVault`,
   `AmpsStaking.setVault`, `BountyPot.setVault`, `PoolRegistry.setVault` and a best-effort, gas-bounded
   `AmpsHook.setVault` (the hook's `vault` is storage since audit fix 12). All six are `onlyVault`, which is why
