@@ -37,7 +37,7 @@ import {
   type PotSnapshot,
   type VaultSnapshot,
 } from '../domain/types.js'
-import {VAULT_REPORTED_GAS_ALLOWANCE_USD18, VAULT_REPORTED_WORK_VALUE_USD18} from '../domain/bounty.js'
+import {WAD} from '../domain/bounty.js'
 import type {Logger} from '../logger.js'
 
 /** Every address the keeper talks to, all of them derived from AMPS. */
@@ -167,11 +167,10 @@ export class ChainReader {
       this.client.readContract({...pot, functionName: 'budgetLeftUsd18'}),
       this.client.readContract({...pot, functionName: 'balance'}),
       this.client.readContract({...pot, functionName: 'usdScale'}),
-      this.client.readContract({
-        ...pot,
-        functionName: 'quote',
-        args: [VAULT_REPORTED_WORK_VALUE_USD18, VAULT_REPORTED_GAS_ALLOWANCE_USD18],
-      }),
+      // A reference quote, not a prediction: $1 of work against $1 of gas allowance. The real payout is
+      // per-job and comes from the vault's own `BountyPaid`; this is the dashboard's "is the pot answering,
+      // and what is binding it right now" gauge, which is why the reason is exported as a label.
+      this.client.readContract({...pot, functionName: 'quote', args: [WAD, WAD]}),
     ])
 
     const [payableRaw, reason] = quote as [bigint, `0x${string}`]
@@ -222,7 +221,6 @@ export class ChainReader {
     poolId: `0x${string}`,
     vault: VaultSnapshot,
     sellFeeBps: number,
-    lastPlacementAt: number,
   ): Promise<PoolSnapshot | null> {
     const registry = {address: topology.registry, abi: poolRegistryAbi} as const
     const config = (await this.client.readContract({
@@ -235,7 +233,7 @@ export class ChainReader {
 
     const gate = {address: topology.oracleGate, abi: oracleGateAbi} as const
     const hook = {address: topology.hook, abi: ampsHookAbi} as const
-    const [gateSnapshot, placement, highWater, hookState, ladderCells] = await Promise.all([
+    const [gateSnapshot, placement, highWater, hookState, ladderCells, lastPlacementAt] = await Promise.all([
       this.client.readContract({...gate, functionName: 'snapshotByPool', args: [poolId]}) as Promise<{
         state: number
         session: number
@@ -265,6 +263,16 @@ export class ChainReader {
         functionName: 'ladderLength',
         args: [poolId],
       }) as Promise<bigint>,
+      // The vault's own placement clock. Before the pre-audit slice this had no getter and the keeper had to
+      // reconstruct it from the newest `placedAt` across the ladder — a lower bound, because a `compound` that
+      // relaid nothing stamps the map without touching a record — and correct it from the `PlacementCooldown`
+      // revert. `AmpsVault.lastPlacementAt` is the authority, one read per pool.
+      this.client.readContract({
+        address: topology.vault,
+        abi: ampsVaultAbi,
+        functionName: 'lastPlacementAt',
+        args: [poolId],
+      }) as Promise<number>,
     ])
 
     return {
@@ -278,7 +286,7 @@ export class ChainReader {
       poolTick: Number(gateSnapshot.poolTick),
       fairTick: Number(gateSnapshot.fairTick),
       ladderCells: Number(ladderCells),
-      lastPlacementAt,
+      lastPlacementAt: Number(lastPlacementAt),
       highWaterTick: Number(highWater),
       surgeBps: Number(hookState.surgeBps),
       lastSwapAt: Number(hookState.lastSwapAt),
@@ -339,50 +347,8 @@ export class ChainReader {
     }
   }
 
-  /**
-   * Seeds the cooldown clock from the ladder records at start-up.
-   *
-   * `AmpsVault._lastPlacementAt` is private and has no getter, so this reproduces
-   * `11_GenesisPlacement.lastPlacementAt`: the newest `placedAt` across a pool's records. It is a **lower
-   * bound** — a `compound` that relaid nothing stamps the vault's map without touching a record — so it is only
-   * a seed. The authority is the simulation, which reverts `PlacementCooldown(poolId, readyAt)` and hands the
-   * keeper the exact timestamp.
-   */
-  async seedLastPlacementAt(topology: Topology, poolIds: readonly `0x${string}`[]): Promise<Map<string, number>> {
-    const out = new Map<string, number>()
-    const vault = {address: topology.vault, abi: ampsVaultAbi} as const
-
-    await Promise.all(
-      poolIds.map(async (poolId) => {
-        try {
-          const length = Number(
-            (await this.client.readContract({...vault, functionName: 'ladderLength', args: [poolId]})) as bigint,
-          )
-          let newest = 0
-          const records = await Promise.all(
-            Array.from({length}, (_, i) =>
-              this.client.readContract({...vault, functionName: 'ladderAt', args: [poolId, BigInt(i)]}),
-            ),
-          )
-          for (const record of records) {
-            const placedAt = Number((record as readonly unknown[])[6] as number)
-            if (placedAt > newest) newest = placedAt
-          }
-          out.set(poolId, newest)
-        } catch (error) {
-          this.logger.warn('ladder seed failed', {poolId, error})
-        }
-      }),
-    )
-    return out
-  }
-
   /** One whole scan. */
-  async snapshot(
-    topology: Topology,
-    lastPlacementAt: ReadonlyMap<string, number>,
-    ethUsd18: bigint,
-  ): Promise<ChainSnapshot> {
+  async snapshot(topology: Topology, ethUsd18: bigint): Promise<ChainSnapshot> {
     const block = await this.client.getBlock({blockTag: 'latest'})
     const now = Number(block.timestamp)
 
@@ -406,12 +372,10 @@ export class ChainReader {
     const pools = (
       await Promise.all(
         ids.map((poolId) =>
-          this.poolSnapshot(topology, poolId, vault, Number(sellFeeBps), lastPlacementAt.get(poolId) ?? 0).catch(
-            (error: unknown) => {
-              this.logger.warn('pool read failed', {poolId, error})
-              return null
-            },
-          ),
+          this.poolSnapshot(topology, poolId, vault, Number(sellFeeBps)).catch((error: unknown) => {
+            this.logger.warn('pool read failed', {poolId, error})
+            return null
+          }),
         ),
       )
     ).filter((p): p is PoolSnapshot => p !== null)

@@ -82,7 +82,11 @@ pnpm --filter @amplestocks/abis test
   `AmpsVault` and `AmpsBonds` is in the exported ABI, and that the exported ABI carries no mutating selector the
   enumeration does not classify. A stale ABI is a keeper building calldata for a contract that no longer exists;
 * the exact signatures `apps/keeper` encodes (`compound(bytes32)`, `rollout(uint16)`, `deployBonded(uint16)`,
-  `checkpoint()`, `touch()`), `BountyPot.quote(uint256,uint256)`, the `OracleGate` reads, and the event sets the
-  indexer subscribes to on `AmpsVault`, `PoolRegistry`, `AmpsHook`, `BountyPot` and the v4 `PoolManager`.
+  `checkpoint()`, `touch()`, `lastPlacementAt(bytes32)`), `BountyPot.quote(uint256,uint256)`, the `OracleGate`
+  reads, and the event sets the indexer subscribes to on `AmpsVault`, `PoolRegistry`, `AmpsHook`, `BountyPot`
+  and the v4 `PoolManager`;
+* the **shape** of the events the keeper decodes off a receipt rather than merely their presence:
+  `BountyPot.BountyPaid`'s five fields (the keeper reads the vault's measured work value and the pot's payout
+  out of it), `AmpsVault.Placement`'s `reason`/`lowerTick`/`upperTick`, and `AmpsVault.Rollout`.
 
 MIT licensed — see the repository root `LICENSE`.

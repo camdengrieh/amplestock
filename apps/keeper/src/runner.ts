@@ -25,15 +25,27 @@
 
 import type {Address, PublicClient} from 'viem'
 import {qualify, screen} from './domain/decide.js'
-import {GateState, type ChainSnapshot, type JobKind, type Screening, type Verdict} from './domain/types.js'
 import {
-  measuredGasAllowanceUsd18,
-  VAULT_REPORTED_GAS_ALLOWANCE_USD18,
-  VAULT_REPORTED_WORK_VALUE_USD18,
-} from './domain/bounty.js'
+  BOUNTIED_JOBS,
+  GateState,
+  type ChainSnapshot,
+  type JobKind,
+  type PoolSnapshot,
+  type Screening,
+  type Verdict,
+} from './domain/types.js'
+import {vaultGasAllowanceUsd18} from './domain/bounty.js'
 import type {KeeperPolicy} from './domain/policy.js'
 import {ChainReader, type Topology} from './chain/reader.js'
-import {cooldownFrom, encodeJob, revertLabel, simulateJob} from './jobs/index.js'
+import {
+  cooldownFrom,
+  encodeJob,
+  placedPools,
+  readBountyReport,
+  revertLabel,
+  simulateBounty,
+  simulateJob,
+} from './jobs/index.js'
 import type {Submitter} from './chain/submitter.js'
 import type {Logger} from './logger.js'
 import type {Metrics} from './metrics.js'
@@ -70,10 +82,26 @@ export interface ScanResult {
 
 export class Runner {
   private readonly options: RunnerOptions
-  private readonly lastPlacementAt = new Map<string, number>()
+  /**
+   * Placements this scan has made or learned about, layered over the snapshot for the rest of the cycle.
+   *
+   * `AmpsVault.lastPlacementAt(poolId)` is the authority and is re-read every scan, so this is **not** a cache
+   * that survives anything: it is cleared at the top of every cycle. It exists because the snapshot is taken
+   * once and a job sent early in a scan stamps pools that later candidates in the same scan would otherwise
+   * still see as free — a `compound` on the hub, then a `rollout` that harvests from it. Without the overlay
+   * that rollout costs one simulation to learn what the keeper already knew.
+   */
+  private readonly placedThisScan = new Map<string, number>()
   private readonly inFlight = new Map<string, InFlight>()
   private topologyCache: Topology | null = null
-  private seeded = false
+  /**
+   * Whether this node answers `eth_simulateV1` with the logs a job would emit.
+   *
+   * Latched to false the first time a bountied job simulates cleanly but produces no `BountyPaid`, because a
+   * node that cannot do it will not start being able to; from then on the keeper decides from its own estimate
+   * of the work value and its mirror of the vault's gas allowance.
+   */
+  private bountySimulation = true
   private lastTouchAt = 0
   private stopped = false
 
@@ -89,8 +117,6 @@ export class Runner {
       for (const key of Object.keys(next) as (keyof Topology)[]) {
         if (previous[key] !== next[key]) {
           this.options.logger.warn('topology pointer moved', {pointer: key, from: previous[key], to: next[key]})
-          // A vault move invalidates every cooldown: the new vault's `_lastPlacementAt` starts empty.
-          if (key === 'vault') this.lastPlacementAt.clear()
         }
       }
     }
@@ -98,9 +124,9 @@ export class Runner {
     return next
   }
 
-  /** Cooldowns this process knows about. Exposed for the chain suite. */
+  /** Placements this scan has made or learned about. Exposed for the tests; cleared every cycle. */
   cooldowns(): ReadonlyMap<string, number> {
-    return this.lastPlacementAt
+    return this.placedThisScan
   }
 
   stop(): void {
@@ -117,15 +143,12 @@ export class Runner {
     const started = this.nowMs()
     const topology = await this.topology()
 
-    if (!this.seeded) {
-      const ids = await reader.poolIds(topology)
-      const seed = await reader.seedLastPlacementAt(topology, ids)
-      for (const [poolId, at] of seed) if (at > 0) this.lastPlacementAt.set(poolId, at)
-      this.seeded = true
-      logger.info('cooldown clock seeded from ladder records', {pools: ids.length, known: this.lastPlacementAt.size})
+    this.placedThisScan.clear()
+    const read = await reader.snapshot(topology, this.options.ethUsd18)
+    const snapshot: ChainSnapshot = {
+      ...read,
+      pools: read.pools.map((pool) => this.withOverlay(pool)),
     }
-
-    const snapshot = await reader.snapshot(topology, this.lastPlacementAt, this.options.ethUsd18)
     this.recordSnapshotMetrics(snapshot)
 
     const screenings = screen(snapshot, policy, this.lastTouchAt)
@@ -142,9 +165,6 @@ export class Runner {
       if (!screening.eligible) {
         metrics.skipped.inc({job: job.kind, reason: screening.reason ?? 'not-due'})
         logger.debug('screened out', {job: job.key, reason: screening.reason, detail: screening.detail})
-        if (screening.reason === 'cooldown' && screening.readyAt !== undefined) {
-          this.rememberReadyAt(job.target, screening.readyAt)
-        }
         continue
       }
       perJobEligible.set(job.kind, (perJobEligible.get(job.kind) ?? 0) + 1)
@@ -160,13 +180,31 @@ export class Runner {
       }
 
       metrics.simulations.inc({job: job.kind})
-      const simulation = await simulateJob(this.options.client, topology.vault, this.options.submitter.sender, job)
+      const base = await simulateJob(this.options.client, topology.vault, this.options.submitter.sender, job)
+      const reported =
+        base.ok && this.bountySimulation
+          ? await simulateBounty(
+              this.options.client,
+              topology.vault,
+              topology.bountyPot,
+              this.options.submitter.sender,
+              job,
+            )
+          : undefined
+      // One probe: a node without `eth_simulateV1` is not asked again, and the keeper runs on its own estimate.
+      if (base.ok && this.bountySimulation && reported === undefined && BOUNTIED_JOBS.includes(job.kind)) {
+        this.bountySimulation = false
+        logger.info('eth_simulateV1 did not yield a BountyPaid; falling back to the keeper estimate', {job: job.key})
+      }
+      const simulation = reported === undefined ? base : {...base, bounty: reported}
 
       if (!simulation.ok) {
         metrics.simulationReverts.inc({job: job.kind, error: revertLabel(simulation)})
-        const cooldown = cooldownFrom(simulation)
+        // A cooldown revert names the pool it is about, which for a `rollout` is an entry pool rather than the
+        // constituent the job was addressed to. Recording it saves the rest of this scan a wasted round trip.
+        const cooldown = cooldownFrom(base)
         if (cooldown !== null) {
-          this.rememberReadyAt(cooldown.poolId, cooldown.readyAt - policy.placementCooldownSeconds)
+          this.placedThisScan.set(cooldown.poolId, cooldown.readyAt - policy.placementCooldownSeconds)
         }
         logger.debug('simulation reverted', {job: job.key, error: simulation.revert})
       }
@@ -200,7 +238,7 @@ export class Runner {
         continue
       }
 
-      const outcome = await this.send(topology.vault, verdict, snapshot)
+      const outcome = await this.send(topology, verdict, snapshot)
       if (outcome !== null) sent.push(outcome)
     }
 
@@ -214,14 +252,14 @@ export class Runner {
     return {snapshot, screenings, verdicts, sent}
   }
 
-  private rememberReadyAt(poolId: string, lastPlacement: number): void {
-    if (!poolId.startsWith('0x')) return
-    const known = this.lastPlacementAt.get(poolId) ?? 0
-    if (lastPlacement > known) this.lastPlacementAt.set(poolId, lastPlacement)
+  /** The snapshot's view of a pool, with anything this scan has since learned about its placement clock. */
+  private withOverlay(pool: PoolSnapshot): PoolSnapshot {
+    const overlay = this.placedThisScan.get(pool.poolId) ?? 0
+    return overlay > pool.lastPlacementAt ? {...pool, lastPlacementAt: overlay} : pool
   }
 
   private async send(
-    vault: Address,
+    topology: Topology,
     verdict: Verdict,
     snapshot: ChainSnapshot,
   ): Promise<{key: string; hash: string | null; success?: boolean; gasUsed?: bigint} | null> {
@@ -233,15 +271,18 @@ export class Runner {
     metrics.gasEstimate.observe({job: job.kind}, Number(verdict.gasEstimate))
     metrics.bountyExpected.set({job: job.kind}, Number(verdict.bountyUsd18) / 1e18)
     metrics.measuredWorkValue.set({job: job.kind}, Number(verdict.workValueUsd18) / 1e18)
-    metrics.reportedWorkValue.set({job: job.kind}, Number(VAULT_REPORTED_WORK_VALUE_USD18) / 1e18)
     metrics.measuredGasAllowance.set(
       {job: job.kind},
-      Number(measuredGasAllowanceUsd18(verdict.gasEstimate, snapshot.baseFeeWei, snapshot.ethUsd18)) / 1e18,
+      Number(vaultGasAllowanceUsd18(verdict.gasEstimate, snapshot.baseFeeWei, snapshot.ethUsd18)) / 1e18,
     )
-    metrics.reportedGasAllowance.set({job: job.kind}, Number(VAULT_REPORTED_GAS_ALLOWANCE_USD18) / 1e18)
 
     try {
-      const submission = await submitter.submit({to: vault, data: encodeJob(job), gasLimit, jobKey: job.key})
+      const submission = await submitter.submit({
+        to: topology.vault,
+        data: encodeJob(job),
+        gasLimit,
+        jobKey: job.key,
+      })
       metrics.sent.inc({job: job.kind})
       this.inFlight.set(job.key, {key: job.key, submittedAt: this.nowMs(), id: submission.id})
       logger.info('submitted', {
@@ -258,9 +299,28 @@ export class Runner {
       if (receipt.success) {
         metrics.confirmed.inc({job: job.kind})
         metrics.gasUsed.observe({job: job.kind}, Number(receipt.gasUsed))
+        // What the vault actually reported and the pot actually paid, from the receipt's own `BountyPaid`. This
+        // is the other half of the measured-versus-reported comparison: `reported_*` is the chain's number,
+        // `measured_*` is the keeper's, and a persistent gap means they disagree about what a job is worth.
+        const paid = readBountyReport(receipt.logs, topology.bountyPot)
+        if (paid !== undefined) {
+          metrics.reportedWorkValue.set({job: job.kind}, Number(paid.workValueUsd18) / 1e18)
+          metrics.bountyPaid.inc({job: job.kind}, Number(paid.paidUsd18) / 1e18)
+          if (paid.reason !== '') metrics.bountyReason.set({job: job.kind, reason: paid.reason}, 1)
+        }
+        metrics.reportedGasAllowance.set(
+          {job: job.kind},
+          Number(vaultGasAllowanceUsd18(receipt.gasUsed, snapshot.baseFeeWei, snapshot.ethUsd18)) / 1e18,
+        )
         if (job.kind === 'touch') this.lastTouchAt = snapshot.now
-        if (job.target.startsWith('0x')) this.lastPlacementAt.set(job.target, Math.floor(this.nowMs() / 1000))
-        else this.markConstituentPools(job.kind, job.target, snapshot)
+
+        // Exactly the pools the vault stamped, from the `Placement` logs the job emitted. A `rollout` is
+        // addressed by constituent but places into the destination spoke and whichever entry pools it
+        // harvested, and only the receipt knows which.
+        const placed = placedPools(receipt.logs, topology.vault)
+        for (const record of placed) this.placedThisScan.set(record.poolId, snapshot.now)
+        if (placed.length === 0) this.markConstituentPools(job.kind, job.target, snapshot)
+        else logger.debug('placements landed', {job: job.key, pools: placed.map((r) => r.reason)})
         logger.info('confirmed', {job: job.key, hash: receipt.hash, gasUsed: receipt.gasUsed})
       } else {
         metrics.failed.inc({job: job.kind})
@@ -276,18 +336,23 @@ export class Runner {
   }
 
   /**
-   * Stamps the cooldowns a constituent-addressed job just consumed.
+   * The fallback when a confirmed job emitted no `Placement` at all.
    *
-   * `deployBonded` places into the spoke and nothing else. `rollout` harvests unfilled asks out of **both**
-   * entry pools before it places, and each of those is a `place` in its own right, so all three pools are on
-   * cooldown afterwards.
+   * `compound` on a pool with nothing to re-ladder is the real case: it still stamps the vault's own
+   * `_lastPlacementAt`, so the pool is on cooldown even though nothing was placed. A `rollout` or
+   * `deployBonded` that moved nothing returns early without stamping anything, which the conservative guess
+   * here over-reports by one scan at worst — the next scan reads the chain and corrects it.
    */
   private markConstituentPools(kind: JobKind, target: string, snapshot: ChainSnapshot): void {
-    const at = Math.floor(this.nowMs() / 1000)
+    const at = snapshot.now
+    if (target.startsWith('0x')) {
+      this.placedThisScan.set(target, at)
+      return
+    }
     const constituent = snapshot.constituents.find((c) => c.constituentId === Number(target))
-    if (constituent !== undefined) this.lastPlacementAt.set(constituent.poolId, at)
+    if (constituent !== undefined) this.placedThisScan.set(constituent.poolId, at)
     if (kind !== 'rollout') return
-    for (const pool of snapshot.pools) if (pool.constituentId === 0) this.lastPlacementAt.set(pool.poolId, at)
+    for (const pool of snapshot.pools) if (pool.constituentId === 0) this.placedThisScan.set(pool.poolId, at)
   }
 
   private recordSnapshotMetrics(snapshot: ChainSnapshot): void {

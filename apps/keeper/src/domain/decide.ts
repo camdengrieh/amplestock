@@ -35,10 +35,9 @@ import {
   meetsChost,
   quoteBounty,
   splitAmpsFees,
+  vaultGasAllowanceUsd18,
   BPS,
   WAD,
-  VAULT_REPORTED_GAS_ALLOWANCE_USD18,
-  VAULT_REPORTED_WORK_VALUE_USD18,
 } from './bounty.js'
 import type {KeeperPolicy} from './policy.js'
 
@@ -373,7 +372,7 @@ export function qualify(
   pool?: PoolSnapshot,
 ): Verdict {
   const {candidate: job} = screening
-  const base = {candidate: job, gasEstimate: simulation.gasEstimate}
+  const base = {candidate: job, gasEstimate: simulation.gasEstimate, reportedBounty: simulation.bounty !== undefined}
 
   if (!simulation.ok) {
     return {
@@ -393,7 +392,11 @@ export function qualify(
     return {...base, send: true, workValueUsd18: 0n, gasCostUsd18: gasCost, bountyUsd18: 0n}
   }
 
-  const workValue = measureWorkValueUsd18(job.kind, simulation.result, snapshot, constituent, pool)
+  // The vault measures its own work value now, and a simulation that captured `BountyPaid` carries it. That
+  // number wins: the keeper's own estimate excludes `compound`'s counter-side fees (the call does not return
+  // them) and is therefore a lower bound, which would skip jobs the vault would happily pay for.
+  const estimated = measureWorkValueUsd18(job.kind, simulation.result, snapshot, constituent, pool)
+  const workValue = simulation.bounty?.workValueUsd18 ?? estimated
   const chost = policy.chostOverrideUsd18 ?? snapshot.pot.chostUsd18
   if (!meetsChost(workValue, chost)) {
     return {
@@ -407,8 +410,21 @@ export function qualify(
     }
   }
 
-  // What the pot will actually pay: the vault reports flat $1/$1, whatever the keeper measured.
-  const quote = quoteBounty(snapshot.pot, VAULT_REPORTED_WORK_VALUE_USD18, VAULT_REPORTED_GAS_ALLOWANCE_USD18)
+  // What the pot will actually pay. The reported `BountyPaid` is authoritative where the node could produce it;
+  // otherwise the pot's own formula is re-run against the keeper's estimate and its mirror of the vault's gas
+  // allowance, which is the same arithmetic one round trip earlier.
+  const quote =
+    simulation.bounty === undefined
+      ? quoteBounty(
+          snapshot.pot,
+          workValue,
+          vaultGasAllowanceUsd18(simulation.gasEstimate, snapshot.baseFeeWei, snapshot.ethUsd18),
+        )
+      : {
+          payableUsd18: simulation.bounty.paidUsd18,
+          payableRaw: simulation.bounty.paidRaw,
+          reason: simulation.bounty.reason as ReturnType<typeof quoteBounty>['reason'],
+        }
   const bounty = quote.payableUsd18
 
   if (quote.reason === 'dailyCeiling') {

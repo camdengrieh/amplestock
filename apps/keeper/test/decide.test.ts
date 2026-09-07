@@ -206,12 +206,37 @@ describe('qualification — the simulation half', () => {
     expect(verdict.detail).toBe('NavBleedExceeded')
   })
 
-  it('sends a compound whose fees clear chost', () => {
-    // 10 AMPS of fees at $1 is $10 of work, ten times the $1 dust guard.
+  it('sends a compound whose fees clear chost, priced at the pot’s real formula', () => {
+    // 10 AMPS of fees at $1 is $10 of work: tip $0.05 + 2% chip = $0.25 of gross. The 3x gas cap on a 1.5M-gas
+    // job at the Orbit floor basefee is 3 x $0.0395 = $0.1185, and that is what binds — which is the whole
+    // point of the vault reporting a measured allowance instead of a flat $1.
     const verdict = qualify(eligible, ok([10n * WAD, 0n]), snapshot(), POLICY, undefined, pool())
     expect(verdict.send).toBe(true)
     expect(verdict.workValueUsd18).toBe(10n * WAD)
-    expect(verdict.bountyUsd18).toBe(7n * 10n ** 16n)
+    expect(verdict.bountyUsd18).toBe(118_500_000_000_000_000n)
+  })
+
+  it('takes the vault’s own reported work value over its own estimate when the simulation carried one', () => {
+    // `compound` returns `(ampsFees, burned)` and says nothing about the counter-side fees, which the vault
+    // does price in. A simulation that captured `BountyPaid` therefore beats the keeper's lower bound.
+    const reported = {
+      ...ok([0n, 0n]),
+      bounty: {workValueUsd18: 12n * WAD, paidUsd18: 118_500_000_000_000_000n, paidRaw: 118_500n, reason: ''},
+    }
+    const verdict = qualify(eligible, reported, snapshot(), POLICY, undefined, pool())
+    expect(verdict.send).toBe(true)
+    expect(verdict.workValueUsd18).toBe(12n * WAD)
+    expect(verdict.bountyUsd18).toBe(118_500_000_000_000_000n)
+  })
+
+  it('honours a reported `chost` refusal even when its own estimate looked sufficient', () => {
+    const reported = {
+      ...ok([10n * WAD, 0n]),
+      bounty: {workValueUsd18: 0n, paidUsd18: 0n, paidRaw: 0n, reason: 'chost'},
+    }
+    const verdict = qualify(eligible, reported, snapshot(), POLICY, undefined, pool())
+    expect(verdict.send).toBe(false)
+    expect(verdict.reason).toBe('below-chost')
   })
 
   it('blocks a dust compound the on-chain guard would have paid for', () => {
@@ -234,22 +259,31 @@ describe('qualification — the simulation half', () => {
     expect(verdict.reason).toBe('unprofitable')
   })
 
-  it('the launch tip stops covering a compound one order of magnitude above the floor basefee', () => {
-    // A finding worth pinning: §12 measures `compound` at 1.0-3.3M gas. At the Orbit floor (0.01 gwei) a 3.3M
-    // compound costs $0.0825 against a $0.07 bounty, so the flat tip is already marginal at launch and is
-    // under water at 0.1 gwei. The keeper is right to refuse; the fix is a governance one (raise `tip`, or
-    // give the entry points a gas-allowance argument so `chip` can price the work).
+  it('the measured allowance makes the whole §12 gas range payable at the floor basefee', () => {
+    // §12 measures `compound` at 1.0-3.3M gas. With the allowance tracking the job's own gas, the 3x cap grows
+    // with it, so every point in that range is now paid more than it costs — which the flat $1 report never
+    // managed.
     const floor = snapshot()
-    expect(qualify(eligible, ok([10n * WAD, 1_500_000n], 1_500_000n), floor, POLICY, undefined, pool()).send).toBe(
-      true,
-    )
-    expect(qualify(eligible, ok([10n * WAD, 0n], 3_300_000n), floor, POLICY, undefined, pool()).reason).toBe(
-      'unprofitable',
-    )
+    for (const gas of [1_000_000n, 1_500_000n, 2_200_000n, 3_300_000n]) {
+      const verdict = qualify(eligible, ok([10n * WAD, 0n], gas), floor, POLICY, undefined, pool())
+      expect(verdict.send, `gas ${gas}`).toBe(true)
+      expect(verdict.bountyUsd18).toBeGreaterThan(verdict.gasCostUsd18)
+    }
+  })
+
+  it('tip + chip is still the binding term once the basefee leaves the floor', () => {
+    // The surviving half of the tip-economics finding. At 0.1 gwei a 1.5M-gas compound costs $0.375, the 3x cap
+    // is $1.185 — generous — but the gross is only tip + 2% of $10 = $0.25, so the job is under water and the
+    // keeper refuses it. The governance lever is `tip`/`chipBps`, not the cap.
     const tenTimes = snapshot({baseFeeWei: 100_000_000n})
-    expect(qualify(eligible, ok([10n * WAD, 0n], 1_500_000n), tenTimes, POLICY, undefined, pool()).reason).toBe(
-      'unprofitable',
-    )
+    const verdict = qualify(eligible, ok([10n * WAD, 0n], 1_500_000n), tenTimes, POLICY, undefined, pool())
+    expect(verdict.reason).toBe('unprofitable')
+    expect(verdict.bountyUsd18).toBe(250_000_000_000_000_000n)
+    expect(verdict.gasCostUsd18).toBe(375_000_000_000_000_000n)
+
+    // ...and a job worth enough for the chip to cover the gas is sent at the same basefee.
+    const worthwhile = qualify(eligible, ok([100n * WAD, 0n], 1_500_000n), tenTimes, POLICY, undefined, pool())
+    expect(worthwhile.send).toBe(true)
   })
 
   it('refuses when the rolling daily ceiling is exhausted', () => {

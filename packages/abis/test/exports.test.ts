@@ -134,6 +134,9 @@ describe('the selectors the keeper and the indexer build against', () => {
     'deployBonded(uint16)': 'AmpsVault',
     'checkpoint()': 'AmpsVault',
     'touch()': 'AmpsVault',
+    // The pre-audit slice's placement clock. The keeper reads it per pool every scan; before it existed the
+    // clock had to be reconstructed from `ladderAt(...).placedAt` and corrected from a revert.
+    'lastPlacementAt(bytes32)': 'AmpsVault',
   } as const
 
   it('the five keeper jobs exist with the signatures the keeper encodes', () => {
@@ -214,5 +217,32 @@ describe('the selectors the keeper and the indexer build against', () => {
     const events = eventAbi(contractAbis.BountyPot).map((e) => e.name)
     expect(events).toContain('BountyPaid')
     expect(events).toContain('PotFunded')
+
+    // The keeper decodes this one out of a simulated and a confirmed transaction, so its shape is load-bearing:
+    // the work value the vault measured, what the pot paid, and which constraint bound it.
+    const paid = eventAbi(contractAbis.BountyPot).find((e) => e.name === 'BountyPaid')
+    expect(paid?.inputs.map((i) => `${i.type} ${i.name ?? ''}`)).toEqual([
+      'address to',
+      'uint256 workValueUsd18',
+      'uint256 paidUsd18',
+      'uint256 paidRaw',
+      'bytes32 reason',
+    ])
+  })
+
+  it('the vault events the keeper decodes off a receipt carry what it needs', () => {
+    // `Placement` names exactly the pools the vault stamped `_lastPlacementAt` for, which is how the keeper
+    // knows a `rollout` put the two entry pools on cooldown as well as its destination spoke.
+    const placement = eventAbi(contractAbis.AmpsVault).find((e) => e.name === 'Placement')
+    const names = placement?.inputs.map((i) => i.name)
+    expect(names).toContain('poolId')
+    expect(names).toContain('reason')
+    expect(names).toContain('lowerTick')
+    expect(names).toContain('upperTick')
+
+    const rollout = eventAbi(contractAbis.AmpsVault).find((e) => e.name === 'Rollout')
+    expect(rollout?.inputs.map((i) => i.name)).toEqual(['constituentId', 'poolId', 'movedAmps', 'placedAmps'])
+
+    expect(eventAbi(contractAbis.PoolRegistry).map((e) => e.name)).toContain('PoolGridSet')
   })
 })

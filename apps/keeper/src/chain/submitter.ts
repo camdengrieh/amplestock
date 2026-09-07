@@ -41,13 +41,22 @@ export interface Submission {
   readonly hash: `0x${string}` | null
 }
 
+/** A mined transaction, with the logs the keeper reconciles its bounty against. */
+export interface Receipt {
+  readonly hash: `0x${string}`
+  readonly success: boolean
+  readonly gasUsed: bigint
+  /** The transaction's logs, which carry `BountyPot.BountyPaid` for a bountied job. */
+  readonly logs: readonly {address: string; topics: readonly `0x${string}`[]; data: `0x${string}`}[]
+}
+
 export interface Submitter {
   readonly kind: 'relayer' | 'local'
   /** The address transactions come from, which is also the address simulations are run as. */
   readonly sender: `0x${string}`
   submit(request: TxRequest): Promise<Submission>
   /** Resolves once the transaction is mined, or rejects. */
-  wait(submission: Submission): Promise<{hash: `0x${string}`; success: boolean; gasUsed: bigint}>
+  wait(submission: Submission): Promise<Receipt>
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -124,7 +133,7 @@ export class RelayerSubmitter implements Submitter {
     return {id, hash}
   }
 
-  async wait(submission: Submission): Promise<{hash: `0x${string}`; success: boolean; gasUsed: bigint}> {
+  async wait(submission: Submission): Promise<Receipt> {
     const deadline = Date.now() + this.config.timeoutMs * 10
     let hash = submission.hash
 
@@ -146,7 +155,7 @@ export class RelayerSubmitter implements Submitter {
 
     if (hash === null) throw new Error(`relayer transaction ${submission.id} never produced a hash`)
     const receipt = await this.client.waitForTransactionReceipt({hash})
-    return {hash, success: receipt.status === 'success', gasUsed: receipt.gasUsed}
+    return {hash, success: receipt.status === 'success', gasUsed: receipt.gasUsed, logs: receipt.logs}
   }
 }
 
@@ -186,10 +195,15 @@ export class LocalSignerSubmitter implements Submitter {
     return {id: hash, hash}
   }
 
-  async wait(submission: Submission): Promise<{hash: `0x${string}`; success: boolean; gasUsed: bigint}> {
+  async wait(submission: Submission): Promise<Receipt> {
     if (submission.hash === null) throw new Error('local submitter always has a hash')
     const receipt = await this.client.waitForTransactionReceipt({hash: submission.hash})
-    return {hash: submission.hash, success: receipt.status === 'success', gasUsed: receipt.gasUsed}
+    return {
+      hash: submission.hash,
+      success: receipt.status === 'success',
+      gasUsed: receipt.gasUsed,
+      logs: receipt.logs,
+    }
   }
 }
 

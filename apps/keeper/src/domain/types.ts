@@ -188,6 +188,20 @@ export interface ChainSnapshot {
   readonly ethUsd18: bigint
 }
 
+/**
+ * What the vault reported to `BountyPot`, read out of a simulated or confirmed `BountyPaid` log.
+ *
+ * This is the authoritative answer to both questions the keeper asks about a bountied job: what the vault
+ * measured the work to be worth, and what the pot actually paid for it. `reason` is `BountyPot`'s own
+ * enumeration — `''` when something was payable, otherwise `chost`, `gasCap`, `dailyCeiling` or `depleted`.
+ */
+export interface BountyReport {
+  readonly workValueUsd18: bigint
+  readonly paidUsd18: bigint
+  readonly paidRaw: bigint
+  readonly reason: string
+}
+
 /** The result of `eth_call`-ing a job, plus the gas `eth_estimateGas` measured for it. */
 export interface Simulation {
   readonly ok: boolean
@@ -196,6 +210,13 @@ export interface Simulation {
   readonly gasEstimate: bigint
   /** Decoded revert, when `ok` is false. */
   readonly revert?: {readonly name: string; readonly args: readonly unknown[]; readonly raw: string}
+  /**
+   * The `BountyPaid` the job would emit, when the node supports `eth_simulateV1` and the job is bountied.
+   *
+   * Absent on a node without it — Arbitrum Nitro does not guarantee the method — in which case the keeper falls
+   * back to its own lower-bound estimate of the work value and to {@link quoteBounty} for the payout.
+   */
+  readonly bounty?: BountyReport
 }
 
 /** The final verdict on one candidate, after simulation. */
@@ -210,5 +231,10 @@ export interface Verdict {
   /** 18-decimal USD the pot would actually pay for it. */
   readonly bountyUsd18: bigint
   readonly gasEstimate: bigint
+  /**
+   * True when the bounty figures came from the vault's own `BountyPaid`, false when they are the keeper's
+   * estimate. The distinction is the difference between knowing the payout and predicting it.
+   */
+  readonly reportedBounty: boolean
   readonly detail?: string
 }

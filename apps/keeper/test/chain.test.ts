@@ -28,17 +28,21 @@ import {
 } from 'viem'
 import {ampsVaultAbi, bountyPotAbi, oracleGateAbi, poolManagerAbi, poolRegistryAbi} from '@amplestocks/abis'
 import {chainTestsEnabled, Fixture, KEEPER, KEEPER_KEY, mockAbis, OPERATOR, OPERATOR_KEY, startFixture} from './chain/harness.js'
-import {ChainReader, type Topology} from '../src/chain/reader.js'
+import {ChainReader, decodeBytes32, type Topology} from '../src/chain/reader.js'
 import {LocalSignerSubmitter} from '../src/chain/submitter.js'
 import {Runner, type ScanResult} from '../src/runner.js'
 import {DEFAULT_POLICY, type KeeperPolicy} from '../src/domain/policy.js'
 import {GateState} from '../src/domain/types.js'
+import {readBountyReport} from '../src/jobs/index.js'
 import {createLogger} from '../src/logger.js'
 import {createMetrics} from '../src/metrics.js'
 import {loadConfig} from '../src/config.js'
-import {WAD} from '../src/domain/bounty.js'
+import {vaultGasAllowanceUsd18, WAD} from '../src/domain/bounty.js'
 
 const enabled = chainTestsEnabled()
+
+/** The fixture's ETH/USD aggregator, which is also the feed the vault prices its gas allowance at. */
+const ETH_USD18 = 2_500n * 10n ** 18n
 
 const SWAPPER_ABI = parseAbi([
   'struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }',
@@ -220,7 +224,7 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     expect(topology.hook).toBe(fixture.address('HOOK'))
     expect(topology.oracleGate).toBe(fixture.address('ORACLEGATE'))
 
-    const snapshot = await reader.snapshot(topology, new Map(), 0n)
+    const snapshot = await reader.snapshot(topology, 0n)
     expect(snapshot.pools).toHaveLength(6)
     expect(snapshot.constituents).toHaveLength(4)
     expect(snapshot.globalGateState).toBe(GateState.GREEN)
@@ -260,29 +264,78 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
       abi: bountyPotAbi,
       functionName: 'balance',
     })) as bigint
-    // $0.05 tip + 2% of the flat $1 the vault reports = $0.07 = 70,000 raw USDG units per paid job.
-    expect(potBefore - potAfter).toBe(70_000n * BigInt(compounds.length))
+
+    // The payout is measured now, not flat. Every `BountyPaid` the run emitted is decoded and the pot's balance
+    // change is reconciled against their sum, so the assertion is on the arithmetic rather than on a constant.
+    let paidRaw = 0n
+    let paidUsd = 0n
+    const paidByPool = new Map<string, bigint>()
+    for (const sent of compounds) {
+      const receipt = await client.getTransactionReceipt({hash: sent.hash as `0x${string}`})
+      const report = readBountyReport(receipt.logs, topology.bountyPot)
+      expect(report, `BountyPaid for ${sent.key}`).toBeDefined()
+      // What the vault measured must be real work, and the payout must respect the pot's own formula.
+      expect(report!.workValueUsd18).toBeGreaterThan(0n)
+      // Both of the pot's binding constraints, checked from the keeper's side: the gross (tip + chip on the
+      // work the vault measured) and the 3x cap on the gas allowance. The receipt's `gasUsed` is an upper bound
+      // on the vault's internal `gasleft()` delta, so the cap computed from it is a valid upper bound too.
+      expect(report!.paidUsd18).toBeLessThanOrEqual(
+        result.snapshot.pot.tipUsd18 +
+          (report!.workValueUsd18 * BigInt(result.snapshot.pot.chipBps)) / 10_000n,
+      )
+      expect(report!.paidUsd18).toBeLessThanOrEqual(
+        vaultGasAllowanceUsd18(sent.gasUsed ?? 0n, result.snapshot.baseFeeWei, ETH_USD18) * 3n,
+      )
+      paidRaw += report!.paidRaw
+      paidUsd += report!.paidUsd18
+      paidByPool.set(sent.key.slice('compound:'.length), report!.paidUsd18)
+    }
+    expect(potBefore - potAfter).toBe(paidRaw)
+    expect(paidRaw).toBeGreaterThan(0n)
+
+    // At the Orbit floor basefee the 3x gas cap is what binds: on a ~1.5M-gas compound the allowance is about
+    // $0.0395 and the cap about $0.1185, so the payout is strictly more than the flat $0.07 the pre-audit vault
+    // paid whatever the job did — and bounded well below a runaway.
+    const perJob = paidUsd / BigInt(compounds.length)
+    expect(perJob).toBeGreaterThan(70n * 10n ** 15n) // > the old flat $0.07
+    expect(perJob).toBeLessThan(5n * 10n ** 17n) // < $0.50
 
     const verdict = result.verdicts.find((v) => v.candidate.key.startsWith('compound:') && v.send)
     expect(verdict?.workValueUsd18).toBeGreaterThan(WAD)
-    expect(verdict?.bountyUsd18).toBe(70n * 10n ** 15n)
     expect(metrics.confirmed.get({job: 'compound'})).toBe(compounds.length)
-  }, 120_000)
 
-  it('refuses to compound a pool with nothing accrued — the chost guard the pot cannot apply', async () => {
+    // anvil answers `eth_simulateV1`, so the keeper knew the exact payout before it sent: the work value and
+    // the amount it predicted are the vault's own numbers, not an estimate. `paidByPool` is what the chain
+    // actually paid for that pool, and the prediction has to match it exactly.
+    expect(verdict?.reportedBounty).toBe(true)
+    expect(verdict?.bountyUsd18).toBe(paidByPool.get(verdict!.candidate.target))
+  }, 180_000)
+
+  it('refuses to compound a pool with nothing accrued, and so would the pot', async () => {
     const {runner, metrics} = await makeRunner()
     const result = await runner.scan()
     expect(result.sent.filter((s) => s.key.startsWith('compound:'))).toHaveLength(0)
     expect(metrics.chostBlocked.get({job: 'compound'})).toBe(6)
+    // Every refusal was the dust guard against a work value of exactly zero — the *vault's* measurement, read
+    // out of the simulated `BountyPaid`, not the keeper guessing. Before the pre-audit slice the vault reported
+    // a flat $1 here and the pot paid the full tip for every one of these.
+    for (const verdict of result.verdicts.filter((v) => v.candidate.kind === 'compound')) {
+      expect(verdict.reason).toBe('below-chost')
+      expect(verdict.workValueUsd18).toBe(0n)
+      expect(verdict.reportedBounty).toBe(true)
+    }
 
-    // ...and the pot would have paid for every one of them, which is the finding.
+    // ...and the vault now agrees: an empty job reports a zero work value, so the pot's own `chost` refuses it.
+    // Before the pre-audit slice the vault reported a flat $1 whatever the job did, `1e18 < 1e18` was false, and
+    // every one of these would have been paid the full tip.
     const quote = (await client.readContract({
       address: topology.bountyPot,
       abi: bountyPotAbi,
       functionName: 'quote',
-      args: [WAD, WAD],
+      args: [0n, WAD],
     })) as readonly [bigint, `0x${string}`]
-    expect(quote[0]).toBe(70_000n)
+    expect(quote[0]).toBe(0n)
+    expect(decodeBytes32(quote[1])).toBe('chost')
   }, 120_000)
 
   it('a synthetic spam campaign is blocked 100%', async () => {
@@ -309,14 +362,18 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
 
     // The pot is *not* untouched: `rollout` is real work and is paid for it. What must be true is that not one
     // of the 120 empty `compound()` calls the pot would happily have funded was made — 70,000 raw units each.
+    // `rollout` is real work and is paid for it, so the pot is not untouched. What must be true is that not one
+    // of the 120 empty `compound()` calls was made — and, now that the vault measures what it reports, that an
+    // empty one would have been refused on chain anyway.
     const after = (await client.readContract({
       address: topology.bountyPot,
       abi: bountyPotAbi,
       functionName: 'balance',
     })) as bigint
-    const paidJobs = Number((before - after) / 70_000n)
+    const spent = before - after
     const rollouts = metrics.confirmed.get({job: 'rollout'}) + metrics.confirmed.get({job: 'deployBonded'})
-    expect(paidJobs).toBe(rollouts)
+    if (rollouts === 0) expect(spent).toBe(0n)
+    else expect(spent).toBeGreaterThan(0n)
   }, 300_000)
 
   it('waits out the 60-second cooldown rather than burning gas on a revert', async () => {
@@ -364,7 +421,7 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     // Friday 16:00 ET to Saturday: the equity calendar's CLOSED session, which `OracleGate` reports as DEGRADED
     // for every path but redemption. Three days forward from the fixture's Wednesday lands on Saturday.
     await fixture.increaseTime(3 * 86_400)
-    const snapshot = await reader.snapshot(topology, new Map(), 0n)
+    const snapshot = await reader.snapshot(topology, 0n)
     expect(snapshot.globalGateState).not.toBe(GateState.GREEN)
 
     const {runner, metrics} = await makeRunner()
@@ -397,7 +454,7 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     })
     await client.waitForTransactionReceipt({hash})
 
-    const snapshot = await reader.snapshot(topology, new Map(), 0n)
+    const snapshot = await reader.snapshot(topology, 0n)
     const spokePool = (await client.readContract({
       address: topology.registry,
       abi: poolRegistryAbi,
@@ -436,14 +493,14 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     // `GRACE` is 3,600 s of no observation. Jump a day and the layer-A watchdog trips; `AmpsVault.touch` pokes
     // the gate before it checks it, so one call heals the whole system.
     await fixture.increaseTime(86_400 - 3_600 * 4)
-    const before = await reader.snapshot(topology, new Map(), 0n)
+    const before = await reader.snapshot(topology, 0n)
     expect(before.watchdogTripped || before.globalGateState === GateState.WATCHDOG).toBe(true)
 
     const {runner} = await makeRunner()
     const result = await runner.scan()
     expect(result.sent.map((s) => s.key)).toContain('touch:')
 
-    const after = await reader.snapshot(topology, new Map(), 0n)
+    const after = await reader.snapshot(topology, 0n)
     expect(after.watchdogTripped).toBe(false)
   }, 240_000)
 
@@ -472,7 +529,7 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     const receipt = await client.waitForTransactionReceipt({hash: bond})
     expect(receipt.status).toBe('success')
 
-    const snapshot = await reader.snapshot(topology, new Map(), 0n)
+    const snapshot = await reader.snapshot(topology, 0n)
     const constituent = snapshot.constituents.find((c) => c.constituentId === 1)
     expect(constituent?.idleCollateral).toBeGreaterThan(0n)
     expect(constituent?.idleCollateralUsd18).toBeGreaterThanOrEqual(snapshot.vault.deployThresholdUsd18)
@@ -553,16 +610,32 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
 
   it('measures the gas the pot cannot see, and reports it as a metric', async () => {
     await churn('USDG')
-    const {runner, metrics} = await makeRunner()
+    // The ETH price has to be configured for the keeper's own allowance series to be non-zero; the vault takes
+    // its own from the `AMPS/WETH` counter's feed, which the fixture sets to the same $2,500.
+    const {runner, metrics} = await makeRunner({}, ETH_USD18)
     await runner.scan()
 
     const text = metrics.registry.render()
     expect(text).toContain('amps_keeper_gas_used_bucket{job="compound"')
-    expect(metrics.reportedGasAllowance.get({job: 'compound'})).toBe(1)
-    // With `ethUsd18 = 0` the profitability check is off and the measured allowance is zero by construction;
-    // the point of the assertion is that the *reported* allowance is the flat $1 whatever the keeper measured.
-    expect(metrics.reportedWorkValue.get({job: 'compound'})).toBe(1)
-    expect(metrics.measuredWorkValue.get({job: 'compound'})).toBeGreaterThan(1)
+
+    // The two series now describe the same thing from two sides, so they have to agree.
+    //
+    // Work value: the keeper's estimate is a lower bound (the call does not return `compound`'s counter-side
+    // fees), so `measured <= reported`, and where `eth_simulateV1` gave the keeper the vault's own number they
+    // are equal.
+    const measuredWork = metrics.measuredWorkValue.get({job: 'compound'})
+    const reportedWork = metrics.reportedWorkValue.get({job: 'compound'})
+    expect(reportedWork).toBeGreaterThan(0)
+    expect(measuredWork).toBeGreaterThan(0)
+    expect(measuredWork).toBeLessThanOrEqual(reportedWork * 1.0001)
+
+    // Gas allowance: the keeper prices `eth_estimateGas`, the chain prices the receipt's `gasUsed`. They differ
+    // only by the estimator's margin, so they agree to within 25%.
+    const measuredGas = metrics.measuredGasAllowance.get({job: 'compound'})
+    const reportedGas = metrics.reportedGasAllowance.get({job: 'compound'})
+    expect(measuredGas).toBeGreaterThan(0)
+    expect(reportedGas).toBeGreaterThan(0)
+    expect(Math.abs(measuredGas - reportedGas) / reportedGas).toBeLessThan(0.25)
   }, 180_000)
 
   it('degrades to unpaid work when the pot is empty, only if asked to', async () => {

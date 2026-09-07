@@ -268,6 +268,11 @@ export function createMetrics(registry = new Registry()) {
     ),
     bountyExpected: registry.gauge('amps_keeper_bounty_expected_usd', 'Bounty the pot quoted for the last send.'),
     bountyPaid: registry.counter('amps_keeper_bounty_paid_usd_total', 'Bounty actually paid, from BountyPaid.'),
+    bountyReason: registry.gauge(
+      'amps_keeper_bounty_reason',
+      'One for the constraint that bound the last payout, by job and reason: chost, gasCap, dailyCeiling, ' +
+        'depleted. At the Orbit floor basefee gasCap is the usual answer.',
+    ),
     unprofitable: registry.counter(
       'amps_keeper_unprofitable_total',
       'Jobs refused because the bounty did not cover gas, by job.',

@@ -756,6 +756,13 @@ export const ampsBondsAbi = [
   },
   {
     type: 'function',
+    inputs: [{ name: 'owner', internalType: 'address', type: 'address' }],
+    name: 'unvestedOf',
+    outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     inputs: [],
     name: 'vault',
     outputs: [{ name: '', internalType: 'address', type: 'address' }],
@@ -824,6 +831,12 @@ export const ampsBondsAbi = [
         name: 'floorBinding',
         internalType: 'bool',
         type: 'bool',
+        indexed: false,
+      },
+      {
+        name: 'vestSeconds',
+        internalType: 'uint32',
+        type: 'uint32',
         indexed: false,
       },
     ],
@@ -1264,6 +1277,32 @@ export const ampsBondsLensAbi = [
           { name: 'marketId', internalType: 'uint16', type: 'uint16' },
         ],
       },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [
+      { name: 'bonds', internalType: 'contract IAmpsBonds', type: 'address' },
+      { name: 'owners', internalType: 'address[]', type: 'address[]' },
+    ],
+    name: 'unvested',
+    outputs: [
+      { name: 'unvestedAmps', internalType: 'uint256', type: 'uint256' },
+      { name: 'claimableAmps', internalType: 'uint256', type: 'uint256' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [
+      { name: 'bonds', internalType: 'contract IAmpsBonds', type: 'address' },
+      { name: 'marketId', internalType: 'uint16', type: 'uint16' },
+      { name: 'owners', internalType: 'address[]', type: 'address[]' },
+    ],
+    name: 'unvestedOf',
+    outputs: [
+      { name: 'unvestedAmps', internalType: 'uint256', type: 'uint256' },
     ],
     stateMutability: 'view',
   },
@@ -2556,6 +2595,7 @@ export const ampsQuoterAbi = [
           },
           { name: 'checkpointAge', internalType: 'uint32', type: 'uint32' },
           { name: 'degraded', internalType: 'uint8', type: 'uint8' },
+          { name: 'tickSpacing', internalType: 'int24', type: 'int24' },
         ],
       },
     ],
@@ -2625,6 +2665,7 @@ export const ampsQuoterAbi = [
           },
           { name: 'checkpointAge', internalType: 'uint32', type: 'uint32' },
           { name: 'degraded', internalType: 'uint8', type: 'uint8' },
+          { name: 'tickSpacing', internalType: 'int24', type: 'int24' },
         ],
       },
     ],
@@ -3903,6 +3944,13 @@ export const ampsVaultAbi = [
   },
   {
     type: 'function',
+    inputs: [{ name: 'poolId', internalType: 'PoolId', type: 'bytes32' }],
+    name: 'lastPlacementAt',
+    outputs: [{ name: 'timestamp', internalType: 'uint32', type: 'uint32' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     inputs: [],
     name: 'liveCells',
     outputs: [{ name: 'count', internalType: 'uint32', type: 'uint32' }],
@@ -4513,6 +4561,24 @@ export const ampsVaultAbi = [
         type: 'int24',
         indexed: false,
       },
+      {
+        name: 'reason',
+        internalType: 'bytes32',
+        type: 'bytes32',
+        indexed: false,
+      },
+      {
+        name: 'lowerTick',
+        internalType: 'int24',
+        type: 'int24',
+        indexed: false,
+      },
+      {
+        name: 'upperTick',
+        internalType: 'int24',
+        type: 'int24',
+        indexed: false,
+      },
     ],
     name: 'Placement',
   },
@@ -4604,6 +4670,37 @@ export const ampsVaultAbi = [
     anonymous: false,
     inputs: [
       {
+        name: 'constituentId',
+        internalType: 'uint16',
+        type: 'uint16',
+        indexed: true,
+      },
+      {
+        name: 'poolId',
+        internalType: 'PoolId',
+        type: 'bytes32',
+        indexed: true,
+      },
+      {
+        name: 'movedAmps',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'placedAmps',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'Rollout',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
         name: 'standby',
         internalType: 'address',
         type: 'address',
@@ -4646,6 +4743,12 @@ export const ampsVaultAbi = [
         name: 'amount',
         internalType: 'uint256',
         type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'reason',
+        internalType: 'bytes32',
+        type: 'bytes32',
         indexed: false,
       },
     ],
@@ -6313,10 +6416,29 @@ export const ladderPositionValuerAbi = [
   },
   {
     type: 'function',
+    inputs: [{ name: 'poolId', internalType: 'PoolId', type: 'bytes32' }],
+    name: 'amountsOf',
+    outputs: [
+      { name: 'amps', internalType: 'uint256', type: 'uint256' },
+      { name: 'counter', internalType: 'uint256', type: 'uint256' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     inputs: [],
     name: 'poolManager',
     outputs: [
       { name: '', internalType: 'contract IExtsload', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [{ name: 'poolId', internalType: 'PoolId', type: 'bytes32' }],
+    name: 'referenceSqrtPriceX96',
+    outputs: [
+      { name: 'sqrtPriceX96', internalType: 'uint160', type: 'uint160' },
     ],
     stateMutability: 'view',
   },
@@ -6365,10 +6487,18 @@ export const ladderPositionValuerAbi = [
   },
   {
     type: 'error',
+    inputs: [{ name: 'counterDecimals', internalType: 'uint8', type: 'uint8' }],
+    name: 'DecimalsOutOfRange',
+  },
+  {
+    type: 'error',
     inputs: [{ name: 'tickSpacing', internalType: 'int24', type: 'int24' }],
     name: 'InvalidTickSpacing',
   },
+  { type: 'error', inputs: [], name: 'PriceOutOfTickRange' },
+  { type: 'error', inputs: [], name: 'PriceOverflow' },
   { type: 'error', inputs: [], name: 'ZeroAddress' },
+  { type: 'error', inputs: [], name: 'ZeroPrice' },
 ] as const
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -8357,6 +8487,25 @@ export const poolRegistryAbi = [
         type: 'bytes32',
         indexed: true,
       },
+      {
+        name: 'gridBaseTick',
+        internalType: 'int24',
+        type: 'int24',
+        indexed: false,
+      },
+    ],
+    name: 'PoolGridSet',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'poolId',
+        internalType: 'PoolId',
+        type: 'bytes32',
+        indexed: true,
+      },
       { name: 'feed', internalType: 'address', type: 'address', indexed: true },
       {
         name: 'sqrtPriceX96',
@@ -8391,6 +8540,24 @@ export const poolRegistryAbi = [
       },
       {
         name: 'constituentId',
+        internalType: 'uint16',
+        type: 'uint16',
+        indexed: false,
+      },
+      {
+        name: 'tickSpacing',
+        internalType: 'int24',
+        type: 'int24',
+        indexed: false,
+      },
+      {
+        name: 'counterDecimals',
+        internalType: 'uint8',
+        type: 'uint8',
+        indexed: false,
+      },
+      {
+        name: 'buyFeeBps',
         internalType: 'uint16',
         type: 'uint16',
         indexed: false,

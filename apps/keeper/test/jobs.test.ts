@@ -1,8 +1,21 @@
 // SPDX-License-Identifier: MIT
 import {describe, expect, it} from 'vitest'
-import {encodeErrorResult, toFunctionSelector} from 'viem'
-import {ampsVaultAbi} from '@amplestocks/abis'
-import {cooldownFrom, decodeRevert, encodeJob, KEEPER_ERROR_ABI, retryAfter} from '../src/jobs/index.js'
+import {
+  encodeAbiParameters,
+  encodeErrorResult,
+  encodeEventTopics,
+  toFunctionSelector,
+  type AbiEvent,
+} from 'viem'
+import {ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
+import {
+  cooldownFrom,
+  decodeRevert,
+  encodeJob,
+  readBountyReport,
+  KEEPER_ERROR_ABI,
+  retryAfter,
+} from '../src/jobs/index.js'
 import {jobKey} from '../src/domain/decide.js'
 import {SPOKE_POOL} from './helpers.js'
 
@@ -93,5 +106,52 @@ describe('revert decoding', () => {
   it('retryAfter is null for anything but a cooldown', () => {
     expect(retryAfter({ok: true, gasEstimate: 1n})).toBeNull()
     expect(retryAfter({ok: false, gasEstimate: 0n, revert: {name: 'GateNotHealthy', args: [], raw: '0x'}})).toBeNull()
+  })
+})
+
+describe('reading the vault’s own bounty report', () => {
+  const POT = '0x00000000000000000000000000000000000000b3' as const
+
+  function bountyPaidLog(workValueUsd18: bigint, paidUsd18: bigint, paidRaw: bigint, reason: string) {
+    const event = bountyPotAbi.find((i) => i.type === 'event' && i.name === 'BountyPaid') as AbiEvent
+    const encoded = encodeEventTopics({
+      abi: bountyPotAbi,
+      eventName: 'BountyPaid',
+      args: {to: '0x00000000000000000000000000000000000000e0'},
+    })
+    const padded = `0x${Buffer.from(reason, 'ascii').toString('hex').padEnd(64, '0')}` as `0x${string}`
+    return {
+      address: POT,
+      topics: encoded as `0x${string}`[],
+      data: encodeAbiParameters(
+        event.inputs.filter((i) => i.indexed !== true),
+        [workValueUsd18, paidUsd18, paidRaw, padded],
+      ),
+    }
+  }
+
+  it('decodes the work value, the payout and the constraint that bound it', () => {
+    const report = readBountyReport([bountyPaidLog(12n * 10n ** 18n, 118_500_000_000_000_000n, 118_500n, '')], POT)
+    expect(report).toEqual({
+      workValueUsd18: 12n * 10n ** 18n,
+      paidUsd18: 118_500_000_000_000_000n,
+      paidRaw: 118_500n,
+      reason: '',
+    })
+  })
+
+  it('reads the reason back as its ASCII name', () => {
+    for (const reason of ['chost', 'gasCap', 'dailyCeiling', 'depleted']) {
+      expect(readBountyReport([bountyPaidLog(0n, 0n, 0n, reason)], POT)?.reason).toBe(reason)
+    }
+  })
+
+  it('ignores logs from anything but the pot, so a hostile token cannot forge a payout', () => {
+    const forged = {...bountyPaidLog(1_000n * 10n ** 18n, 0n, 0n, ''), address: '0x00000000000000000000000000000000000000ff'}
+    expect(readBountyReport([forged], POT)).toBeUndefined()
+  })
+
+  it('is undefined when the job emitted no BountyPaid at all', () => {
+    expect(readBountyReport([], POT)).toBeUndefined()
   })
 })

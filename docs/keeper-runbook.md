@@ -64,71 +64,93 @@ keeper self-healing after an outage.
 | 5 | the pot can pay something (unless `AMPS_RUN_UNPAID=1`) | `pot-depleted` |
 | 6 | `bounty >= gasEstimate x basefee x ethUsd x (1 + margin)` | `unprofitable` |
 
-**Work value** is measured, not taken on trust:
+**Work value** comes from the vault where it can, and from the keeper's own estimate where it cannot:
 
-* `compound` — `(ampsFees + boughtBack) x P_ref`, where `boughtBack = burned - burnCut` and `burnCut` comes
-  from re-running §3.6 step 5's split client-side. Counter-side fees are not returned by the call and are not
-  counted, so the measure is a lower bound — the safe direction for a dust guard.
-* `rollout` — `moved x P_ref`.
-* `deployBonded` — the placed slice of the idle collateral, valued at the feed.
-
----
-
-## 3. Two contract-side gaps the operator has to know about
-
-Both are v1 facts, not bugs the keeper can fix, and both are why the keeper carries guards the contracts appear
-to have already.
-
-### 3.1 `BountyPot`'s `chost` dust guard cannot fire
-
-`VaultPlacementLib` and `VaultRolloutLib` pass **hardcoded private constants** to `BountyPot.pay`:
-
-```solidity
-uint256 private constant WORK_VALUE_USD18    = 1e18;   // $1, flat
-uint256 private constant GAS_ALLOWANCE_USD18 = 1e18;   // $1, flat
-```
-
-`BountyPot._quote` refuses when `workValueUsd18 < chostUsd18`, and `1e18 < 1e18` is false at the launch `chost`
-of $1. So **a `compound()` on a pool with zero accrued fees is paid the full tip**, and on-chain a spam
-campaign is bounded only by the 60-second per-pool cooldown ($0.07 per pool per minute) and the $25 daily
-ceiling.
-
-The guard that works is the keeper's own, applied to the work value it measured. `test/chain.test.ts` runs
-twenty consecutive scans against an idle chain and asserts the pot is untouched.
-
-*Governance levers:* raise `chostUsd18` (it still cannot fire), or lower `dailyCeilingUsd18` to bound the loss.
-*The real fix is v2:* give the three entry points a `workValueUsd18` argument, or have the libraries compute it.
-
-### 3.2 The 3x gas cap is inert, so the keeper reports gas as a metric instead
-
-The plan asks Phase 4's keeper to "report measured gas to make the cap live". **There is no channel for it**:
-`compound`, `rollout` and `deployBonded` take no gas-allowance argument, and the constants above are `private`
-in a linked library. `3 x $1 = $3` is far above the `$0.05 + 2% x $1 = $0.07` a job earns, so the cap never
-binds and a gas spike is not what stops a job — the keeper's own profitability check is.
-
-What the keeper does instead is measure and publish:
-
-| Metric | Meaning |
-|---|---|
-| `amps_keeper_measured_work_value_usd` | what the job was actually worth |
-| `amps_keeper_reported_work_value_usd` | the flat `$1` the vault reports (always 1) |
-| `amps_keeper_measured_gas_allowance_usd` | `gasEstimate x basefee x ethUsd`, i.e. what would make the cap bind |
-| `amps_keeper_reported_gas_allowance_usd` | the flat `$1` the vault reports (always 1) |
-| `amps_keeper_gas_used` | a histogram of real `gasUsed`, by job |
-
-The gap between the measured and reported series is the input governance needs to size `tip`, `chipBps` and
-`gasCapMultiple`, and the evidence for the v2 change.
-
-### 3.3 A note on the launch tip
-
-`docs/phase3-state-model.md` §12 measures `compound` at 1.0–3.3M gas. At the Arbitrum Orbit floor basefee
-(0.01 gwei) and $2,500 ETH that is **$0.025–$0.083** of gas against a **$0.07** bounty, and at 0.1 gwei the tip
-does not cover the cheapest compound. With `AMPS_ETH_USD18` set, the keeper refuses those jobs (metric
-`amps_keeper_unprofitable_total`) rather than working at a loss. `AMPS_ETH_USD18=0` — the default, and the
-honest setting until Phase 0 resolves the ETH/USD feed on 4663 — turns the check off and the keeper works
-whatever the gas costs.
+* **Preferred** — the `BountyPaid` the job would emit, captured by running it through `eth_simulateV1`. That is
+  the vault's own measurement and the pot's own payout, so `chost`, the daily ceiling, the 3× cap and the pot's
+  balance are all already applied to it (§3.2).
+* **Fallback**, on a node without `eth_simulateV1`:
+  * `compound` — `(ampsFees + boughtBack) x P_ref`, where `boughtBack = burned - burnCut` and `burnCut` comes
+    from re-running §3.6 step 5's split client-side. Counter-side fees are not returned by the call and are not
+    counted, so this is a **lower bound** — the safe direction for a dust guard.
+  * `rollout` — `moved x P_ref`.
+  * `deployBonded` — the placed slice of the idle collateral, valued at the feed.
+  The payout is then `BountyPot._quote` re-run client-side against that work value and
+  `vaultGasAllowanceUsd18(eth_estimateGas, basefee, ethUsd)`, which is the vault's own gas formula.
 
 ---
+
+## 3. What the vault reports, and what the keeper still checks itself
+
+### 3.1 The vault measures its own bounty (was: two gaps, both now fixed)
+
+The pre-audit slice replaced two hardcoded constants with measurements, and both of the gaps this runbook used
+to warn about are closed.
+
+**`BountyPot`'s `chost` dust guard fires.** `compound` reports the counter-side fees at their feed price plus
+`ampsFees + boughtBack` at `P_ref`; `rollout` reports the AMPS actually moved at `P_ref`; `deployBonded` reports
+the collateral placed at the same feed price its threshold was tested against. An empty job therefore reports
+**zero**, and `workValueUsd18 < chostUsd18` is unambiguously true. Previously the vault reported a flat `$1`
+whatever the job did, `1e18 < 1e18` was false, and an empty `compound()` was paid the full tip.
+
+**The 3× gas cap binds, and is usually *the* binding constraint.** `VaultPlacementLib._gasUsed` is a real
+`gasleft()` delta with the EIP-150 `gasleft()/63` correction, plus `KEEPER_GAS_OVERHEAD` (80,000) for the
+intrinsic cost and the payment, clamped at `KEEPER_GAS_MAX` (8M). `_gasCostUsd18` prices it at `block.basefee`
+clamped into `[0.01, 1] gwei` and at the ETH/USD answer the feed registry holds for the `AMPS/WETH` counter —
+the same feed `A` values the vault's WETH bids with, so no new oracle and no new governed parameter.
+
+Concretely, at the Orbit floor basefee and $2,500 ETH:
+
+| job gas | allowance | 3× cap | gross on $10 of work | paid |
+|---|---|---|---|---|
+| 1.0M | $0.0270 | $0.0810 | $0.25 | **$0.0810** |
+| 1.5M | $0.0395 | $0.1185 | $0.25 | **$0.1185** |
+| 3.3M | $0.0845 | $0.2535 | $0.25 | **$0.2535** |
+
+The cap now grows with the job, so the whole §12 gas range is paid more than it costs — which the flat report
+never managed. `src/domain/bounty.ts` mirrors all of it (`vaultGasUsed`, `clampBaseFee`,
+`vaultGasAllowanceUsd18`), and `test/bounty.test.ts` pins the numbers above.
+
+### 3.2 The keeper still measures, for two reasons
+
+**It reads the vault's own report where it can.** `src/jobs/index.ts`'s `simulateBounty` runs the job through
+`eth_simulateV1` and decodes the `BountyPaid` it would emit, so the keeper knows the exact work value, the exact
+payout and the exact binding constraint *before* it sends. `eth_simulateV1` is not universal — anvil has it,
+Arbitrum Nitro does not guarantee it — so the first bountied job that simulates cleanly without producing a
+`BountyPaid` latches the feature off for the process and the keeper falls back to its own estimate. There is
+nothing to configure; the log line `eth_simulateV1 did not yield a BountyPaid` records the fallback.
+
+**Its own estimate is a lower bound.** `compound` returns `(ampsFees, burned)` and says nothing about the
+counter-side fees, which the vault does price in. So the fallback path under-states the work and can skip a job
+the vault would have paid for; it never sends one the vault would refuse. `amps_keeper_measured_work_value_usd`
+against `amps_keeper_reported_work_value_usd` (from the confirmed `BountyPaid`) is exactly that gap, and the
+chain suite asserts `measured ≤ reported`.
+
+The gas series are the same comparison from two sides: the keeper prices `eth_estimateGas`, the chain prices the
+receipt's `gasUsed`, and the suite asserts they agree within 25%. A persistent divergence means the vault and
+the keeper disagree about what a job costs — and the 3× cap is the thing that binds, so it matters.
+
+### 3.3 The tip economics, which survive
+
+The cap is generous now, but **`tip + chip` is still the binding term once the basefee leaves the floor.** At
+0.1 gwei a 1.5M-gas compound costs $0.375 while the gross on $10 of work is only $0.05 + 2% = $0.25, so the job
+is under water and the keeper refuses it (`amps_keeper_unprofitable_total`). The lever is `tipUsd18` and
+`chipBps` through the 48-hour timelock, not `gasCapMultiple`. With `AMPS_ETH_USD18` unset the check is off and
+the keeper works whatever the gas costs — the honest setting until Phase 0 resolves the ETH/USD feed on 4663.
+
+### 3.4 The cooldown clock is a chain read
+
+`AmpsVault.lastPlacementAt(PoolId)` exists, and the keeper reads it per pool every scan. It previously had no
+getter, and the keeper reconstructed it from the newest `placedAt` across the ladder — a lower bound, because a
+`compound` that relaid nothing stamps the map without touching a record — and corrected it from the
+`PlacementCooldown` revert. Both workarounds are gone.
+
+Within a single scan the keeper layers an overlay on top: the snapshot is taken once, and a job sent early
+stamps pools that later candidates in the same cycle would otherwise still see as free. The overlay is
+populated from the confirmed job's own `Placement` logs — which now carry `reason`, `lowerTick` and `upperTick`,
+and which name **exactly** the pools the vault stamped, including the entry pools a `rollout` harvested — and it
+is cleared at the top of every scan. The chain is the authority; the overlay only covers one snapshot's
+staleness.
 
 ## 4. Configuration
 
@@ -206,7 +228,9 @@ simulation already prices it into the work value.
 `amps_keeper_live_cell_budget`.
 
 **Pot** `amps_keeper_pot_balance_raw`, `amps_keeper_pot_budget_left_usd`, `amps_keeper_pot_spent_24h_usd`,
-`amps_keeper_pot_quote_usd`, `amps_keeper_pot_quote_reason{reason}`.
+`amps_keeper_pot_quote_usd`, `amps_keeper_pot_quote_reason{reason}`. The last two are a **reference** quote —
+$1 of work against $1 of allowance — answering "is the pot responding, and what is binding it right now". The
+per-job payout is the vault's own, in `amps_keeper_bounty_paid_usd_total` and `amps_keeper_bounty_reason`.
 
 **Decisions** `amps_keeper_candidates{job}`, `amps_keeper_eligible{job}`, `amps_keeper_skipped_total{job,reason}`,
 `amps_keeper_simulations_total{job}`, `amps_keeper_simulation_reverts_total{job,error}`.
@@ -215,10 +239,17 @@ simulation already prices it into the work value.
 `amps_keeper_submit_errors_total{job}`, `amps_keeper_in_flight`.
 
 **Bounty and gas** `amps_keeper_gas_estimate{job}`, `amps_keeper_gas_used{job}`,
-`amps_keeper_measured_work_value_usd{job}`, `amps_keeper_reported_work_value_usd{job}`,
-`amps_keeper_measured_gas_allowance_usd{job}`, `amps_keeper_reported_gas_allowance_usd{job}`,
+`amps_keeper_measured_work_value_usd{job}` (the keeper's estimate) against
+`amps_keeper_reported_work_value_usd{job}` (the vault's, from the confirmed `BountyPaid`);
+`amps_keeper_measured_gas_allowance_usd{job}` (priced from `eth_estimateGas`) against
+`amps_keeper_reported_gas_allowance_usd{job}` (priced from the receipt's `gasUsed`);
 `amps_keeper_bounty_expected_usd{job}`, `amps_keeper_bounty_paid_usd_total{job}`,
-`amps_keeper_unprofitable_total{job}`, `amps_keeper_chost_blocked_total{job}`.
+`amps_keeper_bounty_reason{job,reason}`, `amps_keeper_unprofitable_total{job}`,
+`amps_keeper_chost_blocked_total{job}`.
+
+`measured` should sit at or just below `reported` (§3.2), and the two gas series within a quarter of each other.
+A sustained gap in either pair is the alert that the keeper and the vault disagree about what a job is worth or
+what it costs.
 
 `skipped_total`'s `reason` label is a closed set — every value is in the table in §2 — so a dashboard can
 enumerate it. Logs are one JSON object per line on stdout.
@@ -321,16 +352,18 @@ The chain suite spawns its own anvil, stands the whole system up through
 drives the keeper against it. It is opt-in (`AMPS_KEEPER_CHAIN_TESTS=1`) because the CI `node` job does not
 install Foundry, and it takes about eleven minutes.
 
-Twenty drills: the fixture itself and the topology resolution; `compound` firing on accrued fees with the
-bounty landing in the keeper's account; the dust guard refusing an empty pool; a 20-scan spam campaign blocked
+Twenty drills: the fixture itself and the topology resolution; `compound` firing on accrued fees, with every
+`BountyPaid` decoded and reconciled against the pot's balance change, the payout checked against both of the
+pot's constraints, and the keeper's pre-send prediction asserted equal to what the chain paid; the dust guard
+refusing an empty pool against a work value the *vault* measured at zero; a 20-scan spam campaign blocked
 outright; the cooldown waited out; a guardian freeze and a closed market stopping everything; a diverged pool
 refused while its neighbours run; a stale checkpoint refreshed; a tripped watchdog healed by `touch`;
 `deployBonded` firing above the deploy threshold and not below it; a 48-hour outage resumed with no duplicate
 send; a second instance deciding identically; the bounty-versus-gas refusal at a pinned 1 gwei basefee; the
-measured-versus-reported gas metrics; the pot swept empty and the degrade-to-unpaid switch; and the assertion
-that only the five permissionless jobs are ever encoded and that no ladder cell moves.
+measured-versus-reported work and gas series agreeing; the pot swept empty and the degrade-to-unpaid switch;
+and the assertion that only the five permissionless jobs are ever encoded and that no ladder cell moves.
 
-### A Phase 3 script bug the fixture found
+### A Phase 3 script bug the fixture found (being fixed by the deploy agent)
 
 **`10_TestnetPools.run()` and `09_Phase3Wire.run()` cannot broadcast as written.** Both delegate to a helper
 contract deployed inside the script (`_registrar().execute(...)`, `wireScript.execute(...)`), and a

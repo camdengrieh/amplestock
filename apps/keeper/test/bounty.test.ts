@@ -2,14 +2,17 @@
 import {describe, expect, it} from 'vitest'
 import {
   budgetLeftUsd18,
+  clampBaseFee,
   compoundWorkValueUsd18,
-  gasCostUsd18,
-  measuredGasAllowanceUsd18,
   meetsChost,
   quoteBounty,
   splitAmpsFees,
-  VAULT_REPORTED_GAS_ALLOWANCE_USD18,
-  VAULT_REPORTED_WORK_VALUE_USD18,
+  vaultGasAllowanceUsd18,
+  vaultGasUsed,
+  KEEPER_BASEFEE_CAP_WEI,
+  KEEPER_BASEFEE_FLOOR_WEI,
+  KEEPER_GAS_MAX,
+  KEEPER_GAS_OVERHEAD,
   WAD,
 } from '../src/domain/bounty.js'
 import {pot} from './helpers.js'
@@ -61,33 +64,51 @@ describe('quoteBounty mirrors BountyPot._quote', () => {
   })
 })
 
-describe('the v1 gap: what the vault actually reports', () => {
-  it('the flat $1 work value clears the $1 chost, so the on-chain dust guard never fires', () => {
-    // This is the finding, asserted rather than described: `1e18 < 1e18` is false, so a `compound()` on a pool
-    // with zero accrued fees is paid the full tip. On-chain, only the 60 s cooldown and the daily ceiling bound
-    // a spam campaign; the guard that works is the keeper's own, over its measured work value.
-    const launch = pot()
-    const quote = quoteBounty(launch, VAULT_REPORTED_WORK_VALUE_USD18, VAULT_REPORTED_GAS_ALLOWANCE_USD18)
-    expect(VAULT_REPORTED_WORK_VALUE_USD18).toBe(launch.chostUsd18)
-    expect(quote.reason).toBe('')
-    expect(quote.payableUsd18).toBeGreaterThan(0n)
+describe('the measured reporting the vault does now', () => {
+  it('gas used is the delta plus the fixed overhead, under the hard ceiling', () => {
+    expect(vaultGasUsed(1_500_000n)).toBe(1_500_000n + KEEPER_GAS_OVERHEAD)
+    expect(vaultGasUsed(0n)).toBe(KEEPER_GAS_OVERHEAD)
+    // No measurement of any shape may report more gas than the worst job can plausibly burn.
+    expect(vaultGasUsed(KEEPER_GAS_MAX)).toBe(KEEPER_GAS_MAX)
+    expect(vaultGasUsed(50_000_000n)).toBe(KEEPER_GAS_MAX)
   })
 
-  it('the flat $1 gas allowance makes the 3x cap inert across a fuzzed gas series', () => {
-    // The cap is `3 x $1 = $3`; the payout is `$0.05 + 2% x $1 = $0.07`. No gas price in a plausible range can
-    // make the cap bind, which is why "the keeper reports measured gas" needs an entry-point argument that
-    // `VaultPlacementLib` does not have.
-    const launch = pot()
-    for (let gas = 100_000n; gas <= 30_000_000n; gas += 373_337n) {
-      for (const baseFee of [1n, 10n ** 6n, 10n ** 8n, 10n ** 9n, 50n * 10n ** 9n]) {
-        const measured = measuredGasAllowanceUsd18(gas, baseFee, 2_500n * WAD)
-        const quote = quoteBounty(launch, VAULT_REPORTED_WORK_VALUE_USD18, VAULT_REPORTED_GAS_ALLOWANCE_USD18)
-        expect(quote.payableUsd18).toBe(7n * 10n ** 16n)
-        // ...whereas quoting with the measured allowance does move, which is the point of measuring it.
-        const honest = quoteBounty(launch, VAULT_REPORTED_WORK_VALUE_USD18, measured)
-        expect(honest.payableUsd18).toBeLessThanOrEqual(quote.payableUsd18)
-      }
-    }
+  it('the basefee is clamped at both ends: a free block is not free and a spike is not the pot’s to fund', () => {
+    expect(clampBaseFee(0n)).toBe(KEEPER_BASEFEE_FLOOR_WEI)
+    expect(clampBaseFee(1n)).toBe(KEEPER_BASEFEE_FLOOR_WEI)
+    expect(clampBaseFee(50n * 10n ** 9n)).toBe(KEEPER_BASEFEE_CAP_WEI)
+    expect(clampBaseFee(10n ** 8n)).toBe(10n ** 8n)
+  })
+
+  it('a 1.5M-gas compound at the Orbit floor and $2,500 ETH is ~$0.0395 of allowance and a ~$0.119 cap', () => {
+    // This is the number the whole Phase 4 economics turns on, so it is pinned rather than described:
+    // (1,500,000 + 80,000) x 0.01 gwei x $2,500 = $0.0395, and BountyPot's 3x cap is $0.1185.
+    const allowance = vaultGasAllowanceUsd18(1_500_000n, KEEPER_BASEFEE_FLOOR_WEI, 2_500n * WAD)
+    expect(allowance).toBe(39_500_000_000_000_000n)
+    expect(allowance * 3n).toBe(118_500_000_000_000_000n)
+  })
+
+  it('the 3x gas cap now binds — it is the usual constraint at the floor basefee', () => {
+    // $10 of work earns tip + chip = $0.05 + $0.20 = $0.25, but the cap on a 1.5M-gas job is $0.1185.
+    const allowance = vaultGasAllowanceUsd18(1_500_000n, KEEPER_BASEFEE_FLOOR_WEI, 2_500n * WAD)
+    const quote = quoteBounty(pot(), 10n * WAD, allowance)
+    expect(quote.payableUsd18).toBe(118_500_000_000_000_000n)
+    expect(quote.reason).toBe('')
+  })
+
+  it('an empty job reports a zero work value, so `chost` refuses it on chain', () => {
+    // The v1 gap this replaces: the vault used to report a flat $1 whatever the job did, and `1e18 < 1e18` is
+    // false, so an empty `compound()` was paid the full tip. A measured zero is unambiguously below the guard.
+    const quote = quoteBounty(pot(), 0n, vaultGasAllowanceUsd18(1_500_000n, KEEPER_BASEFEE_FLOOR_WEI, 2_500n * WAD))
+    expect(quote.payableRaw).toBe(0n)
+    expect(quote.reason).toBe('chost')
+  })
+
+  it('an unpriceable ETH feed leaves the allowance at zero, which makes the job unpaid rather than free money', () => {
+    expect(vaultGasAllowanceUsd18(1_500_000n, KEEPER_BASEFEE_FLOOR_WEI, 0n)).toBe(0n)
+    const quote = quoteBounty(pot(), 100n * WAD, 0n)
+    expect(quote.payableRaw).toBe(0n)
+    expect(quote.reason).toBe('gasCap')
   })
 
   it('every bounty stays inside the daily ceiling and the 3x cap under a fuzzed gas series', () => {
@@ -95,10 +116,17 @@ describe('the v1 gap: what the vault actually reports', () => {
     let spent = 0n
     for (let i = 0; i < 1_000; i += 1) {
       const gas = 250_000n + BigInt(i) * 29_000n
-      const gasCost = gasCostUsd18(gas, 100_000_000n, 2_500n * WAD)
-      const quote = quoteBounty({...launch, spentLast24hUsd18: spent}, 10n * WAD, gasCost)
-      expect(quote.payableUsd18).toBeLessThanOrEqual(3n * gasCost + 1n)
-      spent += quote.payableUsd18
+      for (const baseFee of [0n, KEEPER_BASEFEE_FLOOR_WEI, 10n ** 8n, KEEPER_BASEFEE_CAP_WEI, 50n * 10n ** 9n]) {
+        const allowance = vaultGasAllowanceUsd18(gas, baseFee, 2_500n * WAD)
+        const quote = quoteBounty({...launch, spentLast24hUsd18: spent}, 10n * WAD, allowance)
+        expect(quote.payableUsd18).toBeLessThanOrEqual(3n * allowance)
+        expect(quote.payableUsd18).toBeLessThanOrEqual(budgetLeftUsd18({...launch, spentLast24hUsd18: spent}))
+      }
+      spent += quoteBounty(
+        {...launch, spentLast24hUsd18: spent},
+        10n * WAD,
+        vaultGasAllowanceUsd18(gas, KEEPER_BASEFEE_FLOOR_WEI, 2_500n * WAD),
+      ).payableUsd18
       expect(spent).toBeLessThanOrEqual(launch.dailyCeilingUsd18)
     }
   })

@@ -37,7 +37,17 @@ export * from './domain/types.js'
 export * from './domain/bounty.js'
 export * from './domain/decide.js'
 export * from './domain/policy.js'
-export {encodeJob, simulateJob, decodeRevert, retryAfter, KEEPER_ERROR_ABI} from './jobs/index.js'
+export {
+  cooldownFrom,
+  decodeRevert,
+  encodeJob,
+  placedPools,
+  readBountyReport,
+  retryAfter,
+  simulateBounty,
+  simulateJob,
+  KEEPER_ERROR_ABI,
+} from './jobs/index.js'
 export {decideJobs} from './cre/workflow.js'
 
 export async function main(): Promise<void> {

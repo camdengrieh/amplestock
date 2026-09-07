@@ -84,16 +84,24 @@ It is opt-in (`AMPS_KEEPER_CHAIN_TESTS=1`) because the CI `node` job does not in
 about eleven minutes: a minute of Solidity compilation, a minute standing the system up, and the rest driving
 real transactions through 20 drills.
 
-## Two things the contracts cannot do, and what the keeper does instead
+## What the vault reports, and what the keeper checks itself
 
-`VaultPlacementLib` and `VaultRolloutLib` pass **hardcoded** `WORK_VALUE_USD18 = 1e18` and
-`GAS_ALLOWANCE_USD18 = 1e18` to `BountyPot.pay`, and the three entry points take no argument that could carry
-anything else. Two consequences, both covered in the runbook's §3:
+The vault **measures** what it reports to `BountyPot`: `compound` prices the counter-side fees at their feed
+price plus `ampsFees + boughtBack` at `P_ref`, `rollout` the AMPS moved, `deployBonded` the collateral placed;
+the gas allowance is a real `gasleft()` delta with the EIP-150 correction, priced at a clamped basefee and the
+ETH/USD feed. So `chost` refuses an empty job on chain, the 3× gas cap binds, and `BountyPot.quote` answers the
+real payout.
 
-1. **`BountyPot`'s `chost` guard cannot fire** (`1e18 < 1e18` is false), so an empty `compound()` is paid the
-   full tip. The keeper applies its own dust guard to the work it measured.
-2. **The 3x gas cap is inert**, so "the keeper reports measured gas to make the cap live" has no channel. The
-   keeper measures it and publishes it — `amps_keeper_measured_gas_allowance_usd` against
-   `amps_keeper_reported_gas_allowance_usd` — which is what governance needs to size `tip` and `chipBps`.
+The keeper reads that report directly where the node allows: `simulateBounty` runs the job through
+`eth_simulateV1` and decodes the `BountyPaid` it would emit, so it knows the exact payout and the exact binding
+constraint before it sends. Where the node has no `eth_simulateV1` — anvil does, Arbitrum Nitro does not
+guarantee it — it falls back to its own estimate, which for `compound` is a **lower bound** because the call
+does not return the counter-side fees. `amps_keeper_measured_*` against `amps_keeper_reported_*` is that gap,
+and the chain suite asserts the bound holds.
+
+At the Orbit floor basefee the 3× cap is what binds: a 1.5M-gas compound has a $0.0395 allowance and is paid
+$0.1185. What survives of the old tip-economics finding is that **`tip + chip` binds once the basefee leaves the
+floor** — at 0.1 gwei a 1.5M-gas compound costs $0.375 against a $0.25 gross — so the keeper refuses it and the
+lever is `tipUsd18`/`chipBps`. `docs/keeper-runbook.md` §3 has the tables.
 
 MIT licensed — see the repository root `LICENSE`.

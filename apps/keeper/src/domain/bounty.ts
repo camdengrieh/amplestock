@@ -3,43 +3,37 @@
 /**
  * The bounty arithmetic, mirrored from `contracts/src/keeper/BountyPot.sol` and `VaultPlacementLib`.
  *
- * Pure. No I/O, no viem. Two jobs:
+ * Pure. No I/O, no viem. Three jobs:
  *
- *  1. **`quoteBounty`** reproduces `BountyPot._quote` exactly, so the keeper can predict a payout for any
- *     `(workValue, gasAllowance)` pair without an RPC round trip — including the pairs the vault does *not*
- *     currently pass, which is what makes the "report measured gas" analysis possible at all.
- *  2. **`splitAmpsFees`** reproduces §3.6 step 5 of `docs/phase3-state-model.md`, so `compound`'s single
- *     `ampsFees` return can be decomposed into the creator, staker, burn and re-ladder slices — and the
- *     buyback-burn component can be separated out of `burned`, which is what the work value is measured from.
+ *  1. **`quoteBounty`** reproduces `BountyPot._quote` exactly, so the keeper can predict a payout without an RPC
+ *     round trip.
+ *  2. **`vaultGasAllowanceUsd18`** reproduces `VaultPlacementLib._gasUsed` and `_gasCostUsd18`: the gas the job
+ *     burned plus `KEEPER_GAS_OVERHEAD`, capped at `KEEPER_GAS_MAX`, priced at `block.basefee` clamped into
+ *     `[KEEPER_BASEFEE_FLOOR_WEI, KEEPER_BASEFEE_CAP_WEI]` and at the ETH/USD answer the feed registry holds for
+ *     the `AMPS/WETH` counter. This is what makes the pot's 3x cap predictable from the keeper's side.
+ *  3. **`splitAmpsFees`** reproduces §3.6 step 5, so `compound`'s single `ampsFees` return can be decomposed and
+ *     the buyback-burn component separated out of `burned`.
  *
- * ## The v1 gap this file exists to make visible
+ * ## What changed, and what the keeper still has to do itself
  *
- * `VaultPlacementLib` and `VaultRolloutLib` both hard-code
+ * The pre-audit slice made the vault **measure** what it reports. `compound` accumulates the counter-side fees
+ * at their feed price plus `ampsFees + boughtBack` at `P_ref`; `rollout` reports the AMPS actually moved at
+ * `P_ref`; `deployBonded` reports the collateral placed at the same feed price its threshold was tested
+ * against. The gas allowance is a real `gasleft()` delta with the EIP-150 63/64 correction. Three consequences:
  *
- * ```solidity
- * uint256 private constant WORK_VALUE_USD18   = 1e18;   // $1
- * uint256 private constant GAS_ALLOWANCE_USD18 = 1e18;  // $1
- * ```
+ *  * **`chost` fires.** An empty `compound` reports a zero work value and is paid exactly nothing, so the
+ *    on-chain dust guard now does the work the keeper's own guard used to have to do alone.
+ *  * **The 3x gas cap binds**, and at the Orbit floor basefee it is usually *the* binding constraint: a 1.5M-gas
+ *    compound has an allowance of about $0.066 and a cap of about $0.20, well under the tip-plus-chip a
+ *    meaningful fee collection earns.
+ *  * **`BountyPot.quote` answers the real payout**, so a simulation that captures the `BountyPaid` log tells the
+ *    keeper exactly what it will be paid before it sends.
  *
- * and pass them to `BountyPot.pay`. They are `private constant`s in a linked library, and neither `compound`,
- * `rollout` nor `deployBonded` takes an argument the caller could use to report anything else. So the keeper
- * **cannot** feed its measured gas into the on-chain cap, however carefully it measures: the plan's
- * "Phase 4's keeper should report measured gas to make the cap live" has no channel in the landed ABI.
- *
- * Two consequences the keeper is built around:
- *
- *  * The 3x gas cap is inert. `3 x $1 = $3` is far above the `$0.05 + 2% x $1 = $0.07` a job earns, so the cap
- *    never binds and a gas spike is not what stops a job — the keeper's own profitability check is.
- *  * **`chost` is inert too.** The guard is `workValueUsd18 < chostUsd18`, and `1e18 < 1e18` is false at the
- *    launch `chost` of $1, so a `compound()` on a pool with *zero* accrued fees is paid the full tip. On-chain,
- *    a spam campaign is bounded only by the 60-second per-pool cooldown and the $25 daily ceiling. The dust
- *    guard that actually works is the keeper's own, in {@link meetsChost}, applied to the work value the keeper
- *    measures rather than the flat $1 the vault reports.
- *
- * Both are reported to the operator as metrics rather than papered over: `amps_keeper_reported_work_value_usd`
- * versus `amps_keeper_measured_work_value_usd` is exactly the divergence governance needs to size `tip`, `chip`
- * and `gasCapMultiple`, and it is the input to the v2 change that would give the entry points a
- * `gasAllowanceUsd18` argument.
+ * The keeper keeps its own guard anyway, for one reason: its estimate of `compound`'s work value from the return
+ * value alone is a **lower bound** (the counter-side fees are not returned by the call), so a keeper that only
+ * ever trusted its own estimate would skip jobs the vault would pay for. {@link meetsChost} against that lower
+ * bound is therefore a *floor* on what it will attempt, and the authoritative number is the one the vault
+ * reports — which `src/jobs/index.ts` reads out of the simulated `BountyPaid` event where the node supports it.
  */
 
 /** Basis points denominator, `Constants.BPS`. */
@@ -48,11 +42,17 @@ export const BPS = 10_000n
 /** 1e18. */
 export const WAD = 10n ** 18n
 
-/** `VaultPlacementLib.WORK_VALUE_USD18` / `VaultRolloutLib.WORK_VALUE_USD18`: flat $1 in v1. */
-export const VAULT_REPORTED_WORK_VALUE_USD18 = WAD
+/** `Constants.KEEPER_GAS_OVERHEAD`: the intrinsic cost and the payment itself, added to the measured delta. */
+export const KEEPER_GAS_OVERHEAD = 80_000n
 
-/** `VaultPlacementLib.GAS_ALLOWANCE_USD18` / `VaultRolloutLib.GAS_ALLOWANCE_USD18`: flat $1 in v1. */
-export const VAULT_REPORTED_GAS_ALLOWANCE_USD18 = WAD
+/** `Constants.KEEPER_GAS_MAX`: no measurement of any shape may report more gas than the worst job can burn. */
+export const KEEPER_GAS_MAX = 8_000_000n
+
+/** `Constants.KEEPER_BASEFEE_FLOOR_WEI`: 0.01 gwei, the Arbitrum Orbit floor. */
+export const KEEPER_BASEFEE_FLOOR_WEI = 10_000_000n
+
+/** `Constants.KEEPER_BASEFEE_CAP_WEI`: 1 gwei. A spike beyond it is not the pot's to fund. */
+export const KEEPER_BASEFEE_CAP_WEI = 1_000_000_000n
 
 /** The pot parameters {@link quoteBounty} needs. A subset of `PotSnapshot`, so the CRE mirror can build one. */
 export interface BountyParameters {
@@ -153,15 +153,34 @@ export function gasCostUsd18(gas: bigint, baseFeeWei: bigint, ethUsd18: bigint):
   return (gas * baseFeeWei * ethUsd18) / WAD
 }
 
+/** `VaultPlacementLib._gasUsed`: the measured delta plus the overhead, under the hard ceiling. */
+export function vaultGasUsed(measured: bigint): bigint {
+  const total = measured + KEEPER_GAS_OVERHEAD
+  return total > KEEPER_GAS_MAX ? KEEPER_GAS_MAX : total
+}
+
+/** `VaultPlacementLib._gasCostUsd18`'s basefee clamp: the pot funds neither a free block nor a spike. */
+export function clampBaseFee(baseFeeWei: bigint): bigint {
+  if (baseFeeWei < KEEPER_BASEFEE_FLOOR_WEI) return KEEPER_BASEFEE_FLOOR_WEI
+  if (baseFeeWei > KEEPER_BASEFEE_CAP_WEI) return KEEPER_BASEFEE_CAP_WEI
+  return baseFeeWei
+}
+
 /**
- * The gas allowance the keeper *would* report if the entry points accepted one, in 18-decimal USD.
+ * The gas allowance the **vault** reports to `BountyPot`, reproduced from the keeper's side.
  *
- * Identical arithmetic to {@link gasCostUsd18}; it is a separate name because it is a distinct claim — this is
- * the number that would make `BountyPot`'s `gasCapMultiple` bind, and it is exported as a metric so governance
- * can see how far the flat $1 is from the truth.
+ * `VaultPlacementLib._gasUsed` measures `gasStart - gasleft()` with the EIP-150 `gasleft()/63` correction, adds
+ * `KEEPER_GAS_OVERHEAD` and clamps at `KEEPER_GAS_MAX`; `_gasCostUsd18` prices it at the clamped basefee and the
+ * ETH/USD answer. Feeding this an `eth_estimateGas` result reproduces it within the intrinsic-cost and
+ * EIP-150 residual terms, which is what `amps_keeper_measured_gas_allowance_usd` against
+ * `amps_keeper_reported_gas_allowance_usd` is for: a persistent divergence means the vault and the keeper
+ * disagree about what a job costs, and the 3x cap is the thing that binds.
+ *
+ * A zero `ethUsd18` yields zero, exactly as the vault yields zero when the feed registry cannot price ETH — and
+ * a zero allowance makes the 3x cap bind at zero and the job unpaid.
  */
-export function measuredGasAllowanceUsd18(gas: bigint, baseFeeWei: bigint, ethUsd18: bigint): bigint {
-  return gasCostUsd18(gas, baseFeeWei, ethUsd18)
+export function vaultGasAllowanceUsd18(measuredGas: bigint, baseFeeWei: bigint, ethUsd18: bigint): bigint {
+  return gasCostUsd18(vaultGasUsed(measuredGas), clampBaseFee(baseFeeWei), ethUsd18)
 }
 
 /** The AMPS-side split of `compound`, §3.6 step 5. */

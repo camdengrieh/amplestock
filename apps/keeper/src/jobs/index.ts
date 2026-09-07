@@ -18,16 +18,18 @@
 
 import {
   decodeErrorResult,
+  decodeEventLog,
   encodeFunctionData,
   parseAbi,
+  toEventSelector,
   BaseError,
   ContractFunctionRevertedError,
   type Address,
   type Hex,
   type PublicClient,
 } from 'viem'
-import {ampsVaultAbi} from '@amplestocks/abis'
-import type {JobCandidate, JobKind, Simulation} from '../domain/types.js'
+import {ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
+import {BOUNTIED_JOBS, type BountyReport, type JobCandidate, type JobKind, type Simulation} from '../domain/types.js'
 
 /**
  * The custom errors the keeper decodes.
@@ -204,3 +206,139 @@ export function revertLabel(simulation: Simulation): string {
 
 /** The jobs, in the order the runner considers them. */
 export const JOB_ORDER: readonly JobKind[] = ['touch', 'checkpoint', 'compound', 'deployBonded', 'rollout']
+
+// ---------------------------------------------------------------------------------------------------------------
+// Reading the vault's own bounty report
+// ---------------------------------------------------------------------------------------------------------------
+
+/** `BountyPot.BountyPaid`, the one event the keeper decodes out of a simulation. */
+const BOUNTY_PAID = bountyPotAbi.find(
+  (item): item is Extract<typeof bountyPotAbi[number], {type: 'event'}> =>
+    item.type === 'event' && item.name === 'BountyPaid',
+)
+
+/** `bytes32` holding a short ASCII string, as `BountyPot` emits its `reason`. */
+function decodeReason(value: `0x${string}`): string {
+  let out = ''
+  for (let i = 2; i + 1 < value.length; i += 2) {
+    const code = Number.parseInt(value.slice(i, i + 2), 16)
+    if (code === 0) break
+    out += String.fromCharCode(code)
+  }
+  return out
+}
+
+/** Pulls the `BountyPaid` the vault emitted out of a set of logs, or `undefined` when it emitted none. */
+export function readBountyReport(
+  logs: readonly {address: string; topics: readonly `0x${string}`[]; data: `0x${string}`}[],
+  pot: Address,
+): BountyReport | undefined {
+  if (BOUNTY_PAID === undefined) return undefined
+  const topic = toEventSelector(BOUNTY_PAID)
+  for (const log of logs) {
+    if (log.address.toLowerCase() !== pot.toLowerCase()) continue
+    if (log.topics[0] !== topic) continue
+    try {
+      const decoded = decodeEventLog({abi: bountyPotAbi, data: log.data, topics: log.topics as [`0x\${string}`, ...`0x\${string}`[]]})
+      if (decoded.eventName !== 'BountyPaid') continue
+      const args = decoded.args as unknown as {
+        workValueUsd18: bigint
+        paidUsd18: bigint
+        paidRaw: bigint
+        reason: `0x${string}`
+      }
+      return {
+        workValueUsd18: args.workValueUsd18,
+        paidUsd18: args.paidUsd18,
+        paidRaw: args.paidRaw,
+        reason: decodeReason(args.reason),
+      }
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+/**
+ * Runs a job through `eth_simulateV1` to capture the logs it would emit, and reads the `BountyPaid` out of them.
+ *
+ * This is how the keeper learns what the vault *measured* rather than what the keeper can estimate: `compound`
+ * returns `(ampsFees, burned)` and nothing about the counter-side fees, but the vault prices those into the work
+ * value it reports, so the return value alone is a lower bound. The event is the whole answer — work value,
+ * payout and the constraint that bound it.
+ *
+ * `eth_simulateV1` is not universal. Anvil has it; Arbitrum Nitro does not guarantee it. Any failure returns
+ * `undefined` and the caller falls back to the estimate, which is why this is a separate function rather than
+ * part of {@link simulateJob}: a node without it must still produce a keeper that works, only less precisely.
+ */
+export async function simulateBounty(
+  client: PublicClient,
+  vault: Address,
+  pot: Address,
+  sender: Address,
+  job: JobCandidate,
+): Promise<BountyReport | undefined> {
+  if (!BOUNTIED_JOBS.includes(job.kind)) return undefined
+  try {
+    const result = (await client.request({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- eth_simulateV1 is not in viem's RPC union
+      method: 'eth_simulateV1' as any,
+      params: [
+        {
+          blockStateCalls: [{calls: [{from: sender, to: vault, data: encodeJob(job)}]}],
+          traceTransfers: false,
+          validation: false,
+        },
+        'latest',
+      ],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)) as {calls?: {status?: string; logs?: {address: string; topics: `0x${string}`[]; data: `0x${string}`}[]}[]}[]
+
+    const call = result?.[0]?.calls?.[0]
+    if (call === undefined || call.status === '0x0') return undefined
+    return readBountyReport(call.logs ?? [], pot)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Every pool a confirmed job actually placed into, from the `Placement` logs it emitted.
+ *
+ * The vault stamps `_lastPlacementAt` for exactly these pools, so this is the precise answer to "what is on
+ * cooldown now" — better than inferring it from the job's own target, which for a `rollout` names a constituent
+ * while the placements land in the destination spoke *and* whichever entry pools were harvested. The
+ * pre-audit slice added `reason`, `lowerTick` and `upperTick` to the event; the keeper needs only the pool id,
+ * but the reason is worth logging because it names which of the five placement kinds ran.
+ */
+export function placedPools(
+  logs: readonly {address: string; topics: readonly `0x${string}`[]; data: `0x${string}`}[],
+  vault: Address,
+): {poolId: `0x${string}`; reason: string}[] {
+  const out: {poolId: `0x${string}`; reason: string}[] = []
+  const event = ampsVaultAbi.find(
+    (item): item is Extract<typeof ampsVaultAbi[number], {type: 'event'}> =>
+      item.type === 'event' && item.name === 'Placement',
+  )
+  if (event === undefined) return out
+  const topic = toEventSelector(event)
+
+  for (const log of logs) {
+    if (log.address.toLowerCase() !== vault.toLowerCase()) continue
+    if (log.topics[0] !== topic) continue
+    try {
+      const decoded = decodeEventLog({
+        abi: ampsVaultAbi,
+        data: log.data,
+        topics: log.topics as [`0x${string}`, ...`0x${string}`[]],
+      })
+      if (decoded.eventName !== 'Placement') continue
+      const args = decoded.args as unknown as {poolId: `0x${string}`; reason: `0x${string}`}
+      out.push({poolId: args.poolId, reason: decodeReason(args.reason)})
+    } catch {
+      // A log we cannot decode is a log we do not use.
+    }
+  }
+  return out
+}

@@ -27,20 +27,30 @@ const TOPOLOGY: Topology = {
   feedRegistry: '0x00000000000000000000000000000000000000b7',
 }
 
-/** A reader that answers from a scripted queue of snapshots. */
-function fakeReader(snapshots: ChainSnapshot[], topology: Topology = TOPOLOGY): ChainReader {
+/**
+ * A reader that answers from a scripted queue of snapshots.
+ *
+ * `stamp` is the chain's `_lastPlacementAt` map: the vault writes it when a placement lands, and
+ * `AmpsVault.lastPlacementAt(poolId)` reads it back. The fake mirrors that rather than the keeper's old
+ * in-memory cache, because the cache is gone — the clock is a chain read now.
+ */
+function fakeReader(
+  snapshots: ChainSnapshot[],
+  stamp: Map<string, number> = new Map(),
+  topology: Topology = TOPOLOGY,
+): ChainReader {
   let index = 0
   return {
     topology: async () => topology,
     poolIds: async () => (snapshots[Math.min(index, snapshots.length - 1)] as ChainSnapshot).pools.map((p) => p.poolId),
-    seedLastPlacementAt: async () => new Map<string, number>(),
-    // Faithful to `ChainReader.snapshot`: the runner's cooldown map is what fills `pool.lastPlacementAt`.
-    snapshot: async (_t: Topology, lastPlacementAt: ReadonlyMap<string, number>) => {
+    // Faithful to `ChainReader.snapshot`, which now reads `AmpsVault.lastPlacementAt` per pool. `stamp` stands
+    // in for the chain: a job the runner sends writes into it, and the next snapshot reads it back.
+    snapshot: async () => {
       const next = snapshots[Math.min(index, snapshots.length - 1)] as ChainSnapshot
       index += 1
       return {
         ...next,
-        pools: next.pools.map((p) => ({...p, lastPlacementAt: lastPlacementAt.get(p.poolId) ?? p.lastPlacementAt})),
+        pools: next.pools.map((p) => ({...p, lastPlacementAt: stamp.get(p.poolId) ?? p.lastPlacementAt})),
       }
     },
   } as unknown as ChainReader
@@ -57,7 +67,11 @@ function fakeClient(results: Record<string, unknown>, gas = 1_500_000n, throwFor
   } as unknown as PublicClient
 }
 
-function fakeSubmitter(): Submitter & {submitted: TxRequest[]} {
+/**
+ * A submitter that also plays the vault's side of the placement clock: a confirmed job stamps `stamp`, which is
+ * what the fake reader answers `AmpsVault.lastPlacementAt` from on the next scan.
+ */
+function fakeSubmitter(stamp: Map<string, number> = new Map(), at = NOW): Submitter & {submitted: TxRequest[]} {
   const submitted: TxRequest[] = []
   return {
     kind: 'local',
@@ -67,20 +81,22 @@ function fakeSubmitter(): Submitter & {submitted: TxRequest[]} {
       submitted.push(request)
       return {id: `tx-${submitted.length}`, hash: `0x${String(submitted.length).padStart(64, '0')}` as `0x${string}`}
     },
-    wait: async (submission: Submission) => ({
-      hash: submission.hash as `0x${string}`,
-      success: true,
-      gasUsed: 1_400_000n,
-    }),
+    wait: async (submission: Submission) => {
+      const request = submitted.find((r) => r.jobKey !== undefined && submission.id.endsWith(String(submitted.indexOf(r) + 1)))
+      const target = request?.jobKey.split(':')[1] ?? ''
+      if (target.startsWith('0x')) stamp.set(target, at)
+      return {hash: submission.hash as `0x${string}`, success: true, gasUsed: 1_400_000n, logs: []}
+    },
   }
 }
 
 function build(snapshots: ChainSnapshot[], client: PublicClient, now = () => NOW * 1000) {
-  const submitter = fakeSubmitter()
+  const stamp = new Map<string, number>()
+  const submitter = fakeSubmitter(stamp)
   const metrics = createMetrics()
   const runner = new Runner({
     client,
-    reader: fakeReader(snapshots),
+    reader: fakeReader(snapshots, stamp),
     submitter,
     policy: DEFAULT_POLICY,
     logger: createLogger({}, {sink: () => undefined}),
@@ -90,7 +106,7 @@ function build(snapshots: ChainSnapshot[], client: PublicClient, now = () => NOW
     ethUsd18: 2_500n * WAD,
     now,
   })
-  return {runner, submitter, metrics}
+  return {runner, submitter, metrics, stamp}
 }
 
 describe('one scan', () => {
@@ -181,7 +197,7 @@ describe('idempotence and resumption', () => {
     expect(coldSent).toContain('checkpoint:')
   })
 
-  it('learns the exact ready time from a PlacementCooldown revert', async () => {
+  it('records the pool a PlacementCooldown revert names, for the rest of the scan', async () => {
     const {encodeErrorResult} = await import('viem')
     const {KEEPER_ERROR_ABI} = await import('../src/jobs/index.js')
     const poolId = pool().poolId
@@ -200,27 +216,30 @@ describe('idempotence and resumption', () => {
 
     const {runner} = build([baseSnapshot({constituents: [], pools: [pool()]})], client)
     await runner.scan()
+    // The overlay is scan-scoped — `AmpsVault.lastPlacementAt` is the authority across scans — but within the
+    // cycle it saves every later candidate for that pool a wasted round trip.
     expect(runner.cooldowns().get(poolId)).toBe(NOW + 45 - DEFAULT_POLICY.placementCooldownSeconds)
   })
 
-  it('clears its cooldown cache when the vault pointer moves', async () => {
+  it('follows a vault pointer move without a restart', async () => {
     const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
     const state = baseSnapshot({constituents: [], vault: vault({checkpointTimestamp: NOW})})
     const moved: Topology = {...TOPOLOGY, vault: '0x00000000000000000000000000000000000000aa'}
     let topology = TOPOLOGY
 
-    const submitter = fakeSubmitter()
+    const stamp = new Map<string, number>()
+    const submitter = fakeSubmitter(stamp)
     const runner = new Runner({
       client,
       reader: {
         topology: async () => topology,
         poolIds: async () => state.pools.map((p) => p.poolId),
-        seedLastPlacementAt: async () => new Map<string, number>(),
-        snapshot: async (_t: Topology, lastPlacementAt: ReadonlyMap<string, number>) => ({
+        snapshot: async () => ({
           ...state,
+          // The new vault's `_lastPlacementAt` starts empty, which is what a real migration looks like.
           pools: state.pools.map((p) => ({
             ...p,
-            lastPlacementAt: lastPlacementAt.get(p.poolId) ?? p.lastPlacementAt,
+            lastPlacementAt: topology === moved ? 0 : (stamp.get(p.poolId) ?? p.lastPlacementAt),
           })),
         }),
       } as unknown as ChainReader,
