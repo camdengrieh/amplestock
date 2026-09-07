@@ -412,7 +412,11 @@ contract Phase2IntegrationTest is Phase2Fixture {
             if (tokens[i] == address(usdg)) usdgIndex = i;
         }
         assertTrue(usdgIndex != type(uint256).max, "USDG is a redeemable asset");
-        assertEq(amounts[usdgIndex], ((usdgBefore * 200e18 / supply) * 9900) / Constants.BPS, "and it paid out");
+        assertEq(
+            amounts[usdgIndex],
+            ((usdgBefore * 200e18 / supply) * (Constants.BPS - Constants.REDEEM_FEE_BPS_DEFAULT)) / Constants.BPS,
+            "and it paid out"
+        );
         assertGt(usdg.balanceOf(BOB), 0, "the redeemer was paid with every oracle dead");
         assertLt(amps.totalSupply(), supply, "and the shares were burned");
 

@@ -71,7 +71,12 @@ contract VaultAttackTest is AmpsVaultFixture {
 
         assertEq(stock.balanceOf(address(this)), expected, "exactly pro rata of the inflated balance, no more");
         assertLt(stock.balanceOf(address(this)), flash, "the attacker is strictly worse off");
-        assertApproxEqRel(stock.balanceOf(address(this)), flash / 10, 0.01e18, "they got back their own 10%, less fee");
+        assertApproxEqRel(
+            stock.balanceOf(address(this)),
+            (flash / 10) * (Constants.BPS - Constants.REDEEM_FEE_BPS_DEFAULT) / Constants.BPS,
+            0.001e18,
+            "they got back their own 10%, less the redemption fee"
+        );
     }
 
     /// @notice And the honest holder is never worse off: a flash deposit can only raise what they are owed.
