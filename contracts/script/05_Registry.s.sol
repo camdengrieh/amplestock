@@ -13,6 +13,7 @@ import {
     InclusionRecord,
     PoolClass
 } from "../src/types/Types.sol";
+import {Gov} from "./lib/Gov.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -47,6 +48,18 @@ import {console2} from "forge-std/console2.sol";
 ///      job — and it never points the vault at the `OracleGate`. Pool registration must happen with the gate
 ///      pointer *unset*, because `OracleGate` reports `WATCHDOG` until the hub pool's observation ring covers
 ///      `twapWindow`, and a freshly initialised pool has no observations (`docs/phase2-state-model.md` §9.1).
+///
+/// @dev **How the ~97 governed calls are made** (`docs/deploy-runbook.md` §0.2). Every registry and feed mutator
+///      is `onlyTimelock`, and on 4663 the timelock is a `TimelockController` that cannot sign a transaction. So
+///      `script/lib/Gov.sol` picks the mode: with `AMPS_GOV_RELAY=true` each call is `schedule(delay 0)` +
+///      `execute` signed by `AMPS_DEPLOYER`; otherwise the script broadcasts as the timelock itself, which is what
+///      a single-operator testnet and the fork-free dry run do. `Gov` is a library of `internal` functions
+///      precisely so that the broadcast window and every call belong to *this* contract: a window opened by a
+///      helper writes every transaction with the same nonce under Foundry 1.8.1 (§0.1).
+///
+/// @dev **Constituent ids are read back, not returned.** `TimelockController.execute` discards the target's return
+///      data, so `addConstituent`'s `(uint16, PoolId)` is recovered from `constituentIdOf` / `poolIdOf` in both
+///      modes rather than in one.
 ///
 /// @dev **Usage.**
 /// ```
@@ -193,7 +206,12 @@ contract Registry is Script {
     // -----------------------------------------------------------------------------------------------------------
 
     /// @notice Loads the config, registers everything missing, and rewrites `script/config/pools.json`.
-    function run() external {
+    /// @dev `virtual` because `10_TestnetPools` **is** a `Registry`: it substitutes mock counter assets for the
+    ///      4663 addresses and then runs this same registration in its own frame. Delegating to a separate
+    ///      `Registry` instance instead would open the broadcast window inside a helper contract, and Foundry
+    ///      1.8.1 writes every transaction from such a window with the same nonce
+    ///      (`docs/deploy-runbook.md` §0.1).
+    function run() external virtual {
         Wiring memory w = loadWiring();
         Result memory result = execute(w, loadEntryPools(), loadSpokes());
         writePools(w, result);
@@ -221,8 +239,12 @@ contract Registry is Script {
         result.pools = new OpenedPool[](entries.length + spokes.length);
         uint256 opened;
 
+        Gov.Ctx memory ctx = Gov.load(w.timelock);
+        Gov.describe(ctx);
+        Gov.requireBootstrappable(ctx);
+
         vm.recordLogs();
-        vm.startBroadcast(w.timelock);
+        Gov.begin(ctx);
 
         for (uint256 i; i < entries.length; ++i) {
             EntryPoolSpec memory e = entries[i];
@@ -237,8 +259,12 @@ contract Registry is Script {
                 revert PlaceholderAddress(e.symbol, e.counter, e.feed);
             }
 
-            _installFeed(w.feedRegistry, e.counter, e.feed, e.heartbeatSeconds);
-            registry.registerEntryPool(key, e.counterDecimals, e.buyFeeBps, e.feed);
+            _installFeed(ctx, w.feedRegistry, e.counter, e.feed, e.heartbeatSeconds);
+            Gov.send(
+                ctx,
+                w.registry,
+                abi.encodeCall(IPoolRegistry.registerEntryPool, (key, e.counterDecimals, e.buyFeeBps, e.feed))
+            );
             result.pools[opened++] = OpenedPool({
                 poolId: PoolId.unwrap(poolId), counter: e.counter, sqrtPriceX96: 0, constituentId: 0, symbol: e.symbol
             });
@@ -254,8 +280,14 @@ contract Registry is Script {
             }
             if (s.token == address(0) || s.feed == address(0)) revert PlaceholderAddress(s.symbol, s.token, s.feed);
 
-            _installFeed(w.feedRegistry, s.token, s.feed, s.heartbeatSeconds);
-            (uint16 constituentId, PoolId poolId) = registry.addConstituent(_addParams(s, w.registrationWeightBps));
+            _installFeed(ctx, w.feedRegistry, s.token, s.feed, s.heartbeatSeconds);
+            Gov.send(
+                ctx, w.registry, abi.encodeCall(IPoolRegistry.addConstituent, (_addParams(s, w.registrationWeightBps)))
+            );
+            // Read the ids back off the registry rather than off the return value: `TimelockController.execute`
+            // discards the target's return data, so a relayed call has none to decode.
+            uint16 constituentId = registry.constituentIdOf(s.token);
+            PoolId poolId = registry.poolIdOf(constituentId);
             result.pools[opened++] = OpenedPool({
                 poolId: PoolId.unwrap(poolId),
                 counter: s.token,
@@ -267,10 +299,10 @@ contract Registry is Script {
             console2.log("spoke %s registered as constituent %s", s.symbol, constituentId);
         }
 
-        result.weightsInstalled = _installWeights(registry, spokes);
-        _applyBondParams(w, registry, spokes);
+        result.weightsInstalled = _installWeights(ctx, w.registry, spokes);
+        _applyBondParams(ctx, w, registry, spokes);
 
-        vm.stopBroadcast();
+        Gov.end(ctx);
 
         // Trim to what was actually opened, then fill in the price each pool opened at from `PoolOpened`.
         OpenedPool[] memory trimmed = new OpenedPool[](opened);
@@ -414,31 +446,47 @@ contract Registry is Script {
 
     /// @dev Allowlists an aggregator as a Chainlink Standard proxy and configures it for `token`. A no-op when the
     ///      feed registry is not wired yet or the feed is already the configured one.
-    function _installFeed(address feedRegistry, address token, address aggregator, uint32 heartbeatSeconds) private {
+    function _installFeed(
+        Gov.Ctx memory ctx,
+        address feedRegistry,
+        address token,
+        address aggregator,
+        uint32 heartbeatSeconds
+    ) private {
         if (feedRegistry == address(0)) return;
-        IFeedRegistry feeds = IFeedRegistry(feedRegistry);
-        if (feeds.feedOf(token) == aggregator) return;
+        if (IFeedRegistry(feedRegistry).feedOf(token) == aggregator) return;
 
-        feeds.setStandardProxy(aggregator, true);
-        feeds.setFeed(
-            token,
-            aggregator,
-            FeedConfig({
-                aggregator: address(0),
-                decimals: 0,
-                set: false,
-                heartbeat: heartbeatSeconds,
-                thresholdBps: FEED_THRESHOLD_BPS,
-                minAnswerUsd8: FEED_MIN_ANSWER_USD8,
-                maxAnswerUsd8: type(uint128).max
-            })
+        Gov.send(ctx, feedRegistry, abi.encodeCall(IFeedRegistry.setStandardProxy, (aggregator, true)));
+        Gov.send(
+            ctx,
+            feedRegistry,
+            abi.encodeCall(
+                IFeedRegistry.setFeed,
+                (
+                    token,
+                    aggregator,
+                    FeedConfig({
+                        aggregator: address(0),
+                        decimals: 0,
+                        set: false,
+                        heartbeat: heartbeatSeconds,
+                        thresholdBps: FEED_THRESHOLD_BPS,
+                        minAnswerUsd8: FEED_MIN_ANSWER_USD8,
+                        maxAnswerUsd8: type(uint128).max
+                    })
+                )
+            )
         );
     }
 
     /// @dev Installs the launch weight vector over every ACTIVE constituent. Returns false — without reverting —
     ///      when the registry holds an active name this run has no weight for, because `setIndexWeights` requires
     ///      the active weights to sum to exactly 10,000 and a partial vector cannot satisfy that.
-    function _installWeights(IPoolRegistry registry, SpokeSpec[] memory spokes) private returns (bool installed) {
+    function _installWeights(Gov.Ctx memory ctx, address registryAddress, SpokeSpec[] memory spokes)
+        private
+        returns (bool installed)
+    {
+        IPoolRegistry registry = IPoolRegistry(registryAddress);
         uint16 count = registry.constituentCount();
         uint16 active = registry.activeConstituentCount();
         if (active == 0) return false;
@@ -470,7 +518,7 @@ contract Registry is Script {
         }
         if (!changed) return false;
 
-        registry.setIndexWeights(ids, weights);
+        Gov.send(ctx, registryAddress, abi.encodeCall(IPoolRegistry.setIndexWeights, (ids, weights)));
         installed = true;
         console2.log("index weights installed over %s constituents", active);
     }
@@ -483,7 +531,9 @@ contract Registry is Script {
     }
 
     /// @dev Applies per-market bond overrides, and only the ones that differ from what the market already holds.
-    function _applyBondParams(Wiring memory w, IPoolRegistry registry, SpokeSpec[] memory spokes) private {
+    function _applyBondParams(Gov.Ctx memory ctx, Wiring memory w, IPoolRegistry registry, SpokeSpec[] memory spokes)
+        private
+    {
         if (w.bonds == address(0)) return;
         IAmpsBonds bonds = IAmpsBonds(w.bonds);
 
@@ -497,15 +547,25 @@ contract Registry is Script {
 
             BondMarket memory m = bonds.market(marketId);
             if (m.dBaseBps != s.bond.dBaseBps || m.dMinBps != s.bond.dMinBps || m.dMaxBps != s.bond.dMaxBps) {
-                bonds.setDiscountParams(marketId, s.bond.dBaseBps, s.bond.dMinBps, s.bond.dMaxBps);
+                Gov.send(
+                    ctx,
+                    w.bonds,
+                    abi.encodeCall(
+                        IAmpsBonds.setDiscountParams, (marketId, s.bond.dBaseBps, s.bond.dMinBps, s.bond.dMaxBps)
+                    )
+                );
                 console2.log("%s discount params updated", s.symbol);
             }
             if (m.kWeightX18 != s.bond.kWeightX18 || m.kFillX18 != s.bond.kFillX18) {
-                bonds.setCoefficients(marketId, s.bond.kWeightX18, s.bond.kFillX18);
+                Gov.send(
+                    ctx,
+                    w.bonds,
+                    abi.encodeCall(IAmpsBonds.setCoefficients, (marketId, s.bond.kWeightX18, s.bond.kFillX18))
+                );
                 console2.log("%s bond coefficients updated", s.symbol);
             }
             if (m.capBpsPerEpoch != s.bond.capBpsPerEpoch) {
-                bonds.setCapBpsPerEpoch(marketId, s.bond.capBpsPerEpoch);
+                Gov.send(ctx, w.bonds, abi.encodeCall(IAmpsBonds.setCapBpsPerEpoch, (marketId, s.bond.capBpsPerEpoch)));
                 console2.log("%s bond capacity updated", s.symbol);
             }
         }

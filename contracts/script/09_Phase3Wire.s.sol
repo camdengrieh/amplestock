@@ -11,6 +11,8 @@ import {IPoolRegistry} from "../src/interfaces/IPoolRegistry.sol";
 import {OracleGate} from "../src/oracle/OracleGate.sol";
 import {Constants} from "../src/types/Constants.sol";
 import {GateState} from "../src/types/Types.sol";
+import {Calendar} from "./lib/Calendar.sol";
+import {Gov} from "./lib/Gov.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Script} from "forge-std/Script.sol";
 import {stdJson} from "forge-std/StdJson.sol";
@@ -58,6 +60,12 @@ import {console2} from "forge-std/console2.sol";
 ///      {checkBootstrap} asserts steps 1-4 as a precondition and {assertGateGreen} is the step-4 gate itself, so
 ///      the ordering is a check in code rather than a paragraph in a runbook.
 ///
+/// @dev **`WIRE_REDEPLOY_GATE`.** `03_Core` already deploys an `OracleGate` against `AmpsHook`, so a fresh
+///      deployment runs this with `WIRE_REDEPLOY_GATE=false` and the script only re-points. `true` deploys a new
+///      gate and re-installs the calendar from `script/lib/Calendar.sol`, which is the shape a *later* gate
+///      replacement takes — the gate stores the DST table and the holiday bitmap and exposes neither, so a
+///      replacement cannot copy them off the old one.
+///
 /// @dev **Usage.**
 /// ```
 ///   # emit the proposal calldata for the Safe (default)
@@ -89,7 +97,7 @@ contract Phase3Wire is Script {
     /// @notice The year the bundled NYSE holiday bitmap covers. Later years are installed by their own
     ///         `setHolidayBitmap` proposal; the gate treats an unknown year as having no full-day closures, which
     ///         is a liveness choice, not a safety one.
-    uint16 internal constant HOLIDAY_YEAR = 2026;
+    uint16 internal constant HOLIDAY_YEAR = Calendar.HOLIDAY_YEAR;
 
     // -----------------------------------------------------------------------------------------------------------
     // Types
@@ -163,6 +171,7 @@ contract Phase3Wire is Script {
         if (direct) {
             address gate = execute(t, redeployGate);
             console2.log("oracleGate now %s", gate);
+            recordGate(gate);
         } else {
             writeProposal(buildCalls(t, t.oracleGate));
         }
@@ -183,57 +192,79 @@ contract Phase3Wire is Script {
         IAmpsVault vault = IAmpsVault(t.vault);
         if (vault.initialized()) revert AlreadyGenesis();
 
+        Gov.Ctx memory ctx = Gov.load(t.timelock);
+        Gov.describe(ctx);
+        Gov.requireBootstrappable(ctx);
+
         gate = t.oracleGate;
         if (redeployGate) {
             _require(t.guardian, "guardian");
             _require(t.registry, "registry");
             _require(t.feedRegistry, "feedRegistry");
-            vm.startBroadcast(t.timelock);
+            // The deployment itself is not a governed call: anyone may deploy a gate, and only the pointer move
+            // that follows is privileged.
+            vm.startBroadcast(ctx.sender);
             gate = address(new OracleGate(t.timelock, t.guardian, t.feedRegistry, t.registry, t.hook));
             vm.stopBroadcast();
             console2.log("OracleGate redeployed at %s (marketReference = AmpsHook)", gate);
             installCalendar(t, gate);
         } else if (gate != address(0) && IOracleGate(gate).marketReference() != t.hook) {
-            vm.startBroadcast(t.timelock);
-            IOracleGate(gate).setMarketReference(t.hook);
-            vm.stopBroadcast();
+            Gov.begin(ctx);
+            Gov.send(ctx, gate, abi.encodeCall(IOracleGate.setMarketReference, (t.hook)));
+            Gov.end(ctx);
         }
         _require(gate, "oracleGate");
 
-        vm.startBroadcast(t.timelock);
+        Gov.begin(ctx);
 
-        if (vault.marketReference() != t.hook) vault.setPolicyPointer(SLOT_MARKET_REFERENCE, t.hook);
+        if (vault.marketReference() != t.hook) {
+            Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_MARKET_REFERENCE, t.hook)));
+        }
         if (t.positionValuer != address(0) && vault.positionValuer() != t.positionValuer) {
-            vault.setPolicyPointer(SLOT_POSITION_VALUER, t.positionValuer);
+            Gov.send(
+                ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_POSITION_VALUER, t.positionValuer))
+            );
         }
         if (t.ladderPolicy != address(0) && vault.ladderPolicy() != t.ladderPolicy) {
-            vault.setPolicyPointer(SLOT_LADDER_POLICY, t.ladderPolicy);
+            Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_LADDER_POLICY, t.ladderPolicy)));
         }
         if (t.rolloutPolicy != address(0) && vault.rolloutPolicy() != t.rolloutPolicy) {
-            vault.setPolicyPointer(SLOT_ROLLOUT_POLICY, t.rolloutPolicy);
+            Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_ROLLOUT_POLICY, t.rolloutPolicy)));
         }
         if (t.feePolicy != address(0) && AmpsHook(t.hook).feePolicy() != t.feePolicy) {
-            AmpsHook(t.hook).setFeePolicy(t.feePolicy);
+            Gov.send(ctx, t.hook, abi.encodeCall(AmpsHook.setFeePolicy, (t.feePolicy)));
         }
         if (t.bondPolicy != address(0) && t.bonds != address(0) && IAmpsBonds(t.bonds).policy() != t.bondPolicy) {
-            IAmpsBonds(t.bonds).setPolicy(t.bondPolicy);
+            Gov.send(ctx, t.bonds, abi.encodeCall(IAmpsBonds.setPolicy, (t.bondPolicy)));
         }
         if (t.feedRegistry != address(0) && IFeedRegistry(t.feedRegistry).oracleGate() != gate) {
-            IFeedRegistry(t.feedRegistry).setOracleGate(gate);
+            Gov.send(ctx, t.feedRegistry, abi.encodeCall(IFeedRegistry.setOracleGate, (gate)));
         }
 
-        vm.stopBroadcast();
+        Gov.end(ctx);
 
         // Step 4 of §9.1, and only now: the gate pointer goes in last, and only if the pools and the hub ring
         // are actually there. Before this line the vault is ungated, which is what let step 2 happen at all.
         checkBootstrap(t, uint16(_expectedPools()));
 
-        vm.startBroadcast(t.timelock);
-        if (vault.oracleGate() != gate) vault.setPolicyPointer(SLOT_ORACLE_GATE, gate);
-        vm.stopBroadcast();
+        Gov.begin(ctx);
+        if (vault.oracleGate() != gate) {
+            Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_ORACLE_GATE, gate)));
+        }
+        Gov.end(ctx);
 
         assertGateGreen(gate);
         console2.log("bootstrap step 4 complete: gate is GREEN, genesis() may run");
+    }
+
+    /// @notice Records the gate this run ended up pointing at in `script/config/deployments.json`.
+    /// @dev A targeted key write rather than a rewrite of the file: `09` owns exactly one entry in it, and the
+    ///      rest of the address book belongs to `03_Core`. Only `run()` calls this — `execute()` deliberately
+    ///      touches no file, so the fork-free dry run cannot dirty the working tree.
+    /// @param gate The `OracleGate` address.
+    function recordGate(address gate) public {
+        vm.writeJson(vm.toString(gate), DEPLOYMENTS_PATH, ".core.oracleGate");
+        console2.log("recorded oracleGate in %s", DEPLOYMENTS_PATH);
     }
 
     /// @notice Re-installs the DST table and the NYSE holiday bitmap on a freshly deployed gate.
@@ -244,10 +275,11 @@ contract Phase3Wire is Script {
     /// @param t The addresses (for the timelock).
     /// @param gate The gate to configure.
     function installCalendar(Targets memory t, address gate) public {
-        vm.startBroadcast(t.timelock);
-        OracleGate(gate).setDstTable(dstStarts(), dstEnds());
-        OracleGate(gate).setHolidayBitmap(HOLIDAY_YEAR, holidayBitmap2026());
-        vm.stopBroadcast();
+        Gov.Ctx memory ctx = Gov.load(t.timelock);
+        Gov.begin(ctx);
+        Gov.send(ctx, gate, abi.encodeCall(OracleGate.setDstTable, (dstStarts(), dstEnds())));
+        Gov.send(ctx, gate, abi.encodeCall(OracleGate.setHolidayBitmap, (HOLIDAY_YEAR, holidayBitmap2026())));
+        Gov.end(ctx);
         console2.log("calendar installed on %s (DST 2025-2032, NYSE %s)", gate, uint256(HOLIDAY_YEAR));
     }
 
@@ -436,39 +468,19 @@ contract Phase3Wire is Script {
     /// @notice US DST window starts, UTC: the second Sunday in March at 02:00 EST, 2025 through 2032.
     /// @return starts The timestamps.
     function dstStarts() public pure returns (uint32[] memory starts) {
-        starts = new uint32[](8);
-        starts[0] = 1_741_503_600;
-        starts[1] = 1_772_953_200;
-        starts[2] = 1_805_007_600;
-        starts[3] = 1_836_457_200;
-        starts[4] = 1_867_906_800;
-        starts[5] = 1_899_356_400;
-        starts[6] = 1_930_806_000;
-        starts[7] = 1_962_860_400;
+        starts = Calendar.dstStarts();
     }
 
     /// @notice US DST window ends, UTC: the first Sunday in November at 02:00 EDT, 2025 through 2032.
     /// @return ends The timestamps.
     function dstEnds() public pure returns (uint32[] memory ends) {
-        ends = new uint32[](8);
-        ends[0] = 1_762_063_200;
-        ends[1] = 1_793_512_800;
-        ends[2] = 1_825_567_200;
-        ends[3] = 1_857_016_800;
-        ends[4] = 1_888_466_400;
-        ends[5] = 1_919_916_000;
-        ends[6] = 1_951_365_600;
-        ends[7] = 1_983_420_000;
+        ends = Calendar.dstEnds();
     }
 
     /// @notice The 2026 NYSE full-day closures as days of the year, packed into the gate's two-word bitmap.
     /// @return bitmap The bitmap.
     function holidayBitmap2026() public pure returns (uint256[2] memory bitmap) {
-        uint16[10] memory daysOfYear = [1, 19, 47, 93, 145, 170, 184, 250, 330, 359];
-        for (uint256 i; i < daysOfYear.length; ++i) {
-            uint256 index = uint256(daysOfYear[i]) - 1;
-            bitmap[index >> 8] |= uint256(1) << (index & 255);
-        }
+        bitmap = Calendar.holidayBitmap();
     }
 
     // -----------------------------------------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 {
-  "$comment": "The core Amplestocks addresses every Phase 3 script reads: filled in as scripts 01-08 run on a chain, zero until then. Every entry may be overridden by the environment variable named beside it, which is what the dry-run harness and a one-off re-run use. This file is deployment state, not reference data: the Uniswap, Chainlink and asset addresses live in packages/config and script/config/constituents.json.",
+  "$comment": "The core Amplestocks addresses every deployment script reads and writes: filled in as 02_Libraries, 03_Core and 09_Phase3Wire run on a chain, zero until then. Every entry may be overridden by the environment variable named beside it in envOverrides, which is what the dry-run harness and a one-off re-run use. This file is deployment state, not reference data: the Uniswap, Chainlink and asset addresses live in packages/config, script/config/preflight.json and script/config/constituents.json.",
   "chainId": 0,
   "network": "unset",
   "core": {
@@ -22,6 +22,7 @@
     "rolloutPolicy": "0x0000000000000000000000000000000000000000",
     "feePolicy": "0x0000000000000000000000000000000000000000",
     "bondPolicy": "0x0000000000000000000000000000000000000000",
+    "quoter": "0x0000000000000000000000000000000000000000",
     "weth9": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
     "usdg": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
   },
@@ -45,6 +46,7 @@
     "rolloutPolicy": "AMPS_ROLLOUT_POLICY",
     "feePolicy": "AMPS_FEE_POLICY",
     "bondPolicy": "AMPS_BOND_POLICY",
+    "quoter": "AMPS_QUOTER",
     "weth9": "AMPS_WETH9",
     "usdg": "AMPS_USDG"
   }

@@ -8,6 +8,8 @@
     "build": "forge build",
     "test": "forge test",
     "fmt": "forge fmt --check",
-    "lint": "forge lint"
+    "lint": "forge lint",
+    "broadcast-test": "bash test/script/broadcast.sh",
+    "preflight": "forge script script/00_Preflight.s.sol"
   }
 }

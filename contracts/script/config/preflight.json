@@ -1,0 +1,118 @@
+{
+  "$comment": "Chain reference data 00_Preflight.s.sol probes on chain. This is the deployment-side mirror of packages/config/src/index.ts (addresses.4663) \u2014 the Foundry root cannot read outside contracts/, so the two files carry the same addresses and must be changed together. NOTHING HERE IS VERIFIED: Phase 0 of the plan re-reads every one of these on chain, and 00_Preflight is the script that does it. An entry whose address is zero is a Phase 0 placeholder and is reported as TODO rather than probed.",
+  "chainId": 4663,
+  "network": "Robinhood Chain mainnet",
+  "arbOsVersion": 61,
+  "poolManagerCodeHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "poolManagerCodeHashNote": "keccak256 of the deployed PoolManager runtime code, pinned against Uniswap v4-core 1.0.2. TODO: Phase 0 records `cast keccak $(cast code $POOL_MANAGER)` here; while it is zero the check reports TODO instead of comparing.",
+  "infrastructureCount": 17,
+  "infrastructure": [
+    {
+      "name": "poolManager",
+      "address": "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+      "required": true,
+      "note": "Uniswap v4 PoolManager. Every Amplestocks pool lives here."
+    },
+    {
+      "name": "positionManager",
+      "address": "0x58DAeC3116aaE6d93017bAAea7749052E8a04Fa7",
+      "required": false,
+      "note": "v4 PositionManager. Not used by the protocol; the dApp and third-party LPs read it."
+    },
+    {
+      "name": "stateView",
+      "address": "0xF3334192D15450cDd385C8b70e03F9A6bd9E673B",
+      "required": false,
+      "note": "v4 StateView. The indexer and the keeper read pool state through it."
+    },
+    {
+      "name": "v4Quoter",
+      "address": "0x8Dc178EFB8111bb0973dd9d722ebeFf267c98f94",
+      "required": false,
+      "note": "v4 Quoter. The quote-never-reverts exit criterion is measured against it."
+    },
+    {
+      "name": "universalRouter",
+      "address": "0x06afBA43fd06227fA663b0dAeCF536F6eaA6BF99",
+      "required": false,
+      "note": "The live UniversalRouter. The two-hop rotation route is one V4_SWAP command through it."
+    },
+    {
+      "name": "permit2",
+      "address": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+      "required": false,
+      "note": "Canonical Permit2, the UniversalRouter's token approval path."
+    },
+    {
+      "name": "weth9",
+      "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+      "required": true,
+      "note": "The AMPS/WETH entry pool's counter asset. Native ETH is address(0) and would take currency0 from AMPS, so the route wraps."
+    },
+    {
+      "name": "usdg",
+      "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      "required": true,
+      "note": "USDG, 6 decimals, the hub pool's counter asset and the BountyPot's unit."
+    },
+    {
+      "name": "usdc",
+      "address": "0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8",
+      "required": false,
+      "note": "Bridged USDC. Only the dApp's Across zap touches it."
+    },
+    {
+      "name": "create2Factory",
+      "address": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+      "required": true,
+      "note": "Canonical deterministic-deployment proxy. Recorded UNVERIFIED on 4663: this check is what verifies it. Amps, the four vault libraries and AmpsHook are all mined against it."
+    },
+    {
+      "name": "multicall3",
+      "address": "0xcA11bde05977b3631167028862bE2a173976CA11",
+      "required": false,
+      "note": "Canonical Multicall3. The dApp and the indexer batch reads through it."
+    },
+    {
+      "name": "safeL2Singleton",
+      "address": "0x29fcB43b46531BcA003ddC8FCB67FFE91900C762",
+      "required": false,
+      "note": "Safe v1.4.1 L2 singleton. The proposer Safe 3/5 and the guardian Safe 2/4 are deployed from it."
+    },
+    {
+      "name": "chainlinkStreamsVerifierProxy",
+      "address": "0xcE73c8ad08CBDEaCa6078BF0627C8fe0a9a536E7",
+      "required": false,
+      "note": "Data Streams VerifierProxy. v1 does not use it; StreamsRelay in v1.5 will."
+    },
+    {
+      "name": "zeroExAllowanceHolder",
+      "address": "0x0000000000001fF3684f28c67538d4D072C22734",
+      "required": false,
+      "note": "0x AllowanceHolder. Distribution, not protocol."
+    },
+    {
+      "name": "acrossSpokePool",
+      "address": "0xD29C85F15DF544bA632C9E25829fd29d767d7978",
+      "required": false,
+      "note": "Across SpokePool. The dApp's USDC -> USDG zap."
+    },
+    {
+      "name": "ccipRouter",
+      "address": "0x06fC836cf9839B1cd891C440A0a45242DA6Ae1c9",
+      "required": false,
+      "note": "CCIP router. v2 distribution only."
+    },
+    {
+      "name": "stockTokenBeacon",
+      "address": "0xE10b6f6b275De231345c20d14aB812DB62151b00",
+      "required": false,
+      "note": "The Stock Token beacon. blockAccounts(0x6abf7081) on it is the indexer's denylist alarm."
+    }
+  ],
+  "precompiles": {
+    "arbSys": "0x0000000000000000000000000000000000000064",
+    "arbGasInfo": "0x000000000000000000000000000000000000006C",
+    "note": "Arbitrum Orbit precompiles. arbOSVersion() gives the ArbOS version (61 expected, i.e. EIP-7702 live and EIP-1153 available); getGasAccountingParams() returns (speedLimitPerSecond, gasPoolMax, maxTxGasLimit), the last of which bounds a single deployment or a 32-pool checkpoint()."
+  }
+}

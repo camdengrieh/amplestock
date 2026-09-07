@@ -59,8 +59,47 @@ test/script/                  fork-free dry run of the deployment scripts agains
 
 ## Deployment
 
-`docs/deploy-runbook.md` is the runbook: the library-linking flags, the bootstrap order the contracts force, and
-what is still placeholder config pending Phase 0.
+`docs/deploy-runbook.md` is the runbook: the numbered pipeline, the library-linking flags, the bootstrap order the
+contracts force, the broadcast rule, verification, and what is still placeholder config pending Phase 0.
+`docs/launch-runbook.md` is the guarded mainnet launch: genesis, the capped start, the TVL ratchet, who signs
+what, and the incident runbooks.
+
+### The pipeline
+
+| script | what it does |
+|---|---|
+| `script/00_Preflight.s.sol` | reads the chain and reports: chain id, ArbOS, `maxTxGasLimit`, code at every configured address (CREATE2 factory included), the PoolManager code hash, TSTORE/TLOAD acceptance, every feed's `latestRoundData` and Standard-vs-SVR proxy shape, AMPS ordering. Deploys nothing, sends nothing |
+| `script/01_MineAmps.s.sol`, `script/mine-amps.py` | the AMPS CREATE2 salt: three leading zero bytes, so AMPS is `currency0` in all 32 pools |
+| `script/02_Libraries.s.sol` | the four linked vault libraries, in two passes |
+| `script/03_Core.s.sol` | the `TimelockController`, `Amps`, `AmpsVault`, `AmpsHook`, `PoolRegistry` and the whole periphery, plus the set-once wiring; records every address and every constructor argument. `CORE_STAGE=finalize` hands governance over |
+| `script/04_MineHook.s.sol` | the `0x38C0` hook salt; the standalone re-check CI runs after every dependency bump |
+| `script/05_Registry.s.sol` | the 32 pools, 30 bond markets and the launch index weight vector |
+| `script/09_Phase3Wire.s.sol` | the Phase 3 pointer moves and the `OracleGate`, in the §9.1 bootstrap order |
+| `script/10_TestnetPools.s.sol` | the same shape against mocks on a test chain; **is** a `05_Registry` rather than owning one |
+| `script/11_GenesisPlacement.s.sol` | `genesis()` and the §3.3 ladders, in two phases sixty seconds apart |
+| `script/12_Verify.s.sol` | the Blockscout `forge verify-contract` commands, with the right constructor args and `--libraries` |
+
+`script/lib/Gov.sol` is how every script makes a governed call — directly when the timelock is an address you
+control, or `schedule`+`execute` through a real `TimelockController` when it is not. `script/lib/Calendar.sol`
+holds the DST and NYSE holiday tables `OracleGate` has no getter for.
+
+### The broadcast rule
+
+Under Foundry 1.8.1 a `vm.startBroadcast` window opened by a **helper contract** writes every transaction with the
+same nonce, and the run dies with `EOA nonce changed unexpectedly`. Simulation is unaffected, so `forge test`
+cannot see it. Every broadcast window and every state-changing call must therefore belong to the contract
+`forge script` was pointed at; helpers are `internal` libraries, or `pure`/`view` contracts created outside every
+window. `test/script/broadcast.sh` is the harness that proves it:
+
+```bash
+pnpm --filter @amplestocks/contracts broadcast-test
+```
+
+It starts an anvil, runs the whole pipeline with `--broadcast` through a real `TimelockController`, asserts the
+chain state with `cast`, runs it all again and asserts nothing moved, then finalises the timelock. About three
+minutes, localhost only, and its own CI job.
+
+### Library linking
 
 `AmpsVault` reaches four **deployed** libraries by `DELEGATECALL`, so an unlinked artefact carries `__$...$__`
 placeholders and cannot be deployed. Every command that builds, deploys, measures or verifies the vault takes all
@@ -74,8 +113,5 @@ four flags, which `script/02_Libraries.s.sol` prints and records in `script/conf
 ```
 
 They are deliberately **not** in `foundry.toml`'s `libraries` key: that would pin one chain's addresses into every
-build, `forge test` included, where Foundry deploys its own copies at its own addresses.
-
-Later phases add `src/vault/AmpsVault.sol`, `src/hook/AmpsHook.sol`, `src/bonds/AmpsBonds.sol`,
-`src/staking/AmpsStaking.sol`, `src/policy/*`, `src/oracle/*`, `src/registry/PoolRegistry.sol`,
-`src/keeper/BountyPot.sol` and `src/periphery/AmpsQuoter.sol` as described in the implementation plan.
+build, `forge test` included, where Foundry deploys its own copies at its own addresses. `03_Core` proves the
+link on the deployed vault rather than assuming it.

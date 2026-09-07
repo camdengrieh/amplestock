@@ -7,6 +7,7 @@ import {IPoolRegistry} from "../src/interfaces/IPoolRegistry.sol";
 import {LadderLib} from "../src/lib/LadderLib.sol";
 import {Constants} from "../src/types/Constants.sol";
 import {ConstituentStatus, GateState, PoolConfig} from "../src/types/Types.sol";
+import {Gov} from "./lib/Gov.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Script} from "forge-std/Script.sol";
@@ -42,6 +43,13 @@ import {console2} from "forge-std/console2.sol";
 ///      pool's opening price down onto its own grid origin (§12 ruling C). A pool that opened off-grid would put
 ///      the seed bids a whole doubling low, and this is what catches it. See {assertLayout}'s own note for why
 ///      the ask block may legitimately start at `m = 1` rather than `m = 0` for a minority of pools.
+///
+/// @dev **Who signs what: everything here is a governed call.** `genesis()` is `onlyTimelock` and pulls the seed
+///      from `msg.sender`, so the founders' $5,000 has to be sitting in the timelock. And `AmpsVault.place` is
+///      `msg.sender == timelock || msg.sender == registry` — the `locked` modifier is not the whole guard, which
+///      is easy to misread from the signature — so the 34 placements are governed too. All of it goes through
+///      `script/lib/Gov.sol`: a direct call when the timelock is an address the operator controls, `schedule` +
+///      `execute` when it is a `TimelockController`.
 ///
 /// @dev **Usage.**
 /// ```
@@ -185,17 +193,20 @@ contract GenesisPlacement is Script {
 
         assertGateGreen(p.vault);
 
+        Gov.Ctx memory ctx = Gov.load(p.timelock);
+        Gov.describe(ctx);
+
         if (phase == PHASE_GENESIS_AND_ASKS) {
             if (!vault.initialized()) {
-                _genesis(p);
+                _genesis(ctx, p);
                 report.genesisRan = true;
             }
             report.navPerShareX18 = vault.navPerShareX18();
             _assertLaunchPrice(report.navPerShareX18);
-            report.askPools = _placeAsks(p, vault, registry);
+            report.askPools = _placeAsks(ctx, p, vault, registry);
         } else {
             report.navPerShareX18 = vault.navPerShareX18();
-            report.bidPools = _placeEntryBids(p, vault, registry);
+            report.bidPools = _placeEntryBids(ctx, p, vault, registry);
         }
 
         report.liveCells = vault.liveCells();
@@ -395,37 +406,49 @@ contract GenesisPlacement is Script {
     }
 
     /// @dev `genesis()` itself: approve the seed assets out of the timelock, mint `S0`, split 250/4,750.
-    function _genesis(Params memory p) private {
+    function _genesis(Gov.Ctx memory ctx, Params memory p) private {
         if (p.teamVestingWallet == address(0)) revert MissingAddress("teamVestingWallet");
         if (p.creator == address(0)) revert MissingAddress("creator");
 
-        vm.startBroadcast(p.timelock);
+        // `genesis()` pulls the seed from `msg.sender`, which is the timelock, so both the approvals and the
+        // call itself are governed calls: on a live deployment the founders' $5,000 sits in the timelock, not
+        // in the deployer's wallet.
+        Gov.begin(ctx);
         for (uint256 i; i < p.seedTokens.length; ++i) {
-            IERC20(p.seedTokens[i]).approve(p.vault, p.seedAmounts[i]);
+            Gov.send(ctx, p.seedTokens[i], abi.encodeCall(IERC20.approve, (p.vault, p.seedAmounts[i])));
         }
-        IAmpsVault(p.vault)
-            .genesis(
-                IAmpsVault.GenesisParams({
-                    teamVestingWallet: p.teamVestingWallet,
-                    creator: p.creator,
-                    teamShares: Constants.TEAM_SHARES,
-                    polShares: Constants.POL_SHARES,
-                    seedTokens: p.seedTokens,
-                    seedAmounts: p.seedAmounts
-                })
-            );
-        vm.stopBroadcast();
+        Gov.send(
+            ctx,
+            p.vault,
+            abi.encodeCall(
+                IAmpsVault.genesis,
+                (IAmpsVault.GenesisParams({
+                        teamVestingWallet: p.teamVestingWallet,
+                        creator: p.creator,
+                        teamShares: Constants.TEAM_SHARES,
+                        polShares: Constants.POL_SHARES,
+                        seedTokens: p.seedTokens,
+                        seedAmounts: p.seedAmounts
+                    }))
+            )
+        );
+        Gov.end(ctx);
         console2.log("genesis complete: S0 minted, creator %s", p.creator);
     }
 
     /// @dev The ask ladder in every pool that has none: 1,662.5 AMPS in each entry pool, 47.5 in each spoke.
-    function _placeAsks(Params memory p, IAmpsVault vault, IPoolRegistry registry) private returns (uint16 placed) {
+    function _placeAsks(Gov.Ctx memory ctx, Params memory p, IAmpsVault vault, IPoolRegistry registry)
+        private
+        returns (uint16 placed)
+    {
         PoolId hub = registry.hubPoolId();
         PoolId weth = registry.wethPoolId();
         PoolId[] memory pools = allPools(p.vault);
         uint256 buckets = uint256(vault.ladderDoublings());
 
-        vm.startBroadcast(p.timelock);
+        // `AmpsVault.place` is `msg.sender == timelock || msg.sender == registry` — the `locked` modifier is not
+        // the whole guard — so every ladder placement is a governed call, exactly like `genesis()` above.
+        Gov.begin(ctx);
         for (uint256 i; i < pools.length; ++i) {
             PoolId poolId = pools[i];
             if (_countSide(vault, poolId, true) != 0) continue;
@@ -435,18 +458,18 @@ contract GenesisPlacement is Script {
 
             uint32 live = vault.liveCells();
             if (uint256(live) + buckets > Constants.MAX_LIVE_CELLS) {
-                vm.stopBroadcast();
+                Gov.end(ctx);
                 revert CellBudgetExhausted(live, buckets);
             }
 
-            vault.place(poolId, true, amount);
+            Gov.send(ctx, p.vault, abi.encodeCall(IAmpsVault.place, (poolId, true, amount)));
             ++placed;
         }
-        vm.stopBroadcast();
+        Gov.end(ctx);
     }
 
     /// @dev The two entry-pool seed bid ladders, once the cooldown allows.
-    function _placeEntryBids(Params memory p, IAmpsVault vault, IPoolRegistry registry)
+    function _placeEntryBids(Gov.Ctx memory ctx, Params memory p, IAmpsVault vault, IPoolRegistry registry)
         private
         returns (uint16 placed)
     {
@@ -459,7 +482,7 @@ contract GenesisPlacement is Script {
             if (wait != 0) revert CooldownNotElapsed(pools[i], wait);
         }
 
-        vm.startBroadcast(p.timelock);
+        Gov.begin(ctx);
         for (uint256 i; i < 2; ++i) {
             if (_countSide(vault, pools[i], false) != 0) continue;
             uint256 amount = _seedAmountOf(p, counters[i]);
@@ -468,14 +491,14 @@ contract GenesisPlacement is Script {
             uint32 live = vault.liveCells();
             uint256 buckets = uint256(vault.seedHalvings());
             if (uint256(live) + buckets > Constants.MAX_LIVE_CELLS) {
-                vm.stopBroadcast();
+                Gov.end(ctx);
                 revert CellBudgetExhausted(live, buckets);
             }
 
-            vault.place(pools[i], false, amount);
+            Gov.send(ctx, p.vault, abi.encodeCall(IAmpsVault.place, (pools[i], false, amount)));
             ++placed;
         }
-        vm.stopBroadcast();
+        Gov.end(ctx);
     }
 
     /// @dev The seed amount configured for `token`, i.e. what genesis settled into the vault's claims.

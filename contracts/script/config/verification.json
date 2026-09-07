@@ -1,0 +1,7 @@
+{
+  "$comment": "Written by script/12_Verify.s.sol from deployments.json and libraries.json. `constructorArgs` is the ABI-encoded blob Blockscout matches the creation code against; AmpsVault and VaultRolloutLib also need their --libraries flags, because a linked DELEGATECALL target is part of the code. Empty until a deployment has run.",
+  "chainId": 0,
+  "solc": "0.8.30",
+  "verifierUrl": "https://robinhoodchain.blockscout.com/api/",
+  "contracts": []
+}

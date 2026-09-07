@@ -1,0 +1,10 @@
+{
+  "$comment": "Written by script/00_Preflight.s.sol. A read-only report: the script deploys nothing and sends nothing. PASS/WARN/FAIL are verdicts; TODO means a Phase 0 placeholder is still in the config; SKIP means this chain does not expose the probe. Empty until the pre-flight has run.",
+  "chainId": 0,
+  "blockNumber": 0,
+  "timestamp": 0,
+  "checks": 0,
+  "failures": 0,
+  "warnings": 0,
+  "findings": []
+}

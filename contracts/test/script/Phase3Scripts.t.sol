@@ -146,7 +146,6 @@ contract Phase3Scripts is V4TestBase {
         wireScript = new Phase3Wire();
         testnetScript = new TestnetPools();
         genesisScript = new GenesisPlacement();
-        testnetScript.setRegistrar(registryScript);
 
         // Step 0: the counter assets, deployed by the script under test. They come first because `PoolRegistry`
         // takes WETH9 and USDG in its constructor.

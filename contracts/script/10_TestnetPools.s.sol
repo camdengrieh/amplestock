@@ -5,10 +5,11 @@ import {MockAggregator} from "../test/mocks/MockAggregator.sol";
 import {MockStockToken} from "../test/mocks/MockStockToken.sol";
 import {MockUsdg} from "../test/mocks/MockUsdg.sol";
 import {Registry} from "./05_Registry.s.sol";
+import {Gov} from "./lib/Gov.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Script} from "forge-std/Script.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 import {console2} from "forge-std/console2.sol";
+import {V4PoolManagerDeployer} from "hookmate/artifacts/V4PoolManager.sol";
 
 /// @title MockWeth9
 /// @notice A WETH9 stand-in for chain 46630: an 18-decimal ERC-20 with `deposit`/`withdraw` and an open `mint`
@@ -73,7 +74,7 @@ contract MockWeth9 is ERC20 {
 ///   forge script script/10_TestnetPools.s.sol --broadcast --rpc-url $ROBINHOOD_TESTNET_RPC_URL \
 ///     --libraries ...   # the four flags from script/config/libraries.json
 /// ```
-contract TestnetPools is Script {
+contract TestnetPools is Registry {
     using stdJson for string;
 
     // -----------------------------------------------------------------------------------------------------------
@@ -86,17 +87,18 @@ contract TestnetPools is Script {
     /// @notice Where the deployed mocks are recorded, and re-read on a resume.
     string internal constant TESTNET_PATH = "./script/config/testnet.json";
 
-    /// @notice The launch registration set the mocks stand in for.
-    string internal constant CONSTITUENTS_PATH = "./script/config/constituents.json";
-
     /// @notice USDG's decimals, matching the real token on 4663.
     uint8 internal constant USDG_DECIMALS = 6;
+
+    /// @notice The deployment address book this script fills in for `03_Core`.
+    string internal constant DEPLOYMENTS_CONFIG_PATH = "./script/config/deployments.json";
 
     // -----------------------------------------------------------------------------------------------------------
     // Types
     // -----------------------------------------------------------------------------------------------------------
 
     /// @notice Everything this script deploys.
+    /// @param poolManager The Uniswap v4 `PoolManager`, deployed here only on a chain that has none.
     /// @param usdg The `MockUsdg`.
     /// @param usdgFeed Its aggregator, at $1.00.
     /// @param weth9 The {MockWeth9}.
@@ -104,6 +106,7 @@ contract TestnetPools is Script {
     /// @param stocks The 30 `MockStockToken`s, in `constituents.json` order.
     /// @param feeds Their 30 `MockAggregator`s, parallel to `stocks`.
     struct Assets {
+        address poolManager;
         address usdg;
         address usdgFeed;
         address weth9;
@@ -132,26 +135,31 @@ contract TestnetPools is Script {
     error CurrencyOrder(address amps, address counter);
 
     // -----------------------------------------------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------------------------------------------
-
-    /// @notice The `05_Registry` instance this script delegates registration to. Deployed on first use, outside
-    ///         any broadcast window, so it is a simulation-local helper and never a recorded transaction.
-    Registry public registrar;
-
-    // -----------------------------------------------------------------------------------------------------------
     // Entry points
     // -----------------------------------------------------------------------------------------------------------
 
     /// @notice Deploys whatever is missing, registers the 32 pools, and rewrites `script/config/testnet.json`.
-    function run() external {
+    /// @dev Two passes on a chain that starts empty, because `PoolRegistry` takes WETH9 and USDG in its
+    ///      constructor: `TESTNET_ASSETS_ONLY=true` first (mocks, and the v4 `PoolManager` if the chain has
+    ///      none), then `03_Core`, then this again to register. On a chain where the core already exists, one
+    ///      pass does both.
+    function run() external override {
         if (block.chainid != TESTNET_CHAIN_ID && !vm.envOr("TESTNET_ALLOW_ANY_CHAIN", false)) {
             revert WrongChain(block.chainid);
         }
-        Registry.Wiring memory core = _registrar().loadWiring();
+        Registry.Wiring memory core = loadWiring();
+
+        if (vm.envOr("TESTNET_ASSETS_ONLY", false)) {
+            Assets memory only = deployAssets(_deployer(core), loadAssets(), loadSpokes().length);
+            writeAssets(only);
+            recordAssets(only);
+            return;
+        }
+
         (Assets memory assets, Registry.Result memory result) = execute(core, loadAssets());
         writeAssets(assets);
-        _registrar().writePools(core, result);
+        recordAssets(assets);
+        writePools(core, result);
     }
 
     /// @notice Deploys the missing mocks and registers every pool that is not registered yet.
@@ -163,10 +171,10 @@ contract TestnetPools is Script {
         public
         returns (Assets memory assets, Registry.Result memory result)
     {
-        Registry.SpokeSpec[] memory spokes = _registrar().loadSpokes();
-        Registry.EntryPoolSpec[] memory entries = _registrar().loadEntryPools();
+        Registry.SpokeSpec[] memory spokes = loadSpokes();
+        Registry.EntryPoolSpec[] memory entries = loadEntryPools();
 
-        assets = deployAssets(core.timelock, known, spokes.length);
+        assets = deployAssets(_deployer(core), known, spokes.length);
         _assertOrdering(core.amps, assets);
 
         // Substitute the mocks for the 4663 addresses the config carries, name by name. The entry pools are
@@ -183,7 +191,10 @@ contract TestnetPools is Script {
             spokes[i].feed = assets.feeds[i];
         }
 
-        result = _registrar().execute(core, entries, spokes);
+        // Inherited, not delegated: `Registry.execute` opens the broadcast window, and a window opened by a
+        // *helper contract* writes every transaction with the same nonce (docs/deploy-runbook.md §0.1). Because
+        // this contract IS a `Registry`, the window and all ~97 calls belong to the script forge was pointed at.
+        result = execute(core, entries, spokes);
     }
 
     /// @notice Deploys the two counter assets, their aggregators and the 30 stock/aggregator pairs, skipping
@@ -199,6 +210,7 @@ contract TestnetPools is Script {
 
         vm.startBroadcast(sender);
 
+        assets.poolManager = _resolvePoolManager(known.poolManager, sender);
         assets.usdg = _has(known.usdg) ? known.usdg : address(new MockUsdg("Global Dollar", "USDG", USDG_DECIMALS));
         assets.usdgFeed = _has(known.usdgFeed)
             ? known.usdgFeed
@@ -243,6 +255,7 @@ contract TestnetPools is Script {
     /// @return assets The recorded set; zero addresses mean "not deployed yet".
     function loadAssets() public view returns (Assets memory assets) {
         string memory json = vm.readFile(TESTNET_PATH);
+        assets.poolManager = vm.readFile(DEPLOYMENTS_CONFIG_PATH).readAddress(".core.poolManager");
         assets.usdg = json.readAddress(".usdg");
         assets.usdgFeed = json.readAddress(".usdgFeed");
         assets.weth9 = json.readAddress(".weth9");
@@ -280,6 +293,7 @@ contract TestnetPools is Script {
             "owner-settable multiplier; nothing in this file exists on 4663 and nothing on 4663 may read it."
         );
         vm.serializeUint(root, "chainId", block.chainid);
+        vm.serializeAddress(root, "poolManager", assets.poolManager);
         vm.serializeAddress(root, "usdg", assets.usdg);
         vm.serializeAddress(root, "usdgFeed", assets.usdgFeed);
         vm.serializeAddress(root, "weth9", assets.weth9);
@@ -290,21 +304,38 @@ contract TestnetPools is Script {
         console2.log("wrote %s (%s stocks)", TESTNET_PATH, assets.stocks.length);
     }
 
-    /// @notice Points this script at an existing `05_Registry` instance instead of letting it deploy one.
-    /// @param instance The registrar.
-    function setRegistrar(Registry instance) external {
-        registrar = instance;
+    /// @notice Writes the three addresses `03_Core` needs out of this run into `script/config/deployments.json`:
+    ///         the v4 `PoolManager`, WETH9 and USDG. Targeted key writes — the rest of the address book is
+    ///         `03_Core`'s.
+    /// @param assets The deployed set.
+    function recordAssets(Assets memory assets) public {
+        vm.writeJson(vm.toString(assets.poolManager), DEPLOYMENTS_CONFIG_PATH, ".core.poolManager");
+        vm.writeJson(vm.toString(assets.weth9), DEPLOYMENTS_CONFIG_PATH, ".core.weth9");
+        vm.writeJson(vm.toString(assets.usdg), DEPLOYMENTS_CONFIG_PATH, ".core.usdg");
+        console2.log("recorded poolManager, weth9 and usdg in %s", DEPLOYMENTS_CONFIG_PATH);
     }
 
     // -----------------------------------------------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @dev `05_Registry` as a library of behaviour. Created outside every broadcast window, so it is a
-    ///      simulation-local helper and never lands in the broadcast file.
-    function _registrar() internal returns (Registry instance) {
-        if (address(registrar) == address(0)) registrar = new Registry();
-        instance = registrar;
+    /// @dev The account that signs this script's transactions: the deployer in relay mode, the timelock itself
+    ///      in direct mode. The mocks are owned by whoever deploys them, and the drills — a scheduled multiplier,
+    ///      a paused oracle, a denylisted account — are driven from that account.
+    function _deployer(Registry.Wiring memory core) private view returns (address deployer) {
+        deployer = Gov.load(core.timelock).sender;
+    }
+
+    /// @dev The v4 `PoolManager`. On 46630 and 4663 it already exists and is left alone; on a bare local chain —
+    ///      the broadcast harness in `test/script/broadcast.sh` — there is none, and `TESTNET_DEPLOY_POOL_MANAGER`
+    ///      deploys one from hookmate's prebuilt artefact. That artefact is the reason: `v4-core`'s PoolManager
+    ///      source is BUSL-1.1 and the licence gate forbids reaching it, while the prebuilt bytecode is a
+    ///      deployment input rather than a source dependency.
+    function _resolvePoolManager(address configured, address owner) private returns (address poolManager) {
+        if (_has(configured) && configured.code.length != 0) return configured;
+        if (!vm.envOr("TESTNET_DEPLOY_POOL_MANAGER", false)) return configured;
+        poolManager = V4PoolManagerDeployer.deploy(owner);
+        console2.log("PoolManager deployed at %s", poolManager);
     }
 
     /// @dev I1's precondition, asserted rather than assumed: AMPS is `currency0` in all 32 pools only because its
