@@ -294,7 +294,9 @@ within one block — or a 1-wei self-transfer probe failing for a constituent.
 
 *Assess, immediately.* Is the blocked address the vault, the hook, `AmpsBonds`, or the PoolManager? Only the
 PoolManager is usefully denylistable in normal operation, because `sweepClean` (I12) means the protocol holds no
-stock ERC-20 balance between transactions. If a *protocol* address is blocked, escalate to evacuation.
+movable stock ERC-20 balance between transactions. A blocked vault degrades gracefully in the meantime: the exit
+sweep skips the token and emits `SweepResidue`, and a redemption pays that constituent as an ERC-6909 claim the
+redeemer takes later, so the floor keeps working. If a *protocol* address is blocked, escalate to evacuation.
 
 *Preconditions for evacuation.* The standby vault must already be registered — that is a **14-day** proposal, so
 it is registered at launch and re-registered whenever a new standby is built. `emergencyMigrate` refuses unless
@@ -303,11 +305,14 @@ self-transfer probe failing for at least two constituents. The guardian cannot m
 
 *Act.* Guardian Safe 2/4 calls `AmpsVault.emergencyMigrate(standby)`. In one `unlock` it unwinds every ladder,
 takes the assets as ERC-6909 claims, transfers them PoolManager-internally to the standby, which re-adds at the
-same ticks; `Amps.setVault(new)` and `AmpsBonds.setVault(new)` happen in the same transaction. The placement
+same ticks; `Amps.setVault(new)`, `AmpsBonds.setVault(new)`, `AmpsStaking.setVault(new)`, `BountyPot.setVault(new)`,
+`PoolRegistry.setVault(new)` and a best-effort `AmpsHook.setVault(new)` happen in the same transaction
+(`VaultNavLib.handover`), and the idle-ERC-20 leg of the evacuation is best-effort so an idle wei of the blocking
+token cannot veto it. The placement
 bleed cap is relaxed to 50 bp inside migration and only inside migration.
 
-*After.* Verify `Amps.vault()`, `AmpsBonds.vault()`, `AmpsStaking.vault()` and `BountyPot.vault()` all point at
-the standby; verify NAV/share moved by less than 50 bp; re-point the keeper and indexer; register a **new**
+*After.* Verify `Amps.vault()`, `AmpsBonds.vault()`, `AmpsStaking.vault()`, `BountyPot.vault()`,
+`PoolRegistry.vault()` and `AmpsHook.vault()` all point at the standby; verify NAV/share moved by less than 50 bp; re-point the keeper and indexer; register a **new**
 standby (14 days) so the next evacuation is possible; publish the incident.
 
 *Drill this.* §9 requires a full rehearsal on 46630, including `AmpsBonds.setVault`, before launch.
@@ -439,7 +444,7 @@ Rehearse all of these on 46630 before §1 item 5 can be ticked, and re-rehearse 
 | 6 | Execute a matured proposal from an address with no roles | it succeeds — the executor is open |
 | 7 | Swap a policy pointer (`FeePolicy`) | new fees apply to new swaps only; nothing re-prices retroactively |
 | 8 | Swap `BondPolicy` | only new bonds re-price; existing vesting positions are untouched |
-| 9 | Register a standby vault (14 d), then run the full denylist → `emergencyMigrate` drill | NAV/share moves < 50 bp; all four `setVault` pointers move; a new standby is registered afterwards |
+| 9 | Register a standby vault (14 d), then run the full denylist → `emergencyMigrate` drill | NAV/share moves < 50 bp; all six vault pointers move (AMPS, bonds, staking, pot, registry, hook); the standby can `initializePool` and place; a new standby is registered afterwards |
 | 10 | Retire a constituent, then reinstate it | I37 holds throughout; vesting claims keep working |
 | 11 | Lose the deployer key **after** `finalize` | nothing is lost: it has no roles |
 | 12 | Lose 2 of 5 proposer signers | the Safe still reaches 3/5 and governance continues |

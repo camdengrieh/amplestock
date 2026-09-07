@@ -152,6 +152,15 @@ and which name **exactly** the pools the vault stamped, including the entry pool
 is cleared at the top of every scan. The chain is the authority; the overlay only covers one snapshot's
 staleness.
 
+### 3.5 Feed refresh (recommended, unpaid)
+
+`FeedRegistry.refresh(token)` / `refreshMany(tokens)` advance the accepted-answer latch that the two-confirmation
+rule measures against. Since the 2026-09-07 audit fixes the rule no longer depends on it — when the latch is older
+than one heartbeat the registry evaluates a jump against the aggregator's own previous round — but a keeper that
+calls `refreshMany` over the registered assets once per heartbeat keeps the latch path (and its `confirmSeconds`
+release) live and makes held-back jumps clear on schedule. It is unpaid, so run it from the same relayer on a
+timer rather than through the bounty logic.
+
 ## 4. Configuration
 
 Everything is environment. **No endpoint and no address is a literal in a code path**; the RPC defaults come

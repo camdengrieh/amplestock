@@ -17,14 +17,14 @@ reasoning that is too fine-grained for here.
 
 | Source | Kind | Filter | What it is for |
 |---|---|---|---|
-| `AmpsVault` | logs | its address | NAV and reference checkpoints, redemption, burns, placements, compounds, gate mirrors, every governed parameter |
-| `AmpsBonds` | logs | its address | markets, purchases, positions, claims, per-epoch and per-day issuance and accretion |
+| `AmpsVault` | logs | its address | NAV and reference checkpoints, redemption, burns, placements, compounds, gate mirrors, the exit sweep's residue disclosures, every governed parameter |
+| `AmpsBonds` | logs | its address | markets, purchases, positions, claims, per-epoch and per-day issuance and accretion, forwarded collateral, the vault pointer |
 | `AmpsStaking` | logs | its address | the reward stream, the xAMPS share price, the realised APR |
 | `Amps` | logs | its address | the token's vault pointer |
-| `PoolRegistry` | logs | its address | **the allowlist**: which pools and constituents are ours |
+| `PoolRegistry` | logs | its address | **the allowlist**: which pools and constituents are ours; bond-market detachments and the vault pointer |
 | `OracleGate` | logs | its address | gate state per pool, watchdog, divergence, freezes |
 | `FeedRegistry` | logs | its address | the answers the protocol accepted, and the jumps it held back |
-| `AmpsHook` | logs | its address | rotation credits, surges, dividend steps, high-water marks, `RebalanceNeeded` |
+| `AmpsHook` | logs | its address | rotation credits, surges, dividend steps, high-water marks, `RebalanceNeeded`, the vault pointer |
 | `BountyPot` | logs | its address | bounty payments, and the keeper-job ledger they anchor |
 | `PoolManager` | logs | our `PoolId`s | `Swap`, `ModifyLiquidity`, `Initialize` |
 | `LadderPositionValuer` | **reads only** | its address | `amountsOf` and `referenceSqrtPriceX96` for the ladder cross-check (§4). It emits nothing; it is configured so `context.contracts` carries its address and ABI |
@@ -63,7 +63,7 @@ are written from.
 
 ## 2. Schema
 
-46 tables. Conventions: event rows are keyed `"<blockNumber>-<logIndex>"` zero-padded so text order
+47 tables. Conventions: event rows are keyed `"<blockNumber>-<logIndex>"` zero-padded so text order
 is chain order; entity rows are keyed by on-chain identity, lower-cased; AMPS is 18-decimal wei, USD
 is 18-decimal (`Usd18`), Chainlink answers stay in their own 8 decimals (`Usd8`), prices are `X18`;
 enums are stored as the on-chain ordinal *and* a decoded label.
@@ -105,7 +105,7 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | Table | Key | What it holds |
 |---|---|---|
 | `constituent` | id | token, symbol, pool, status, target and rollout weights, market id, feed, freeze, and the polled issuer state (`uiMultiplierX18`, `newUiMultiplierX18`, `effectiveAt`, `oraclePaused`, `tokenPaused`, `vaultBlocked`) plus the latest accepted answer |
-| `constituent_event` | event | the lifecycle log: added / retired / reinstated / reconfigured / frozen |
+| `constituent_event` | event | the lifecycle log: added / retired / reinstated / reconfigured / frozen / bonded deposits / retired bids withdrawn / `bondMarketDetached` |
 | `token_index` | token | token → constituent id, the reverse lookup Ponder's write API cannot query for |
 | `index_weights` | event | every `setIndexWeights` vector |
 | `gate_status` | `PoolId` or `"protocol"` | current state and label, divergence, watchdog, protocol freeze |
@@ -120,7 +120,8 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 
 | Table | Key | What it holds |
 |---|---|---|
-| `bond_market` | market id | collateral and class, open flag, discount parameters, capacity, epoch, cumulative issuance, collateral and realised accretion |
+| `bond_market` | market id | collateral and class, open flag, **`detached`** (`AmpsBonds` no longer attributes the market to that collateral, so `setMarketOpen` refuses it forever), discount parameters, capacity, epoch, cumulative issuance, collateral and realised accretion, and **`forwardedCollateral`** — the running total `bond()` pushed on to the vault |
+| `collateral_index` | collateral | collateral → market id, the mirror of `AmpsBonds.marketIdOf` and the lookup `CollateralForwarded` needs; deleted by `CollateralRemoved` |
 | `bond_purchase` | event | `amountIn`, `ampsOut`, `qX18`, `discountBps`, `floorBinding`, NAV either side, realised accretion in USD and bps |
 | `bond_position` | `"<owner>-<positionId>"` | principal, claimed, start, vest length, fully-claimed |
 | `bond_claim` | event | every claim |
@@ -318,6 +319,7 @@ indexer.
 | `gate` | `critical` | the watchdog tripped, a protocol freeze was set, or the vault migrated |
 | `gate` | `warning` | any pool gate left `GREEN` |
 | `corporate-action` | `warning` | a `uiMultiplier` step past `DIVIDEND_STEP_BPS_MAX`, or a constituent frozen for a corporate action |
+| `sweep-residue` | `warning` | `AmpsVault.SweepResidue`: the exit sweep could not fold a token's idle balance into the vault's ERC-6909 claims, so the token is paused, denylisting the vault or unreadable. Disclosure, not a breach — the residue stays part of the vault's holdings, is valued in `A` and is paid out by redemption — so it pages one step below the denylist alarm that would raise the same fact if it could see the issuer's call |
 
 The denylist alarm also has its own table, `denylist_alarm`, served at `/api/alerts/denylist`, which
 records the detection method, the decoded account list and whether it touched a protocol address.
@@ -484,6 +486,32 @@ inferred, and that is the number the reconciliation compares against `Amps.total
 - **`AmpsQuoter.PoolQuote` gained a trailing `tickSpacing`.** The indexer does not read the quoter
   (it decomposes the ladder itself), so this is noted only because it moves the struct's shape for
   anything that does.
+- **Three reverts became logs, and every one of them is indexed.** The audit's answer to donation
+  griefing was the same in each place: a fact a hostile or frozen counterparty could turn into a
+  permanent revert is emitted instead, so nothing bricks and the index can see it.
+  - `AmpsVault.SweepResidue(token, balance)` replaces the `SweepDirty` revert at the exit of every
+    entry point. One `alert` row per residue, kind `sweep-residue`, severity `warning` (§5).
+    `SweepDirty` survives as a declaration in `Errors.sol` and the keeper still restates it, so a
+    revert from a vault deployed before the change is still named rather than printed as a selector;
+    nothing in the audited contracts raises it any more.
+  - `AmpsBonds.CollateralForwarded(collateral, amount)` — residual collateral pushed on to the
+    vault at the end of `bond()`. It is a donation to the bonds shell and nothing else, so it is
+    recorded as one `parameter_change` row (`bonds:collateralForwarded:<marketId>`) and a running
+    `bond_market.forwardedCollateral`, and moves no issuance figure. The market is resolved through
+    `collateral_index`, because the log names only the collateral.
+  - `PoolRegistry.BondMarketDetached(constituentId, marketId)` — `retireConstituent` /
+    `reinstateConstituent` found the market gone from `AmpsBonds` and said so rather than reverting,
+    which is what stops a removed collateral from making a constituent unretirable forever. It
+    writes a `constituent_event` of kind `bondMarketDetached` and sets `bond_market.detached`, the
+    same flag `AmpsBonds.CollateralRemoved` sets from the other side.
+- **The hook and the registry gained a vault pointer.** `AmpsHook.vault` is storage rather than an
+  immutable now, with a `setVault`, and `PoolRegistry` gained the same handover; both announce it
+  with `VaultChanged(previousVault, newVault)`. They land in `parameter_state` as
+  `hook.pointer:vault` and `registry.pointer:vault`, beside the pointers `AmpsBonds`, `AmpsStaking`,
+  `BountyPot` and `Amps` already emit, so a migration is legible from one table.
+- **`AmpsHook.rotationCredit()` is now `rotationCredit(address sender)`.** Nothing off-chain reads
+  it: the indexer takes the credit from `RotationCreditConsumed` (§3) and the dApp takes it from the
+  quoter's simulation, so the signature change touches no handler.
 
 ## 9. Licence
 
