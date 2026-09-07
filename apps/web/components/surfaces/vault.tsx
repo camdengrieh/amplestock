@@ -10,9 +10,11 @@ import {
   GateStatusTable,
   LadderFillPanel,
   NavHistoryPanel,
+  PolDepthTable,
   SupplyBreakdown,
   VaultHeadline,
   type GateRow,
+  type PolRow,
 } from './vault-panels'
 import {FieldRow, Stat, StatGrid} from '@/components/common/stat'
 import {NotDeployed, SurfaceHeading} from '@/components/common/states'
@@ -21,6 +23,7 @@ import {Value} from '@/components/common/value'
 import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
 import {useIndexerQuery} from '@/hooks/use-indexer'
 import {usePoolDirectory} from '@/hooks/use-pools'
+import {useLastPlacementAt, usePolAmounts} from '@/hooks/use-pol'
 import {useStaking} from '@/hooks/use-staking'
 import {useTx} from '@/hooks/use-tx'
 import {useVaultSnapshot} from '@/hooks/use-vault'
@@ -45,6 +48,9 @@ export function VaultSurface() {
   const snapshot = useVaultSnapshot()
   const staking = useStaking()
   const {pools} = usePoolDirectory()
+  const poolIds = React.useMemo(() => pools.map((pool) => pool.poolId), [pools])
+  const pol = usePolAmounts(poolIds)
+  const placements = useLastPlacementAt(poolIds)
 
   const supply = useReadContract({
     ...(ampsToken ?? {address: undefined as unknown as Address, abi: [] as never}),
@@ -100,6 +106,18 @@ export function VaultSurface() {
     simulationError: simulation.error,
     isSimulating: simulation.isLoading,
     ...(isConnected ? {} : {blockedReason: 'Connect a wallet to call checkpoint().'}),
+  })
+
+  const polRows: PolRow[] = pools.map((pool) => {
+    const amounts = pol.amounts.get(pool.poolId)
+    const lastPlacementAt = placements.lastPlacement.get(pool.poolId)
+    return {
+      poolId: pool.poolId,
+      symbol: pool.symbol,
+      counterDecimals: pool.symbol === 'USDG' || pool.symbol === 'USDC' ? 6 : 18,
+      ...(amounts ? {amps: amounts.amps, counter: amounts.counter} : {}),
+      ...(lastPlacementAt ? {lastPlacementAt} : {}),
+    }
   })
 
   const gateRows: GateRow[] = pools.map((pool) => ({
@@ -221,6 +239,8 @@ export function VaultSurface() {
         unavailable={navHistory.unavailable || !navHistory.configured}
         {...(navHistory.reason ? {reason: navHistory.reason} : {})}
       />
+
+      <PolDepthTable rows={polRows} now={now} />
 
       <GateStatusTable rows={gateRows} />
 

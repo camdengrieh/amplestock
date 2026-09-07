@@ -23,6 +23,7 @@ import {
   ampsQuoterAbi,
   ampsStakingAbi,
   ampsVaultAbi,
+  ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
   poolRegistryLensAbi,
@@ -42,9 +43,21 @@ export const abis = {
   registryLens: poolRegistryLensAbi,
   hook: ampsHookAbi,
   oracleGate: oracleGateAbi,
-} as const satisfies Partial<Record<AmpsContractKey, Abi>>
+  /**
+   * `LadderPositionValuer` has no deployment slot of its own: it is a pointer the vault holds, so
+   * the app reads `AmpsVault.positionValuer()` rather than carrying another environment variable.
+   */
+  valuer: ladderPositionValuerAbi,
+} as const
 
 export type AbiKey = keyof typeof abis
+
+/**
+ * The ABIs that also have a deployment address of their own. `valuer` deliberately does not: its
+ * address comes from `AmpsVault.positionValuer()`, so it is used with an explicit address instead
+ * of through {contract}.
+ */
+export type DeployedAbiKey = AbiKey & AmpsContractKey
 
 /** Every ABI the error decoder should try, so a revert from any of them is named. */
 export const allAbis: readonly Abi[] = Object.values(abis) as unknown as readonly Abi[]
@@ -55,7 +68,7 @@ export interface ContractHandle<K extends AbiKey> {
 }
 
 /** The handle for a contract, or `undefined` when it is not deployed on this chain. */
-export function contract<K extends AbiKey>(key: K, from: Deployment = deployment): ContractHandle<K> | undefined {
+export function contract<K extends DeployedAbiKey>(key: K, from: Deployment = deployment): ContractHandle<K> | undefined {
   const address = from[key]
   if (!address) return undefined
   return {address, abi: abis[key]}

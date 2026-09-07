@@ -13,6 +13,7 @@ import {NOTES} from '@/lib/copy'
 import {formatAmount, formatBps, formatPremiumX18, formatUsd18} from '@/lib/format'
 import {pipsToBps, pipsToPercent} from '@/lib/fees'
 import {gateStateName, quoteAvailability, sessionName, type PoolQuote} from '@/lib/quoter'
+import {hexToString} from 'viem'
 import {sessionLabels} from '@/lib/protocol'
 
 /**
@@ -22,11 +23,25 @@ import {sessionLabels} from '@/lib/protocol'
  * a curve simulation. When one is unavailable the other is still shown — that is what the degraded
  * bitfield is *for* — and neither is ever substituted for the other.
  */
+/** `bytes32("rail")` / `bytes32("uninitialized")` / `bytes32(0)` as a string. */
+function decodeReason(reason: `0x${string}`): string | null {
+  if (/^0x0*$/.test(reason)) return null
+  try {
+    return hexToString(reason, {size: 32}).replace(/\0+$/, '')
+  } catch {
+    return null
+  }
+}
+
 export interface SwapQuoteViewProps {
   side: 'buy' | 'sell'
   quote: PoolQuote | undefined
-  /** From `V4Quoter`. `undefined` while it has not answered. */
+  /** From `AmpsQuoter.quoteExactIn`. `undefined` while it has not answered. */
   amountOut?: bigint
+  /** What the route will sign for: the quote less the slippage tolerance. */
+  amountOutMinimum?: bigint
+  /** From `AmpsQuoter.wouldRevert` — the hook's own answer, with its reason. */
+  railVerdict?: {refuse: boolean; reason: `0x${string}`; degraded: number}
   amountOutDecimals: number
   amountOutSymbol: string
   /** AMPS credit this sell would consume, when it is part of a rotation. Zero for a plain sell. */
@@ -39,6 +54,8 @@ export function SwapQuoteView({
   side,
   quote,
   amountOut,
+  amountOutMinimum,
+  railVerdict,
   amountOutDecimals,
   amountOutSymbol,
   creditUsed,
@@ -57,18 +74,28 @@ export function SwapQuoteView({
 
   const avail = quoteAvailability(quote.degraded)
   const feePips = side === 'buy' ? quote.buyFeePips : quote.sellFeePips
-  const refused = side === 'buy' ? quote.refuseBuy : quote.refuseSell
+  // `wouldRevert` is the hook's own verdict and carries a reason; the quote's refusal flags are the
+  // same answer without one. Prefer the verdict when it is there, and never invent a refusal from a
+  // degraded read — both sources fail open for display.
+  const refused = railVerdict ? railVerdict.refuse : side === 'buy' ? quote.refuseBuy : quote.refuseSell
+  const railReason = railVerdict ? decodeReason(railVerdict.reason) : null
 
   return (
     <div className="space-y-4" data-testid="swap-quote">
       <DegradedNotice degraded={quote.degraded} />
-      {refused && avail.refusals ? (
+      {refused && (avail.refusals || railVerdict) ? (
         <Alert variant="danger" data-testid="rail-warning">
           <AlertTitle>This swap would revert</AlertTitle>
           <AlertDescription>
-            The pool starts beyond its outer rail on the side this trade would push it further. The rail is a
-            start-of-swap condition, so a smaller size does not help — only a trade in the other direction, or waiting
-            for the pool to come back inside.
+            {railReason === 'uninitialized' ? (
+              <p>This pool has not been initialised, so there is nothing to swap against.</p>
+            ) : (
+              <p>
+                The pool starts beyond its outer rail on the side this trade would push it further. The rail is a
+                start-of-swap condition, so a smaller size does not help — only a trade in the other direction, or
+                waiting for the pool to come back inside.
+              </p>
+            )}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -77,9 +104,16 @@ export function SwapQuoteView({
           <CardTitle>Quote</CardTitle>
         </CardHeader>
         <CardContent>
-          <FieldRow label="You receive" hint="From V4Quoter — a curve simulation, not a promise">
+          <FieldRow label="You receive" hint="From AmpsQuoter.quoteExactIn — a curve simulation at this instant, not a promise">
             <Value unavailable={amountOut === undefined}>
               {amountOut !== undefined ? `${formatAmount(amountOut, amountOutDecimals)} ${amountOutSymbol}` : null}
+            </Value>
+          </FieldRow>
+          <FieldRow label="Minimum received" hint="What the transaction signs for; below this it reverts and nothing moves">
+            <Value unavailable={amountOutMinimum === undefined}>
+              {amountOutMinimum !== undefined
+                ? `${formatAmount(amountOutMinimum, amountOutDecimals)} ${amountOutSymbol}`
+                : null}
             </Value>
           </FieldRow>
           <FieldRow

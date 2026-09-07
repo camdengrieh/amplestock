@@ -10,10 +10,12 @@ import {Badge} from '@/components/ui/badge'
 import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
 import {NOTES} from '@/lib/copy'
+import {PLACEMENT_COOLDOWN_SECONDS} from '@/lib/protocol'
 import {formatAmount, formatBps, formatDuration, formatPremiumX18, formatTimestamp, formatUsd18} from '@/lib/format'
 import type {BurnEvent, LadderFill, NavPoint} from '@/lib/indexer/types'
 import {gateStateName, sessionName} from '@/lib/quoter'
 import {sessionLabels} from '@/lib/protocol'
+import {hexToString} from 'viem'
 
 export function VaultHeadline({
   navPerShareX18,
@@ -108,7 +110,10 @@ export function SupplyBreakdown({
         <FieldRow label="Protocol inventory" hint="Finite and never minted: the genesis tranche plus re-laddered fee AMPS, less sales">
           <Value unavailable={inventory === undefined}>{inventory !== undefined ? formatAmount(inventory, 18) : null}</Value>
         </FieldRow>
-        <FieldRow label="Vesting in bonds">
+        <FieldRow
+          label="Vesting in bonds (upper bound)"
+          hint="AMPS held by the bond shell. `AmpsBonds` cannot enumerate its own positions, so the exact unvested total is only knowable over a known owner set; vested-but-unclaimed AMPS is still sitting here."
+        >
           <Value unavailable={vesting === undefined}>{vesting !== undefined ? formatAmount(vesting, 18) : null}</Value>
         </FieldRow>
         <FieldRow label="Staked as xAMPS">
@@ -120,7 +125,11 @@ export function SupplyBreakdown({
 }
 
 /**
- * Ladder fill, per pool, with proceeds per cell.
+ * Ladder fill history, per pool, with proceeds per cell.
+ *
+ * The *live* numbers — bid depth and ask inventory right now — come from the chain through
+ * `LadderPositionValuer.amountsOf` and are rendered by {PolDepthTable}. This panel is the history
+ * around them: which cell was placed when, how much of it the market has taken, and what it raised.
  *
  * Ladders are static: a cell is placed once and only ever removed by redemption, rollout, the
  * high-water buyback burn or a migration. Nothing is re-centred or re-widened, so "fill" is a real
@@ -182,6 +191,90 @@ export function LadderFillPanel({fills, unavailable, reason}: {fills?: readonly 
   )
 }
 
+
+export interface PolRow {
+  poolId: string
+  symbol: string
+  counterDecimals: number
+  /** AMPS wei across the pool's grid cells — the unfilled ask inventory. */
+  amps?: bigint
+  /** Counter asset across them — the entire bid under AMPS in this pool. */
+  counter?: bigint
+  /** When the pool last placed, from `AmpsVault.lastPlacementAt`. */
+  lastPlacementAt?: number
+}
+
+/**
+ * Protocol-owned liquidity, per pool, read from the chain.
+ *
+ * The plan requires this number to be published rather than hidden: the pools are POL-only, so the
+ * bid under AMPS in a pool is exactly the counter asset the protocol has earned and is holding
+ * there — nothing else is bidding. `LadderPositionValuer.amountsOf` decomposes the vault's grid
+ * cells at the same reference price the vault values `A` at, so the counter column is to the wei
+ * the term NAV credits that pool with.
+ *
+ * A pool the valuer could not answer for is shown as unavailable, not as zero: `amountsOf` returns
+ * `(0, 0)` both for an empty pool and for one it could not price, and those are different facts.
+ */
+export function PolDepthTable({rows, now}: {rows: readonly PolRow[]; now: number}) {
+  return (
+    <Card data-testid="pol-depth">
+      <CardHeader>
+        <CardTitle>Protocol-owned liquidity, per pool</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Pool</TableHead>
+              <TableHead>Bid depth (counter)</TableHead>
+              <TableHead>Ask inventory (AMPS)</TableHead>
+              <TableHead>Last placement</TableHead>
+              <TableHead>Next placement eligible</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => {
+              const readyAt = row.lastPlacementAt ? row.lastPlacementAt + PLACEMENT_COOLDOWN_SECONDS : undefined
+              const waiting = readyAt !== undefined && readyAt > now
+              return (
+                <TableRow key={row.poolId} data-testid={`pol-row-${row.symbol}`}>
+                  <TableCell className="font-medium">AMPS / {row.symbol}</TableCell>
+                  <TableCell>
+                    <Value unavailable={row.counter === undefined} reason="The valuer could not price this pool">
+                      {row.counter !== undefined ? `${formatAmount(row.counter, row.counterDecimals)} ${row.symbol}` : null}
+                    </Value>
+                  </TableCell>
+                  <TableCell>
+                    <Value unavailable={row.amps === undefined} reason="The valuer could not price this pool">
+                      {row.amps !== undefined ? formatAmount(row.amps, 18) : null}
+                    </Value>
+                  </TableCell>
+                  <TableCell>
+                    <Value unavailable={!row.lastPlacementAt}>
+                      {row.lastPlacementAt ? formatTimestamp(row.lastPlacementAt) : null}
+                    </Value>
+                  </TableCell>
+                  <TableCell>
+                    <Value unavailable={readyAt === undefined}>
+                      {readyAt === undefined ? null : waiting ? `in ${formatDuration(readyAt - now)}` : 'now'}
+                    </Value>
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+        <p className="mt-3 text-xs text-muted-foreground">
+          {NOTES.polDepth} A placement is refused within {formatDuration(PLACEMENT_COOLDOWN_SECONDS)} of the previous
+          one in the same pool, which is the cooldown a <code className="font-mono">compound()</code> has to clear
+          before it can re-ladder anything.
+        </p>
+      </CardContent>
+    </Card>
+  )
+}
+
 export interface GateRow {
   poolId: string
   symbol: string
@@ -231,6 +324,29 @@ export function GateStatusTable({rows}: {rows: readonly GateRow[]}) {
   )
 }
 
+/**
+ * The `Burn` event's `bytes32` reason, as a person reads it.
+ *
+ * `redeemProRata` now emits `Burn(shares, "redeem")`, so a redemption is a first-class row in this
+ * feed rather than an inference from a supply delta.
+ */
+export function burnReasonLabel(reason: string): string {
+  const LABELS: Readonly<Record<string, string>> = {
+    redeem: 'Redemption',
+    buyback: 'High-water buyback',
+    fee: 'Fee sink',
+    compound: 'Compound',
+  }
+  let decoded = ''
+  try {
+    decoded = hexToString(reason as `0x${string}`, {size: 32}).replace(/\0+$/, '')
+  } catch {
+    decoded = ''
+  }
+  if (decoded === '') return reason.slice(0, 10)
+  return LABELS[decoded] ?? decoded
+}
+
 export function BurnHistoryTable({burns, unavailable, reason}: {burns?: readonly BurnEvent[]; unavailable?: boolean; reason?: string}) {
   if (unavailable || !burns) return <IndexerUnavailable what="Burn history" {...(reason ? {reason} : {})} />
   return (
@@ -252,7 +368,9 @@ export function BurnHistoryTable({burns, unavailable, reason}: {burns?: readonly
               <TableRow key={burn.txHash}>
                 <TableCell>{formatTimestamp(burn.timestamp)}</TableCell>
                 <TableCell>{burn.amount}</TableCell>
-                <TableCell className="font-mono text-xs">{burn.reason}</TableCell>
+                <TableCell>
+                  <Badge variant="muted">{burnReasonLabel(burn.reason)}</Badge>
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

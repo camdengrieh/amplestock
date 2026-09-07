@@ -84,6 +84,29 @@ export function useBondTotals() {
   return {...query, totals: data ? {principal: data[0], claimed: data[1], claimableNow: data[2]} : undefined}
 }
 
+/**
+ * The connected wallet's exact unvested principal, and what has vested and not been claimed.
+ *
+ * `AmpsBondsLens.unvested(bonds, owners)` sums over an owner set the caller supplies, because
+ * `AmpsBonds` cannot enumerate its own positions — they live in per-owner arrays. For one wallet
+ * that set is one address and the answer is exact. The protocol-wide figure needs the distinct
+ * `Bond.buyer` set from the indexer; without it, `Amps.balanceOf(bonds)` remains the upper bound.
+ */
+export function useUnvested() {
+  const lens = contract('bondsLens')
+  const bonds = addressOf('bonds')
+  const {address} = useAccount()
+  const enabled = lens !== undefined && bonds !== undefined && address !== undefined
+  const query = useReadContract({
+    ...(lens ?? NO_CONTRACT),
+    functionName: 'unvested',
+    args: enabled ? [bonds as Address, [address as Address]] : undefined,
+    query: {enabled, refetchInterval: 15_000},
+  })
+  const data = query.data as readonly [bigint, bigint] | undefined
+  return {...query, enabled, unvested: data ? {unvestedAmps: data[0], claimableAmps: data[1]} : undefined}
+}
+
 /** The rolling daily issuance against the global cap. */
 export function useDailyIssuance() {
   const bonds = contract('bonds')

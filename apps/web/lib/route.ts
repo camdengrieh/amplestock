@@ -59,6 +59,27 @@ export function ampsPoolKey(params: {amps: Address; counter: Address; tickSpacin
   }
 }
 
+/**
+ * The pool key for a route, built from one `AmpsQuoter.quoteAll()` row.
+ *
+ * A `PathKey` needs `fee`, `tickSpacing` and `hooks`, and getting any of them wrong produces a
+ * `PoolId` that does not exist. Two of the three are invariant across all 32 pools — `fee` is
+ * `DYNAMIC_FEE_FLAG` (the hook overrides per swap) and `hooks` is the one immutable hook — and the
+ * third is now the trailing field of `PoolQuote`, so the quote the surface already holds is enough
+ * and no second read into the registry is needed.
+ *
+ * Returns `null` rather than guessing when the registry read behind the quote failed: bit 6 zeroes
+ * `counter` and `tickSpacing`, and a route built on those would be a route to nowhere.
+ */
+export function poolKeyFromQuote(
+  quote: {counter: Address; tickSpacing: number; degraded: number},
+  params: {amps: Address; hooks: Address},
+): PoolKeyLike | null {
+  const registryDegraded = (quote.degraded & 0x40) !== 0
+  if (registryDegraded || quote.tickSpacing === 0) return null
+  return ampsPoolKey({amps: params.amps, counter: quote.counter, tickSpacing: quote.tickSpacing, hooks: params.hooks})
+}
+
 function pathKey(pool: PoolKeyLike, intermediateCurrency: Address) {
   return {
     intermediateCurrency,

@@ -53,6 +53,7 @@ export function poolQuote(overrides: Partial<PoolQuote> = {}): PoolQuote {
     observationCoverage: 1_800,
     checkpointAge: 30,
     degraded: 0,
+    tickSpacing: 60,
     ...overrides,
   }
 }

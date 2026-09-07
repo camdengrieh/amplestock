@@ -15,7 +15,7 @@ import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
 import {Input} from '@/components/ui/input'
 import {Label} from '@/components/ui/label'
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
-import {useBondBoard, useBondMarketQuote, useBondPositions, useBondTotals, useDailyIssuance} from '@/hooks/use-bonds'
+import {useBondBoard, useBondMarketQuote, useBondPositions, useBondTotals, useDailyIssuance, useUnvested} from '@/hooks/use-bonds'
 import {useTx} from '@/hooks/use-tx'
 import {activeChainId} from '@/lib/chains'
 import {abis, addressOf, contract} from '@/lib/contracts'
@@ -249,6 +249,7 @@ export function BondSurface() {
   const positions = useBondPositions()
   const totals = useBondTotals()
   const daily = useDailyIssuance()
+  const unvested = useUnvested()
 
   const rows = React.useMemo<BoardRow[]>(() => {
     const data = board.data as readonly {
@@ -387,14 +388,22 @@ export function BondSurface() {
                   {issuance ? `${formatAmount(issuance.issued, 18)} / ${formatAmount(issuance.capacity, 18)} AMPS` : null}
                 </Value>
               </FieldRow>
-              <FieldRow label="Your vesting total">
+              <FieldRow label="Your bonded total" hint="Principal across every position you hold, vested or not">
                 <Value unavailable={!totals.totals}>
                   {totals.totals ? `${formatAmount(totals.totals.principal, 18)} AMPS` : null}
                 </Value>
               </FieldRow>
+              <FieldRow
+                label="Still vesting"
+                hint="Exact, from AmpsBondsLens.unvested over your address — not an upper bound"
+              >
+                <Value unavailable={!unvested.unvested} data-testid="bond-unvested">
+                  {unvested.unvested ? `${formatAmount(unvested.unvested.unvestedAmps, 18)} AMPS` : null}
+                </Value>
+              </FieldRow>
               <FieldRow label="Claimable now">
-                <Value unavailable={!totals.totals}>
-                  {totals.totals ? `${formatAmount(totals.totals.claimableNow, 18)} AMPS` : null}
+                <Value unavailable={!unvested.unvested}>
+                  {unvested.unvested ? `${formatAmount(unvested.unvested.claimableAmps, 18)} AMPS` : null}
                 </Value>
               </FieldRow>
             </div>

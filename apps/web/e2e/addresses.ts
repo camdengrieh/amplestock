@@ -20,6 +20,8 @@ export const E2E = {
   hook: '0x00000000000000000000000000000000000038c0',
   oracleGate: '0x00000000000000000000000000000000000a0009',
   timelock: '0x00000000000000000000000000000000000a000a',
+  /** Read from `AmpsVault.positionValuer()` rather than configured; the mock answers with it. */
+  valuer: '0x00000000000000000000000000000000000a000b',
 } as const
 
 export const RPC_URL = 'http://127.0.0.1:8545'

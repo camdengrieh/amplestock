@@ -25,8 +25,8 @@ deployed on this chain" state rather than reading the zero address and showing t
 | `dev` | Next dev server on port 3000 |
 | `build` | production build; succeeds with no network access |
 | `typecheck` / `lint` | `tsc --noEmit` (the same check twice, matching the rest of the workspace) |
-| `test` | vitest — 218 tests, all offline |
-| `test:e2e` | Playwright — 16 tests against a real production build with a mocked chain. **Not** part of `test` and not run in CI: it needs a browser. |
+| `test` | vitest — 237 tests, all offline |
+| `test:e2e` | Playwright — 17 tests against a real production build with a mocked chain. **Not** part of `test` and not run in CI: it needs a browser. |
 
 `test:e2e` rebuilds `.next` with a fixture deployment baked in, because `NEXT_PUBLIC_*` is inlined
 at build time. Run `pnpm --filter @amplestocks/web build` afterwards to restore the ordinary bundle.

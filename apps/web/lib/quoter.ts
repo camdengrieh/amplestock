@@ -30,11 +30,24 @@ export const DegradedBit = {
   BONDS: 1 << 4,
   /** `pMktX18` — the observation ring covers less than `twapWindow` */
   TWAP: 1 << 5,
+  /** a read into `PoolRegistry` failed: `poolClass`, `counter` and `tickSpacing` are not trustworthy */
+  REGISTRY: 1 << 6,
+  /** a PoolManager `extsload` failed, or a tick walk did not finish: `poolTick` and any simulated amount */
+  POOL: 1 << 7,
 } as const
 
 export type DegradedBitName = keyof typeof DegradedBit
 
-export const degradedBitOrder: readonly DegradedBitName[] = ['HOOK', 'GATE', 'FEEDS', 'CHECKPOINT', 'BONDS', 'TWAP']
+export const degradedBitOrder: readonly DegradedBitName[] = [
+  'HOOK',
+  'GATE',
+  'FEEDS',
+  'CHECKPOINT',
+  'BONDS',
+  'TWAP',
+  'REGISTRY',
+  'POOL',
+]
 
 export const degradedBitLabels: Readonly<Record<DegradedBitName, string>> = {
   HOOK: 'Hook read failed — ticks, bands and fees unavailable',
@@ -43,6 +56,8 @@ export const degradedBitLabels: Readonly<Record<DegradedBitName, string>> = {
   CHECKPOINT: 'Vault checkpoint read failed — NAV/share, reference and premium unavailable',
   BONDS: 'Bond market read failed — bond price and capacity unavailable',
   TWAP: 'Not enough observation history yet — the market price is not available',
+  REGISTRY: 'Registry read failed — the pool’s class, counter asset and tick spacing are unavailable',
+  POOL: 'PoolManager read failed — the live tick and any simulated amount are unavailable',
 }
 
 /** `IAmpsQuoter.PoolQuote`, decoded. Field names and order mirror the struct exactly. */
@@ -77,6 +92,12 @@ export interface PoolQuote {
   observationCoverage: number
   checkpointAge: number
   degraded: number
+  /**
+   * The pool's tick spacing, as the registry stored it at initialisation. The trailing field of the
+   * struct, and the reason one `quoteAll()` is now enough to build a Universal Router `PathKey`:
+   * `fee` is `DYNAMIC_FEE_FLAG` in all 32 pools and `hooks` is the one immutable hook.
+   */
+  tickSpacing: number
 }
 
 export function hasDegradedBit(degraded: number, bit: number): boolean {
@@ -94,6 +115,10 @@ export function degradedBits(degraded: number): DegradedBitName[] {
  */
 export interface QuoteAvailability {
   ticksAndBands: boolean
+  /** `poolClass`, `counter` and `tickSpacing` — everything needed to build a route. */
+  poolIdentity: boolean
+  /** The live `slot0` tick, and any amount simulated from it. */
+  liveTick: boolean
   fees: boolean
   refusals: boolean
   gate: boolean
@@ -113,8 +138,12 @@ export function quoteAvailability(degraded: number): QuoteAvailability {
   const checkpoint = !hasDegradedBit(degraded, DegradedBit.CHECKPOINT)
   const bonds = !hasDegradedBit(degraded, DegradedBit.BONDS)
   const twap = !hasDegradedBit(degraded, DegradedBit.TWAP)
+  const registry = !hasDegradedBit(degraded, DegradedBit.REGISTRY)
+  const pool = !hasDegradedBit(degraded, DegradedBit.POOL)
   return {
-    ticksAndBands: hook,
+    ticksAndBands: hook && pool,
+    poolIdentity: registry,
+    liveTick: pool,
     fees: hook,
     refusals: hook,
     gate,

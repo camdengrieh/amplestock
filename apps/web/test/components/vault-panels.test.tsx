@@ -7,8 +7,10 @@ import {
   GateStatusTable,
   LadderFillPanel,
   NavHistoryPanel,
+  PolDepthTable,
   SupplyBreakdown,
   VaultHeadline,
+  burnReasonLabel,
 } from '@/components/surfaces/vault-panels'
 
 const WAD = 10n ** 18n
@@ -117,5 +119,61 @@ describe('indexer-backed panels', () => {
     expect(screen.getByTestId('ladder-fill')).toHaveTextContent('12')
     expect(screen.getByTestId('ladder-fill')).toHaveTextContent('25%')
     expect(screen.getByText(/entire bid under AMPS in this pool/i)).toBeInTheDocument()
+  })
+})
+
+describe('PolDepthTable — the number the plan says must be published', () => {
+  const rows = [
+    {
+      poolId: '0x01',
+      symbol: 'WETH',
+      counterDecimals: 18,
+      amps: 1_662n * WAD,
+      counter: 2n * WAD,
+      lastPlacementAt: 1_800_000_000,
+    },
+    {poolId: '0x02', symbol: 'NVDA', counterDecimals: 18},
+  ]
+
+  it('shows bid depth and ask inventory per pool, from the chain', () => {
+    render(<PolDepthTable rows={rows} now={1_800_000_000} />)
+    const weth = screen.getByTestId('pol-row-WETH')
+    expect(weth).toHaveTextContent('2 WETH')
+    expect(weth).toHaveTextContent('1,662')
+    expect(screen.getByText(/entire bid under AMPS in this pool/i)).toBeInTheDocument()
+  })
+
+  it('renders a pool the valuer could not price as unavailable, not as zero', () => {
+    // `amountsOf` returns (0, 0) both for an empty pool and for one it could not price; those are
+    // different facts and only one of them is a number.
+    render(<PolDepthTable rows={rows} now={1_800_000_000} />)
+    const nvda = screen.getByTestId('pol-row-NVDA')
+    expect(nvda.querySelectorAll('[data-unavailable="true"]').length).toBeGreaterThan(0)
+    expect(nvda).not.toHaveTextContent('0 NVDA')
+  })
+
+  it('turns the last placement into a next-eligible hint through the cooldown', () => {
+    const {rerender} = render(<PolDepthTable rows={rows} now={1_800_000_000 + 10} />)
+    expect(screen.getByTestId('pol-row-WETH')).toHaveTextContent('in 50s')
+    rerender(<PolDepthTable rows={rows} now={1_800_000_000 + 120} />)
+    expect(screen.getByTestId('pol-row-WETH')).toHaveTextContent('now')
+  })
+})
+
+describe('burnReasonLabel', () => {
+  it('reads the redemption burn the vault now emits', () => {
+    const redeem = `0x${Buffer.from('redeem').toString('hex').padEnd(64, '0')}`
+    expect(burnReasonLabel(redeem)).toBe('Redemption')
+  })
+
+  it('reads the other reasons, and passes an unknown one through', () => {
+    const buyback = `0x${Buffer.from('buyback').toString('hex').padEnd(64, '0')}`
+    const other = `0x${Buffer.from('something').toString('hex').padEnd(64, '0')}`
+    expect(burnReasonLabel(buyback)).toBe('High-water buyback')
+    expect(burnReasonLabel(other)).toBe('something')
+  })
+
+  it('falls back to the raw prefix for an unreadable reason', () => {
+    expect(burnReasonLabel(`0x${'00'.repeat(32)}`)).toBe('0x00000000')
   })
 })

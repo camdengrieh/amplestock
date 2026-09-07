@@ -109,3 +109,29 @@ describe('premiumBps', () => {
     expect(premiumBps(-50_000_000_000_000_000n)).toBe(-500)
   })
 })
+
+describe('the two bits the quoter grew', () => {
+  it('names the registry and PoolManager reads', () => {
+    expect(DegradedBit.REGISTRY).toBe(0x40)
+    expect(DegradedBit.POOL).toBe(0x80)
+    expect(degradedBits(DegradedBit.REGISTRY | DegradedBit.POOL)).toEqual(['REGISTRY', 'POOL'])
+  })
+
+  it('withdraws the pool identity — class, counter, tick spacing — when the registry read failed', () => {
+    const availability = quoteAvailability(DegradedBit.REGISTRY)
+    expect(availability.poolIdentity).toBe(false)
+    expect(availability.nav).toBe(true)
+  })
+
+  it('withdraws the live tick, and the bands measured against it, when the extsload failed', () => {
+    const availability = quoteAvailability(DegradedBit.POOL)
+    expect(availability.liveTick).toBe(false)
+    expect(availability.ticksAndBands).toBe(false)
+    expect(availability.fees).toBe(true)
+  })
+
+  it('still refuses to call a quote with either bit tradeable', () => {
+    expect(isTradeable(poolQuote({degraded: DegradedBit.REGISTRY}), 'buy')).toBe(false)
+    expect(isTradeable(poolQuote({degraded: DegradedBit.POOL}), 'sell')).toBe(false)
+  })
+})

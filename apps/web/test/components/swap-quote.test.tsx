@@ -84,3 +84,60 @@ describe('RotationCreditNote', () => {
     expect(screen.getByTestId('rotation-credit-note')).toHaveTextContent(/exact-output sell does not consume it/i)
   })
 })
+
+describe('the quote now carries the amount and the hook’s own verdict', () => {
+  it('shows what you receive and what the transaction signs for', () => {
+    render(
+      <SwapQuoteView
+        side="buy"
+        quote={poolQuote()}
+        amountOut={100n * 10n ** 18n}
+        amountOutMinimum={995n * 10n ** 17n}
+        amountOutDecimals={18}
+        amountOutSymbol="AMPS"
+      />,
+    )
+    expect(screen.getByText('100 AMPS')).toBeInTheDocument()
+    expect(screen.getByText('99.5 AMPS')).toBeInTheDocument()
+    expect(screen.getByText(/below this it reverts and nothing moves/i)).toBeInTheDocument()
+  })
+
+  it('prefers wouldRevert’s verdict, and explains an uninitialised pool differently from a rail', () => {
+    const rail = `0x${Buffer.from('rail').toString('hex').padEnd(64, '0')}` as `0x${string}`
+    const uninit = `0x${Buffer.from('uninitialized').toString('hex').padEnd(64, '0')}` as `0x${string}`
+    const {rerender} = render(
+      <SwapQuoteView
+        side="sell"
+        quote={poolQuote({refuseSell: false})}
+        railVerdict={{refuse: true, reason: rail, degraded: 0}}
+        amountOutDecimals={18}
+        amountOutSymbol="WETH"
+      />,
+    )
+    expect(screen.getByTestId('rail-warning')).toHaveTextContent(/beyond its outer rail/i)
+    rerender(
+      <SwapQuoteView
+        side="sell"
+        quote={poolQuote({refuseSell: false})}
+        railVerdict={{refuse: true, reason: uninit, degraded: 0}}
+        amountOutDecimals={18}
+        amountOutSymbol="WETH"
+      />,
+    )
+    expect(screen.getByTestId('rail-warning')).toHaveTextContent(/has not been initialised/i)
+  })
+
+  it('does not invent a refusal when the verdict says the swap is fine', () => {
+    const none = `0x${'00'.repeat(32)}` as `0x${string}`
+    render(
+      <SwapQuoteView
+        side="sell"
+        quote={poolQuote({refuseSell: true})}
+        railVerdict={{refuse: false, reason: none, degraded: 0}}
+        amountOutDecimals={18}
+        amountOutSymbol="WETH"
+      />,
+    )
+    expect(screen.queryByTestId('rail-warning')).not.toBeInTheDocument()
+  })
+})

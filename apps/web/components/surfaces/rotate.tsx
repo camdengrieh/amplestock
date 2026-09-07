@@ -15,7 +15,6 @@ import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
 import {Input} from '@/components/ui/input'
 import {Label} from '@/components/ui/label'
 import {usePoolDirectory} from '@/hooks/use-pools'
-import {usePoolKeys} from '@/hooks/use-pool-keys'
 import {useRotationQuote} from '@/hooks/use-quotes'
 import {useTx} from '@/hooks/use-tx'
 import {activeChainId} from '@/lib/chains'
@@ -24,7 +23,7 @@ import {NOTES} from '@/lib/copy'
 import {explorerTxUrl, referenceBook} from '@/lib/deployment'
 import {blendedSellFeeBps, bpsToPips, pipsToPercent} from '@/lib/fees'
 import {formatAmount, parseAmount} from '@/lib/format'
-import {deadlineFromNow, encodeRotation, minOutFromSlippage, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
+import {deadlineFromNow, encodeRotation, minOutFromSlippage, poolKeyFromQuote, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
 
 const DEFAULT_SLIPPAGE_BPS = 50
 
@@ -84,10 +83,10 @@ export function RotateSurface() {
   const from = React.useMemo(() => spokes.find((p) => p.poolId === fromPoolId) ?? spokes[0], [spokes, fromPoolId])
   const to = React.useMemo(() => spokes.find((p) => p.poolId === toPoolId) ?? spokes[1] ?? spokes[0], [spokes, toPoolId])
   const amount = parseAmount(amountText, 18)
-  const spokeIds = React.useMemo(() => spokes.map((p) => p.poolId), [spokes])
-  const {keys} = usePoolKeys(spokeIds)
-  const fromKey = from ? keys.get(from.poolId) : undefined
-  const toKey = to ? keys.get(to.poolId) : undefined
+  const hook = addressOf('hook')
+  // Both hop keys come out of the same `quoteAll()` the pool pickers are already rendering.
+  const fromKey = from && amps && hook ? poolKeyFromQuote(from.quote, {amps, hooks: hook}) : null
+  const toKey = to && amps && hook ? poolKeyFromQuote(to.quote, {amps, hooks: hook}) : null
 
   const rotation = useRotationQuote({
     ...(from ? {hop1: from.poolId} : {}),
@@ -144,7 +143,7 @@ export function RotateSurface() {
         : from?.poolId === to?.poolId
           ? 'Pick two different spokes.'
           : !fromKey || !toKey
-            ? 'Waiting for the pool keys from the registry.'
+            ? 'The quoter could not read one of these pools’ registry entries, so there is no route to build.'
             : undefined
 
   const tx = useTx({

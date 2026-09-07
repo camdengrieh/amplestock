@@ -16,14 +16,14 @@ import {Label} from '@/components/ui/label'
 import {Tabs, TabsContent, TabsList, TabsTrigger} from '@/components/ui/tabs'
 import {useTx} from '@/hooks/use-tx'
 import {usePoolDirectory} from '@/hooks/use-pools'
-import {usePoolKeys} from '@/hooks/use-pool-keys'
+import {useExactInQuote, useWouldRevert} from '@/hooks/use-quotes'
 import {activeChainId} from '@/lib/chains'
 import {explorerTxUrl, referenceBook} from '@/lib/deployment'
 import {addressOf} from '@/lib/contracts'
 import {featureFlags} from '@/lib/flags'
 import {parseAmount} from '@/lib/format'
 import {isTradeable} from '@/lib/quoter'
-import {deadlineFromNow, encodeSingleHop, minOutFromSlippage, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
+import {deadlineFromNow, encodeSingleHop, minOutFromSlippage, poolKeyFromQuote, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
 
 type Side = 'buy' | 'sell'
 
@@ -55,28 +55,44 @@ export function BuySellSurface() {
     () => entryPools.find((p) => p.poolId === poolId) ?? entryPools[0],
     [entryPools, poolId],
   )
-  const entryPoolIds = React.useMemo(() => entryPools.map((p) => p.poolId), [entryPools])
-  const {keys} = usePoolKeys(entryPoolIds)
-  const poolKey = selected ? keys.get(selected.poolId) : undefined
+  const hook = addressOf('hook')
+  // One `quoteAll()` is enough to route: `PoolQuote` carries the pool's own `tickSpacing`, and the
+  // other two `PathKey` fields are invariant across all 32 pools.
+  const poolKey =
+    selected && amps && hook ? poolKeyFromQuote(selected.quote, {amps, hooks: hook}) : null
   const isWethPool = selected?.symbol === 'WETH'
   const counterDecimals = selected?.symbol === 'USDG' ? 6 : 18
   const inputDecimals = side === 'buy' ? counterDecimals : 18
   const amount = parseAmount(amountText, inputDecimals)
 
+  // AMPS is `currency0` in all 32 pools, so a sell is unconditionally `zeroForOne`.
+  const zeroForOne = side === 'sell'
+  const exactIn = useExactInQuote({
+    ...(selected ? {poolId: selected.poolId} : {}),
+    zeroForOne,
+    ...(amount !== null && amount > 0n ? {amountIn: amount} : {}),
+  })
+  const rail = useWouldRevert({
+    ...(selected ? {poolId: selected.poolId} : {}),
+    zeroForOne,
+    ...(amount !== null && amount > 0n ? {amountIn: amount} : {}),
+  })
+  const quotedOut = exactIn.exactIn?.amountOut
+  const amountOutMinimum = quotedOut !== undefined ? minOutFromSlippage(quotedOut, DEFAULT_SLIPPAGE_BPS) : 0n
+
   const route = React.useMemo(() => {
     if (!selected || !amps || !poolKey || !book || amount === null || amount <= 0n) return null
-    const minOut = minOutFromSlippage(0n, DEFAULT_SLIPPAGE_BPS)
     return encodeSingleHop({
       currencyIn: side === 'buy' ? selected.counter : amps,
       currencyOut: side === 'buy' ? amps : selected.counter,
       pool: poolKey,
       amountIn: amount,
-      amountOutMinimum: minOut,
+      amountOutMinimum,
       recipient: (address ?? amps) as Address,
       wrapEthIn: side === 'buy' && isWethPool && useNativeEth,
       unwrapWethOut: side === 'sell' && isWethPool && useNativeEth,
     })
-  }, [selected, amps, poolKey, book, amount, side, address, isWethPool, useNativeEth])
+  }, [selected, amps, poolKey, book, amount, amountOutMinimum, side, address, isWethPool, useNativeEth])
 
   const request = React.useMemo(() => {
     if (!route || !book) return null
@@ -106,10 +122,10 @@ export function BuySellSurface() {
       : amount === null || amount <= 0n
         ? 'Enter an amount.'
         : !poolKey
-          ? 'Waiting for the pool key from the registry.'
+          ? 'The quoter could not read this pool’s registry entry, so there is no route to build.'
           : quote && quote.degraded !== 0
             ? 'The quote is degraded. A quote with any flag raised is not permission to trade.'
-            : !tradeable
+            : !tradeable || rail.verdict?.refuse === true
               ? 'The hook would refuse this swap at the current tick.'
               : undefined
 
@@ -217,6 +233,9 @@ export function BuySellSurface() {
           <SwapQuoteView
             side={side}
             quote={quote}
+            {...(quotedOut !== undefined ? {amountOut: quotedOut} : {})}
+            {...(amountOutMinimum > 0n ? {amountOutMinimum} : {})}
+            {...(rail.verdict ? {railVerdict: rail.verdict} : {})}
             amountOutDecimals={side === 'buy' ? 18 : counterDecimals}
             amountOutSymbol={side === 'buy' ? 'AMPS' : (selected?.symbol ?? '')}
           />

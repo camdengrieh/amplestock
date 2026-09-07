@@ -23,6 +23,7 @@ import {
   ampsQuoterAbi,
   ampsStakingAbi,
   ampsVaultAbi,
+  ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
   poolRegistryLensAbi,
@@ -64,6 +65,8 @@ const ABIS: Record<string, Abi> = {
   [E2E.registry.toLowerCase()]: poolRegistryAbi as unknown as Abi,
   [E2E.registryLens.toLowerCase()]: poolRegistryLensAbi as unknown as Abi,
   [E2E.oracleGate.toLowerCase()]: oracleGateAbi as unknown as Abi,
+  // `LadderPositionValuer` has no environment slot: the app reads its address from the vault.
+  [E2E.valuer.toLowerCase()]: ladderPositionValuerAbi as unknown as Abi,
 }
 
 function poolQuote(overrides: Record<string, unknown> = {}) {
@@ -98,6 +101,7 @@ function poolQuote(overrides: Record<string, unknown> = {}) {
     observationCoverage: 1_800,
     checkpointAge: 30,
     degraded: 0,
+    tickSpacing: 60,
     ...overrides,
   }
 }
@@ -152,6 +156,8 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     quotePool: [QUOTES[0]],
     quoteRotation: [8n * WAD, 500, 500, 10n * WAD],
     bondQuote: [8n * WAD, 1_250, 50n * WAD, true, 0],
+    quoteExactIn: [95n * WAD, 50_000, false, 0],
+    wouldRevert: [false, `0x${'00'.repeat(32)}`, 0],
   },
   [E2E.vault.toLowerCase()]: {
     checkpointData: [{navPerShareX18: WAD, pRefX18: 1_120_000_000_000_000_000n, pMktX18: 1_150_000_000_000_000_000n, timestamp: 1_800_000_000, blockNumber: 12_345}],
@@ -166,6 +172,12 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     initialized: [true],
     previewRedeem: [[WETH9, USDG, NVDA], [990_000_000_000_000_000n, 1_980_000n, 2_970_000_000_000_000_000n], 2n * WAD],
     creatorBpsAt: [50],
+    positionValuer: [E2E.valuer],
+    lastPlacementAt: [1_800_000_000],
+  },
+  [E2E.valuer.toLowerCase()]: {
+    amountsOf: [1_662n * WAD, 2n * WAD],
+    referenceSqrtPriceX96: [79_228_162_514_264_337_593_543_950_336n],
   },
   [E2E.amps.toLowerCase()]: {
     totalSupply: [5_000n * WAD],
@@ -216,6 +228,7 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     ],
     positionsOf: [[{principal: 12n * WAD, claimed: 0n, start: 1_800_000_000, vestSeconds: 43_200, marketId: 1}]],
     positionTotals: [12n * WAD, 0n, 6n * WAD],
+    unvested: [6n * WAD, 6n * WAD],
   },
   [E2E.registry.toLowerCase()]: {
     constituentCount: [2],

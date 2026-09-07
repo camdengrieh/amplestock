@@ -9,6 +9,7 @@ import {
   encodeRotation,
   encodeSingleHop,
   minOutFromSlippage,
+  poolKeyFromQuote,
   routeToRequest,
 } from '@/lib/route'
 import {DYNAMIC_FEE_FLAG} from '@/lib/protocol'
@@ -211,5 +212,38 @@ describe('minOutFromSlippage', () => {
 describe('deadlineFromNow', () => {
   it('is now plus the window', () => {
     expect(deadlineFromNow(600, 1_000)).toBe(1_600n)
+  })
+})
+
+describe('poolKeyFromQuote — one quoteAll() is enough to route', () => {
+  const params = {amps: AMPS, hooks: HOOK}
+
+  it('takes the tick spacing from the quote and the other two fields from the invariants', () => {
+    const key = poolKeyFromQuote({counter: NVDA, tickSpacing: 200, degraded: 0}, params)
+    expect(key).not.toBeNull()
+    expect(key!.currency0).toBe(AMPS)
+    expect(key!.currency1).toBe(NVDA)
+    expect(key!.tickSpacing).toBe(200)
+    expect(key!.fee).toBe(DYNAMIC_FEE_FLAG)
+    expect(key!.hooks).toBe(HOOK)
+  })
+
+  it('builds a route that encodes identically to one built from an explicit key', () => {
+    const fromQuote = poolKeyFromQuote({counter: NVDA, tickSpacing: 60, degraded: 0}, params)!
+    const explicit = ampsPoolKey({amps: AMPS, counter: NVDA, tickSpacing: 60, hooks: HOOK})
+    expect(fromQuote).toEqual(explicit)
+  })
+
+  it('refuses rather than guessing when the registry read behind the quote failed', () => {
+    // Bit 6 zeroes `counter` and `tickSpacing`; a route built on those is a route to nowhere.
+    expect(poolKeyFromQuote({counter: NVDA, tickSpacing: 60, degraded: 0x40}, params)).toBeNull()
+  })
+
+  it('refuses a zero tick spacing, which no initialised pool has', () => {
+    expect(poolKeyFromQuote({counter: NVDA, tickSpacing: 0, degraded: 0}, params)).toBeNull()
+  })
+
+  it('is unbothered by degradation that has nothing to do with the pool key', () => {
+    expect(poolKeyFromQuote({counter: NVDA, tickSpacing: 60, degraded: 0x08 | 0x20}, params)).not.toBeNull()
   })
 })

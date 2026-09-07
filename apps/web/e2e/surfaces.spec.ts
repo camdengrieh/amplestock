@@ -31,6 +31,14 @@ test('Buy / Sell loads, quotes from the chain and states the fee rules', async (
   await expect(page.getByTestId('tx-blocked-reason')).toContainText('Connect a wallet')
 })
 
+test('Buy / Sell prices the amount on chain once one is entered', async ({page}) => {
+  await page.goto('/buy')
+  await page.getByTestId('amount-input').fill('1')
+  // From AmpsQuoter.quoteExactIn on the mocked chain, with the signed minimum derived from it.
+  await expect(page.getByTestId('swap-quote')).toContainText('95 AMPS')
+  await expect(page.getByTestId('swap-quote')).toContainText('94.525 AMPS')
+})
+
 test('Buy / Sell offers the native-ETH wrap on the WETH pool and the Across zap behind its flag', async ({page}) => {
   await page.goto('/buy')
   await expect(page.getByTestId('native-eth-toggle')).toBeVisible()
@@ -55,6 +63,9 @@ test('Bond shows the board, including the market that cannot be bonded', async (
   await expect(page.getByTestId('bond-board')).toContainText('Closed')
   await expect(page.getByTestId('bond-positions')).toBeVisible()
   await expect(page.getByTestId('bond-surface')).toContainText('never the collateral taken')
+  // Exact unvested principal for the connected wallet — but there is no wallet, so it is
+  // unavailable rather than zero.
+  await expect(page.getByTestId('bond-surface')).toContainText('Still vesting')
 })
 
 test('Redeem previews the payout per asset at NAV minus the live fee', async ({page}) => {
@@ -82,6 +93,9 @@ test('Vault shows NAV, the premium as a number, the gate per pool and a free che
   await expect(page.getByTestId('vault-headline')).toContainText('+12.00%')
   await expect(page.getByTestId('checkpoint-button')).toBeVisible()
   await expect(page.getByTestId('gate-status')).toContainText('GREEN')
+  // Per-pool POL depth comes from LadderPositionValuer.amountsOf, not from the indexer.
+  await expect(page.getByTestId('pol-depth')).toContainText('2 WETH')
+  await expect(page.getByTestId('pol-row-WETH')).toContainText('1,662')
   // Indexer-backed panels say so rather than drawing a flat line at zero.
   await expect(page.getByTestId('indexer-unavailable').first()).toContainText('it is not zero')
 })

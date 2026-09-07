@@ -11,8 +11,9 @@ gates, one rule about numbers, and a build that never touches the network.
 - **Gates**: an IP geo-block on US / CA / UK / CH with a pluggable provider, plus a per-browser
   terms gate carrying a jurisdiction self-attestation. Every trading surface is behind both.
 - **The rule**: `AmpsQuoter` never reverts — a read that fails leaves its fields at zero and raises
-  a bit in `degraded`. **A degraded field is rendered as unavailable, never as zero**, and a
-  degraded quote is never permission to trade.
+  one of eight bits in `degraded` (hook, gate, feeds, checkpoint, bonds, TWAP coverage, registry,
+  PoolManager). **A degraded field is rendered as unavailable, never as zero**, and a degraded quote
+  is never permission to trade.
 
 ---
 
@@ -95,13 +96,18 @@ revert and to say which of its sub-reads failed.
 `AmpsQuoter.quoteAll()`.
 
 - **Reads**: `AmpsQuoter.quoteAll()` (fees in both directions, `refuseBuy`/`refuseSell`, ticks and
-  bands, gate state, session, NAV, reference and market price, `degraded`); ERC-20 and Permit2
+  bands, gate state, session, NAV, reference and market price, `tickSpacing`, `degraded`);
+  `AmpsQuoter.quoteExactIn(poolId, zeroForOne, amountIn)` for the amount and the exact fee;
+  `AmpsQuoter.wouldRevert(...)` for the hook's own rail verdict and its reason; ERC-20 and Permit2
   allowances for the input token.
 - **Writes**: `UniversalRouter.execute(commands, inputs, deadline)` — `WRAP_ETH` (optional),
   `V4_SWAP`, `UNWRAP_WETH` (optional). The router address is `@amplestocks/config`'s
   `universalRouter`, never the SDK's own default.
-- Shows the sell fee and the rotation-credit rule on the surface, not in a tooltip. Renders
-  `refuseBuy`/`refuseSell` as "this swap would revert" with the reason a smaller size does not help.
+- Shows the sell fee and the rotation-credit rule on the surface, not in a tooltip. Shows the amount
+  received and the minimum the transaction signs for, both from the chain. Renders a refusal as
+  "this swap would revert", distinguishing `bytes32("rail")` from `bytes32("uninitialized")`, and
+  never invents one from a degraded read — both the quote's flags and `wouldRevert` fail open for
+  display.
   The Across USDC→USDG zap sits behind `NEXT_PUBLIC_FLAG_ACROSS_ZAP` and is an explicit, disabled
   stub — the entry point and the SpokePool address exist, the bridge call does not.
 
@@ -111,7 +117,7 @@ revert and to say which of its sub-reads failed.
 Stock → AMPS → stock, exact input, one transaction.
 
 - **Reads**: `AmpsQuoter.quoteRotation(hop1, hop2, amountIn)` → `(amountOut, hop1FeePips,
-  hop2FeePips, creditUsed)`; `quoteAll()` for the spoke list and per-pool fees.
+  hop2FeePips, creditUsed)`; `quoteAll()` for the spoke list, per-pool fees and both hop keys.
 - **Writes**: `UniversalRouter.execute` with one `V4_SWAP` carrying one `SWAP_EXACT_IN` and a
   two-element `PathKey[]`.
 - Shows the credited second hop next to the same two swaps done separately. It does **not** claim
@@ -123,7 +129,8 @@ Stock → AMPS → stock, exact input, one transaction.
 - **Reads**: `AmpsBondsLens.board(bonds, amountIn)` (every market, including the ones that cannot be
   bonded — `quote()` never reverts for a known market, it returns `ampsOut == 0` with a reason);
   `AmpsBonds.quote(marketId, amountIn)`; `AmpsBonds.dailyIssuance()`;
-  `AmpsBondsLens.positionsOf` / `positionTotals`.
+  `AmpsBondsLens.positionsOf` / `positionTotals`; `AmpsBondsLens.unvested(bonds, [owner])` for the
+  connected wallet's **exact** unvested principal and its vested-but-unclaimed balance.
 - **Writes**: `AmpsBonds.bond(marketId, amountIn, minAmpsOut, to)`; `AmpsBonds.claim(positionId, to)`.
 - **`minAmpsOut` is always exactly the quoted `ampsOut`.** The capacity clamp reduces the AMPS
   issued and never the collateral taken, so a lower bound is not tolerance — it is consent to hand
@@ -159,10 +166,18 @@ The disclosure page.
 
 - **Reads (chain)**: `AmpsVault.checkpointData` (NAV/share, `P_ref`, `P_mkt`, timestamp),
   `previewNavPerShareX18`, `totalAssetsUsd18`, `inventoryAmps`, `redeemFeeBps`, `burnBps`,
-  `stakerBps`, `genesisTimestamp`, `liveCells`, `initialized`; `Amps.totalSupply`;
-  `AmpsStaking.totalAssets`; `AmpsQuoter.quoteAll` for the per-pool gate table.
-- **Reads (indexer)**: NAV/share history, ladder fill per pool with proceeds per cell, burn
-  history, `peg_dev_bp`.
+  `stakerBps`, `genesisTimestamp`, `liveCells`, `initialized`, `positionValuer`,
+  `lastPlacementAt(poolId)`; `LadderPositionValuer.amountsOf(poolId)` per pool;
+  `Amps.totalSupply` and `Amps.balanceOf(bonds)`; `AmpsStaking.totalAssets`;
+  `AmpsQuoter.quoteAll` for the per-pool gate table.
+- **Reads (indexer)**: NAV/share history, the ladder cell by cell with proceeds, burn history,
+  `peg_dev_bp`. History only — the live per-pool numbers come from the chain.
+- **Per-pool POL depth is published from the chain.** `LadderPositionValuer.amountsOf` decomposes
+  the vault's grid cells at the same reference price the vault values `A` at, so the counter column
+  is to the wei the term NAV credits that pool with, and the AMPS column is the unfilled ask
+  inventory NAV values at zero. `amountsOf` returns `(0, 0)` both for an empty pool and for one it
+  could not price, so a pool that did not answer is rendered unavailable rather than as zero.
+  `lastPlacementAt` plus the 60-second cooldown gives the "next placement eligible" hint.
 - **Writes**: `AmpsVault.checkpoint()` — free, permissionless, and offered as a button.
 - Premium is `pRef / navPerShare - 1` rendered as a signed number with the note that nothing on
   chain consumes it.
@@ -232,7 +247,7 @@ cp apps/web/.env.example apps/web/.env.local    # then fill in what you have
 pnpm --filter @amplestocks/web dev              # http://localhost:3000
 
 pnpm --filter @amplestocks/web typecheck
-pnpm --filter @amplestocks/web test             # vitest, 218 tests
+pnpm --filter @amplestocks/web test             # vitest, 237 tests
 pnpm --filter @amplestocks/web build            # production build, no network required
 pnpm --filter @amplestocks/web test:e2e         # Playwright, 16 tests — NOT part of `pnpm test`
 ```
@@ -246,21 +261,21 @@ Run `pnpm --filter @amplestocks/web build` afterwards to restore the ordinary bu
 
 ## Tests
 
-**vitest — 218 tests in 21 files**, all offline.
+**vitest — 237 tests in 21 files**, all offline.
 
 | File | What it pins |
 |---|---|
 | `test/fees.test.ts` | the rotation-credit blend `buyFee + ceilDiv((sellFee - buyFee)(in - c), in)`, its rounding direction and monotonicity; the fee clamp and the degraded fee floor; the creator schedule reaching exactly zero at day 30 |
-| `test/route.test.ts` | the **golden vector** below, plus the wrap/unwrap commands and that AMPS stays `currency0` |
+| `test/route.test.ts` | the **golden vector** below, the wrap/unwrap commands, that AMPS stays `currency0`, and `poolKeyFromQuote` refusing to guess a key from a registry-degraded quote |
 | `test/bonds.test.ts` | `minAmpsOut` is exactly the quote and `assertBondMinAmpsOut` refuses anything else; capacity-clamp detection; `q_floor`; the linear vest |
-| `test/quoter.test.ts` | the degraded bitfield → per-field availability map; `isTradeable` false for any degraded quote |
+| `test/quoter.test.ts` | all eight degraded bits → the per-field availability map; `isTradeable` false for any degraded quote |
 | `test/redeem.test.ts` | pro-rata preview, fee reconstruction, the floor as arithmetic |
 | `test/geo.test.ts`, `test/terms.test.ts` | the two gates |
 | `test/copy.test.ts` | scans `app/`, `components/` and `lib/` for language the plan forbids, and asserts each required disclosure is present |
 | `test/errors.test.ts`, `test/format.test.ts`, `test/indexer.test.ts`, `test/deployment.test.ts` | error surfacing, "never a zero for an unavailable value", the indexer client, address handling |
 | `test/components/*.test.tsx` (9 files) | degraded rendering, the swap quote, the terms gate, the bond board and quote panel, the redeem preview, the rotation comparison, the vault panels, the governance tables, the transaction states |
 
-**Playwright — 16 tests in 2 files**: every surface loads and renders chain data from the mock;
+**Playwright — 17 tests in 2 files**: every surface loads and renders chain data from the mock;
 both gates behave; `/risk` is reachable with nothing accepted and from a blocked jurisdiction.
 
 ### The route-encoding golden vector
@@ -320,30 +335,47 @@ Enforced by `test/copy.test.ts`, which scans every `.ts`, `.tsx` and `.css` file
 - **Deployment addresses have no home in `packages/config`.** They live in the environment because
   nothing is deployed yet. When the Phase 6 scripts run, either keep them in `.env` or add a
   deployment record to `packages/config`; `lib/deployment.ts` is the one file that changes.
+  `LadderPositionValuer` is deliberately *not* one of them: its address is read from
+  `AmpsVault.positionValuer()`, which is both one fewer variable and the only answer that cannot go
+  stale.
 - **The indexer's field shapes are the dApp's requirement, not a transcription.** `ENDPOINTS` in
   `lib/indexer/client.ts` matches `docs/indexer.md` §7 route for route; the response types in
   `lib/indexer/types.ts` are what the panels need. Every reader tolerates a missing field by
   rendering that panel as unavailable, so a name that differs costs one panel rather than the page.
   `bigint` crosses the wire as a decimal string, per that document.
-- **Amount-level quotes need `V4Quoter`.** `AmpsQuoter` is a fee-and-state view by design;
-  `lib/v4quoter.ts` carries the `IV4Quoter` ABI for the curve half. The two are shown side by side
-  and never substituted for one another.
-- **No contract-side gap blocks the UI**, but three views would remove a workaround each. None was
-  added; `contracts/**` is out of scope for this change.
-  1. **Per-pool POL depth is not readable from the chain.** The plan requires bid depth to be
-     published per pool, and it is the counter-asset the vault currently holds as bids there. The
-     vault's `ladderAt`/`ladderLength` give the amount *at placement*, not the live decomposition,
-     and `LadderPositionValuer` computes valuations without exposing the token amounts. A view like
-     `amountsOf(poolId) -> (uint256 amps, uint256 counter)` would let the dApp publish the number
-     from the chain instead of from the indexer.
-  2. **`AmpsQuoter.PoolQuote` carries no `tickSpacing`.** Building a Universal Router `PathKey`
-     needs the pool's `fee`, `tickSpacing` and `hooks`, and `quoteAll()` returns only `poolId` and
-     `counter`. The app therefore issues one `PoolRegistry.poolKey(poolId)` per routed pool
-     (`hooks/use-pool-keys.ts`). An `int24 tickSpacing` on `PoolQuote`, or a batched
-     `PoolRegistryLens.poolKeys()`, would make one `quoteAll()` sufficient to route.
-  3. **There is no view for unvested bonded AMPS.** The Vault surface's circulating / inventory /
-     vesting / staked split uses `Amps.balanceOf(bonds)`, which is the honest upper bound — vested
-     but unclaimed AMPS is still sitting there. `AmpsBonds` knows the exact unvested total.
-  Also observed and worked around rather than a gap: `peg_dev_bp` has no chain view and comes from
-  the indexer, and `TimelockController` cannot enumerate its own queue, so the pending-operations
-  panel says so rather than implying it is empty.
+- **Protocol-wide unvested bonded AMPS is still an upper bound.** `AmpsBonds` cannot enumerate its
+  own positions — they live in per-owner arrays — so `AmpsBondsLens.unvested(bonds, owners)` is
+  exact only over an owner set the caller supplies. The Bond surface passes the connected wallet and
+  gets an exact figure; the Vault surface's supply split still uses `Amps.balanceOf(bonds)` and is
+  labelled "upper bound", because the distinct `Bond.buyer` set lives in the indexer and is not
+  served yet. Closing this is an indexer change, not a contract one.
+- **`peg_dev_bp` has no chain view** and comes from the indexer, and **`TimelockController` cannot
+  enumerate its own queue** — it answers only for an operation id you already hold — so the
+  pending-operations panel says so rather than implying the queue is empty. Both need the indexer's
+  log streams.
+
+### Closed since the first pass
+
+Three gaps this document previously recorded were closed in the pre-audit slice, and the app now
+uses each of them:
+
+1. **`AmpsQuoter.PoolQuote` gained a trailing `int24 tickSpacing`.** One `quoteAll()` is now enough
+   to build a `PathKey` — `fee` is `DYNAMIC_FEE_FLAG` and `hooks` is the one immutable hook, both
+   invariant across all 32 pools — so the per-pool `PoolRegistry.poolKey` reads are gone and
+   `hooks/use-pool-keys.ts` with them. `lib/route.ts` exports `poolKeyFromQuote`, which returns
+   `null` rather than guessing when bit 6 (registry) is raised or `tickSpacing` is zero.
+2. **`LadderPositionValuer.amountsOf(poolId)` and `referenceSqrtPriceX96(poolId)`** made per-pool
+   POL depth a chain read; the Vault surface publishes it and the indexer's ladder series is now
+   history around it rather than the source of it.
+3. **`AmpsBonds.unvestedOf(address)` / `AmpsBondsLens.unvested(bonds, owners)`** made the connected
+   wallet's unvested principal exact.
+
+Two further additions are used as well: **`AmpsVault.lastPlacementAt(PoolId)`** drives the "next
+placement eligible" hint, and **`redeemProRata` now emits `Burn(shares, "redeem")`**, so a
+redemption is a first-class row in the burn feed rather than an inference from a supply delta.
+
+`AmpsQuoter` also grew **`quoteExactIn`, `simulateExactIn`, `wouldRevert` and `quoteSellWithCredit`**,
+and two `degraded` bits (6 registry, 7 PoolManager). Buy/Sell now takes its amount and its rail
+verdict from the quoter, so the app no longer carries a `V4Quoter` ABI at all — the reconciliation
+against `V4Quoter` that Phase 5's exit criteria call for belongs in a test or a script, not in the
+client bundle.
