@@ -225,10 +225,13 @@ jobs:
       - name: Lint
         run: ruff check packages/quant/src packages/quant/tests packages/quant/tools
 
+  # The gate compiles the whole tree (tests included) with `--build-info` from a cold cache, which
+  # took 20-24 minutes on 4d18a1f and was CANCELLED by `timeout-minutes: 25` with solc still running.
+  # A cancelled job fails the roll-up, so the budget carries the same margin as the build steps.
   licence-gate:
     name: licence gate
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
