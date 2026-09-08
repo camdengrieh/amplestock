@@ -53,7 +53,7 @@ contract AlwaysReverts {
 ///      extra exemptions are asserted below to refuse for their own reason in every gate state.
 contract GuardSymmetryTest is AmpsVaultFixture {
     /// @dev Every external state-changing selector on `AmpsVault`. Update the count deliberately, never silently.
-    uint256 internal constant EXPECTED_MUTATING_COUNT = 25;
+    uint256 internal constant EXPECTED_MUTATING_COUNT = 26;
 
     // -------------------------------------------------------------------------------------------------------------
     // The `AmpsBonds` half of step 1
@@ -153,7 +153,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         }
         assertEq(exempt, 3, "redeemProRata, emergencyMigrate and unlockCallback, and nothing else");
         assertEq(bondsGated, 2, "depositBonded and mintVesting, and nothing else");
-        assertEq(entries.length - exempt - bondsGated, 20, "the rest take the management policy");
+        assertEq(entries.length - exempt - bondsGated, 21, "the rest take the management policy");
     }
 
     /// @notice The `AmpsBonds` classification is complete, disjoint and the size the ABI says it should be.
@@ -508,7 +508,10 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             Guard.BONDS
         );
         _add("mintVesting", abi.encodeCall(IAmpsVault.mintVesting, (BONDS, 1e18)), BONDS, Guard.BONDS);
-        _add("genesis", abi.encodeCall(IAmpsVault.genesis, (genesisParams())), TIMELOCK, Guard.MANAGEMENT);
+        _add("genesisMint", abi.encodeCall(IAmpsVault.genesisMint, (genesisMintParams())), TIMELOCK, Guard.MANAGEMENT);
+        _add(
+            "genesisPlace", abi.encodeCall(IAmpsVault.genesisPlace, (genesisPlaceParams())), TIMELOCK, Guard.MANAGEMENT
+        );
         _add(
             "initializePool",
             abi.encodeCall(IAmpsVault.initializePool, (key, 1 << 96)),

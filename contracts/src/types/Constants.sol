@@ -47,24 +47,42 @@ library Constants {
     // Supply and genesis (immutable: `S0` and the split are not governable at all)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice `S0`: the entire genesis supply, minted exactly once. 5,000 AMPS.
-    uint256 internal constant S0 = 5000e18;
+    /// @notice `S0`: the entire genesis supply, minted exactly once. 20,000 AMPS.
+    /// @dev At the $1.00 auction floor that is a $20,000 fully diluted market capitalisation, and a full clear of
+    ///      the auction tranche at the floor raises $10,000, i.e. `NAV/share = raised / S0 = $0.50` under the
+    ///      fully diluted accounting of decision 14. The premium `P0 / NAV - 1` is disclosed, never smoothed.
+    uint256 internal constant S0 = 20_000e18;
 
     /// @notice Team tranche: 5% of `S0` into an OZ `VestingWallet`, 2-month linear, no cliff.
-    uint256 internal constant TEAM_SHARES = 250e18;
+    uint256 internal constant TEAM_SHARES = 1000e18;
 
-    /// @notice Protocol-owned-liquidity tranche: 95% of `S0`, held by the vault as ask inventory.
-    uint256 internal constant POL_SHARES = 4750e18;
+    /// @notice Auction tranche: 50% of `S0`, sold through two Continuous Clearing Auctions at genesis.
+    /// @dev Minted to the `AmpsGenesis` adapter by {IAmpsVault-genesisMint}; whatever does not clear comes back
+    ///      to the vault as inventory at {IAmpsVault-genesisPlace}.
+    uint256 internal constant AUCTION_SHARES = 10_000e18;
+
+    /// @notice The USDG leg of the auction tranche: half of {AUCTION_SHARES}, sold for USDG.
+    uint256 internal constant AUCTION_USDG_SHARES = 5000e18;
+
+    /// @notice The ETH leg of the auction tranche: half of {AUCTION_SHARES}, sold for native ETH and wrapped to
+    ///         WETH9 at settlement.
+    uint256 internal constant AUCTION_ETH_SHARES = 5000e18;
+
+    /// @notice Protocol-owned-liquidity tranche: 45% of `S0`, held by the vault as ask inventory.
+    /// @dev 2,700 of it leaves as the 30 spokes' seed asks (`spokeSeedBps` = 100 bp of this tranche, 90 AMPS
+    ///      each) and 6,300 as the two entry pools' ask ladders (3,150 each), all anchored at the clearing
+    ///      price `P0` rather than at $1.00.
+    uint256 internal constant POL_SHARES = 9000e18;
 
     /// @notice Team vest length: 60 days, linear, no cliff.
     uint32 internal constant TEAM_VEST_SECONDS = 60 * ONE_DAY;
 
     /// @notice The divide-by-zero guard in `navPerShare = (A + 1) / (T + VIRTUAL_SHARES)`. 1e3 wei of AMPS, i.e.
     ///         1e-15 AMPS: enough to make the denominator non-zero in every reachable state (I22) and far too small
-    ///         to matter against a 5,000e18 supply. There is no genesis burn because there is no NAV mint.
+    ///         to matter against a 20,000e18 supply. There is no genesis burn because there is no NAV mint.
     uint256 internal constant VIRTUAL_SHARES = 1e3;
 
-    /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 47.5 AMPS per spoke.
+    /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 90 AMPS per spoke.
     uint16 internal constant SPOKE_SEED_BPS_DEFAULT = 100;
 
     /// @notice Lower bound of the governed `spokeSeedBps`.

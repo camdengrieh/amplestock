@@ -99,7 +99,9 @@ contract VaultLayoutTest is AmpsVaultFixture {
     }
 
     /// @notice Slot 3: `address creator [0..159] | uint32 genesisTimestamp [160..191] | bool initialized [192] |
-    ///         bool wiringFrozen [200]`.
+    ///         bool wiringFrozen [200] | bool genesisMinted [208]`.
+    /// @dev The third latch is revision 7's, and it is packed into slot 3's free upper bits rather than appended,
+    ///      which is exactly what those bits were left free for: nothing below it moves.
     function test_slot3_creatorAndLatches() public view {
         uint256 word = uint256(vm.load(address(vault), bytes32(uint256(3))));
 
@@ -107,10 +109,11 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(uint32(word >> 160), vault.genesisTimestamp(), "genesisTimestamp [160..191]");
         assertEq(uint8(word >> 192), 1, "initialized [192..199]");
         assertEq(uint8(word >> 200), 1, "wiringFrozen [200..207]");
-        assertEq(word >> 208, 0, "[208..255] is free");
+        assertEq(uint8(word >> 208), 1, "genesisMinted [208..215]");
+        assertEq(word >> 216, 0, "[216..255] is free");
 
         uint256 expected = uint256(uint160(CREATOR)) | (uint256(vault.genesisTimestamp()) << 160) | (uint256(1) << 192)
-            | (uint256(1) << 200);
+            | (uint256(1) << 200) | (uint256(1) << 208);
         assertEq(word, expected, "slot 3 reconstructed");
     }
 
@@ -263,9 +266,13 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(vault.timelock(), TIMELOCK, "timelock");
         assertEq(vault.guardian(), GUARDIAN, "guardian");
 
-        // Slots 22 and beyond are unused: the documented layout ends at 20 and slot 21 is the one append since.
-        for (uint256 slot = 22; slot < 26; ++slot) {
-            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 21");
+        // Slot 22 is revision 7's `genesis` adapter pointer, appended for the same reason slots 20 and 21 were.
+        assertEq(_addressAt(22), address(genesisHolder), "slot 22 genesis");
+        assertEq(vault.genesis(), address(genesisHolder), "and the getter agrees");
+
+        // Slots 23 and beyond are unused: the documented layout ends at 20 and 21-22 are the two appends since.
+        for (uint256 slot = 23; slot < 27; ++slot) {
+            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 22");
         }
     }
 

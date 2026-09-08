@@ -24,11 +24,11 @@ import {Vm} from "forge-std/Vm.sol";
 ///      are the ones where the schedule proposes something the vault must refuse. `IRolloutPolicy.propose` is
 ///      `pure`, so a hostile proposal is injected with `vm.mockCall` rather than with a flag on the stub.
 contract VaultRolloutTest is PlacementFixture {
-    /// @dev 200 bp of the 4,750-AMPS POL tranche: 95 AMPS a day at launch.
+    /// @dev 200 bp of the 9,000-AMPS POL tranche: 180 AMPS a day at launch.
     uint256 internal constant DAILY_BUDGET =
         Constants.POL_SHARES * Constants.ROLLOUT_BPS_PER_DAY_DEFAULT / Constants.BPS;
 
-    /// @dev 30% of the POL tranche: 1,425 AMPS the entry pools may never be taken below.
+    /// @dev 30% of the POL tranche: 2,700 AMPS the entry pools may never be taken below.
     uint256 internal constant ENTRY_FLOOR = Constants.POL_SHARES * Constants.ENTRY_FLOOR_BPS_DEFAULT / Constants.BPS;
 
     function setUp() public {
@@ -586,6 +586,7 @@ contract VaultRolloutTest is PlacementFixture {
     ///      this **drains** the buffer, so a test that also wants the `Rollout` reads the logs once itself.
     function _lastBountyPaid()
         private
+        view
         returns (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw, bytes32 reason)
     {
         return _bountyIn(vm.getRecordedLogs());

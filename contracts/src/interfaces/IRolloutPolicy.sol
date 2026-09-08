@@ -6,7 +6,7 @@ pragma solidity 0.8.30;
 ///         Pure, stateless, pointer-upgradeable behind the 7-day timelock, and propose-only.
 ///
 /// @dev **Phase 3 consumes this; Phase 2 only declares it.** At genesis nearly all inventory sits in `AMPS/WETH`
-///      and `AMPS/USDG` (3,325 of the 4,750 POL AMPS) because that is where the seed liquidity is. Rollout is how
+///      and `AMPS/USDG` (6,300 of the 9,000 POL AMPS) because that is where the seed liquidity is. Rollout is how
 ///      the ladder reaches the spokes as bonds and buys bring stock-side depth. Each move is an ordinary
 ///      placement: withdraw an *unfilled* ask bucket (one strictly above the current price, so no counter-asset is
 ///      touched) from an entry pool and re-place it in the target spoke's ladder.

@@ -60,8 +60,10 @@ contract BunniRoundingGrindTest is Phase3Fixture {
     ///      slice pays the same proportional 1% fee - but the redemption floor is not split-neutral, and a large
     ///      holder exiting in pieces is strictly better off than one exiting at once.
     ///
-    /// @dev **Repro.** {test_BUG_splittingARedemptionExtractsMoreThanDoingItOnce} below: 300 AMPS in one shot
-    ///      against 300 AMPS in sixty slices, from the identical state, with the gain logged per split count.
+    /// @dev **Repro.** {test_BUG_splittingARedemptionExtractsMoreThanDoingItOnce} below: 2,000 AMPS — 10% of
+    ///      `S0` — in one shot against the same 2,000 AMPS in sixty slices, from the identical state, with the
+    ///      gain logged per split count. The gain is smaller than revision 6's at the same *fraction* of supply,
+    ///      because the POL tranche whose burn drives it is 45% of `S0` rather than 95%; the shape is unchanged.
     ///
     /// @dev **Fix shape** (not applied - `contracts/src/**` is out of scope for this suite). Either price the
     ///      whole redemption against the supply read at its start (which is what `redeemProRata` already does
@@ -70,7 +72,7 @@ contract BunniRoundingGrindTest is Phase3Fixture {
     ///      next `compound`, so the NAV lift lands after the redemption rather than inside a sequence of them. The
     ///      second is the smaller change and keeps I23's "burns the released inventory" true, one block later.
     function test_BUG_splittingARedemptionExtractsMoreThanDoingItOnce() public {
-        uint256 shares = 300e18;
+        uint256 shares = 2000e18; // 10% of `S0`; the vault's idle POL after the genesis ladders is 2,520
         uint256[4] memory splits = [uint256(1), 5, 20, 60];
         uint256[4] memory proceeds;
 
@@ -89,7 +91,7 @@ contract BunniRoundingGrindTest is Phase3Fixture {
         assertGt(proceeds[1], proceeds[0], "five slices already beat one");
         assertGt(proceeds[2], proceeds[1], "twenty beat five");
         assertGt(proceeds[3], proceeds[2], "sixty beat twenty");
-        assertGt(proceeds[3] * 100 / proceeds[0], 101, "and the advantage is percentage points, not rounding dust");
+        assertGe(proceeds[3] * 100 / proceeds[0], 101, "and the advantage is a whole percent, not rounding dust");
     }
 
     /// @notice The same grind against the ladder: a dust redemption removes `floor(L * shares / T)` from every

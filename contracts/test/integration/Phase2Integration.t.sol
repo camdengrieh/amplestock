@@ -36,8 +36,8 @@ contract Phase2IntegrationTest is Phase2Fixture {
     // (a) Genesis
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Genesis: five constituents added with their collateral markets, seven pools, `A` = $5,000,
-    ///         NAV/share = $1.00 and `P_ref` = NAV because the rate limiter starts from a zero reference.
+    /// @notice Genesis: five constituents added with their collateral markets, seven pools, `A` = $20,000,
+    ///         NAV/share = $1.00 and `P_ref` = the $1.00 launch price `genesisPlace` was seeded with.
     function test_a_genesisNavVector() public view {
         assertEq(registry.poolCount(), 7, "two entry pools and five spokes");
         assertEq(registry.activeConstituentCount(), 5, "five active constituents");
@@ -47,9 +47,12 @@ contract Phase2IntegrationTest is Phase2Fixture {
         assertEq(amps.balanceOf(address(teamVesting)), Constants.TEAM_SHARES, "team tranche");
         assertEq(amps.balanceOf(address(vault)), Constants.POL_SHARES, "POL tranche");
 
-        assertEq(vault.totalAssetsUsd18(), 5000e18, "A is exactly $5,000");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18, "A is exactly $20,000");
         assertEq(vault.navPerShareX18(), 999_999_999_999_999_999, "NAV/share is $1.00 less the virtual-share dust");
-        assertEq(vault.pRefX18(), vault.navPerShareX18(), "P_ref is NAV at genesis");
+        // Revision 7: `genesisPlace` seeds `P_ref` at the launch price it is handed, floored at NAV/share. The
+        // fixture asks for that floor (`GENESIS_P0_AT_NAV`), which is the pre-revision-7 launch shape: the
+        // founders' seed opens with the reference *at* NAV. A `P0` above it is `unit/VaultGenesis.t.sol`'s case.
+        assertEq(vault.pRefX18(), vault.navPerShareX18(), "P_ref is the NAV floor genesis asked for");
 
         console.log("[genesis] A usd18          ", vault.totalAssetsUsd18());
         console.log("[genesis] navPerShareX18   ", vault.navPerShareX18());
@@ -57,8 +60,8 @@ contract Phase2IntegrationTest is Phase2Fixture {
         console.log("[genesis] pMktX18          ", vault.pMktX18());
         console.log("[genesis] totalSupply      ", amps.totalSupply());
 
-        assertEq(claimOf(address(weth)), SEED_WETH, "1 WETH of seed, as an ERC-6909 claim");
-        assertEq(claimOf(address(usdg)), SEED_USDG, "2,500 USDG of seed, as an ERC-6909 claim");
+        assertEq(claimOf(address(weth)), SEED_WETH, "4 WETH of seed, as an ERC-6909 claim");
+        assertEq(claimOf(address(usdg)), SEED_USDG, "10,000 USDG of seed, as an ERC-6909 claim");
         assertEq(IERC20(address(weth)).balanceOf(address(vault)), 0, "and never as an idle balance");
         assertEq(uint256(gate.state(0)), uint256(GateState.GREEN), "the gate is green at genesis");
     }
@@ -192,9 +195,11 @@ contract Phase2IntegrationTest is Phase2Fixture {
     ///      raised NAV/share from $1.00 to $3.58 while the checkpoint still said $1.00, and the next bond issued
     ///      24.88 AMPS ($89) for $25 of collateral, lowering NAV/share for every holder.
     function test_b_secondBondInTheSameBlockPricesAgainstTheLiveNav() public {
-        // A deliberately over-capacity bond: 20 SPY-like tokens ($13,000) for the 25 AMPS the epoch allows.
-        (uint256 firstOut,) = bondAs(ALICE, 2, 20e18, 0);
-        assertEq(firstOut, 25e18, "the epoch capacity clamp binds, and the whole deposit is taken anyway");
+        // A deliberately over-capacity bond: 80 SPY-like tokens ($52,000) for the 100 AMPS the epoch allows
+        // (50 bp of `S0`). The deposit is sized to leave `A` at $72,000 against 20,000 AMPS, i.e. the same $3.60
+        // live NAV the pre-revision-7 vector produced from a quarter of both figures.
+        (uint256 firstOut,) = bondAs(ALICE, 2, 80e18, 0);
+        assertEq(firstOut, 100e18, "the epoch capacity clamp binds, and the whole deposit is taken anyway");
 
         uint256 navBefore = vault.previewNavPerShareX18();
         assertGt(navBefore, 3e18, "the live NAV/share is now well above $1");
@@ -674,7 +679,7 @@ contract Phase2IntegrationTest is Phase2Fixture {
 
         // I21: the pot is not in `A`.
         assertFalse(vault.isAsset(address(pot)), "the pot is not an asset");
-        assertEq(vault.totalAssetsUsd18(), 5000e18, "and its USDG is outside the numerator");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18, "and its USDG is outside the numerator");
 
         assertSweepClean("h/bounty");
     }

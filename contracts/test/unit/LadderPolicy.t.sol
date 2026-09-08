@@ -30,14 +30,14 @@ contract LadderPolicyTest is Test {
     uint8 internal constant DOUBLINGS = Constants.LADDER_DOUBLINGS_DEFAULT;
     uint8 internal constant HALVINGS = Constants.SEED_HALVINGS_DEFAULT;
 
-    /// @dev 1,662.5 AMPS per entry pool: half of the 3,325 AMPS the two entry pools hold at genesis.
-    uint256 internal constant ENTRY_ASK_AMPS = 1662.5e18;
+    /// @dev 3,150 AMPS per entry pool: half of the 6,300 AMPS the two entry pools hold at genesis.
+    uint256 internal constant ENTRY_ASK_AMPS = 3150e18;
 
-    /// @dev 47.5 AMPS per spoke: 1% of the 4,750-AMPS POL tranche.
-    uint256 internal constant SPOKE_ASK_AMPS = 47.5e18;
+    /// @dev 90 AMPS per spoke: 1% of the 9,000-AMPS POL tranche.
+    uint256 internal constant SPOKE_ASK_AMPS = 90e18;
 
-    /// @dev $2,500 of USDG (6 decimals) as the `AMPS/USDG` seed bid.
-    uint256 internal constant SEED_BID_USDG = 2500e6;
+    /// @dev $10,000 of USDG (6 decimals) as the `AMPS/USDG` seed bid.
+    uint256 internal constant SEED_BID_USDG = 10_000e6;
 
     function setUp() public {
         policy = new LadderPolicy();
@@ -67,23 +67,23 @@ contract LadderPolicyTest is Test {
 
     /* --------------------------------------- the genesis ladders --------------------------------------- */
 
-    /// @dev §3.3, entry pools: 1,662.5 AMPS as ten doublings above $1.00 at tilt 1.25. Every bucket to the wei.
+    /// @dev §3.3, entry pools: 3,150 AMPS as ten doublings above `P0` at tilt 1.25. Every bucket to the wei.
     function test_genesisEntryAskLadderToTheWei() public view {
         int24 anchor = _entryAnchor();
         ILadderPolicy.LadderBucket[] memory buckets =
             _propose(anchor, anchor, ENTRY_SPACING, DOUBLINGS, ENTRY_ASK_AMPS, true);
 
         uint256[10] memory expected = [
-            uint256(49_995_634_990_694_670_637),
-            62_494_543_738_368_338_712,
-            78_118_179_672_960_424_637,
-            97_647_724_591_200_531_212,
-            122_059_655_739_000_663_600,
-            152_574_569_673_750_829_500,
-            190_718_212_092_188_536_875,
-            238_397_765_115_235_671_925,
-            297_997_206_394_044_589_075,
-            372_496_507_992_555_743_827
+            uint256(94_728_571_561_316_218_050),
+            118_410_714_451_645_273_350,
+            148_013_393_064_556_594_050,
+            185_016_741_330_695_743_350,
+            231_270_926_663_369_678_400,
+            289_088_658_329_212_098_000,
+            361_360_822_911_515_122_500,
+            451_701_028_639_393_904_700,
+            564_626_285_799_242_379_300,
+            705_782_857_249_052_988_300
         ];
 
         uint256 total;
@@ -104,23 +104,23 @@ contract LadderPolicyTest is Test {
         assertApproxEqAbs(buckets[9].amount * 1e18 / ENTRY_ASK_AMPS, 224_058_049_920_334_282, 1, "w_9 == 22.4058%");
     }
 
-    /// @dev §3.3, spokes: 47.5 AMPS, ten doublings, tilt 1.25, anchored at `tickOf(P_ref / P_stock)`.
+    /// @dev §3.3, spokes: 90 AMPS, ten doublings, tilt 1.25, anchored at `tickOf(P_ref / P_stock)`.
     function test_genesisSpokeAskLadderToTheWei() public view {
         int24 anchor = _spokeAnchor();
         ILadderPolicy.LadderBucket[] memory buckets =
             _propose(anchor, anchor, SPOKE_SPACING, DOUBLINGS, SPOKE_ASK_AMPS, true);
 
         uint256[10] memory expected = [
-            uint256(1_428_446_714_019_847_732),
-            1_785_558_392_524_809_677,
-            2_231_947_990_656_012_132,
-            2_789_934_988_320_015_177,
-            3_487_418_735_400_018_960,
-            4_359_273_419_250_023_700,
-            5_449_091_774_062_529_625,
-            6_811_364_717_578_162_055,
-            8_514_205_896_972_702_545,
-            10_642_757_371_215_878_397
+            uint256(2_706_530_616_037_606_230),
+            3_383_163_270_047_007_810,
+            4_228_954_087_558_759_830,
+            5_286_192_609_448_449_810,
+            6_607_740_761_810_562_240,
+            8_259_675_952_263_202_800,
+            10_324_594_940_329_003_500,
+            12_905_743_675_411_254_420,
+            16_132_179_594_264_067_980,
+            20_165_224_492_830_085_380
         ];
 
         uint256 total;
@@ -129,18 +129,18 @@ contract LadderPolicyTest is Test {
             total += buckets[k].amount;
         }
         assertEq(total, SPOKE_ASK_AMPS, "the split is exact");
-        // Thirty spokes at 47.5 AMPS is the 1,425-AMPS half of the POL tranche.
-        assertEq(SPOKE_ASK_AMPS * 30, 1425e18, "the spoke tranche closes");
+        // Thirty spokes at 90 AMPS is the 2,700-AMPS half of the POL tranche.
+        assertEq(SPOKE_ASK_AMPS * 30, 2700e18, "the spoke tranche closes");
     }
 
-    /// @dev §3.3, seed bids: $2,500 of USDG as four halvings below $1.00, weighted 1.25x toward the anchor.
+    /// @dev §3.3, seed bids: $10,000 of USDG as four halvings below `P0`, weighted 1.25x toward the anchor.
     function test_genesisSeedBidLadderToTheWei() public view {
         int24 anchor = _entryAnchor();
         ILadderPolicy.LadderBucket[] memory buckets =
             _propose(anchor, anchor, ENTRY_SPACING, HALVINGS, SEED_BID_USDG, false);
 
         // The weight vector runs with price, so bucket 0 — the halving adjacent to $1 — is the largest.
-        uint256[4] memory expected = [uint256(846_883_469), 677_506_775, 542_005_420, 433_604_336];
+        uint256[4] memory expected = [uint256(3_387_533_876), 2_710_027_100, 2_168_021_680, 1_734_417_344];
 
         uint256 total;
         uint256 previous = type(uint256).max;

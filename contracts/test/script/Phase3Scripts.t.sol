@@ -3,11 +3,15 @@ pragma solidity 0.8.30;
 
 import {Libraries} from "../../script/02_Libraries.s.sol";
 import {Registry} from "../../script/05_Registry.s.sol";
+import {GenesisAuction} from "../../script/06a_GenesisAuction.s.sol";
+import {GenesisSettle} from "../../script/06b_GenesisSettle.s.sol";
 import {Phase3Wire} from "../../script/09_Phase3Wire.s.sol";
 import {MockWeth9, TestnetPools} from "../../script/10_TestnetPools.s.sol";
 import {GenesisPlacement} from "../../script/11_GenesisPlacement.s.sol";
 import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
+import {AmpsGenesis} from "../../src/genesis/AmpsGenesis.sol";
 import {AmpsHook} from "../../src/hook/AmpsHook.sol";
+import {IAmpsGenesis} from "../../src/interfaces/IAmpsGenesis.sol";
 import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {IOracleGate} from "../../src/interfaces/IOracleGate.sol";
@@ -26,6 +30,8 @@ import {Constants} from "../../src/types/Constants.sol";
 import {ConstituentStatus, GateState, PoolClass, PoolConfig} from "../../src/types/Types.sol";
 import {LadderPositionValuer} from "../../src/valuer/LadderPositionValuer.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
+import {MockCCA} from "../mocks/MockCCA.sol";
+import {MockCCAFactory} from "../mocks/MockCCAFactory.sol";
 import {MockMarketReference} from "../mocks/MockMarketReference.sol";
 import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {MockUsdg} from "../mocks/MockUsdg.sol";
@@ -75,9 +81,17 @@ contract Phase3Scripts is V4TestBase {
     uint256 internal constant GENESIS_TIME = 1_788_962_400;
     uint256 internal constant GENESIS_BLOCK = 20_000_000;
 
-    /// @dev The founders' seed: 1 WETH ($2,500) + 2,500 USDG ($2,500) against `S0` = 5,000 AMPS.
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    /// @dev What the two auctions raise in this run: 5,000 USDG and 2 WETH ($5,000 at $2,500/ETH), i.e. both
+    ///      tranches clearing in full at the $1.00 floor. `A` is therefore $10,000 against `S0` = 20,000 AMPS —
+    ///      the launch NAV/share of `raised / S0` = $0.50 and the 100% opening premium revision 7 discloses.
+    uint256 internal constant BID_USDG = 5000e6;
+    uint256 internal constant BID_WETH = 2e18;
+
+    /// @dev ETH/USD at auction creation, 18 decimals. The same $2,500 every other fixture uses.
+    uint256 internal constant ETH_USD_X18 = 2500e18;
+
+    /// @dev A bidder with money.
+    address internal constant BIDDER = address(0xB1DDE2);
 
     /// @dev The launch set: 30 spokes plus `AMPS/USDG` and `AMPS/WETH`.
     uint256 internal constant SPOKES = 30;
@@ -106,6 +120,8 @@ contract Phase3Scripts is V4TestBase {
     Phase3Wire internal wireScript;
     TestnetPools internal testnetScript;
     GenesisPlacement internal genesisScript;
+    GenesisAuction internal auctionScript;
+    GenesisSettle internal settleScript;
 
     // -----------------------------------------------------------------------------------------------------------
     // The system
@@ -124,6 +140,8 @@ contract Phase3Scripts is V4TestBase {
     FeePolicy internal feePolicy;
     BondPolicy internal bondPolicy;
     AmpsRouter internal ampsRouter;
+    AmpsGenesis internal genesisAdapter;
+    MockCCAFactory internal ccaFactory;
     MockMarketReference internal phase2Reference;
     VestingWallet internal teamVesting;
 
@@ -146,6 +164,8 @@ contract Phase3Scripts is V4TestBase {
         wireScript = new Phase3Wire();
         testnetScript = new TestnetPools();
         genesisScript = new GenesisPlacement();
+        auctionScript = new GenesisAuction();
+        settleScript = new GenesisSettle();
 
         // Step 0: the counter assets, deployed by the script under test. They come first because `PoolRegistry`
         // takes WETH9 and USDG in its constructor.
@@ -294,7 +314,7 @@ contract Phase3Scripts is V4TestBase {
         );
         assertTrue(bytes(vm.parseJsonString(libs, ".librariesFlag")).length > 0, "the flag string is recorded");
 
-        // `phase3-proposal.json`: seven calls and the two pieces of timelock calldata.
+        // `phase3-proposal.json`: nine calls and the two pieces of timelock calldata.
         assertEq(vm.parseJsonUint(proposal, ".delaySeconds"), Constants.TIMELOCK_SLOW_SECONDS, "the 7-day delay");
         assertEq(vm.parseJsonAddress(proposal, ".calls[4].target"), address(hook), "the hook call is recorded");
         assertTrue(vm.parseJsonBytes(proposal, ".scheduleBatch").length > 4, "scheduleBatch calldata is recorded");
@@ -327,28 +347,59 @@ contract Phase3Scripts is V4TestBase {
         wireScript.checkBootstrap(t, uint16(POOLS));
     }
 
-    /// @notice The bootstrap check refuses while step 2 is unfinished: no pools, no hub ring, no gate. With the
-    ///         router named, the next thing missing is the pools.
-    function test_wire_bootstrapRefusesBeforeThePoolsExist() public {
+    /// @notice With the router named, the next thing the bootstrap wants is revision 7's genesis adapter: half
+    ///         of `S0` is minted to that pointer, so a launch cannot proceed without it.
+    function test_wire_bootstrapRefusesUntilTheAdapterIsNamed() public {
         vm.prank(TIMELOCK);
         hook.setRouter(address(ampsRouter));
         Phase3Wire.Targets memory t = _targets(address(0));
-        vm.expectRevert(abi.encodeWithSelector(Phase3Wire.PoolsMissing.selector, uint16(0), uint16(POOLS)));
+        vm.expectRevert(abi.encodeWithSelector(Phase3Wire.PointerUnset.selector, bytes32("genesis")));
         wireScript.checkBootstrap(t, uint16(POOLS));
     }
 
+    /// @notice The gate pass refuses while the pools are missing. The *pointer* pass does not, and that is the
+    ///         revision-7 change: the 32 pools are registered after the auctions settle, so "no pools yet" is the
+    ///         correct state on that pass rather than an unfinished step.
+    function test_wire_bootstrapRefusesBeforeThePoolsExist() public {
+        vm.startPrank(TIMELOCK);
+        hook.setRouter(address(ampsRouter));
+        vault.setPolicyPointer(bytes32("genesis"), address(genesisAdapter));
+        vm.stopPrank();
+
+        Phase3Wire.Targets memory t = _targets(address(0));
+        vm.expectRevert(abi.encodeWithSelector(Phase3Wire.PoolsMissing.selector, uint16(0), uint16(POOLS)));
+        wireScript.checkBootstrap(t, uint16(POOLS));
+
+        // ...and the pointer pass is satisfied by exactly the same state.
+        wireScript.checkBootstrap(t, 0);
+    }
+
     /// @notice `11_GenesisPlacement` refuses to touch a vault whose gate pointer is still unset: registration
-    ///         runs ungated on purpose, genesis deliberately does not.
+    ///         and settlement run ungated on purpose, the ladders deliberately do not.
     function test_genesis_refusesWithNoGate() public {
         vm.expectRevert(GenesisPlacement.GateUnset.selector);
         genesisScript.assertGateGreen(address(vault));
     }
 
-    /// @notice The proposal form of the batch: eight timelock calls, in the §9.1 order, with the right
-    ///         selectors — the router move beside the fee policy, and the gate pointer last.
+    /// @notice And it refuses before `genesisPlace`: there is no `P_ref` to anchor a ladder at and no inventory
+    ///         to place.
+    function test_genesis_refusesBeforeThePlacement() public {
+        vm.expectRevert(GenesisPlacement.GenesisNotPlaced.selector);
+        genesisScript.execute(_genesisParams(), 1);
+    }
+
+    /// @notice `05_Registry` refuses before `genesisPlace` too, for the mirror-image reason: `PoolRegistry`
+    ///         anchors every pool it opens at `pRefX18()`, which is still the $1.00 fallback until `P0` lands.
+    function test_registry_refusesBeforeTheAnchorIsSet() public {
+        vm.expectRevert(Registry.AnchorNotSet.selector);
+        registryScript.assertAnchor(_core());
+    }
+
+    /// @notice The proposal form of the batch: nine timelock calls, in the §9.1 order, with the right
+    ///         selectors — the router move beside the fee policy, the genesis adapter next, and the gate last.
     function test_wire_proposalIsEightCallsInOrder() public view {
         Phase3Wire.Call[] memory calls = wireScript.buildCalls(_targets(address(0x9A7E)), address(0x9A7E));
-        assertEq(calls.length, 8, "eight moves");
+        assertEq(calls.length, 9, "nine moves");
         for (uint256 i; i < 4; ++i) {
             assertEq(calls[i].target, address(vault), "the four pointer moves are vault calls");
             assertEq(bytes4(calls[i].data), IAmpsVault.setPolicyPointer.selector, "setPolicyPointer");
@@ -362,7 +413,13 @@ contract Phase3Scripts is V4TestBase {
         );
         assertEq(calls[5].what, "hook.setRouter(AmpsRouter)", "and the proposal says so in words");
         assertEq(calls[6].target, address(bonds), "the bond policy move is a bonds call");
-        assertEq(calls[7].target, address(vault), "the gate pointer goes last");
+        assertEq(calls[7].target, address(vault), "the genesis adapter is a vault pointer");
+        assertEq(
+            calls[7].data,
+            abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("genesis"), address(genesisAdapter))),
+            "...naming the deployed adapter"
+        );
+        assertEq(calls[8].target, address(vault), "the gate pointer goes last");
 
         bytes memory schedule = wireScript.scheduleBatchCalldata(calls, bytes32("salt"), 7 days);
         assertEq(
@@ -383,7 +440,77 @@ contract Phase3Scripts is V4TestBase {
     function test_pipeline_opensThirtyTwoPoolsWiresAndPlacesGenesis() public {
         Registry.Wiring memory core = _core();
 
-        // ---- Bootstrap step 2: register the 32 pools with the gate pointer still unset. -----------------------
+        // ---- Bootstrap step 1b: the pointer pass. The gate is deliberately left unset, and so are the pools. --
+        assertEq(hook.router(), address(0), "the exemption is withdrawn until the batch runs");
+        wireScript.execute(_targets(address(0)), false, true);
+
+        assertEq(vault.marketReference(), address(hook), "marketReference -> AmpsHook");
+        assertEq(vault.positionValuer(), address(valuer), "positionValuer -> LadderPositionValuer");
+        assertEq(vault.ladderPolicy(), address(ladderPolicy), "ladderPolicy");
+        assertEq(vault.rolloutPolicy(), address(rolloutPolicy), "rolloutPolicy");
+        assertEq(hook.feePolicy(), address(feePolicy), "hook.setFeePolicy");
+        assertEq(hook.router(), address(ampsRouter), "hook.setRouter named the protocol router");
+        assertEq(bonds.policy(), address(bondPolicy), "bonds.setPolicy");
+        assertEq(vault.genesis(), address(genesisAdapter), "the genesis adapter is named before anything is minted");
+        assertEq(vault.oracleGate(), address(0), "the gate is still unset, which is what lets 06a and 05 run");
+        assertEq(registry.poolCount(), 0, "and no pool exists yet: they open at P0, after the auctions");
+
+        // ---- Bootstrap step 1c: the feeds, without a single pool. ---------------------------------------------
+        // `genesisPlace` ends in a checkpoint and a checkpoint prices WETH9 and USDG, so their feeds have to be
+        // installed before `06b` — while the pools they belong to are opened after it, at `P0`.
+        uint256 feedsInstalled = testnetScript.installFeedsOnly(core, assets);
+        assertEq(feedsInstalled, SPOKES + 2, "every constituent feed plus the two entry counters");
+        assertEq(registry.poolCount(), 0, "and still not one pool");
+        assertEq(testnetScript.installFeedsOnly(core, assets), 0, "a second feeds pass installs nothing");
+
+        // ---- Bootstrap step 2: 06a — genesisMint and the two auctions. ----------------------------------------
+        GenesisAuction.LaunchConfig memory launch = _launchConfig();
+        auctionScript.execute(_auctionWiring(), launch);
+
+        assertTrue(vault.genesisMinted(), "S0 minted");
+        assertFalse(vault.initialized(), "but the protocol is not open: A is still zero");
+        assertEq(amps.totalSupply(), Constants.S0, "S0 = 20,000 AMPS");
+        assertEq(amps.balanceOf(address(teamVesting)), Constants.TEAM_SHARES, "1,000 AMPS to the vesting wallet");
+        assertEq(amps.balanceOf(address(vault)), Constants.POL_SHARES, "9,000 AMPS of POL stay in the vault");
+        assertEq(vault.creator(), CREATOR, "the creator is recorded at the mint");
+        assertTrue(genesisAdapter.usdgAuction() != address(0), "the USDG auction exists");
+        assertTrue(genesisAdapter.ethAuction() != address(0), "the ETH auction exists");
+        assertEq(amps.balanceOf(genesisAdapter.usdgAuction()), Constants.AUCTION_USDG_SHARES, "and holds its tranche");
+        assertEq(amps.balanceOf(genesisAdapter.ethAuction()), Constants.AUCTION_ETH_SHARES, "...as does the other");
+        assertEq(amps.balanceOf(address(genesisAdapter)), 0, "the adapter kept nothing back");
+
+        // A second 06a pass mints nothing and creates nothing.
+        auctionScript.execute(_auctionWiring(), launch);
+        assertEq(amps.totalSupply(), Constants.S0, "a re-run of 06a is a no-op");
+
+        // ---- Bidding. ----------------------------------------------------------------------------------------
+        vm.roll(launch.startBlock);
+        _bidBothLegs();
+        vm.roll(uint256(launch.endBlock) + 1);
+
+        // ---- Bootstrap step 3: 06b — settle, which calls genesisPlace. ----------------------------------------
+        GenesisSettle.Report memory settled = settleScript.execute(_settleWiring(), _fallbackSeed());
+
+        assertTrue(settled.settled, "settle ran");
+        assertTrue(settled.graduated, "both legs graduated");
+        assertFalse(settled.fallbackRan, "so the founders' seed path did not");
+        assertEq(settled.raisedUsdg, BID_USDG, "the USDG raise reached the vault, net of a zero protocol fee");
+        assertEq(settled.raisedWeth, BID_WETH, "and the ETH raise, wrapped into WETH9");
+        assertEq(settled.unsoldAmps, 0, "both tranches cleared in full");
+        assertTrue(vault.initialized(), "the protocol is open");
+        // $1.00 to within the Q96 floor the auction quotes on; the vault is seeded with exactly what settled.
+        assertApproxEqAbs(genesisAdapter.p0X18(), Constants.WAD, 1e10, "the adapter cleared at $1.00");
+        assertEq(vault.pRefX18(), genesisAdapter.p0X18(), "and P_ref is that clearing price");
+        assertEq(vault.genesisTimestamp(), uint32(block.timestamp), "the creator clock starts at the placement");
+        // Fully diluted, decision 14: `A` is the $10,000 raised and `T` is the whole 20,000 AMPS.
+        assertApproxEqRel(vault.navPerShareX18(), 0.5e18, 0.001e18, "NAV/share is raised / S0 = $0.50");
+        assertApproxEqRel(vault.premiumX18(), 1e18, 0.01e18, "and the launch premium is the disclosed 100%");
+
+        // A second 06b pass does nothing.
+        vm.expectRevert(IAmpsGenesis.AlreadySettled.selector);
+        genesisAdapter.settle();
+
+        // ---- Bootstrap step 4: register the 32 pools, each opening at P0. -------------------------------------
         (TestnetPools.Assets memory again, Registry.Result memory result) = testnetScript.execute(core, assets);
 
         assertEq(again.usdg, assets.usdg, "the asset pass skipped what already existed");
@@ -395,7 +522,7 @@ contract Phase3Scripts is V4TestBase {
         assertEq(registry.poolCount(), uint16(POOLS), "the registry holds 32 pools");
         assertEq(registry.activeConstituentCount(), uint16(SPOKES), "30 active constituents");
         assertEq(bonds.marketCount(), uint16(SPOKES), "30 bond markets");
-        assertEq(vault.oracleGate(), address(0), "the gate is still unset, which is what let step 2 happen");
+        assertEq(vault.oracleGate(), address(0), "the gate is still unset, which is what let step 4 happen");
 
         // Ruling J: the recorded price is the one the pool actually opened at, i.e. the grid origin.
         for (uint256 i; i < result.pools.length; ++i) {
@@ -419,52 +546,38 @@ contract Phase3Scripts is V4TestBase {
         assertEq(rerun.spokesSkipped, uint16(SPOKES), "...and all 30");
         assertEq(registry.poolCount(), uint16(POOLS), "still 32 pools");
 
-        // ---- Bootstrap step 3: let the hub ring cover twapWindow. ---------------------------------------------
+        // ---- Bootstrap step 5: let the hub ring cover twapWindow. ---------------------------------------------
         assertLt(hook.observationCoverage(registry.hubPoolId()), vault.twapWindow(), "the ring starts empty");
         _warpBy(Constants.TWAP_WINDOW_DEFAULT + 1);
         assertGe(hook.observationCoverage(registry.hubPoolId()), vault.twapWindow(), "...and fills with time alone");
 
-        // ---- Bootstrap step 4: the pointer moves, then the gate. ----------------------------------------------
-        assertEq(hook.router(), address(0), "the exemption is withdrawn until the batch runs");
-        address gate = wireScript.execute(_targets(address(0)), true);
+        // ---- Bootstrap step 6: the gate pass. ------------------------------------------------------------------
+        address gate = wireScript.execute(_targets(address(0)), true, false);
 
-        assertEq(vault.marketReference(), address(hook), "marketReference -> AmpsHook");
-        assertEq(vault.positionValuer(), address(valuer), "positionValuer -> LadderPositionValuer");
-        assertEq(vault.ladderPolicy(), address(ladderPolicy), "ladderPolicy");
-        assertEq(vault.rolloutPolicy(), address(rolloutPolicy), "rolloutPolicy");
-        assertEq(hook.feePolicy(), address(feePolicy), "hook.setFeePolicy");
-        assertEq(hook.router(), address(ampsRouter), "hook.setRouter named the protocol router");
-        assertEq(
-            IAmpsHook(address(hook)).router(),
-            address(ampsRouter),
-            "...and the interface a rotation is priced through agrees"
-        );
-        assertEq(bonds.policy(), address(bondPolicy), "bonds.setPolicy");
         assertEq(vault.oracleGate(), gate, "the vault points at the redeployed gate");
         assertEq(IOracleGate(gate).marketReference(), address(hook), "the gate reads the hook's poolState");
         assertEq(feeds.oracleGate(), gate, "FeedRegistry points at the same gate");
-        assertTrue(IOracleGate(gate).state(0) == GateState.GREEN, "gate is GREEN before genesis");
+        assertTrue(IOracleGate(gate).state(0) == GateState.GREEN, "gate is GREEN before the ladders");
 
         // A second wiring pass moves nothing — and, because every move is guarded on the value already in
         // place, it makes no call at all. An empty log is the strongest form of that: a re-sent `setRouter` or
         // `setFeePolicy` would be a governance action against a live vault, not a deployment step.
         vm.recordLogs();
-        address gateAgain = wireScript.execute(_targets(gate), false);
+        address gateAgain = wireScript.execute(_targets(gate), false, false);
         assertEq(vm.getRecordedLogs().length, 0, "a second wiring pass emits nothing, i.e. it sent nothing");
         assertEq(gateAgain, gate, "re-run keeps the same gate");
         assertEq(vault.oracleGate(), gate, "re-run leaves the pointer alone");
         assertEq(hook.router(), address(ampsRouter), "re-run leaves the router pointer alone");
 
-        // ---- Bootstrap step 5: genesis and the ladders. -------------------------------------------------------
-        _fundSeed();
+        // ---- Bootstrap step 7: the §3.3 ladders. ---------------------------------------------------------------
         assertEq(genesisScript.nextPhase(address(vault)), 1, "phase 1 is due");
         GenesisPlacement.Report memory phase1 = genesisScript.execute(_genesisParams(), 1);
 
-        assertTrue(phase1.genesisRan, "genesis ran");
-        assertEq(amps.totalSupply(), Constants.S0, "S0 = 5,000 AMPS");
-        assertEq(amps.balanceOf(address(teamVesting)), Constants.TEAM_SHARES, "250 AMPS to the vesting wallet");
-        assertEq(vault.creator(), CREATOR, "the creator is recorded");
-        assertApproxEqRel(phase1.navPerShareX18, Constants.WAD, 0.001e18, "NAV/share is the $1.00 launch price");
+        // The reference the ladders anchored at, against the reference after they were placed: valuing a fresh
+        // ask ladder at `P_ref` lifts NAV a hair, and `P_ref` can follow it (§12 ruling L).
+        assertApproxEqRel(
+            phase1.p0X18, vault.pRefX18(), 0.01e18, "the ladders anchor at the same P0 the pools opened at"
+        );
         assertEq(phase1.askPools, uint16(POOLS), "an ask ladder in every one of the 32 pools");
         assertEq(
             phase1.liveCells,
@@ -507,7 +620,7 @@ contract Phase3Scripts is V4TestBase {
             amps.balanceOf(address(vault)) + _ampsInLadders(),
             Constants.POL_SHARES,
             1e9,
-            "the 4,750 AMPS POL tranche is fully accounted for"
+            "the 9,000 AMPS POL tranche is fully accounted for"
         );
         assertEq(amps.balanceOf(address(hook)), 0, "the hook holds no AMPS");
         assertEq(amps.totalSupply(), Constants.S0, "and nothing was minted after genesis");
@@ -518,7 +631,7 @@ contract Phase3Scripts is V4TestBase {
     // -----------------------------------------------------------------------------------------------------------
 
     /// @dev §3.3 in full: ten ask cells anchored at the grid origin in every pool, four bid cells at `m = -1..-4`
-    ///      in each entry pool and none anywhere else, 1,662.5 AMPS of asks per entry pool and 47.5 per spoke.
+    ///      in each entry pool and none anywhere else, 3,150 AMPS of asks per entry pool and 90 per spoke.
     ///
     ///      **BUG: `docs/phase3-state-model.md` §3.3 says the genesis asks occupy `m = 0..9`, and for a minority
     ///      of the 32 launch pools they occupy `m = 1..10` instead.** Nothing in `src/` is wrong — this is a
@@ -527,12 +640,12 @@ contract Phase3Scripts is V4TestBase {
     ///
     ///      The mechanism, measured here: `LadderPositionValuer` decomposes each position at the reference price,
     ///      so a freshly placed ask ladder picks up a sliver of counter-side value on the cell the price sits in
-    ///      and NAV/share rises. Genesis leaves NAV at 999999999999999999 (one wei under $1.00); after the first
-    ///      entry ladder it is 1000061029199999999, after the second 1000157335108788085, and after all 32 it is
-    ///      1000203846268456063 — about +2.0 bps. `P_ref` follows NAV, and `VaultPlacementLib._cells` starts an
-    ///      ask ladder at `ceilDiv(fairTick(P_ref) - gridBase, D)`, which is 1 instead of 0 for any pool whose
-    ///      exact fair tick sits within those ~2 ticks below a 60-tick spacing boundary. At 60 ticks per spacing
-    ///      that is a ~3% chance per pool, and in this run RKLB and SPCX are the two that land there.
+    ///      and NAV/share rises a little with every placement. `P_ref` follows NAV whenever NAV is the binding
+    ///      term, and `VaultPlacementLib._cells` starts an ask ladder at `ceilDiv(fairTick(P_ref) - gridBase, D)`,
+    ///      which is 1 instead of 0 for any pool whose exact fair tick sits a tick or two below a 60-tick spacing
+    ///      boundary. Under revision 7 the launch NAV/share is `raised / S0` = $0.50 while `P_ref` is the $1.00
+    ///      clearing price, so NAV is *not* the binding term at launch and the shift is rarer than it was at the
+    ///      old $1.00-NAV launch — but it is still admitted here, because it is I32 working as specified.
     ///
     ///      That behaviour is I32 working as specified — no ask may ever be placed below `P_ref` — so the fix is
     ///      to §3.3's wording, not to the vault: the guaranteed shape is `ladderDoublings` contiguous one-cell
@@ -587,7 +700,7 @@ contract Phase3Scripts is V4TestBase {
                 "ten contiguous ask cells"
             );
             assertEq(bids, isEntry ? Constants.SEED_HALVINGS_DEFAULT : 0, "four seed bid cells, entry pools only");
-            assertApproxEqAbs(askAmps, isEntry ? 1662.5e18 : 47.5e18, 1e12, "the section 3.3 ask inventory");
+            assertApproxEqAbs(askAmps, isEntry ? 3150e18 : 90e18, 1e12, "the section 3.3 ask inventory");
             if (firstAsk == 1) ++shifted;
         }
 
@@ -654,6 +767,11 @@ contract Phase3Scripts is V4TestBase {
         rolloutPolicy = new RolloutPolicy();
         feePolicy = new FeePolicy(Constants.K_VOL_X18, Constants.K_DEV_BPS, Constants.F_WALL_BPS, Constants.LAMBDA_X18);
         ampsRouter = new AmpsRouter(IPoolManager(address(poolManager)), address(amps), address(registry), assets.weth9);
+        // A fee-free stand-in for the canonical `ContinuousClearingAuctionFactory`. The adapter is deployed
+        // against it exactly as `03_Core` deploys it against the configured one.
+        ccaFactory = new MockCCAFactory(address(0), 0);
+        genesisAdapter =
+            new AmpsGenesis(address(vault), address(amps), address(ccaFactory), assets.weth9, assets.usdg, TIMELOCK);
         phase2Reference = new MockMarketReference();
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
     }
@@ -704,32 +822,102 @@ contract Phase3Scripts is V4TestBase {
             rolloutPolicy: address(rolloutPolicy),
             feePolicy: address(feePolicy),
             bondPolicy: address(bondPolicy),
-            router: address(ampsRouter)
+            router: address(ampsRouter),
+            genesis: address(genesisAdapter)
         });
     }
 
-    /// @dev The parameters `11_GenesisPlacement` takes.
+    /// @dev The parameters `11_GenesisPlacement` takes. Both bid sizes are left at zero, which is what a real
+    ///      launch does: the seed bids are the auction proceeds and their size is not knowable in advance, so the
+    ///      script reads the vault's own claim balances.
     function _genesisParams() private view returns (GenesisPlacement.Params memory p) {
         address[] memory seedTokens = new address[](2);
         uint256[] memory seedAmounts = new uint256[](2);
         seedTokens[0] = assets.weth9;
-        seedAmounts[0] = SEED_WETH;
         seedTokens[1] = assets.usdg;
-        seedAmounts[1] = SEED_USDG;
         p = GenesisPlacement.Params({
             timelock: TIMELOCK,
             vault: address(vault),
-            teamVestingWallet: address(teamVesting),
-            creator: CREATOR,
+            genesis: address(genesisAdapter),
             seedTokens: seedTokens,
             seedAmounts: seedAmounts
         });
     }
 
-    /// @dev The founders' $5,000, in the timelock's hands where `genesis()` pulls it from.
-    function _fundSeed() private {
-        MockWeth9(payable(assets.weth9)).mint(TIMELOCK, SEED_WETH);
-        MockUsdg(assets.usdg).mint(TIMELOCK, SEED_USDG);
+    /// @dev The addresses `06a` and `06b` take.
+    function _auctionWiring() private view returns (GenesisAuction.Wiring memory w) {
+        w = GenesisAuction.Wiring({
+            timelock: TIMELOCK,
+            vault: address(vault),
+            genesis: address(genesisAdapter),
+            teamVestingWallet: address(teamVesting),
+            creator: CREATOR,
+            feedRegistry: address(feeds),
+            weth9: assets.weth9
+        });
+    }
+
+    /// @dev The addresses `06b` takes.
+    function _settleWiring() private view returns (GenesisSettle.Wiring memory w) {
+        w = GenesisSettle.Wiring({
+            timelock: TIMELOCK,
+            vault: address(vault),
+            genesis: address(genesisAdapter),
+            weth9: assets.weth9,
+            usdg: assets.usdg
+        });
+    }
+
+    /// @dev A 600-block auction window starting 10 blocks out, with a graduation bar both legs clear.
+    function _launchConfig() private view returns (GenesisAuction.LaunchConfig memory cfg) {
+        cfg.ethUsdX18 = ETH_USD_X18;
+        cfg.startBlock = uint64(block.number + 10);
+        cfg.endBlock = cfg.startBlock + 600;
+        cfg.claimBlock = cfg.endBlock;
+
+        // 1% of each floor, which is what `script/config/genesis.json` recommends.
+        cfg.usdgLeg = GenesisAuction.LegConfig({
+            enabled: true,
+            tickSpacing: (uint256(1e6) * (uint256(1) << 96)) / 1e18 / 100,
+            requiredCurrencyRaised: 1000e6,
+            validationHook: address(0),
+            salt: bytes32(uint256(1)),
+            stepMps: new uint24[](0),
+            stepBlocks: new uint40[](0)
+        });
+        cfg.ethLeg = GenesisAuction.LegConfig({
+            enabled: true,
+            tickSpacing: (((uint256(1) << 96) * uint256(1e18)) / ETH_USD_X18) / 100,
+            requiredCurrencyRaised: 0.4e18,
+            validationHook: address(0),
+            salt: bytes32(uint256(2)),
+            stepMps: new uint24[](0),
+            stepBlocks: new uint40[](0)
+        });
+    }
+
+    /// @dev The founders' seed `06b` would use if nothing graduated. Unused on the happy path, and asserted
+    ///      unused: `settled.fallbackRan` must be false.
+    function _fallbackSeed() private pure returns (GenesisSettle.Fallback memory fb) {
+        fb = GenesisSettle.Fallback({p0X18: 1e18, seedWeth: 4e18, seedUsdg: 10_000e6});
+    }
+
+    /// @dev Bids both tranches out at the floor, so each leg graduates and clears in full at `P0` = $1.00.
+    function _bidBothLegs() private {
+        MockUsdg(assets.usdg).mint(BIDDER, BID_USDG);
+        // Both the bidder and this contract are funded: whether a pranked call debits the pranked address or the
+        // frame that actually makes it is a Foundry implementation detail, and the bid must not depend on it.
+        vm.deal(BIDDER, BID_WETH);
+        vm.deal(address(this), address(this).balance + BID_WETH);
+
+        MockCCA usdgAuction = MockCCA(payable(genesisAdapter.usdgAuction()));
+        MockCCA ethAuction = MockCCA(payable(genesisAdapter.ethAuction()));
+
+        vm.startPrank(BIDDER);
+        MockUsdg(assets.usdg).approve(address(usdgAuction), BID_USDG);
+        usdgAuction.bid(genesisAdapter.floorUsdgQ96(), BID_USDG);
+        ethAuction.bid{value: BID_WETH}(genesisAdapter.floorEthQ96(), BID_WETH);
+        vm.stopPrank();
     }
 
     /// @dev An empty `Assets`, i.e. "nothing deployed yet".

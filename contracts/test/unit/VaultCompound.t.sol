@@ -182,7 +182,7 @@ contract VaultCompoundTest is PlacementFixture {
         MockStockToken stock = stocks[0];
 
         // A buy in the spoke pays its fee in the Stock Token, which is the counter side there. The trade is
-        // deliberately tiny and the buy fee deliberately large: the spoke's ladder is 47.5 AMPS and `syncMarket`
+        // deliberately tiny and the buy fee deliberately large: the spoke's ladder is 90 AMPS and `syncMarket`
         // re-seeds every ring at the *hub's* AMPS price, so a buy that walks the spoke far from the hub would fail
         // the placement divergence check rather than the thing this test is about. A 5% buy fee makes the
         // creator's counter slice comfortably non-zero while what actually reaches the pool moves it ~280 ticks,

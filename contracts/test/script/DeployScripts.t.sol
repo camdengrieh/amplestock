@@ -235,6 +235,7 @@ contract DeployScripts is Test {
         assertEq(fromCore.oracleGate, set.oracleGate, "oracleGate");
         assertEq(fromCore.quoter, set.quoter, "quoter");
         assertEq(fromCore.router, set.router, "router");
+        assertEq(fromCore.genesis, set.genesis, "genesis");
         assertEq(fromCore.usdg, set.usdg, "usdg");
         assertEq(keccak256(abi.encode(fromVerify)), keccak256(abi.encode(fromCore)), "the two readers agree");
         assertEq(
@@ -247,6 +248,11 @@ contract DeployScripts is Test {
             "AMPS_ROUTER",
             "...the router's entry included"
         );
+        assertEq(
+            vm.parseJsonString(writtenDeployments, ".envOverrides.genesis"),
+            "AMPS_GENESIS",
+            "...and the genesis adapter's"
+        );
 
         // ---- 4 ----
         assertEq(vm.parseJsonString(writtenArgs, ".contracts[0].name"), "Amps", "Amps is first");
@@ -257,12 +263,13 @@ contract DeployScripts is Test {
             "AmpsVault takes amps, poolManager, timelock, guardian"
         );
         assertEq(vm.parseJsonBytes(writtenArgs, ".contracts[6].args").length, 0, "BondPolicy takes nothing");
-        assertEq(vm.parseJsonString(writtenArgs, ".contracts[13].name"), "AmpsRouter", "the router is recorded last");
+        assertEq(vm.parseJsonString(writtenArgs, ".contracts[13].name"), "AmpsRouter", "the router is recorded");
         assertEq(
             vm.parseJsonBytes(writtenArgs, ".contracts[13].args"),
             abi.encode(set.poolManager, set.amps, set.registry, set.weth9),
             "AmpsRouter takes poolManager, amps, registry, weth9"
         );
+        assertEq(vm.parseJsonString(writtenArgs, ".contracts[14].name"), "AmpsGenesis", "the adapter is recorded last");
 
         // ---- 5 ----
         bool sawQuoter;
@@ -437,6 +444,7 @@ contract DeployScripts is Test {
             bondPolicy: address(0xB0D),
             quoter: address(0x9407E5),
             router: address(0x120A7E2),
+            genesis: address(0x9E4E515),
             weth9: address(0x9E7),
             usdg: address(0x05D9)
         });

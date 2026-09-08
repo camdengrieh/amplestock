@@ -271,8 +271,8 @@ contract VaultNavResilienceTest is AmpsVaultFixture {
 ///      and claim balances — over the last checkpointed `A` (a live walk would cost ~150k gas per valued pool and
 ///      fail every probe budget at 32 pools while passing here, so the denominator is the checkpoint by design).
 contract VaultSpokeWeightTest is AmpsVaultFixture {
-    /// @dev $2,500 of the Stock Token at $100, against the $5,000 seed: a third of a $7,500 index.
-    uint256 private constant STOCK_AMOUNT = 25e18;
+    /// @dev $10,000 of the Stock Token at $100, against the fixture's $20,000 seed: a third of a $30,000 index.
+    uint256 private constant STOCK_AMOUNT = 100e18;
 
     function setUp() public {
         deployVaultWorld();
@@ -286,11 +286,11 @@ contract VaultSpokeWeightTest is AmpsVaultFixture {
 
     /// @notice A spoke holding half of what its target calls for reports half of it.
     function test_aSpokeAtHalfItsTargetReportsHalfTheWeight() public {
-        // $2,500 of stock in a $7,500 index is 3,333 bp; a target of 6,666 bp is exactly twice that.
+        // $10,000 of stock in a $30,000 index is 3,333 bp; a target of 6,666 bp is exactly twice that.
         registry.setTargetWeightBps(1, 6666);
 
         uint16 realised = vault.spokeWeightBps(1);
-        assertEq(vault.totalAssetsUsd18(), 7500e18, "the index is the $5,000 seed plus $2,500 of the name");
+        assertEq(vault.totalAssetsUsd18(), 30_000e18, "the index is the $20,000 seed plus $10,000 of the name");
         assertEq(realised, 3333, "and the name is a third of it");
         assertApproxEqAbs(uint256(realised) * 2, uint256(registry.constituent(1).targetWeightBps), 1, "half target");
     }
@@ -304,7 +304,7 @@ contract VaultSpokeWeightTest is AmpsVaultFixture {
         vault.checkpoint();
 
         assertGt(vault.spokeWeightBps(1), before, "more of the name is more weight");
-        assertEq(vault.spokeWeightBps(1), 5000, "$5,000 of a $10,000 index");
+        assertEq(vault.spokeWeightBps(1), 5000, "$20,000 of a $40,000 index");
     }
 
     /// @notice A name the protocol holds nothing of is zero, not "unknown": zero is the honest realised weight,

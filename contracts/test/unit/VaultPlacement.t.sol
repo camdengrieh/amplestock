@@ -36,40 +36,39 @@ import {Vm} from "forge-std/Vm.sol";
 contract VaultPlacementTest is PlacementFixture {
     using StateLibrary for IPoolManager;
 
-    /// @dev The exact per-cell AMPS of a 1,662.5-AMPS, ten-doubling, 1.25-tilt ask ladder — `LadderLib.split` of
-    ///      `LadderLib.weights(1.25e18, 10)` — cell 0 nearest the anchor. §3.3's "50.0 AMPS over $1-$2" is the
-    ///      first of these; see {test_genesis_theDocsTopBucketFigureIsWrongAndTheLadderIsRight} for the last.
+    /// @dev The exact per-cell AMPS of a 3,150-AMPS, ten-doubling, 1.25-tilt ask ladder — `LadderLib.split` of
+    ///      `LadderLib.weights(1.25e18, 10)` — cell 0 nearest the anchor.
     uint256[10] internal ENTRY_ASK_CELLS = [
-        uint256(49_995_634_990_694_670_637),
-        62_494_543_738_368_338_712,
-        78_118_179_672_960_424_637,
-        97_647_724_591_200_531_212,
-        122_059_655_739_000_663_600,
-        152_574_569_673_750_829_500,
-        190_718_212_092_188_536_875,
-        238_397_765_115_235_671_925,
-        297_997_206_394_044_589_075,
-        372_496_507_992_555_743_827
+        uint256(94_728_571_561_316_218_050),
+        118_410_714_451_645_273_350,
+        148_013_393_064_556_594_050,
+        185_016_741_330_695_743_350,
+        231_270_926_663_369_678_400,
+        289_088_658_329_212_098_000,
+        361_360_822_911_515_122_500,
+        451_701_028_639_393_904_700,
+        564_626_285_799_242_379_300,
+        705_782_857_249_052_988_300
     ];
 
-    /// @dev The same shape over 47.5 AMPS: a spoke's seed ask, 1% of the 4,750-AMPS POL tranche.
+    /// @dev The same shape over 90 AMPS: a spoke's seed ask, 1% of the 9,000-AMPS POL tranche.
     uint256[10] internal SPOKE_ASK_CELLS = [
-        uint256(1_428_446_714_019_847_732),
-        1_785_558_392_524_809_677,
-        2_231_947_990_656_012_132,
-        2_789_934_988_320_015_177,
-        3_487_418_735_400_018_960,
-        4_359_273_419_250_023_700,
-        5_449_091_774_062_529_625,
-        6_811_364_717_578_162_055,
-        8_514_205_896_972_702_545,
-        10_642_757_371_215_878_397
+        uint256(2_706_530_616_037_606_230),
+        3_383_163_270_047_007_810,
+        4_228_954_087_558_759_830,
+        5_286_192_609_448_449_810,
+        6_607_740_761_810_562_240,
+        8_259_675_952_263_202_800,
+        10_324_594_940_329_003_500,
+        12_905_743_675_411_254_420,
+        16_132_179_594_264_067_980,
+        20_165_224_492_830_085_380
     ];
 
-    /// @dev The four-halving seed bid over $2,500 of USDG, **cell nearest the anchor first**: the weight vector
+    /// @dev The four-halving seed bid over $10,000 of USDG, **cell nearest the anchor first**: the weight vector
     ///      runs with price, so the bid adjacent to the market is the largest (33.875% / 27.100% / 21.680% /
-    ///      17.344%, §3.3's "$846.72 / $677.38 / $541.90 / $433.60" to the cent).
-    uint256[4] internal SEED_BID_CELLS_USDG = [uint256(846_883_469), 677_506_775, 542_005_420, 433_604_336];
+    ///      17.344%).
+    uint256[4] internal SEED_BID_CELLS_USDG = [uint256(3_387_533_876), 2_710_027_100, 2_168_021_680, 1_734_417_344];
 
     function setUp() public {
         deployPlacementWorld();
@@ -80,7 +79,7 @@ contract VaultPlacementTest is PlacementFixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice The entry-pool ask ladder: ten contiguous doublings from the anchor, holding
-    ///         `1.25^k / SUM 1.25^j` of 1,662.5 AMPS each, summing to 1,662.5 AMPS exactly.
+    ///         `1.25^k / SUM 1.25^j` of 3,150 AMPS each, summing to 3,150 AMPS exactly.
     function test_genesis_entryAskLadderIsTenDoublingsToTheWei() public {
         vm.prank(TIMELOCK);
         uint256 placed = vault.place(hubPool, true, ENTRY_ASK_AMPS);
@@ -118,7 +117,7 @@ contract VaultPlacementTest is PlacementFixture {
         assertApproxEqRel(w[9] * 1e18 / w[0], 7_450_580_596_923_828_125, 1e9, "and the ratio is 1.25^9, not 1.25^10");
     }
 
-    /// @notice A spoke's seed ask is the same shape over 47.5 AMPS, anchored at `tickOf(P_ref / P_stock)`.
+    /// @notice A spoke's seed ask is the same shape over 90 AMPS, anchored at `tickOf(P_ref / P_stock)`.
     function test_genesis_spokeSeedAskIsOnePercentOfThePolTranche() public {
         assertEq(SPOKE_SEED_AMPS, Constants.POL_SHARES * Constants.SPOKE_SEED_BPS_DEFAULT / Constants.BPS, "1%");
 

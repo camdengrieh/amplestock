@@ -18,19 +18,19 @@ contract RolloutPolicyTest is Test {
     LadderPolicy internal ladder;
     PriceLibHarness internal price;
 
-    /// @dev The launch state: 4,750 AMPS of POL, 3,325 of it still in the two entry pools, 200 bp a day, a 30%
+    /// @dev The launch state: 9,000 AMPS of POL, 6,300 of it still in the two entry pools, 200 bp a day, a 30%
     ///      entry floor and thirty spokes at roughly 333 bp of rollout weight each.
-    uint256 internal constant POL = 4750e18;
-    uint256 internal constant ENTRY_INVENTORY = 3325e18;
+    uint256 internal constant POL = 9000e18;
+    uint256 internal constant ENTRY_INVENTORY = 6300e18;
     uint16 internal constant RATE = Constants.ROLLOUT_BPS_PER_DAY_DEFAULT;
     uint16 internal constant FLOOR = Constants.ENTRY_FLOOR_BPS_DEFAULT;
     uint16 internal constant WEIGHT = 333;
 
-    /// @dev `200 bp x 4,750 AMPS` is 95 AMPS a day.
-    uint256 internal constant DAILY_ALLOWANCE = 95e18;
+    /// @dev `200 bp x 9,000 AMPS` is 180 AMPS a day.
+    uint256 internal constant DAILY_ALLOWANCE = 180e18;
 
-    /// @dev `30% x 4,750 AMPS` is 1,425 AMPS the entry pools must keep.
-    uint256 internal constant FLOOR_AMPS = 1425e18;
+    /// @dev `30% x 9,000 AMPS` is 2,700 AMPS the entry pools must keep.
+    uint256 internal constant FLOOR_AMPS = 2700e18;
 
     function setUp() public {
         policy = new RolloutPolicy();
@@ -57,9 +57,9 @@ contract RolloutPolicyTest is Test {
     /// @dev A spoke at its target weight with depth: its plain weighted share of the day's budget.
     function test_launchSchedule() public view {
         IRolloutPolicy.RolloutDecision memory decision = policy.propose(_request());
-        // 200 bp of 4,750 == 95 AMPS a day; 333 bp of that is 3.1635 AMPS.
-        assertEq(decision.amountAmps, 3.1635e18, "the weighted share");
-        assertEq(decision.dailyBudgetRemaining, DAILY_ALLOWANCE - 3.1635e18, "what is left of today");
+        // 200 bp of 9,000 == 180 AMPS a day; 333 bp of that is 5.994 AMPS.
+        assertEq(decision.amountAmps, 5.994e18, "the weighted share");
+        assertEq(decision.dailyBudgetRemaining, DAILY_ALLOWANCE - 5.994e18, "what is left of today");
         assertFalse(decision.floorBinding, "neither limit binds at genesis");
     }
 
@@ -112,7 +112,7 @@ contract RolloutPolicyTest is Test {
     function test_theRollingWindowConsumesTheBudget() public view {
         IRolloutPolicy.RolloutRequest memory request = _request();
         request.rolloutWeightBps = 10_000;
-        request.movedLast24hAmps = 90e18;
+        request.movedLast24hAmps = DAILY_ALLOWANCE - 5e18;
         assertEq(policy.propose(request).amountAmps, 5e18, "only the remainder of the day is available");
 
         request.movedLast24hAmps = DAILY_ALLOWANCE;
@@ -161,7 +161,7 @@ contract RolloutPolicyTest is Test {
                 tickSpacing: spacing,
                 buckets: Constants.LADDER_DOUBLINGS_DEFAULT,
                 tiltX18: Constants.LADDER_TILT_X18_DEFAULT,
-                inventory: 3.1635e18,
+                inventory: 5.994e18,
                 above: true
             })
         );
@@ -193,7 +193,7 @@ contract RolloutPolicyTest is Test {
         request.targetWeightBps = 0;
         request.currentWeightBps = 0;
         IRolloutPolicy.RolloutDecision memory decision = policy.propose(request);
-        assertEq(decision.amountAmps, 3.1635e18, "no deficit, no boost, the plain weighted share");
+        assertEq(decision.amountAmps, 5.994e18, "no deficit, no boost, the plain weighted share");
     }
 
     /* -------------------------------------------- refusals -------------------------------------------- */

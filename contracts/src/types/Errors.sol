@@ -71,6 +71,13 @@ error ZeroAmount();
 /// @notice Two array arguments that must be parallel had different lengths.
 error LengthMismatch();
 
+/// @notice An address that must hold code holds none. Shared by `AmpsVault.genesisMint` (the genesis adapter it
+///         mints the auction tranche to) and by `AmpsGenesis.createAuctions` (the auction the factory returned):
+///         both are addresses supplied by a governance proposal that the receiving contract can and must check,
+///         because minting or transferring a tranche to an EOA typo is unrecoverable.
+/// @param account The offending address.
+error NotContract(address account);
+
 /// @notice An index or id was outside the valid range.
 /// @param index The offending value.
 /// @param length The exclusive upper bound.

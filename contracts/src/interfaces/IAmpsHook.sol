@@ -115,7 +115,7 @@ interface IAmpsHook is IMarketReference {
     /// @param newPolicy The policy installed.
     event FeePolicyChanged(address indexed previousPolicy, address indexed newPolicy);
 
-    /// @notice Emitted when the pass-through router pointer moves. **48 h timelock.**
+    /// @notice Emitted when the pass-through router pointer moves. **7-day timelock.**
     /// @param previousRouter The router that loses the pass-through exemption.
     /// @param newRouter The router that gains it; `address(0)` turns the exemption off entirely.
     event RouterChanged(address indexed previousRouter, address indexed newRouter);
@@ -373,7 +373,7 @@ interface IAmpsHook is IMarketReference {
     function setFeePolicy(address newPolicy) external;
 
     /// @notice Names the protocol router, the only `sender` that can hold the pass-through exemption. **Only
-    ///         timelock (48 h).** Replaceable, and `address(0)` is legal: it withdraws the exemption entirely.
+    ///         timelock (7 d).** Replaceable, and `address(0)` is legal: it withdraws the exemption entirely.
     /// @dev The address is never called by the hook, so there is no code check and no zero check. Emits
     ///      {RouterChanged}.
     /// @param newRouter The new router, or `address(0)` for none.

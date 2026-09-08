@@ -7,7 +7,7 @@
 // and then `wagmi generate` against `wagmi.config.ts`. It is committed on purpose: the indexer, the dApp and
 // the keeper consume it as ordinary TypeScript, so a checkout without a Foundry toolchain still typechecks.
 //
-// 18 contracts exported. Regenerate after any change to `contracts/src/**`.
+// 19 contracts exported. Regenerate after any change to `contracts/src/**`.
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Amps
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1328,6 +1328,452 @@ export const ampsBondsLensAbi = [
     name: 'vestedOf',
     outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
     stateMutability: 'view',
+  },
+] as const
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// AmpsGenesis
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+export const ampsGenesisAbi = [
+  {
+    type: 'constructor',
+    inputs: [
+      { name: 'vault_', internalType: 'address', type: 'address' },
+      { name: 'amps_', internalType: 'address', type: 'address' },
+      { name: 'factory_', internalType: 'address', type: 'address' },
+      { name: 'weth9_', internalType: 'address', type: 'address' },
+      { name: 'usdg_', internalType: 'address', type: 'address' },
+      { name: 'timelock_', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'nonpayable',
+  },
+  { type: 'receive', stateMutability: 'payable' },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'amps',
+    outputs: [
+      { name: 'ampsAddress', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [
+      {
+        name: 'usdgSpec',
+        internalType: 'struct IAmpsGenesis.AuctionSpec',
+        type: 'tuple',
+        components: [
+          { name: 'shares', internalType: 'uint128', type: 'uint128' },
+          { name: 'startBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'endBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'claimBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'tickSpacing', internalType: 'uint256', type: 'uint256' },
+          { name: 'validationHook', internalType: 'address', type: 'address' },
+          {
+            name: 'requiredCurrencyRaised',
+            internalType: 'uint128',
+            type: 'uint128',
+          },
+          { name: 'auctionStepsData', internalType: 'bytes', type: 'bytes' },
+          { name: 'salt', internalType: 'bytes32', type: 'bytes32' },
+        ],
+      },
+      {
+        name: 'ethSpec',
+        internalType: 'struct IAmpsGenesis.AuctionSpec',
+        type: 'tuple',
+        components: [
+          { name: 'shares', internalType: 'uint128', type: 'uint128' },
+          { name: 'startBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'endBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'claimBlock', internalType: 'uint64', type: 'uint64' },
+          { name: 'tickSpacing', internalType: 'uint256', type: 'uint256' },
+          { name: 'validationHook', internalType: 'address', type: 'address' },
+          {
+            name: 'requiredCurrencyRaised',
+            internalType: 'uint128',
+            type: 'uint128',
+          },
+          { name: 'auctionStepsData', internalType: 'bytes', type: 'bytes' },
+          { name: 'salt', internalType: 'bytes32', type: 'bytes32' },
+        ],
+      },
+      { name: 'ethUsdX18_', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'createAuctions',
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'ethAuction',
+    outputs: [{ name: 'auction', internalType: 'address', type: 'address' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'ethUsdX18',
+    outputs: [{ name: 'price', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'factory',
+    outputs: [
+      { name: 'factoryAddress', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'floorEthQ96',
+    outputs: [{ name: 'priceQ96', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'floorUsdgQ96',
+    outputs: [{ name: 'priceQ96', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'p0X18',
+    outputs: [{ name: 'price', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [
+      { name: 'mps', internalType: 'uint24', type: 'uint24' },
+      { name: 'blockDelta', internalType: 'uint40', type: 'uint40' },
+    ],
+    name: 'packStep',
+    outputs: [{ name: 'word', internalType: 'bytes8', type: 'bytes8' }],
+    stateMutability: 'pure',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'phase',
+    outputs: [
+      {
+        name: 'current',
+        internalType: 'enum IAmpsGenesis.Phase',
+        type: 'uint8',
+      },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'raisedUsd18',
+    outputs: [{ name: 'value', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'raisedUsdg',
+    outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'raisedWeth',
+    outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'settle',
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'settled',
+    outputs: [{ name: 'done', internalType: 'bool', type: 'bool' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [{ name: 'stepsData', internalType: 'bytes', type: 'bytes' }],
+    name: 'stepsTotals',
+    outputs: [
+      { name: 'totalMps', internalType: 'uint256', type: 'uint256' },
+      { name: 'totalBlocks', internalType: 'uint256', type: 'uint256' },
+    ],
+    stateMutability: 'pure',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'timelock',
+    outputs: [
+      { name: 'timelockAddress', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'unsoldAmps',
+    outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'usdg',
+    outputs: [
+      { name: 'usdgAddress', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'usdgAuction',
+    outputs: [{ name: 'auction', internalType: 'address', type: 'address' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'vault',
+    outputs: [
+      { name: 'vaultAddress', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'weth9',
+    outputs: [
+      { name: 'weth9Address', internalType: 'address', type: 'address' },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'usdgAuction',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'ethAuction',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'floorUsdgQ96',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'floorEthQ96',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'startBlock',
+        internalType: 'uint64',
+        type: 'uint64',
+        indexed: false,
+      },
+      {
+        name: 'endBlock',
+        internalType: 'uint64',
+        type: 'uint64',
+        indexed: false,
+      },
+    ],
+    name: 'AuctionsCreated',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'usdgP0X18',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'ethP0X18',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'toleranceBps',
+        internalType: 'uint16',
+        type: 'uint16',
+        indexed: false,
+      },
+    ],
+    name: 'ClearingPricesDiverged',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'p0X18',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'usdgRaised',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'ethRaised',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'unsoldAmps',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'usdgGraduated',
+        internalType: 'bool',
+        type: 'bool',
+        indexed: false,
+      },
+      {
+        name: 'ethGraduated',
+        internalType: 'bool',
+        type: 'bool',
+        indexed: false,
+      },
+    ],
+    name: 'Settled',
+  },
+  { type: 'error', inputs: [], name: 'AlreadySettled' },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'auction', internalType: 'address', type: 'address' },
+      { name: 'endBlock', internalType: 'uint64', type: 'uint64' },
+    ],
+    name: 'AuctionNotEnded',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'auction', internalType: 'address', type: 'address' },
+      { name: 'held', internalType: 'uint256', type: 'uint256' },
+      { name: 'required', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'AuctionNotFunded',
+  },
+  { type: 'error', inputs: [], name: 'AuctionsAlreadyCreated' },
+  { type: 'error', inputs: [], name: 'AuctionsNotCreated' },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'supplied', internalType: 'uint256', type: 'uint256' },
+      { name: 'feed', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'EthUsdMismatch',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'startBlock', internalType: 'uint64', type: 'uint64' },
+      { name: 'endBlock', internalType: 'uint64', type: 'uint64' },
+      { name: 'claimBlock', internalType: 'uint64', type: 'uint64' },
+    ],
+    name: 'InvalidSchedule',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'totalMps', internalType: 'uint256', type: 'uint256' },
+      { name: 'totalBlocks', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'InvalidSteps',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'usdgShares', internalType: 'uint256', type: 'uint256' },
+      { name: 'ethShares', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'InvalidTranche',
+  },
+  {
+    type: 'error',
+    inputs: [{ name: 'account', internalType: 'address', type: 'address' }],
+    name: 'NotContract',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'token', internalType: 'address', type: 'address' },
+      { name: 'balance', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'NotSweptClean',
+  },
+  {
+    type: 'error',
+    inputs: [{ name: 'caller', internalType: 'address', type: 'address' }],
+    name: 'NotTimelock',
+  },
+  {
+    type: 'error',
+    inputs: [{ name: 'token', internalType: 'address', type: 'address' }],
+    name: 'SafeERC20FailedOperation',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'held', internalType: 'uint256', type: 'uint256' },
+      { name: 'required', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'TrancheNotFunded',
+  },
+  {
+    type: 'error',
+    inputs: [{ name: 'sender', internalType: 'address', type: 'address' }],
+    name: 'UnexpectedNative',
+  },
+  { type: 'error', inputs: [], name: 'ZeroAddress' },
+  {
+    type: 'error',
+    inputs: [{ name: 'auction', internalType: 'address', type: 'address' }],
+    name: 'ZeroClearingPrice',
   },
 ] as const
 
@@ -3521,10 +3967,17 @@ export const ampsVaultAbi = [
   },
   {
     type: 'function',
+    inputs: [],
+    name: 'genesis',
+    outputs: [{ name: 'adapter', internalType: 'address', type: 'address' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     inputs: [
       {
         name: 'params',
-        internalType: 'struct IAmpsVault.GenesisParams',
+        internalType: 'struct IAmpsVault.GenesisMintParams',
         type: 'tuple',
         components: [
           {
@@ -3533,14 +3986,40 @@ export const ampsVaultAbi = [
             type: 'address',
           },
           { name: 'creator', internalType: 'address', type: 'address' },
+          { name: 'genesis', internalType: 'address', type: 'address' },
           { name: 'teamShares', internalType: 'uint256', type: 'uint256' },
+          { name: 'auctionShares', internalType: 'uint256', type: 'uint256' },
           { name: 'polShares', internalType: 'uint256', type: 'uint256' },
-          { name: 'seedTokens', internalType: 'address[]', type: 'address[]' },
-          { name: 'seedAmounts', internalType: 'uint256[]', type: 'uint256[]' },
         ],
       },
     ],
-    name: 'genesis',
+    name: 'genesisMint',
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    inputs: [],
+    name: 'genesisMinted',
+    outputs: [{ name: 'done', internalType: 'bool', type: 'bool' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [
+      {
+        name: 'params',
+        internalType: 'struct IAmpsVault.GenesisPlaceParams',
+        type: 'tuple',
+        components: [
+          { name: 'p0X18', internalType: 'uint256', type: 'uint256' },
+          { name: 'tokens', internalType: 'address[]', type: 'address[]' },
+          { name: 'amounts', internalType: 'uint256[]', type: 'uint256[]' },
+          { name: 'unsoldAmps', internalType: 'uint256', type: 'uint256' },
+        ],
+      },
+    ],
+    name: 'genesisPlace',
     outputs: [],
     stateMutability: 'nonpayable',
   },
@@ -4156,12 +4635,6 @@ export const ampsVaultAbi = [
     anonymous: false,
     inputs: [
       {
-        name: 'teamVestingWallet',
-        internalType: 'address',
-        type: 'address',
-        indexed: true,
-      },
-      {
         name: 'creator',
         internalType: 'address',
         type: 'address',
@@ -4179,8 +4652,63 @@ export const ampsVaultAbi = [
         type: 'uint256',
         indexed: false,
       },
+      {
+        name: 'p0X18',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'raisedUsd18',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
     ],
     name: 'Genesis',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'teamVestingWallet',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'creator',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'genesis',
+        internalType: 'address',
+        type: 'address',
+        indexed: true,
+      },
+      {
+        name: 'teamShares',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'auctionShares',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'polShares',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'GenesisMinted',
   },
   {
     type: 'event',
@@ -4477,16 +5005,17 @@ export const ampsVaultAbi = [
     name: 'GateNotHealthy',
   },
   { type: 'error', inputs: [], name: 'GenesisAlreadyDone' },
+  { type: 'error', inputs: [], name: 'GenesisNotMinted' },
   {
     type: 'error',
     inputs: [
       { name: 'teamShares', internalType: 'uint256', type: 'uint256' },
+      { name: 'auctionShares', internalType: 'uint256', type: 'uint256' },
       { name: 'polShares', internalType: 'uint256', type: 'uint256' },
       { name: 'expectedTotal', internalType: 'uint256', type: 'uint256' },
     ],
     name: 'InvalidGenesisAllocation',
   },
-  { type: 'error', inputs: [], name: 'LengthMismatch' },
   { type: 'error', inputs: [], name: 'MigrationPredicateNotMet' },
   {
     type: 'error',

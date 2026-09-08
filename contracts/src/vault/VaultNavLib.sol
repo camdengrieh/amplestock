@@ -13,8 +13,9 @@ import {IPositionValuer} from "../interfaces/IPositionValuer.sol";
 import {IStockToken} from "../interfaces/IStockToken.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
-import {AlreadyInitialized} from "../types/Errors.sol";
+import {AlreadyInitialized, LengthMismatch, NotContract, ZeroAddress, ZeroAmount} from "../types/Errors.sol";
 import {ConstituentConfig, GateState, PoolConfig} from "../types/Types.sol";
+import {VaultRedeemLib} from "./VaultRedeemLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -423,7 +424,7 @@ library VaultNavLib {
     ///      more, to `AmpsHook`; the rest are freely pointer-upgradeable and none of them can move a fund.
     /// @param name The pointer's short-string name.
     /// @param newPointer The replacement.
-    /// @param wiringFrozen Whether `genesis()` has run.
+    /// @param wiringFrozen Whether `genesisPlace()` has run.
     /// @return previous The pointer being replaced.
     function setPointer(bytes32 name, address newPointer, bool wiringFrozen) public returns (address previous) {
         uint256 slot;
@@ -446,6 +447,10 @@ library VaultNavLib {
             slot = 12;
         } else if (name == bytes32("rolloutPolicy")) {
             slot = 13;
+        } else if (name == bytes32("genesis")) {
+            // Slot 22, and set-once: half of `S0` is minted to whatever address this holds, so it is wiring
+            // rather than policy and the `wiringFrozen` latch `genesisPlace` closes must refuse a later write.
+            (slot, setOnce) = (22, true);
         } else {
             revert IAmpsVault.UnknownPointerSlot(name);
         }
@@ -660,8 +665,136 @@ library VaultNavLib {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // Genesis
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The allocation half of `AmpsVault.genesisMint`: the three tranche checks, the three mints and the
+    ///         {IAmpsVault-GenesisMinted} log.
+    ///
+    /// @dev **The tranches are constants, not choices.** They are carried in the proposal so that it is auditable
+    ///      on its face, and `TEAM_SHARES + AUCTION_SHARES + POL_SHARES == S0` holds by construction, so the one
+    ///      equality below is the whole allocation.
+    ///
+    /// @dev **The adapter is checked twice over.** It must be the address the vault's set-once `genesis` pointer
+    ///      already holds *and* the address the proposal names, and it must hold code: half of `S0` leaves for it
+    ///      in this call and an EOA could never call `genesisPlace` back, so a typo would strand the auction
+    ///      tranche for ever.
+    ///
+    /// @param ampsToken The AMPS token.
+    /// @param registry `PoolRegistry`, which must already be wired.
+    /// @param adapter The vault's `genesis` pointer.
+    /// @param params The `genesisMint` arguments.
+    function genesisAllocate(
+        address ampsToken,
+        address registry,
+        address adapter,
+        IAmpsVault.GenesisMintParams calldata params
+    ) public {
+        if (
+            params.teamShares != Constants.TEAM_SHARES || params.auctionShares != Constants.AUCTION_SHARES
+                || params.polShares != Constants.POL_SHARES
+        ) {
+            revert IAmpsVault.InvalidGenesisAllocation(
+                params.teamShares, params.auctionShares, params.polShares, Constants.S0
+            );
+        }
+        if (params.teamVestingWallet == address(0) || params.creator == address(0) || registry == address(0)) {
+            revert ZeroAddress();
+        }
+        if (adapter == address(0) || adapter != params.genesis) revert ZeroAddress();
+        if (adapter.code.length == 0) revert NotContract(adapter);
+
+        IAmps(ampsToken).mint(params.teamVestingWallet, params.teamShares);
+        IAmps(ampsToken).mint(adapter, params.auctionShares);
+        IAmps(ampsToken).mint(address(this), params.polShares);
+
+        emit IAmpsVault.GenesisMinted(
+            params.teamVestingWallet, params.creator, adapter, params.teamShares, params.auctionShares, params.polShares
+        );
+    }
+
+    /// @notice The custody half of `AmpsVault.genesisPlace`: the registry's assets join the enumeration, the
+    ///         auction proceeds (or the founders' seed) are pulled from `from` into ERC-6909 claims, and the part
+    ///         of the auction tranche that never cleared is pulled back as the vault's own idle inventory.
+    ///
+    /// @dev **It lives here rather than in the vault for the reason the whole read side does**: `AmpsVault`
+    ///      implements the whole of `IAmpsVault` and the two-step genesis path does not fit EIP-170 inlined. A
+    ///      `DELEGATECALL`ed library runs in the vault's context, so `unlock` reaches the PoolManager as the vault,
+    ///      the transient discriminator is the vault's, and the callback comes back to `AmpsVault.unlockCallback`.
+    ///
+    /// @dev **The unsold AMPS is not an asset.** It is pulled with a plain `transferFrom` into the vault's own
+    ///      balance and never registered: every AMPS leg is valued at zero in `A` (I5), and `sweepClean` walks the
+    ///      asset list, so the inventory stays idle where the ask ladders are laid out of it rather than becoming
+    ///      a claim. AMPS is this protocol's own OZ ERC-20 — it reverts on failure and always answers `true` — so
+    ///      there is nothing a `SafeERC20` wrapper would add.
+    ///
+    /// @param assets The vault's registered non-AMPS assets, in registration order.
+    /// @param assetIndex The vault's 1-based asset index.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param ampsToken The AMPS token, which is never an asset.
+    /// @param registry `PoolRegistry`, whose constituents and entry counters join the enumeration.
+    /// @param from Who the proceeds and the unsold AMPS are pulled from: the adapter, or the timelock.
+    /// @param params The `genesisPlace` arguments.
+    function genesisSettle(
+        address[] storage assets,
+        mapping(address token => uint256 index) storage assetIndex,
+        address poolManager,
+        address ampsToken,
+        address registry,
+        address from,
+        IAmpsVault.GenesisPlaceParams calldata params
+    ) public {
+        uint256 count = params.tokens.length;
+        if (count != params.amounts.length) revert LengthMismatch();
+
+        address[] memory known = registryAssets(registry);
+        uint256 knownCount = known.length;
+        for (uint256 i; i < knownCount; ++i) {
+            _registerAsset(assets, assetIndex, ampsToken, known[i]);
+        }
+
+        uint256 slot = VaultRedeemLib.UNLOCK_ACTION;
+        uint256 action = VaultRedeemLib.ACTION_SETTLE;
+        for (uint256 i; i < count; ++i) {
+            address token = params.tokens[i];
+            uint256 amount = params.amounts[i];
+            if (token == address(0) || token == ampsToken) revert ZeroAddress();
+            if (amount == 0) revert ZeroAmount();
+            _registerAsset(assets, assetIndex, ampsToken, token);
+            assembly ("memory-safe") {
+                tstore(slot, action)
+            }
+            IPoolManager(poolManager).unlock(abi.encode(token, from, amount));
+            assembly ("memory-safe") {
+                tstore(slot, 0)
+            }
+        }
+
+        if (params.unsoldAmps != 0) {
+            IAmps(ampsToken).transferFrom(from, address(this), params.unsoldAmps);
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Internals
     // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev Adds `token` to the NAV/redemption enumeration. AMPS is never an asset (I5), and re-registration is a
+    ///      no-op so the list can never carry a duplicate. The vault's own `_registerAsset` is the same rule; this
+    ///      copy exists because {genesisSettle} writes the list from inside the library.
+    function _registerAsset(
+        address[] storage assets,
+        mapping(address token => uint256 index) storage assetIndex,
+        address ampsToken,
+        address token
+    ) private {
+        if (token == address(0) || token == ampsToken) {
+            return;
+        }
+        if (assetIndex[token] != 0) return;
+        assets.push(token);
+        assetIndex[token] = assets.length;
+    }
 
     /// @dev The USD price of AMPS implied by one pool's truncated TWAP, or `(0, false)` when the ring, the pool or
     ///      the counter's answer cannot support one.
