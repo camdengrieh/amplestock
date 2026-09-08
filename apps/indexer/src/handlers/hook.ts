@@ -11,9 +11,14 @@
  * same pool and transaction would wrongly pick up, which is why the consumer also checks the log
  * index ordering.
  *
+ * `RotationCreditConsumed` is emitted by hop 2 of an `AmpsRouter.rotate` and by nothing else since
+ * revision 6: the credit is only read on a hop the router declared, so a credit can no longer be
+ * manufactured by an unrelated buy and spent by somebody else's exit.
+ *
  * Everything else here is the explanation of a swap's dynamic fee — the surge that was armed, the
  * dividend step that armed a capture fee, the gate cache the fee was quoted against — recorded so
- * that `swap.dynamicFeeBps` has something to be read next to.
+ * that `swap.dynamicFeeBps` has something to be read next to — plus `RouterChanged`, the governed
+ * move of the pass-through exemption itself.
  */
 
 import {ponder} from 'ponder:registry'
@@ -189,6 +194,19 @@ ponder.on('AmpsHook:VaultChanged', async ({event, context}) => {
   await recordParameter(context, event, 'hook.pointer', 'vault', {
     previousAddress: event.args.previousVault,
     newAddress: event.args.newVault,
+  })
+})
+
+/**
+ * The pass-through exemption moving. `AmpsHook.router()` is the one address whose declared rotation
+ * hops are priced at `buyFeeBps` instead of `ampsFeeBps`, so this is a governed parameter with real
+ * economics behind it — and the zero address is a legal setting that turns the exemption off
+ * entirely. It is recorded as a pointer so the Governance page reads one table for all of them.
+ */
+ponder.on('AmpsHook:RouterChanged', async ({event, context}) => {
+  await recordParameter(context, event, 'hook.pointer', 'router', {
+    previousAddress: event.args.previousRouter,
+    newAddress: event.args.newRouter,
   })
 })
 

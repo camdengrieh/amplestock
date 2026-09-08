@@ -265,7 +265,7 @@ export function toEnv(addresses: Record<string, string>): NodeJS.ProcessEnv {
     registry: 'AMPS_REGISTRY',
     feedRegistry: 'AMPS_FEED_REGISTRY',
     bonds: 'AMPS_BONDS',
-    staking: 'AMPS_STAKING',
+    router: 'AMPS_ROUTER',
     bountyPot: 'AMPS_BOUNTY_POT',
     valuer: 'AMPS_POSITION_VALUER',
     ladderPolicy: 'AMPS_LADDER_POLICY',

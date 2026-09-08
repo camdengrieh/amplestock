@@ -41,19 +41,36 @@ describe('base fee', () => {
     expect(fee.feeBps).toBe(500)
   })
 
-  it('charges the pool buyFeeBps on a buy', () => {
+  it('charges ampsFeeBps on an ordinary buy too — revision 6 prices both directions the same', () => {
+    const fee = decodeSwapFee({
+      amount0: 100n * WAD,
+      amount1: -95n * 10n ** 6n,
+      feePips: 50_000, // 500 bp
+      ampsFeeBps: 500,
+      buyFeeBps: 30,
+    })
+    expect(fee.sell).toBe(false)
+    expect(fee.baseFeeBps).toBe(500)
+    expect(fee.dynamicFeeBps).toBe(0)
+    expect(fee.ampsAmount).toBe(100n * WAD)
+    expect(fee.counterAmount).toBe(95n * 10n ** 6n)
+    // A buy pays in the counter asset, so the AMPS-side figure is zero and the counter one is not.
+    expect(fee.feeAmps).toBe(0n)
+    expect(fee.feeCounter).toBe(fee.feeAmount)
+  })
+
+  it('charges the pass-through buyFeeBps only on a declared rotation hop', () => {
     const fee = decodeSwapFee({
       amount0: 100n * WAD,
       amount1: -95n * 10n ** 6n,
       feePips: 3_000, // 30 bp
       ampsFeeBps: 500,
       buyFeeBps: 30,
+      passThrough: true,
     })
     expect(fee.sell).toBe(false)
     expect(fee.baseFeeBps).toBe(30)
     expect(fee.dynamicFeeBps).toBe(0)
-    expect(fee.ampsAmount).toBe(100n * WAD)
-    expect(fee.counterAmount).toBe(95n * 10n ** 6n)
   })
 
   it('takes the blend from the hook rather than recomputing it', () => {

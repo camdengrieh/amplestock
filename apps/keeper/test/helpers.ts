@@ -49,8 +49,6 @@ export function vault(overrides: Partial<VaultSnapshot> = {}): VaultSnapshot {
     pMktX18: WAD,
     checkpointTimestamp: NOW - 60,
     liveCells: 328,
-    burnBps: 1_000,
-    stakerBps: 3_000,
     creatorBps: 100,
     deployThresholdUsd18: 100n * WAD,
     rolloutBpsPerDay: 200,

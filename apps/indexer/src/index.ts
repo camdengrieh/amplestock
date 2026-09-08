@@ -6,7 +6,8 @@
  * Ponder loads every module under `src/` (except `src/api/`) and each of them registers its
  * handlers as a side effect of being imported. Importing them here rather than relying on the glob
  * keeps the registration order explicit and makes the dependency graph visible: `vault.ts` calls
- * into `bonds.ts` and `reconcile.ts`, `poolManager.ts` reads the rows `registry.ts` writes, and
+ * into `bonds.ts` and `reconcile.ts`, `poolManager.ts` reads the rows `registry.ts` writes,
+ * `router.ts` reads the swap rows `poolManager.ts` wrote earlier in the same transaction, and
  * `denylist.ts` reads the reverse index `registry.ts` materialises.
  *
  * The alert sink is installed once, here, from the environment: a webhook when
@@ -24,7 +25,7 @@ import './handlers/vault'
 import './handlers/hook'
 import './handlers/poolManager'
 import './handlers/bonds'
-import './handlers/staking'
+import './handlers/router'
 import './handlers/gate'
 import './handlers/feeds'
 import './handlers/bounty'

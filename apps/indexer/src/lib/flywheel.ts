@@ -26,6 +26,10 @@
  * **Fee APR.** `feeUsd18 / inventoryUsd18` annualised over the sample window. The denominator is
  * the pool's own AMPS-side ladder valued at `P_ref` plus the counter it has raised — the capital
  * actually at risk in that pool, not the whole vault.
+ *
+ * **There is no staking APR.** Revision 6 removed `AmpsStaking`, so there is no reward stream to
+ * annualise: what the creator does not take of a compound's AMPS-side fees is burned, and the
+ * counter side is re-placed as bids in the pool that earned it.
  */
 
 import {BPS, ONE_DAY, WAD} from './constants'
@@ -69,14 +73,25 @@ export function annualisedBps(earned: bigint, capital: bigint, windowSeconds: bi
 }
 
 /**
- * Staking APR from *realised* sell fees: what `stakerBps` of the AMPS-side fees actually notified
- * over the window buys, against the xAMPS assets. Nothing here is a projection — the numerator is
- * `RewardNotified` amounts that have already been paid in.
+ * A counter-asset amount as 18-decimal USD, through the pool's own price and `P_ref`.
+ *
+ * The counter side of a fee is thirty-two different assets with different decimals, so it can only
+ * be aggregated in USD. The chain of prices is deliberately the same one `realisedLvrAmps` and
+ * {@link ampsToUsd18} already use — the pool's live price to get to AMPS, `P_ref` to get to USD —
+ * so the counter-side fee line and the AMPS-side fee line are comparable and neither introduces a
+ * price the rest of the index does not already trust. A pool with no price yet values at zero.
+ *
+ * @param raw the amount in the counter's own decimals
+ * @param counterDecimals the counter token's decimals
+ * @param priceX18 post-swap price of AMPS in counter units, 18-decimal
+ * @param pRefX18 the reference price of AMPS in USD, 18-decimal
  */
-export function stakingAprBps(
-  rewardsInWindow: bigint,
-  totalAssets: bigint,
-  windowSeconds: bigint,
-): number {
-  return annualisedBps(rewardsInWindow, totalAssets, windowSeconds)
+export function counterToUsd18(
+  raw: bigint,
+  counterDecimals: number,
+  priceX18: bigint,
+  pRefX18: bigint,
+): bigint {
+  if (raw === 0n || priceX18 === 0n || pRefX18 === 0n) return 0n
+  return ampsToUsd18((to18(raw, counterDecimals) * WAD) / priceX18, pRefX18)
 }

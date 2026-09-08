@@ -26,7 +26,8 @@ import {
   gateStateLabel,
 } from '../lib/constants'
 import {eventId, poolKey} from '../lib/ids'
-import {changeBps, clampInt, creatorBpsAt, premiumBps, premiumX18} from '../lib/math'
+import {changeBps, clampInt, creatorBpsAt, premiumBps, premiumX18, priceX18FromSqrt} from '../lib/math'
+import {counterToUsd18} from '../lib/flywheel'
 import {recordKeeperJob} from '../lib/keeper'
 import {recordParameter} from '../lib/parameters'
 import {jsonRecord} from '../lib/json'
@@ -209,7 +210,7 @@ ponder.on('AmpsVault:Burn', async ({event, context}) => {
     netSupplyChange: row.netSupplyChange - event.args.amount,
   }))
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
-    burned: row.burned + event.args.amount,
+    burnedAmps: row.burnedAmps + event.args.amount,
     netSupplyChange: row.netSupplyChange - event.args.amount,
   }))
   await reconcileAgain(context, event.block.number, event.block.timestamp)
@@ -346,12 +347,39 @@ ponder.on('AmpsVault:Rollout', async ({event, context}) => {
   })
 })
 
+/**
+ * `Compound`, revision 6: `(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`.
+ *
+ * The two currencies are kept apart on purpose all the way through the schema. The creator takes
+ * `creatorBps(t) / ampsFeeBps` of **each** of them in kind — AMPS by transfer, the counter asset in
+ * kind with an ERC-6909 claim fallback — the whole AMPS-side remainder is burned, and the counter
+ * side is re-placed as bids in the pool that earned it. Adding the two into one figure would hide
+ * exactly the distinction the revision exists to make, so the counter legs are carried both raw (in
+ * the counter's own decimals, which only mean something per pool) and in 18-decimal USD (which is
+ * the only way thirty-two assets can be summed).
+ *
+ * `burned` is the AMPS-side fee remainder **plus** the buyback burn, so it can exceed `ampsFees`;
+ * the two `Burn` logs beside it (`"compound"` and `"buyback"`) are what separate them, and the
+ * `Burn` handler indexes both with their reasons.
+ */
 ponder.on('AmpsVault:Compound', async ({event, context}) => {
   const id = poolKey(event.args.poolId)
   const navAfter = (await getState(context.db, STATE.navPerShareX18)) ?? 0n
   const navBefore = (await getState(context.db, PREV_NAV)) ?? navAfter
   const genesisAt = (await getState(context.db, STATE.genesisAt)) ?? 0n
   const pRef = (await getState(context.db, STATE.pRefX18)) ?? 0n
+
+  // The counter legs are priced through the pool that produced them: its live price to reach AMPS,
+  // then `P_ref` to reach USD. A pool the indexer has not seen open yet prices at zero rather than
+  // guessing a decimals count.
+  const poolRow = await context.db.find(schema.pool, {id})
+  const counterDecimals = poolRow?.counterDecimals ?? 18
+  const priceX18 =
+    poolRow === null || poolRow.sqrtPriceX96 === 0n
+      ? 0n
+      : priceX18FromSqrt(poolRow.sqrtPriceX96, 18, counterDecimals)
+  const counterFeesUsd18 = counterToUsd18(event.args.counterFees, counterDecimals, priceX18, pRef)
+  const creatorCounterUsd18 = counterToUsd18(event.args.creatorCounter, counterDecimals, priceX18, pRef)
 
   await context.db.insert(schema.compoundEvent).values({
     id: eventId(event.block.number, event.log.logIndex),
@@ -361,10 +389,12 @@ ponder.on('AmpsVault:Compound', async ({event, context}) => {
     poolId: id,
     caller: event.transaction.from,
     ampsFees: event.args.ampsFees,
-    creatorPaid: event.args.creatorPaid,
-    stakerPaid: event.args.stakerPaid,
+    counterFees: event.args.counterFees,
+    creatorAmps: event.args.creatorAmps,
+    creatorCounter: event.args.creatorCounter,
     burned: event.args.burned,
-    relaid: event.args.relaid,
+    counterFeesUsd18,
+    creatorCounterUsd18,
     creatorBps: creatorBpsAt(event.block.timestamp, genesisAt, CREATOR_FEE_BPS, CREATOR_DECAY_SECONDS),
     navBeforeX18: navBefore,
     navAfterX18: navAfter,
@@ -374,19 +404,16 @@ ponder.on('AmpsVault:Compound', async ({event, context}) => {
 
   await updateSummary(context.db, event.block.number, event.block.timestamp, (row) => ({
     feesAmpsTotal: row.feesAmpsTotal + event.args.ampsFees,
-    creatorPaidTotal: row.creatorPaidTotal + event.args.creatorPaid,
-    stakerPaidTotal: row.stakerPaidTotal + event.args.stakerPaid,
+    feesCounterUsd18: row.feesCounterUsd18 + counterFeesUsd18,
+    creatorPaidAmpsTotal: row.creatorPaidAmpsTotal + event.args.creatorAmps,
+    creatorPaidCounterUsd18: row.creatorPaidCounterUsd18 + creatorCounterUsd18,
     burnedTotal: row.burnedTotal + event.args.burned,
-    relaidTotal: row.relaidTotal + event.args.relaid,
     compoundCount: row.compoundCount + 1,
   }))
 
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
-    stakerPaid: row.stakerPaid + event.args.stakerPaid,
-    creatorPaid: row.creatorPaid + event.args.creatorPaid,
-    relaid: row.relaid + event.args.relaid,
-    sellFeeAmps: row.sellFeeAmps + event.args.ampsFees,
-    sellFeeUsd18: row.sellFeeUsd18 + (event.args.ampsFees * pRef) / 10n ** 18n,
+    creatorPaidAmps: row.creatorPaidAmps + event.args.creatorAmps,
+    creatorPaidCounterUsd18: row.creatorPaidCounterUsd18 + creatorCounterUsd18,
   }))
 
   await recordKeeperJob({

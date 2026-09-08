@@ -435,33 +435,44 @@ export const launchParameters = {
     launchPriceUsd: 1.0,
     entryPools: ['AMPS/WETH', 'AMPS/USDG'],
   },
+  /**
+   * The revision-6 fee model, in one place.
+   *
+   * - **`ampsFeeBps` is charged both ways.** Entering the index and leaving it are the same trade
+   *   seen from two sides, so the hook charges it on every net buy *and* every net sell in all 32
+   *   pools. A fee charged on one side alone is a fee a round trip halves.
+   * - **The pass-through fee is only reachable through the router.** `buyFeeBps*` is what a
+   *   *rotation* hop pays — selling one constituent to buy another, which passes through AMPS and
+   *   leaves the index's AMPS float where it found it. The exemption is bound to one contract:
+   *   `sender == AmpsHook.router()` **and** the hop carries the router's rotate flag. `AmpsRouter`
+   *   sets it on the two hops of `rotate` and nowhere else, so its own `buy` and `sell` pay
+   *   `ampsFeeBps` like everybody else.
+   * - **The creator is paid in kind, in every currency.** At `compound()` the creator receives
+   *   `creatorBps(t) / ampsFeeBps` of the fees collected in *each* currency — AMPS by transfer,
+   *   the counter asset in kind with an ERC-6909 claim fallback — which is exactly
+   *   `creatorFeeBps` of the volume that produced them, decaying linearly to zero over
+   *   `creatorFeeDecaySeconds`. It is carved out of the fee, never added on top.
+   * - **Everything left of the AMPS side is burned.** There is no staker slice and nothing is
+   *   re-laddered, so `totalSupply` falls by `ampsFees - creatorAmps` at every compound and by the
+   *   whole buyback on top. The counter side stays in the pool that earned it, re-placed as bids.
+   */
   fees: {
-    /** Charged on every AMPS-in swap in all 32 pools unless covered by the rotation credit. */
+    /** Charged on every net buy and every net sell in all 32 pools. Both directions, always. */
     ampsFeeBps: 500,
     ampsFeeBpsBand: {min: 100, max: 600},
-    /** Buy fees: entry pools / spokes / high-sigma spokes. */
+    /** The **pass-through** base fee, paid only by an `AmpsRouter.rotate` hop: entry / spoke /
+     *  high-sigma spoke. No other swap in the protocol is priced at it. */
     buyFeeBpsEntry: 30,
     buyFeeBpsSpoke: 5,
     buyFeeBpsSpokeHighVol: 10,
     buyFeeBpsEntryBand: {min: 5, max: 100},
     buyFeeBpsSpokeBand: {min: 1, max: 50},
-    /** The floor exit: dearer than a spoke buy, cheaper than the sell fee. */
-    redeemFeeBps: 100,
+    /** The floor exit: dearer than a rotation hop, cheaper than a market exit at 500 bp. */
+    redeemFeeBps: 250,
     redeemFeeBpsCap: 500,
-    /** Share of AMPS-side fees burned at `compound()`, after creator and staker slices. */
-    burnBps: 1_000,
-    burnBpsCap: 2_500,
-    /** Carved out of the sell fee, not added on top. Immutable schedule, expires by itself. */
+    /** 1% of volume to the creator, in every currency in kind, decaying to zero over 30 days. */
     creatorFeeBps: 100,
     creatorFeeDecaySeconds: 30 * DAY,
-  },
-  staking: {
-    /** Share of AMPS-side fees streamed to xAMPS at every `compound()`. */
-    stakerBps: 3_000,
-    stakerBpsCap: 5_000,
-    /** Linear stream, to defeat compound-sandwiching. */
-    rewardStreamSeconds: 24 * HOUR,
-    rewardStreamSecondsBand: {min: 1 * HOUR, max: 7 * DAY},
   },
   bonds: {
     dBaseBps: 1_250,

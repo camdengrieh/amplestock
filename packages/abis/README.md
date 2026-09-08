@@ -22,13 +22,19 @@ to depend on. A Next.js consumer that transpiles `node_modules` should list `@am
 
 One `<contract>Abi` const per contract, `as const` so viem and wagmi infer argument and return types:
 
-`ampsAbi`, `ampsVaultAbi`, `ampsHookAbi`, `ampsBondsAbi`, `ampsStakingAbi`, `bountyPotAbi`, `poolRegistryAbi`,
+`ampsAbi`, `ampsVaultAbi`, `ampsHookAbi`, `ampsBondsAbi`, `ampsRouterAbi`, `bountyPotAbi`, `poolRegistryAbi`,
 `poolRegistryLensAbi`, `ampsBondsLensAbi`, `oracleGateAbi`, `feedRegistryAbi`, `ampsQuoterAbi`, `bondPolicyAbi`,
 `feePolicyAbi`, `ladderPolicyAbi`, `rolloutPolicyAbi`, `ladderPositionValuerAbi`, `poolManagerAbi`.
 
 `poolManagerAbi` is Uniswap v4-core's `IPoolManager`: nothing here deploys a PoolManager, and the indexer
 subscribes to `Initialize` / `Swap` / `ModifyLiquidity` / `Donate` on the canonical deployment named in
 `@amplestocks/config`.
+
+`ampsRouterAbi` replaced `ampsStakingAbi` in revision 6. **There is no staking contract**, so nothing here
+exports one and no exported ABI carries a `staking` pointer, a `stakerBps` or a `burnBps`; what the creator
+does not take of a compound's AMPS-side fees is burned outright. The router is the protocol's own
+`buy` / `sell` / `rotate` front end and the only address whose rotation hops the hook prices at the
+pass-through fee — `AmpsHook.router()` names it, `setRouter` moves it and `RouterChanged` logs the move.
 
 `src/index.ts` adds three things codegen cannot:
 
@@ -74,7 +80,7 @@ byte-identical ABI** — a compiler profile may change codegen, never the interf
 pnpm --filter @amplestocks/abis test
 ```
 
-`test/exports.test.ts` (13 cases) checks:
+`test/exports.test.ts` (20 cases) checks:
 
 * the export set and that no ABI is empty, and that viem can hash every function and event item;
 * **the I14 tables**: it parses the classification tables out of `contracts/test/unit/GuardSymmetry.t.sol` — the
@@ -85,6 +91,13 @@ pnpm --filter @amplestocks/abis test
   `checkpoint()`, `touch()`, `lastPlacementAt(bytes32)`), `BountyPot.quote(uint256,uint256)`, the `OracleGate`
   reads, and the event sets the indexer subscribes to on `AmpsVault`, `PoolRegistry`, `AmpsHook`, `BountyPot`
   and the v4 `PoolManager`;
+* **the revision-6 fee model**: the five-argument `quoteFee(bytes32,bool,bool,uint256,bool)` — the fifth
+  argument is what says whether the hop is a pass-through rotation, and a consumer that omits it quotes the
+  wrong fee; `AmpsHook.router` / `setRouter` / `RouterChanged` / `rotationCredit(address)`; the six fields of
+  `AmpsVault.Compound` (`poolId`, `ampsFees`, `counterFees`, `creatorAmps`, `creatorCounter`, `burned`); the
+  router's `buy` / `sell` / `rotate` and its `Bought` / `Sold` / `Rotated` logs; and the negative half — no
+  `ampsStakingAbi`, no `AmpsStaking` entry, and no `staking`, `stakerBps` or `burnBps` on *any* exported
+  contract;
 * the **shape** of the events the keeper decodes off a receipt rather than merely their presence:
   `BountyPot.BountyPaid`'s five fields (the keeper reads the vault's measured work value and the pot's payout
   out of it), `AmpsVault.Placement`'s `reason`/`lowerTick`/`upperTick`, and `AmpsVault.Rollout`.

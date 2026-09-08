@@ -4,6 +4,7 @@ import {dirname, resolve} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {describe, expect, it} from 'vitest'
 import {toFunctionSelector, toEventSelector, type AbiFunction, type AbiEvent} from 'viem'
+import * as abis from '../src/index.js'
 import {abiItem, contractAbis, contractNames, eventAbi} from '../src/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -60,7 +61,7 @@ describe('exported surface', () => {
       'AmpsVault',
       'AmpsHook',
       'AmpsBonds',
-      'AmpsStaking',
+      'AmpsRouter',
       'BountyPot',
       'PoolRegistry',
       'PoolRegistryLens',
@@ -85,6 +86,131 @@ describe('exported surface', () => {
       for (const item of contractAbis[name]) {
         if (item.type === 'function') expect(toFunctionSelector(item as AbiFunction)).toMatch(/^0x[0-9a-f]{8}$/)
         if (item.type === 'event') expect(toEventSelector(item as AbiEvent)).toMatch(/^0x[0-9a-f]{64}$/)
+      }
+    }
+  })
+})
+
+describe('the revision-6 fee model', () => {
+  /**
+   * The hook charges `ampsFeeBps` on both directions of every pool, and the pass-through base fee applies only
+   * to a hop `AmpsRouter.rotate` declares. A quote therefore has to say *which* of the two it is pricing, which
+   * is the fifth argument. A consumer that builds `quoteFee` calldata without it is quoting the wrong fee.
+   *
+   * A four-argument overload is still on the hook while the contracts wave that removes it lands, so this pins
+   * the arity that must exist rather than the arity that must not.
+   */
+  it('the hook quotes a fee that knows whether the hop is pass-through', () => {
+    const overloads = (contractAbis.AmpsHook as readonly AbiFunction[]).filter(
+      (item) => item.type === 'function' && item.name === 'quoteFee',
+    )
+    const five = overloads.find((item) => item.inputs.length === 5)
+    expect(five, 'quoteFee(bytes32,bool,bool,uint256,bool)').toBeDefined()
+    expect(five!.inputs.map((i) => `${i.type} ${i.name ?? ''}`)).toEqual([
+      'bytes32 poolId',
+      'bool zeroForOne',
+      'bool exactInput',
+      'uint256 amountIn',
+      'bool passThrough',
+    ])
+    expect(five!.stateMutability).toBe('view')
+  })
+
+  /**
+   * The pass-through exemption is bound to one contract rather than to a property of the swap, so the hook has
+   * to name it, governance has to be able to move it, and the indexer has to be able to see it move.
+   */
+  it('the hook names the router, lets governance move it, and logs the move', () => {
+    const router = abiItem(contractAbis.AmpsHook, 'router') as AbiFunction | undefined
+    expect(router).toBeDefined()
+    expect(router!.inputs).toEqual([])
+    expect(router!.outputs.map((o) => o.type)).toEqual(['address'])
+    expect(router!.stateMutability).toBe('view')
+
+    const setRouter = abiItem(contractAbis.AmpsHook, 'setRouter') as AbiFunction | undefined
+    expect(setRouter).toBeDefined()
+    expect(setRouter!.inputs.map((i) => i.type)).toEqual(['address'])
+    expect(setRouter!.stateMutability).toBe('nonpayable')
+
+    const changed = eventAbi(contractAbis.AmpsHook).find((e) => e.name === 'RouterChanged')
+    expect(changed?.inputs.map((i) => `${i.type} ${i.name ?? ''}`)).toEqual([
+      'address previousRouter',
+      'address newRouter',
+    ])
+  })
+
+  /** The transient rotation credit, read per sender. `AmpsQuoter` simulates it; nothing else may guess at it. */
+  it('the hook exposes the rotation credit by sender', () => {
+    const credit = abiItem(contractAbis.AmpsHook, 'rotationCredit') as AbiFunction | undefined
+    expect(credit).toBeDefined()
+    expect(credit!.inputs.map((i) => i.type)).toEqual(['address'])
+    expect(credit!.outputs.map((o) => o.type)).toEqual(['uint256'])
+    expect(credit!.stateMutability).toBe('view')
+  })
+
+  /**
+   * `Compound` is the whole revision-6 split in one log, and the indexer reconstructs the flywheel from it:
+   * fees in both currencies, what the creator took in each, and the AMPS burned (the fee remainder plus the
+   * buyback). There is no staker slice and no re-laid amount, because neither exists.
+   */
+  it('Compound carries both currencies, both creator payouts and the burn', () => {
+    const compound = eventAbi(contractAbis.AmpsVault).find((e) => e.name === 'Compound')
+    expect(compound?.inputs.map((i) => `${i.type} ${i.name ?? ''}`)).toEqual([
+      'bytes32 poolId',
+      'uint256 ampsFees',
+      'uint256 counterFees',
+      'uint256 creatorAmps',
+      'uint256 creatorCounter',
+      'uint256 burned',
+    ])
+    expect(compound?.inputs[0]?.indexed).toBe(true)
+  })
+
+  /** The router itself: the three trades, and the three logs the indexer indexes rotations from. */
+  it('exports the router, with its trades and its logs', () => {
+    expect(abis.ampsRouterAbi).toBeDefined()
+    expect(contractAbis.AmpsRouter).toBe(abis.ampsRouterAbi)
+    for (const name of ['buy', 'sell', 'rotate', 'poolManager', 'amps', 'registry', 'weth', 'ROTATE_FLAG']) {
+      expect(abiItem(contractAbis.AmpsRouter, name), `AmpsRouter.${name}`).toBeDefined()
+    }
+    const rotate = abiItem(contractAbis.AmpsRouter, 'rotate') as AbiFunction
+    expect(rotate.inputs.map((i) => i.type)).toEqual([
+      'bytes32',
+      'bytes32',
+      'uint256',
+      'uint256',
+      'address',
+      'bool',
+      'uint256',
+    ])
+    expect(rotate.outputs.map((o) => o.name)).toEqual(['amountOut', 'ampsThrough'])
+
+    const events = eventAbi(contractAbis.AmpsRouter).map((e) => e.name)
+    expect(events).toEqual(expect.arrayContaining(['Bought', 'Sold', 'Rotated']))
+    const rotated = eventAbi(contractAbis.AmpsRouter).find((e) => e.name === 'Rotated')
+    expect(rotated?.inputs.map((i) => `${i.type} ${i.name ?? ''}`)).toEqual([
+      'bytes32 hop1',
+      'bytes32 hop2',
+      'address to',
+      'uint256 amountIn',
+      'uint256 ampsThrough',
+      'uint256 amountOut',
+    ])
+  })
+
+  /**
+   * Staking is gone, and an ABI that still carried it would let a consumer compile calldata for a contract that
+   * is not deployed. This is the negative half of the export set: no `ampsStakingAbi`, no `AmpsStaking` entry,
+   * and no `staking` pointer, `stakerBps` or `burnBps` on any exported contract.
+   */
+  it('carries no trace of staking on any exported contract', () => {
+    expect(Object.keys(abis)).not.toContain('ampsStakingAbi')
+    expect(contractNames).not.toContain('AmpsStaking' as never)
+    expect(Object.keys(contractAbis)).not.toContain('AmpsStaking')
+
+    for (const name of contractNames) {
+      for (const forbidden of ['staking', 'stakerBps', 'burnBps']) {
+        expect(abiItem(contractAbis[name], forbidden), `${name}.${forbidden}`).toBeUndefined()
       }
     }
   })

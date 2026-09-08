@@ -81,19 +81,27 @@ beforeEach(() => {
   resetLogIndex()
 })
 
+/** A second registered pool, so a rotation has two hops to run between. */
+const POOL_ID_2 = '0x2222222222222222222222222222222222222222222222222222222222222222' as const
+const COUNTER_2 = '0x00000000000000000000000000000000000000c3' as const
+
 /** Register the pool the v4 handlers filter on. */
-async function registerPool(blockNumber = 10n): Promise<void> {
+async function registerPool(
+  blockNumber = 10n,
+  pool: {poolId?: `0x${string}`; counter?: `0x${string}`; buyFeeBps?: number} = {},
+): Promise<void> {
+  const poolId = pool.poolId ?? POOL_ID
   await run(
     'PoolRegistry:PoolRegistered',
     makeEvent({
       args: {
-        poolId: POOL_ID,
-        counter: COUNTER,
+        poolId,
+        counter: pool.counter ?? COUNTER,
         poolClass: 1,
         constituentId: 0,
         tickSpacing: 60,
         counterDecimals: 6,
-        buyFeeBps: 30,
+        buyFeeBps: pool.buyFeeBps ?? 30,
       },
       blockNumber,
       logIndex: 0,
@@ -104,7 +112,7 @@ async function registerPool(blockNumber = 10n): Promise<void> {
   await run(
     'PoolRegistry:PoolOpened',
     makeEvent({
-      args: {poolId: POOL_ID, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
+      args: {poolId, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
       blockNumber,
       logIndex: 1,
       address: ADDRESSES.PoolRegistry,
@@ -115,7 +123,7 @@ async function registerPool(blockNumber = 10n): Promise<void> {
   await run(
     'PoolRegistry:PoolGridSet',
     makeEvent({
-      args: {poolId: POOL_ID, gridBaseTick: 0},
+      args: {poolId, gridBaseTick: 0},
       blockNumber,
       logIndex: 2,
       address: ADDRESSES.PoolRegistry,
@@ -146,7 +154,9 @@ describe('registration', () => {
       'AmpsBonds:Claim',
       'AmpsBonds:CollateralForwarded',
       'AmpsBonds:CollateralRemoved',
-      'AmpsStaking:RewardNotified',
+      'AmpsRouter:Bought',
+      'AmpsRouter:Sold',
+      'AmpsRouter:Rotated',
       'PoolRegistry:ConstituentAdded',
       'PoolRegistry:ConstituentRetired',
       'PoolRegistry:ConstituentReinstated',
@@ -683,7 +693,18 @@ describe('rollout', () => {
 })
 
 describe('compound', () => {
-  it('records the four-way split and the NAV either side', async () => {
+  it('records the revision-6 split in both currencies and the NAV either side', async () => {
+    await registerPool()
+    // The counter legs are priced through the pool and then `P_ref`, so both have to exist.
+    await run(
+      'AmpsVault:RefCheckpoint',
+      makeEvent({
+        args: {pRefX18: WAD, pMktX18: WAD, rateLimited: false, navFloored: true},
+        blockNumber: 99n,
+        logIndex: 0,
+      }),
+      context,
+    )
     await run(
       'AmpsVault:NavCheckpoint',
       makeEvent({
@@ -706,16 +727,18 @@ describe('compound', () => {
       }),
       context,
     )
+    // 100 AMPS and 200 USDG (6 decimals) of fees, the creator's fifth of each, and the whole AMPS
+    // remainder burned: 100 - 20 = 80, plus a 5 AMPS buyback.
     await run(
       'AmpsVault:Compound',
       makeEvent({
         args: {
           poolId: POOL_ID,
           ampsFees: 100n * WAD,
-          creatorPaid: 20n * WAD,
-          stakerPaid: 24n * WAD,
-          burned: 5n * WAD,
-          relaid: 51n * WAD,
+          counterFees: 200_000_000n,
+          creatorAmps: 20n * WAD,
+          creatorCounter: 40_000_000n,
+          burned: 85n * WAD,
         },
         blockNumber: 200n,
         logIndex: 1,
@@ -727,16 +750,36 @@ describe('compound', () => {
     expect(compound!.navBeforeX18).toBe(WAD)
     expect(compound!.navAfterX18).toBe((WAD * 10_010n) / 10_000n)
     expect(compound!.navChangeBps).toBe(10)
-    expect(
-      (compound!.creatorPaid as bigint) +
-        (compound!.stakerPaid as bigint) +
-        (compound!.burned as bigint) +
-        (compound!.relaid as bigint),
-    ).toBe(100n * WAD)
+
+    // The AMPS side is exhausted by the creator slice and the burn: `burned` is that remainder
+    // plus the buyback, so it is the only figure that can exceed `ampsFees`.
+    expect(compound!.creatorAmps).toBe(20n * WAD)
+    expect(compound!.burned).toBe(85n * WAD)
+    expect((compound!.burned as bigint) + (compound!.creatorAmps as bigint)).toBeGreaterThan(
+      compound!.ampsFees as bigint,
+    )
+    // The counter side is carried raw *and* in USD; the creator's share of it is a fifth, the same
+    // fraction the AMPS side was cut at, because both come from `creatorBps / ampsFeeBps`.
+    expect(compound!.counterFees).toBe(200_000_000n)
+    expect(compound!.creatorCounter).toBe(40_000_000n)
+    expect(compound!.counterFeesUsd18).toBeGreaterThan(0n)
+    expect((compound!.creatorCounterUsd18 as bigint) * 5n).toBe(compound!.counterFeesUsd18 as bigint)
+
+    // Nothing on the row is a staker slice or a re-laid amount: neither exists.
+    expect(compound!.stakerPaid).toBeUndefined()
+    expect(compound!.relaid).toBeUndefined()
 
     const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
     expect(summary!.feesAmpsTotal).toBe(100n * WAD)
+    expect(summary!.feesCounterUsd18).toBe(compound!.counterFeesUsd18)
+    expect(summary!.creatorPaidAmpsTotal).toBe(20n * WAD)
+    expect(summary!.creatorPaidCounterUsd18).toBe(compound!.creatorCounterUsd18)
+    expect(summary!.burnedTotal).toBe(85n * WAD)
     expect(summary!.compoundCount).toBe(1)
+
+    const day = db.rows(schema.flywheelDay)[0]
+    expect(day!.creatorPaidAmps).toBe(20n * WAD)
+    expect(day!.creatorPaidCounterUsd18).toBe(compound!.creatorCounterUsd18)
 
     const [job] = db.rows(schema.keeperJob)
     expect(job!.job).toBe('compound')
@@ -772,10 +815,10 @@ describe('compound', () => {
         args: {
           poolId: POOL_ID,
           ampsFees: 1n,
-          creatorPaid: 0n,
-          stakerPaid: 0n,
-          burned: 0n,
-          relaid: 1n,
+          counterFees: 0n,
+          creatorAmps: 0n,
+          creatorCounter: 0n,
+          burned: 1n,
         },
         blockNumber: 200n,
         logIndex: 1,
@@ -833,10 +876,10 @@ describe('the ladder', () => {
     const cell = await db.find(schema.ladderCell, {id: `${POOL_ID}-0`})
     expect(cell).not.toBeNull()
     expect(cell!.above).toBe(true)
-    expect(cell!.cellIndex).toBe(8) // m = 0, GRID_MIN_M = -8
+    expect(cell!.bucketIndex).toBe(8) // m = 0, GRID_MIN_M = -8
     expect(cell!.ampsRemaining).toBeGreaterThan(0n)
-    expect(cell!.counterRaised).toBe(0n)
-    expect(cell!.fillBps).toBe(0)
+    expect(cell!.proceeds).toBe(0n)
+    expect(cell!.filledBps).toBe(0)
 
     const [placement] = db.rows(schema.placement)
     expect(placement!.cells).toBe(1)
@@ -917,8 +960,8 @@ describe('the ladder', () => {
 
     const after = await db.find(schema.ladderCell, {id: `${POOL_ID}-0`})
     expect(after!.ampsRemaining).toBeLessThan(before!.ampsRemaining as bigint)
-    expect(after!.counterRaised).toBeGreaterThan(0n)
-    expect(after!.fillBps).toBeGreaterThan(0)
+    expect(after!.proceeds).toBeGreaterThan(0n)
+    expect(after!.filledBps).toBeGreaterThan(0)
   })
 })
 
@@ -1023,6 +1066,42 @@ describe('swaps', () => {
     expect(pool!.rotationCreditedAmps).toBe(100n * WAD)
   })
 
+  it('charges the AMPS fee on a buy as well — revision 6 prices both directions the same', async () => {
+    // The counter asset goes in, AMPS comes out. Before revision 6 this was the "buy fee" and paid
+    // the pool's 30 bp; now `buyFeeBps` is the *pass-through* fee and only a rotation hop sees it,
+    // so an ordinary buy pays `ampsFeeBps` exactly as the matching sell does.
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: CALLER,
+          amount0: 95n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 45n,
+        logIndex: 0,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    const [swap] = db.rows(schema.swap)
+    expect(swap!.sell).toBe(false)
+    expect(swap!.baseFeeBps).toBe(500)
+    expect(swap!.dynamicFeeBps).toBe(0)
+    // A buy's fee is taken in the counter asset, so the AMPS-side figure stays zero and the
+    // counter-side one is what the pool kept.
+    expect(swap!.feeAmps).toBe(0n)
+    const pool = await db.find(schema.pool, {id: POOL_ID})
+    expect(pool!.sellFeeAmps).toBe(0n)
+    expect(pool!.buyFeeCounter).toBe(5n * 10n ** 6n)
+    expect(pool!.buyVolumeAmps).toBe(95n * WAD)
+  })
+
   it('splits the charged fee into base and dynamic', async () => {
     await run(
       'PoolManager:Swap',
@@ -1087,6 +1166,194 @@ describe('swaps', () => {
     const [swap] = db.rows(schema.swap)
     expect(swap!.baseFeeBps).toBe(300)
     expect(swap!.dynamicFeeBps).toBe(0)
+  })
+})
+
+describe('the protocol router', () => {
+  const ROUTER = ADDRESSES.AmpsRouter as `0x${string}`
+
+  beforeEach(async () => {
+    await registerPool(10n)
+    await registerPool(11n, {poolId: POOL_ID_2, counter: COUNTER_2, buyFeeBps: 5})
+    await run(
+      'AmpsVault:RefCheckpoint',
+      makeEvent({
+        args: {pRefX18: WAD, pMktX18: WAD, rateLimited: false, navFloored: true},
+        blockNumber: 15n,
+        logIndex: 1,
+      }),
+      context,
+    )
+  })
+
+  it('records a buy through the router as an entry, priced at the AMPS fee', async () => {
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: ROUTER,
+          amount0: 95n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 60n,
+        logIndex: 0,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    await run(
+      'AmpsRouter:Bought',
+      makeEvent({
+        args: {poolId: POOL_ID, payer: CALLER, to: CALLER, amountIn: 100n * 10n ** 6n, ampsOut: 95n * WAD},
+        blockNumber: 60n,
+        logIndex: 1,
+        txHash: TX,
+        address: ROUTER,
+      }),
+      context,
+    )
+
+    const [trade] = db.rows(schema.routerTrade)
+    expect(trade!.kind).toBe('buy')
+    // Routing an entry through the protocol's own front end must not make it cheaper.
+    expect(trade!.passThrough).toBe(false)
+    expect(trade!.ampsAmount).toBe(95n * WAD)
+    expect(trade!.feeCounter).toBe(5n * 10n ** 6n)
+    expect(trade!.feeAmps).toBe(0n)
+
+    const [swap] = db.rows(schema.swap)
+    expect(swap!.baseFeeBps).toBe(500)
+    // The stash is consumed exactly once, like the rotation credit before it.
+    expect(db.count(schema.pendingHop)).toBe(0)
+  })
+
+  it('prices both hops of a rotation at the pass-through fee, correcting hop 1 in place', async () => {
+    // Hop 1: buy AMPS in pool 1. Nothing in this log says it is a rotation, so it is decoded at the
+    // default base — `ampsFeeBps` — and left for `Rotated` to correct.
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: ROUTER,
+          amount0: 100n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 4_000,
+        },
+        blockNumber: 61n,
+        logIndex: 0,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    const hop1SwapId = db.rows(schema.swap)[0]!.id as string
+    expect(db.rows(schema.swap)[0]!.baseFeeBps).toBe(500)
+
+    // Hop 2: the hook's `beforeSwap` credits the AMPS hop 1 realised and says so, so the sell is
+    // already decoded at the blended base — which for a fully covered hop is `buyFeeBps` outright.
+    await run(
+      'AmpsHook:RotationCreditConsumed',
+      makeEvent({
+        args: {poolId: POOL_ID_2, consumed: 100n * WAD, blendedFeeBps: 5},
+        blockNumber: 61n,
+        logIndex: 1,
+        txHash: TX,
+        address: ADDRESSES.AmpsHook,
+      }),
+      context,
+    )
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID_2,
+          sender: ROUTER,
+          amount0: -100n * WAD,
+          amount1: 99n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 500,
+        },
+        blockNumber: 61n,
+        logIndex: 2,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+
+    await run(
+      'AmpsRouter:Rotated',
+      makeEvent({
+        args: {
+          hop1: POOL_ID,
+          hop2: POOL_ID_2,
+          to: CALLER,
+          amountIn: 100n * 10n ** 6n,
+          ampsThrough: 100n * WAD,
+          amountOut: 99n * 10n ** 6n,
+        },
+        blockNumber: 61n,
+        logIndex: 3,
+        txHash: TX,
+        address: ROUTER,
+      }),
+      context,
+    )
+
+    // Hop 1's decomposition is corrected once `Rotated` names it: the base is the pool's own
+    // pass-through fee, and the residual over it is the dynamic part, which never moved.
+    const hop1 = await db.find(schema.swap, {id: hop1SwapId})
+    expect(hop1!.baseFeeBps).toBe(30)
+    expect(hop1!.dynamicFeeBps).toBe(10)
+    expect(hop1!.feeBps).toBe(40)
+
+    const [trade] = db.rows(schema.routerTrade)
+    expect(trade!.kind).toBe('rotate')
+    expect(trade!.passThrough).toBe(true)
+    expect(trade!.poolId).toBe(POOL_ID)
+    expect(trade!.hop2PoolId).toBe(POOL_ID_2)
+    expect(trade!.ampsAmount).toBe(100n * WAD)
+    expect(trade!.hop1BaseFeeBps).toBe(30)
+    expect(trade!.hop2BaseFeeBps).toBe(5)
+    // Hop 1 paid in its counter asset, hop 2 in AMPS: the two legs of one pass-through fee.
+    expect(trade!.feeCounter).toBe(400_000n)
+    expect(trade!.feeAmps).toBe((100n * WAD * 500n) / 1_000_000n)
+    expect(db.count(schema.pendingHop)).toBe(0)
+  })
+
+  it('leaves an ordinary swap out of the stash entirely', async () => {
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: CALLER,
+          amount0: -10n * WAD,
+          amount1: 9n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 62n,
+        logIndex: 0,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    expect(db.count(schema.pendingHop)).toBe(0)
   })
 })
 
@@ -1659,7 +1926,7 @@ describe('the disclosures that replaced reverts', () => {
     expect(registry!.previousAddress).toBe(ADDRESSES.AmpsVault)
     const hook = await db.find(schema.parameterState, {id: 'hook.pointer:vault'})
     expect(hook!.addressValue).toBe(NEW_VAULT)
-    // Same shape as the pointers `AmpsBonds`, `AmpsStaking` and `BountyPot` already emit, so the
+    // Same shape as the pointers `AmpsBonds` and `BountyPot` already emit, so the
     // Governance page reads one table for all of them.
     expect(db.rows(schema.parameterChange).filter((c) => c.name === 'vault')).toHaveLength(2)
   })

@@ -8,8 +8,9 @@
  *
  * The only address the keeper needs given to it is **AMPS**. Everything else is resolved from the chain:
  * `Amps.vault()` names the live vault (so an `emergencyMigrate` is followed without a redeploy), and the vault
- * names the registry, the bonds, the staking contract, the bounty pot, the oracle gate and the hook. That is
- * what "tolerates reverting pointers gracefully" means in practice: the topology is a read, not a config file.
+ * names the registry, the bonds, the bounty pot, the oracle gate and the hook. That is what "tolerates
+ * reverting pointers gracefully" means in practice: the topology is a read, not a config file. There is no
+ * staking pointer to resolve: revision 6 removed the contract, and the keeper runs no staking job.
  */
 
 import {chains, chainById, type AmpsChainId} from '@amplestocks/config'

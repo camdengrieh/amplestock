@@ -14,21 +14,23 @@
  * when the contract is not deployed, which is what stops a surface from issuing reads against `0x0`
  * and rendering the answers as data.
  *
- * **Four entries are hand-written, on purpose and temporarily.** The generated package has not been
- * regenerated since revision 6, so its `AmpsVault` still exposes `staking()`/`stakerBps()`/
- * `burnBps()` and the old five-way `Compound`, its `AmpsQuoter` is missing the two appended
- * pass-through fee legs of `PoolQuote` — a positional decode, so reading a revision-6 quote against
- * it shifts every field after `sellFeePips` — its `AmpsHook` has no `router()`/`setRouter` and a
- * four-argument `quoteFee`, and `AmpsRouter` has no artefact at all. `lib/abi/{vault,quoter,hook,
- * router}.ts` are transcribed from the interfaces in `contracts/src/interfaces/`. When the package
- * regenerates, each of those four imports moves back to `@amplestocks/abis/generated` and the four
- * files go away; a compile error is the worst that can happen.
+ * **Every entry comes from the generated package again.** The four revision-6 ABIs this file used to
+ * import from `lib/abi/` were hand transcriptions, standing in while `@amplestocks/abis` still
+ * carried revision 5; the package has been regenerated from the revision-6 artefacts, so
+ * `ampsVaultAbi` carries the six-field `Compound` and no `staking()`, `ampsQuoterAbi` carries both
+ * pass-through legs of `PoolQuote` in the positions `lib/quoter.ts` decodes them from,
+ * `ampsHookAbi` carries `router()` / `setRouter` and the five-argument `quoteFee`, and
+ * `ampsRouterAbi` exists at all. The transcriptions are gone with them.
  */
 
 import {
   ampsAbi,
   ampsBondsAbi,
   ampsBondsLensAbi,
+  ampsHookAbi,
+  ampsQuoterAbi,
+  ampsRouterAbi,
+  ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
@@ -36,10 +38,6 @@ import {
 } from '@amplestocks/abis/generated'
 import type {Abi, Address} from 'viem'
 
-import {ampsHookAbi} from './abi/hook'
-import {ampsQuoterAbi} from './abi/quoter'
-import {ampsRouterAbi} from './abi/router'
-import {ampsVaultAbi} from './abi/vault'
 import {deployment, type AmpsContractKey, type Deployment} from './deployment'
 
 export const abis = {

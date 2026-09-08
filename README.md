@@ -4,13 +4,17 @@ AMPS is a fixed-balance ERC-20 share of a protocol-owned index of tokenised equi
 Chain (4663). One immutable Uniswap v4 hook serves 32 protocol-owned-liquidity pools: 30
 `AMPS/<stock>` spokes plus `AMPS/WETH` and `AMPS/USDG` entry pools. The vault holds the basket,
 prices it from Chainlink equity feeds, and publishes a fully diluted NAV per share; pro-rata
-redemption at NAV minus a 1% fee is unpausable, so NAV is a hard floor while the market sets any
-premium above it. All 32 pools are POL-only, so 100% of swap fees accrue to NAV. A 5% sell fee (band
-1–6%) is charged in AMPS and split creator → xAMPS stakers → burn → re-laddered as asks; buys are
-cheap (5–30 bp). Genesis is 5,000 AMPS against $5,000 of seed liquidity — $1.00 per share — with 5%
-vesting to the team and 95% placed as a 1.25×-per-doubling ask ladder. After genesis the only path
-that increases supply is discounted, vesting bonds against registered collateral. The constituent
-set, fees and bond parameters are timelocked state; the contracts themselves are immutable bytecode.
+redemption at NAV minus a 2.5% fee is unpausable, so NAV is a hard floor while the market sets any
+premium above it. All 32 pools are POL-only, so 100% of swap fees accrue to NAV. A 5% AMPS fee (band
+1–6%) is charged on **both** directions of every pool, in the swap's input currency; at `compound()`
+the creator takes 1% of the volume in each currency in kind, the whole AMPS-side remainder is burned
+and the counter side is re-placed as bids. There is no staking. The cheap pass-through fee (5–30 bp)
+is reachable only through `AmpsRouter.rotate`, which moves between two constituents through AMPS
+without entering or leaving the index. Genesis is 5,000 AMPS against $5,000 of seed liquidity —
+$1.00 per share — with 5% vesting to the team and 95% placed as a 1.25×-per-doubling ask ladder.
+After genesis the only path that increases supply is discounted, vesting bonds against registered
+collateral. The constituent set, fees and bond parameters are timelocked state; the contracts
+themselves are immutable bytecode.
 
 **Status: Phase 1 (monorepo scaffold).** No production Solidity is written yet, no contract is
 deployed, and every address in `packages/config` is marked for on-chain re-verification.
@@ -20,7 +24,7 @@ deployed, and every address in `packages/config` is marked for on-chain re-verif
 ```
 amplestock/
 ├─ contracts/          Foundry workspace — solc 0.8.30, evm_version=cancun, tests run --isolate
-│  ├─ src/             production Solidity (token, vault, hook, bonds, staking, policy, oracle, registry)
+│  ├─ src/             production Solidity (token, vault, hook, bonds, periphery, policy, oracle, registry)
 │  ├─ script/          deploy and preflight scripts
 │  ├─ test/            unit / fuzz / invariant / fork / attack / gas
 │  └─ lib/             git submodules: forge-std, uniswap-hooks (+ v4-core, v4-periphery), OZ, hookmate

@@ -64,9 +64,13 @@ const read = async <T>(
 }
 
 /**
- * Sample the four share classes from chain. `inventoryAmps()` is the vault's own view (ERC-20 plus
- * the ERC-6909 claim, §12 ruling F); the other three are plain balances, which is exactly what they
+ * Sample the three share classes from chain. `inventoryAmps()` is the vault's own view (ERC-20 plus
+ * the ERC-6909 claim, §12 ruling F); the other two are plain balances, which is exactly what they
  * are on-chain — no accounting is invented here.
+ *
+ * There is no staked class. Revision 6 removed `AmpsStaking`, so the AMPS that used to sit in it is
+ * either circulating or burned, and a fourth read against a contract that is not deployed would be
+ * an RPC round trip that can only fail.
  */
 export async function sampleShares(
   context: JobContext,
@@ -76,7 +80,6 @@ export async function sampleShares(
 ): Promise<void> {
   const amps = addressOf(context, 'AmpsToken')
   const vault = addressOf(context, 'AmpsVault')
-  const staking = addressOf(context, 'AmpsStaking')
   const bonds = addressOf(context, 'AmpsBonds')
   if (amps === ZERO || vault === ZERO) return
 
@@ -88,20 +91,18 @@ export async function sampleShares(
   if (summary === null) return
   const vesting = (summary.teamVestingWallet as `0x${string}` | undefined) ?? ZERO
 
-  const [totalSupply, inventory, stakedRaw, vestingRaw, bondRaw] = await Promise.all([
+  const [totalSupply, inventory, vestingRaw, bondRaw] = await Promise.all([
     read<bigint>(context, amps, ampsAbi, 'totalSupply'),
     read<bigint>(context, vault, ampsVaultAbi, 'inventoryAmps'),
-    read<bigint>(context, amps, ampsAbi, 'balanceOf', [staking]),
     read<bigint>(context, amps, ampsAbi, 'balanceOf', [vesting]),
     read<bigint>(context, amps, ampsAbi, 'balanceOf', [bonds]),
   ])
   if (totalSupply === undefined) return
 
-  const staked = stakedRaw ?? 0n
   const vested = vestingRaw ?? 0n
   const bondUnvested = bondRaw ?? 0n
   const held = inventory ?? 0n
-  const circulating = totalSupply - held - vested - staked - bondUnvested
+  const circulating = totalSupply - held - vested - bondUnvested
 
   await context.db
     .insert(schema.sharePoint)
@@ -112,7 +113,6 @@ export async function sampleShares(
       totalSupply,
       inventory: held,
       vesting: vested,
-      staked,
       bondUnvested,
       circulating: circulating > 0n ? circulating : 0n,
       source,
@@ -121,7 +121,6 @@ export async function sampleShares(
       totalSupply,
       inventory: held,
       vesting: vested,
-      staked,
       bondUnvested,
       circulating: circulating > 0n ? circulating : 0n,
       source,
@@ -131,7 +130,6 @@ export async function sampleShares(
     totalSupply,
     inventory: held,
     vesting: vested,
-    staked,
     circulating: circulating > 0n ? circulating : 0n,
   }))
 }

@@ -37,7 +37,7 @@ import {
   type PotSnapshot,
   type VaultSnapshot,
 } from '../domain/types.js'
-import {WAD} from '../domain/bounty.js'
+import {AMPS_FEE_BPS_DEFAULT, WAD} from '../domain/bounty.js'
 import type {Logger} from '../logger.js'
 
 /** Every address the keeper talks to, all of them derived from AMPS. */
@@ -46,7 +46,6 @@ export interface Topology {
   readonly vault: Address
   readonly registry: Address
   readonly bonds: Address
-  readonly staking: Address
   readonly bountyPot: Address
   readonly oracleGate: Address
   /** `AmpsVault.marketReference()`, which is `AmpsHook` from the Phase 3 wiring onward. */
@@ -83,13 +82,12 @@ export class ChainReader {
       vaultOverride ??
       ((await this.client.readContract({address: amps, abi: ampsAbi, functionName: 'vault'})) as Address)
 
-    const read = async (name: 'registry' | 'bonds' | 'staking' | 'bountyPot' | 'oracleGate' | 'marketReference' | 'poolManager' | 'feedRegistry') =>
+    const read = async (name: 'registry' | 'bonds' | 'bountyPot' | 'oracleGate' | 'marketReference' | 'poolManager' | 'feedRegistry') =>
       (await this.client.readContract({address: vault, abi: ampsVaultAbi, functionName: name})) as Address
 
-    const [registry, bonds, staking, bountyPot, oracleGate, hook, poolManager, feedRegistry] = await Promise.all([
+    const [registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry] = await Promise.all([
       read('registry'),
       read('bonds'),
-      read('staking'),
       read('bountyPot'),
       read('oracleGate'),
       read('marketReference'),
@@ -97,17 +95,17 @@ export class ChainReader {
       read('feedRegistry'),
     ])
 
-    return {amps, vault, registry, bonds, staking, bountyPot, oracleGate, hook, poolManager, feedRegistry}
+    return {amps, vault, registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry}
   }
 
   private async vaultSnapshot(topology: Topology, now: number): Promise<VaultSnapshot> {
     const vault = {address: topology.vault, abi: ampsVaultAbi} as const
-    const [checkpoint, liveCells, burnBps, stakerBps, creatorBps, deployThreshold, rolloutBpsPerDay, entryFloorBps] =
+    // `burnBps` and `stakerBps` are gone with revision 6: what the creator does not take of a compound's
+    // AMPS-side fees is burned outright, so there is no governed share of it left to read.
+    const [checkpoint, liveCells, creatorBps, deployThreshold, rolloutBpsPerDay, entryFloorBps] =
       await Promise.all([
         this.client.readContract({...vault, functionName: 'checkpointData'}),
         this.client.readContract({...vault, functionName: 'liveCells'}),
-        this.client.readContract({...vault, functionName: 'burnBps'}),
-        this.client.readContract({...vault, functionName: 'stakerBps'}),
         this.client.readContract({...vault, functionName: 'creatorBpsAt', args: [BigInt(now)]}),
         this.client.readContract({...vault, functionName: 'deployThresholdUsd18'}),
         this.client.readContract({...vault, functionName: 'rolloutBpsPerDay'}),
@@ -129,8 +127,6 @@ export class ChainReader {
       pMktX18: snapshot.pMktX18,
       checkpointTimestamp: Number(snapshot.timestamp),
       liveCells: Number(liveCells as number),
-      burnBps: Number(burnBps as number),
-      stakerBps: Number(stakerBps as number),
       creatorBps: Number(creatorBps as number),
       deployThresholdUsd18: deployThreshold as bigint,
       rolloutBpsPerDay: Number(rolloutBpsPerDay as number),
@@ -365,7 +361,9 @@ export class ChainReader {
       topology.oracleGate === ZERO
         ? Promise.resolve([0, 0, false] as const)
         : (this.client.readContract({...gate, functionName: 'watchdog'}) as Promise<readonly [number, number, boolean]>),
-      this.client.readContract({address: topology.hook, abi: ampsHookAbi, functionName: 'ampsFeeBps'}).catch(() => 500) as Promise<number>,
+      this.client
+        .readContract({address: topology.hook, abi: ampsHookAbi, functionName: 'ampsFeeBps'})
+        .catch(() => AMPS_FEE_BPS_DEFAULT) as Promise<number>,
     ])
 
     const ids = await this.poolIds(topology)

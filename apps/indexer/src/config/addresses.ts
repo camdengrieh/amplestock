@@ -37,7 +37,7 @@ export const ENV_OVERRIDES = {
   registry: 'AMPS_REGISTRY',
   hook: 'AMPS_HOOK',
   bonds: 'AMPS_BONDS',
-  staking: 'AMPS_STAKING',
+  router: 'AMPS_ROUTER',
   bountyPot: 'AMPS_BOUNTY_POT',
   feedRegistry: 'AMPS_FEED_REGISTRY',
   oracleGate: 'AMPS_ORACLE_GATE',

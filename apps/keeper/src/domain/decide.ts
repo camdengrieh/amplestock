@@ -30,11 +30,11 @@ import {
   type Verdict,
 } from './types.js'
 import {
-  compoundWorkValueUsd18,
+  AMPS_FEE_BPS_DEFAULT,
+  compoundWork,
   gasCostUsd18,
   meetsChost,
   quoteBounty,
-  splitAmpsFees,
   vaultGasAllowanceUsd18,
   BPS,
   WAD,
@@ -324,14 +324,13 @@ export function measureWorkValueUsd18(
   switch (kind) {
     case 'compound': {
       const [ampsFees, burned] = result as [bigint, bigint]
-      const split = splitAmpsFees(
+      return compoundWork(
         ampsFees,
+        burned,
         snapshot.vault.creatorBps,
-        pool?.ampsFeeBps ?? 500,
-        snapshot.vault.stakerBps,
-        snapshot.vault.burnBps,
-      )
-      return compoundWorkValueUsd18(ampsFees, burned, split, pool?.pRefX18 ?? snapshot.vault.pRefX18)
+        pool?.ampsFeeBps ?? AMPS_FEE_BPS_DEFAULT,
+        pool?.pRefX18 ?? snapshot.vault.pRefX18,
+      ).workValueUsd18
     }
     case 'rollout': {
       const moved = result as bigint

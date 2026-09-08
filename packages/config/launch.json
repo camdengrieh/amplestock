@@ -402,21 +402,10 @@
         "min": 1,
         "max": 50
       },
-      "redeemFeeBps": 100,
+      "redeemFeeBps": 250,
       "redeemFeeBpsCap": 500,
-      "burnBps": 1000,
-      "burnBpsCap": 2500,
       "creatorFeeBps": 100,
       "creatorFeeDecaySeconds": 2592000
-    },
-    "staking": {
-      "stakerBps": 3000,
-      "stakerBpsCap": 5000,
-      "rewardStreamSeconds": 86400,
-      "rewardStreamSecondsBand": {
-        "min": 3600,
-        "max": 604800
-      }
     },
     "bonds": {
       "dBaseBps": 1250,

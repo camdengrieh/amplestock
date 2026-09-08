@@ -22,7 +22,7 @@ import {
   ampsBondsLensAbi,
   ampsHookAbi,
   ampsQuoterAbi,
-  ampsStakingAbi,
+  ampsRouterAbi,
   ampsVaultAbi,
   bondPolicyAbi,
   bountyPotAbi,
@@ -43,13 +43,18 @@ import {
  * `PoolManager` is the odd one out: the ABI is Uniswap v4-core's `IPoolManager`, because nothing in this
  * repository deploys a PoolManager — the indexer subscribes to `Initialize`, `Swap`, `ModifyLiquidity` and
  * `Donate` on the canonical deployment named in `@amplestocks/config`.
+ *
+ * `AmpsRouter` took `AmpsStaking`'s place in revision 6. There is no staking contract any more, so there is no
+ * `ampsStakingAbi`, no `stakerBps` and no `burnBps` anywhere in this package; what the creator does not take of
+ * a compound's AMPS-side fees is burned. The router is the protocol's own `buy` / `sell` / `rotate` front end
+ * and the only address whose rotation hops the hook prices at the pass-through fee (`AmpsHook.router()`).
  */
 export const contractAbis = {
   Amps: ampsAbi,
   AmpsVault: ampsVaultAbi,
   AmpsHook: ampsHookAbi,
   AmpsBonds: ampsBondsAbi,
-  AmpsStaking: ampsStakingAbi,
+  AmpsRouter: ampsRouterAbi,
   BountyPot: bountyPotAbi,
   PoolRegistry: poolRegistryAbi,
   PoolRegistryLens: poolRegistryLensAbi,

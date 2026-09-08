@@ -297,7 +297,7 @@ ponder.on('AmpsBonds:Bond', async ({event, context}) => {
     bondIssuedTotal: row.bondIssuedTotal + event.args.ampsOut,
   }))
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
-    bondIssued: row.bondIssued + event.args.ampsOut,
+    bondIssuedAmps: row.bondIssuedAmps + event.args.ampsOut,
   }))
   void pRef
 })

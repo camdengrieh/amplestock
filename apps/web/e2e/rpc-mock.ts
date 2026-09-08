@@ -37,14 +37,17 @@ import {
   type Hex,
 } from 'viem'
 
+// The mock has to encode the exact struct the app will decode, so it reads the *same* ABIs the app
+// does — `@amplestocks/abis`, generated from the revision-6 Foundry artefacts. A `PoolQuote`
+// encoded from a different tuple would decode into a different one, silently.
+import {
+  ampsHookAbi,
+  ampsQuoterAbi,
+  ampsRouterAbi,
+  ampsVaultAbi,
+} from '@amplestocks/abis/generated'
+
 import {ccaAbi, chainlinkAggregatorAbi} from '../lib/abi/cca'
-// The hook, the quoter and the vault come from the app's own revision-6 ABIs rather than from the
-// generated package, for the same reason the app does: the mock has to encode the struct the app
-// will decode, and a `PoolQuote` encoded from the revision-5 tuple decodes into a different one.
-import {ampsHookAbi} from '../lib/abi/hook'
-import {ampsQuoterAbi} from '../lib/abi/quoter'
-import {ampsRouterAbi} from '../lib/abi/router'
-import {ampsVaultAbi} from '../lib/abi/vault'
 import {E2E, MULTICALL3} from './addresses'
 
 const WAD = 10n ** 18n

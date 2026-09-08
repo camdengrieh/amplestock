@@ -8,6 +8,11 @@
  * - **The eight Amplestocks contracts** are ordinary single-address log sources. Their addresses
  *   are deployment state and arrive through `src/config/addresses.ts`; an unresolved one is the
  *   zero address, which is a live source that never matches rather than a missing handler.
+ *   `AmpsRouter` is one of them, and it is the reason `Bought` / `Sold` / `Rotated` can be told
+ *   apart from any other swap at all: the hook prices a hop at the pass-through fee only when the
+ *   `PoolManager`'s caller is `AmpsHook.router()` **and** the hop declares the rotate flag, so a
+ *   rotation is a fact about the router's own log, not about the `Swap`. There is no `AmpsStaking`
+ *   source: revision 6 removed the contract.
  * - **The Uniswap v4 `PoolManager`** is one shared deployment carrying every pool on the chain, so
  *   `Swap`, `ModifyLiquidity` and `Initialize` are filtered to our own `PoolId`s. When the id set
  *   is known ahead of time (`AMPS_POOL_IDS`, or `AMPS_POOLS` pointing at the `pools.json` that
@@ -32,7 +37,7 @@ import {
   ampsAbi,
   ampsBondsAbi,
   ampsHookAbi,
-  ampsStakingAbi,
+  ampsRouterAbi,
   ampsVaultAbi,
   bountyPotAbi,
   feedRegistryAbi,
@@ -84,7 +89,7 @@ export default createConfig({
   contracts: {
     AmpsVault: {chain: 'amps', abi: ampsVaultAbi, address: book.vault, ...window},
     AmpsBonds: {chain: 'amps', abi: ampsBondsAbi, address: book.bonds, ...window},
-    AmpsStaking: {chain: 'amps', abi: ampsStakingAbi, address: book.staking, ...window},
+    AmpsRouter: {chain: 'amps', abi: ampsRouterAbi, address: book.router, ...window},
     AmpsToken: {chain: 'amps', abi: ampsAbi, address: book.amps, ...window},
     PoolRegistry: {chain: 'amps', abi: poolRegistryAbi, address: book.registry, ...window},
     OracleGate: {chain: 'amps', abi: oracleGateAbi, address: book.oracleGate, ...window},

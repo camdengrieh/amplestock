@@ -11,8 +11,9 @@
  * - **`/api/*`** — a small typed layer for the shapes the dApp asks for repeatedly, where a
  *   hand-written SQL aggregate beats a client-side join over GraphQL pages: the vault summary, the
  *   NAV/share and premium history, the ladder per pool with its fill and proceeds, the bond board,
- *   the staking APR, the flywheel dashboard, gate status, burn history and the creator-fee
- *   remainder.
+ *   the flywheel dashboard, gate status, burn history and the creator fee. There is no
+ *   `/api/staking`: revision 6 removed the contract, so an endpoint for it would be a claim that
+ *   the thing it describes still exists.
  *
  * Everything here is **read-only**. `db` from `ponder:api` is a `ReadonlyDrizzle`; there is no
  * write path in this process at all, which is what makes it safe to expose.
@@ -110,7 +111,7 @@ app.get('/api/premium-history', async (c) => {
   return json(c, {points: rows.reverse()})
 })
 
-/** Shares by class over time: circulating, inventory, vesting, staked, bond-unvested. */
+/** Shares by class over time: circulating, inventory, vesting, bond-unvested. */
 app.get('/api/share-history', async (c) => {
   const rows = await db
     .select()
@@ -153,8 +154,12 @@ app.get('/api/burns', async (c) => {
 
 /**
  * The creator fee: the immutable 100 bp schedule decaying to zero 30 days after genesis, what has
- * been paid so far, and what is left of the *schedule* (not of a budget — there is no budget; the
- * fee is a rate carved out of the sell fee).
+ * been paid so far **in each currency**, and what is left of the *schedule* (not of a budget —
+ * there is no budget; the fee is a rate carved out of the fee the pool already charged).
+ *
+ * Two paid totals, not one. Revision 6 pays the creator `creatorBps(t) / ampsFeeBps` of the fees
+ * collected in *every* currency, in kind, so the AMPS side is an amount and the counter side is a
+ * USD aggregate across up to thirty-two assets with different decimals.
  */
 app.get('/api/creator-fee', async (c) => {
   const [summary] = await db.select().from(schema.vaultSummary).where(eq(schema.vaultSummary.id, SINGLETON))
@@ -171,7 +176,8 @@ app.get('/api/creator-fee', async (c) => {
     elapsedSeconds: elapsed,
     remainingSeconds: remaining,
     currentBps: Number((100n * remaining) / decaySeconds),
-    paidTotal: summary.creatorPaidTotal,
+    paidAmpsTotal: summary.creatorPaidAmpsTotal,
+    paidCounterUsd18: summary.creatorPaidCounterUsd18,
   })
 })
 
@@ -185,7 +191,7 @@ app.get('/api/pools', async (c) => {
   return json(c, {pools: rows})
 })
 
-/** One pool's ladder, cell by cell: side, liquidity, principal, fill and what it has raised. */
+/** One pool's ladder, cell by cell: side, liquidity, committed amount, fill and proceeds. */
 app.get('/api/pools/:poolId/ladder', async (c) => {
   const poolId = c.req.param('poolId').toLowerCase() as `0x${string}`
   const [pool] = await db.select().from(schema.pool).where(eq(schema.pool.id, poolId))
@@ -249,7 +255,7 @@ app.get('/api/gate', async (c) => {
 })
 
 // -------------------------------------------------------------------------------------------------
-// Bonds and staking
+// Bonds
 // -------------------------------------------------------------------------------------------------
 
 /** The bond board: every market with its discount, capacity, issuance and realised accretion. */
@@ -280,25 +286,15 @@ app.get('/api/bonds/positions/:owner', async (c) => {
   return json(c, {positions, claims})
 })
 
-/** xAMPS: share price, assets, and the APR realised sell fees have actually paid. */
-app.get('/api/staking', async (c) => {
-  const [state] = await db.select().from(schema.stakingState).where(eq(schema.stakingState.id, SINGLETON))
-  const rewards = await db
-    .select()
-    .from(schema.stakingReward)
-    .orderBy(desc(schema.stakingReward.blockNumber))
-    .limit(limitOf(c.req.query('limit'), 50))
-  return json(c, {state: state ?? null, rewards})
-})
-
 // -------------------------------------------------------------------------------------------------
 // The flywheel dashboard
 // -------------------------------------------------------------------------------------------------
 
 /**
- * Everything the plan's flywheel dashboard names, in one response: sell-fee revenue, bond issuance
- * and realised accretion, fee APR against realised LVR per pool, premium history, NAV/share and net
- * supply change.
+ * Everything the plan's flywheel dashboard names, in one response: fee revenue by currency — the
+ * AMPS side, which is burned, against the counter side, which is re-placed as bids — bond issuance
+ * and realised accretion, fee revenue against realised LVR per pool, NAV/share and net supply
+ * change. There is no `staking` key: there is no reward stream to report an APR on.
  */
 app.get('/api/flywheel', async (c) => {
   const days = await db
@@ -309,7 +305,7 @@ app.get('/api/flywheel', async (c) => {
 
   const pools = await db
     .select({
-      poolId: schema.pool.id,
+      id: schema.pool.id,
       counter: schema.pool.counter,
       counterSymbol: schema.pool.counterSymbol,
       poolClassLabel: schema.pool.poolClassLabel,
@@ -322,12 +318,12 @@ app.get('/api/flywheel', async (c) => {
       sellVolumeAmps: schema.pool.sellVolumeAmps,
       buyVolumeAmps: schema.pool.buyVolumeAmps,
       sellFeeAmps: schema.pool.sellFeeAmps,
+      buyFeeCounter: schema.pool.buyFeeCounter,
       rotationCreditedAmps: schema.pool.rotationCreditedAmps,
     })
     .from(schema.pool)
 
   const [summary] = await db.select().from(schema.vaultSummary).where(eq(schema.vaultSummary.id, SINGLETON))
-  const [staking] = await db.select().from(schema.stakingState).where(eq(schema.stakingState.id, SINGLETON))
 
   const [bondTotals] = await db
     .select({
@@ -339,7 +335,6 @@ app.get('/api/flywheel', async (c) => {
 
   return json(c, {
     summary: summary ?? null,
-    staking: staking ?? null,
     bonds: {
       issued: bondTotals?.issued ?? '0',
       accretionUsd18: bondTotals?.accretion ?? '0',
