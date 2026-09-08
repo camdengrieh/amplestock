@@ -129,7 +129,7 @@ contract Verify is Script {
                 "--libraries src/vault/VaultPlacementLib.sol:VaultPlacementLib:", vm.toString(libs.placementLib)
             );
 
-        Target[] memory buffer = new Target[](20);
+        Target[] memory buffer = new Target[](24);
         uint256 n;
 
         n = _add(buffer, n, "VaultNavLib", "src/vault/VaultNavLib.sol:VaultNavLib", libs.navLib, "", "");
@@ -189,7 +189,7 @@ contract Verify is Script {
         }
     }
 
-    /// @dev The oracle layer, bonds, staking, the pot, the valuer and the quoter.
+    /// @dev The oracle layer, bonds, the pot, the valuer, the quoter and the router.
     function _addPeriphery(Target[] memory buffer, uint256 n, Core.Set memory set) private pure returns (uint256) {
         n = _add(
             buffer,
@@ -221,15 +221,6 @@ contract Verify is Script {
         n = _add(
             buffer,
             n,
-            "AmpsStaking",
-            "src/staking/AmpsStaking.sol:AmpsStaking",
-            set.staking,
-            abi.encode(set.amps, set.vault, set.timelock),
-            ""
-        );
-        n = _add(
-            buffer,
-            n,
             "BountyPot",
             "src/keeper/BountyPot.sol:BountyPot",
             set.bountyPot,
@@ -252,6 +243,15 @@ contract Verify is Script {
             "src/periphery/AmpsQuoter.sol:AmpsQuoter",
             set.quoter,
             abi.encode(set.poolManager, set.hook, set.vault, set.registry, set.bonds, set.oracleGate, set.feedRegistry),
+            ""
+        );
+        n = _add(
+            buffer,
+            n,
+            "AmpsRouter",
+            "src/periphery/AmpsRouter.sol:AmpsRouter",
+            set.router,
+            abi.encode(set.poolManager, set.amps, set.registry, set.weth9),
             ""
         );
         return n;
@@ -293,7 +293,6 @@ contract Verify is Script {
         set.registry = _address(json, ".core.registry", "AMPS_REGISTRY");
         set.hook = _address(json, ".core.hook", "AMPS_HOOK");
         set.bonds = _address(json, ".core.bonds", "AMPS_BONDS");
-        set.staking = _address(json, ".core.staking", "AMPS_STAKING");
         set.bountyPot = _address(json, ".core.bountyPot", "AMPS_BOUNTY_POT");
         set.feedRegistry = _address(json, ".core.feedRegistry", "AMPS_FEED_REGISTRY");
         set.oracleGate = _address(json, ".core.oracleGate", "AMPS_ORACLE_GATE");
@@ -303,6 +302,7 @@ contract Verify is Script {
         set.feePolicy = _address(json, ".core.feePolicy", "AMPS_FEE_POLICY");
         set.bondPolicy = _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY");
         set.quoter = _address(json, ".core.quoter", "AMPS_QUOTER");
+        set.router = _address(json, ".core.router", "AMPS_ROUTER");
         set.weth9 = _address(json, ".core.weth9", "AMPS_WETH9");
         set.usdg = _address(json, ".core.usdg", "AMPS_USDG");
     }

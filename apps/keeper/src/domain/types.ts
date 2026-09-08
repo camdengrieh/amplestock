@@ -112,7 +112,7 @@ export interface PoolSnapshot {
   readonly corporateFreeze: boolean
   readonly pRefX18: bigint
   readonly navPerShareX18: bigint
-  readonly sellFeeBps: number
+  readonly ampsFeeBps: number
 }
 
 /** What one constituent looks like: the rollout and bonded-deployment targets. */
@@ -161,8 +161,8 @@ export interface VaultSnapshot {
   readonly pMktX18: bigint
   readonly checkpointTimestamp: number
   readonly liveCells: number
-  readonly burnBps: number
-  readonly stakerBps: number
+  /** `AmpsVault.creatorBpsAt(now)`: 100 bp at genesis, decaying linearly to zero at genesis + 30 days.
+   *  There is no `burnBps` or `stakerBps` beside it — the AMPS-side remainder is burned unconditionally. */
   readonly creatorBps: number
   readonly deployThresholdUsd18: bigint
   readonly rolloutBpsPerDay: number

@@ -19,7 +19,6 @@ const TOPOLOGY: Topology = {
   vault: VAULT,
   registry: '0x00000000000000000000000000000000000000r0'.replace(/r/g, '1') as `0x${string}`,
   bonds: '0x00000000000000000000000000000000000000b1',
-  staking: '0x00000000000000000000000000000000000000b2',
   bountyPot: '0x00000000000000000000000000000000000000b3',
   oracleGate: '0x00000000000000000000000000000000000000b4',
   hook: '0x00000000000000000000000000000000000000b5',
@@ -111,7 +110,7 @@ function build(snapshots: ChainSnapshot[], client: PublicClient, now = () => NOW
 
 describe('one scan', () => {
   it('sends a compound whose simulated fees clear chost', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n], rollout: 0n, deployBonded: 0n, checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], rollout: 0n, deployBonded: 0n, checkpoint: undefined})
     const {runner, submitter} = build([baseSnapshot({vault: vault({checkpointTimestamp: NOW - 2_000})})], client)
 
     const result = await runner.scan()
@@ -122,7 +121,7 @@ describe('one scan', () => {
   })
 
   it('sends nothing at all when the gate is DEGRADED', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n]})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD]})
     const {runner, submitter, metrics} = build([baseSnapshot({globalGateState: GateState.DEGRADED})], client)
     await runner.scan()
     expect(submitter.submitted).toHaveLength(0)
@@ -130,7 +129,7 @@ describe('one scan', () => {
   })
 
   it('sends nothing when the pool has diverged past 800 ticks', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n]})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD]})
     const diverged = baseSnapshot({pools: [pool({poolTick: 1_200, fairTick: 0})], constituents: []})
     const {runner, submitter, metrics} = build([diverged], client)
     await runner.scan()
@@ -162,7 +161,7 @@ describe('idempotence and resumption', () => {
   it('does not send the same job twice inside one cooldown window', async () => {
     // Scan 1 sends; scan 2 reads the same chain state but the runner has stamped its own cooldown, so the
     // second scan screens the pool out rather than simulating it again.
-    const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], checkpoint: undefined})
     const state = baseSnapshot({constituents: [], vault: vault({checkpointTimestamp: NOW})})
     const {runner, submitter} = build([state, state], client)
 
@@ -175,7 +174,7 @@ describe('idempotence and resumption', () => {
   it('rebuilds its whole decision from chain state after a 48-hour gap', async () => {
     // Two runners: one that has been running, one started cold two days later. Given the same chain state they
     // reach the same decision, because the keeper holds nothing it cannot re-read.
-    const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], checkpoint: undefined})
     const afterOutage = baseSnapshot({
       now: NOW + 48 * 3_600,
       constituents: [],
@@ -222,7 +221,7 @@ describe('idempotence and resumption', () => {
   })
 
   it('follows a vault pointer move without a restart', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], checkpoint: undefined})
     const state = baseSnapshot({constituents: [], vault: vault({checkpointTimestamp: NOW})})
     const moved: Topology = {...TOPOLOGY, vault: '0x00000000000000000000000000000000000000aa'}
     let topology = TOPOLOGY
@@ -264,7 +263,7 @@ describe('idempotence and resumption', () => {
 
 describe('metrics the runbook alerts on', () => {
   it('advances the scan clock and records the gate, the pot and the gas series', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], checkpoint: undefined})
     const {runner, metrics} = build([baseSnapshot({constituents: []})], client, () => 1_700_000_000_000)
     await runner.scan()
 
@@ -279,7 +278,7 @@ describe('metrics the runbook alerts on', () => {
   })
 
   it('counts a submit failure without letting it end the scan', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n], checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], checkpoint: undefined})
     const submitter = fakeSubmitter()
     submitter.submit = async () => {
       throw new Error('relayer down')
@@ -306,7 +305,7 @@ describe('metrics the runbook alerts on', () => {
 
 describe('nothing but the five jobs', () => {
   it('never encodes a call the vault does not expose as permissionless upkeep', async () => {
-    const client = fakeClient({compound: [10n * WAD, 0n], rollout: 5n * WAD, deployBonded: 0n, checkpoint: undefined})
+    const client = fakeClient({compound: [10n * WAD, 10n * WAD], rollout: 5n * WAD, deployBonded: 0n, checkpoint: undefined})
     const {runner, submitter} = build(
       [
         baseSnapshot({

@@ -207,10 +207,13 @@ describe('qualification — the simulation half', () => {
   })
 
   it('sends a compound whose fees clear chost, priced at the pot’s real formula', () => {
-    // 10 AMPS of fees at $1 is $10 of work: tip $0.05 + 2% chip = $0.25 of gross. The 3x gas cap on a 1.5M-gas
-    // job at the Orbit floor basefee is 3 x $0.0395 = $0.1185, and that is what binds — which is the whole
-    // point of the vault reporting a measured allowance instead of a flat $1.
-    const verdict = qualify(eligible, ok([10n * WAD, 0n]), snapshot(), POLICY, undefined, pool())
+    // `compound` returns `(ampsFees, burned)`, and since revision 6 `burned` is the whole AMPS-side remainder
+    // after the creator slice plus the buyback — so a collection of 10 AMPS with the creator's fifth taken and
+    // 2 AMPS bought back burns exactly 10, and `burned` is what the vault measures. At $1 that is $10 of work:
+    // tip $0.05 + 2% chip = $0.25 of gross. The 3x gas cap on a 1.5M-gas job at the Orbit floor basefee is
+    // 3 x $0.0395 = $0.1185, and that is what binds — which is the whole point of the vault reporting a
+    // measured allowance instead of a flat $1.
+    const verdict = qualify(eligible, ok([10n * WAD, 10n * WAD]), snapshot(), POLICY, undefined, pool())
     expect(verdict.send).toBe(true)
     expect(verdict.workValueUsd18).toBe(10n * WAD)
     expect(verdict.bountyUsd18).toBe(118_500_000_000_000_000n)
@@ -218,7 +221,8 @@ describe('qualification — the simulation half', () => {
 
   it('takes the vault’s own reported work value over its own estimate when the simulation carried one', () => {
     // `compound` returns `(ampsFees, burned)` and says nothing about the counter-side fees, which the vault
-    // does price in. A simulation that captured `BountyPaid` therefore beats the keeper's lower bound.
+    // does price in and re-places as bids. A simulation that captured `BountyPaid` therefore beats the
+    // keeper's lower bound.
     const reported = {
       ...ok([0n, 0n]),
       bounty: {workValueUsd18: 12n * WAD, paidUsd18: 118_500_000_000_000_000n, paidRaw: 118_500n, reason: ''},
@@ -231,7 +235,7 @@ describe('qualification — the simulation half', () => {
 
   it('honours a reported `chost` refusal even when its own estimate looked sufficient', () => {
     const reported = {
-      ...ok([10n * WAD, 0n]),
+      ...ok([10n * WAD, 10n * WAD]),
       bounty: {workValueUsd18: 0n, paidUsd18: 0n, paidRaw: 0n, reason: 'chost'},
     }
     const verdict = qualify(eligible, reported, snapshot(), POLICY, undefined, pool())
@@ -240,7 +244,7 @@ describe('qualification — the simulation half', () => {
   })
 
   it('blocks a dust compound the on-chain guard would have paid for', () => {
-    const verdict = qualify(eligible, ok([WAD / 1_000n, 0n]), snapshot(), POLICY, undefined, pool())
+    const verdict = qualify(eligible, ok([WAD / 1_000n, WAD / 1_000n]), snapshot(), POLICY, undefined, pool())
     expect(verdict.send).toBe(false)
     expect(verdict.reason).toBe('below-chost')
   })
@@ -254,7 +258,7 @@ describe('qualification — the simulation half', () => {
   it('refuses when the bounty does not cover gas', () => {
     // 3M gas at 100 gwei against $2,500 ETH is $750 of gas for a $0.07 bounty.
     const expensive = snapshot({baseFeeWei: 100n * 10n ** 9n})
-    const verdict = qualify(eligible, ok([10n * WAD, 0n], 3_000_000n), expensive, POLICY, undefined, pool())
+    const verdict = qualify(eligible, ok([10n * WAD, 10n * WAD], 3_000_000n), expensive, POLICY, undefined, pool())
     expect(verdict.send).toBe(false)
     expect(verdict.reason).toBe('unprofitable')
   })
@@ -265,7 +269,7 @@ describe('qualification — the simulation half', () => {
     // managed.
     const floor = snapshot()
     for (const gas of [1_000_000n, 1_500_000n, 2_200_000n, 3_300_000n]) {
-      const verdict = qualify(eligible, ok([10n * WAD, 0n], gas), floor, POLICY, undefined, pool())
+      const verdict = qualify(eligible, ok([10n * WAD, 10n * WAD], gas), floor, POLICY, undefined, pool())
       expect(verdict.send, `gas ${gas}`).toBe(true)
       expect(verdict.bountyUsd18).toBeGreaterThan(verdict.gasCostUsd18)
     }
@@ -276,28 +280,28 @@ describe('qualification — the simulation half', () => {
     // is $1.185 — generous — but the gross is only tip + 2% of $10 = $0.25, so the job is under water and the
     // keeper refuses it. The governance lever is `tip`/`chipBps`, not the cap.
     const tenTimes = snapshot({baseFeeWei: 100_000_000n})
-    const verdict = qualify(eligible, ok([10n * WAD, 0n], 1_500_000n), tenTimes, POLICY, undefined, pool())
+    const verdict = qualify(eligible, ok([10n * WAD, 10n * WAD], 1_500_000n), tenTimes, POLICY, undefined, pool())
     expect(verdict.reason).toBe('unprofitable')
     expect(verdict.bountyUsd18).toBe(250_000_000_000_000_000n)
     expect(verdict.gasCostUsd18).toBe(375_000_000_000_000_000n)
 
     // ...and a job worth enough for the chip to cover the gas is sent at the same basefee.
-    const worthwhile = qualify(eligible, ok([100n * WAD, 0n], 1_500_000n), tenTimes, POLICY, undefined, pool())
+    const worthwhile = qualify(eligible, ok([100n * WAD, 100n * WAD], 1_500_000n), tenTimes, POLICY, undefined, pool())
     expect(worthwhile.send).toBe(true)
   })
 
   it('refuses when the rolling daily ceiling is exhausted', () => {
     const spent = snapshot({pot: pot({spentLast24hUsd18: 25n * WAD, budgetLeftUsd18: 0n})})
-    const verdict = qualify(eligible, ok([10n * WAD, 0n]), spent, POLICY, undefined, pool())
+    const verdict = qualify(eligible, ok([10n * WAD, 10n * WAD]), spent, POLICY, undefined, pool())
     expect(verdict.send).toBe(false)
     expect(verdict.reason).toBe('daily-ceiling')
   })
 
   it('refuses when the pot is depleted, unless the operator asked for unpaid work', () => {
     const empty = snapshot({pot: pot({balanceRaw: 0n})})
-    expect(qualify(eligible, ok([10n * WAD, 0n]), empty, POLICY, undefined, pool()).reason).toBe('pot-depleted')
+    expect(qualify(eligible, ok([10n * WAD, 10n * WAD]), empty, POLICY, undefined, pool()).reason).toBe('pot-depleted')
     expect(
-      qualify(eligible, ok([10n * WAD, 0n]), empty, {...POLICY, runUnpaid: true}, undefined, pool()).send,
+      qualify(eligible, ok([10n * WAD, 10n * WAD]), empty, {...POLICY, runUnpaid: true}, undefined, pool()).send,
     ).toBe(true)
   })
 
@@ -320,7 +324,7 @@ describe('the synthetic spam campaign', () => {
     let sent = 0
     for (let i = 0; i < 500; i += 1) {
       const dust = BigInt(i) * (WAD / 100_000n) // up to 0.005 AMPS, i.e. half a cent of work
-      const verdict = qualify(eligibleScreening, ok([dust, 0n]), s, POLICY, undefined, pool())
+      const verdict = qualify(eligibleScreening, ok([dust, dust]), s, POLICY, undefined, pool())
       if (verdict.send) sent += 1
       expect(verdict.reason).toBe('below-chost')
     }

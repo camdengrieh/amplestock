@@ -30,12 +30,20 @@ export const publicEnv = {
     quoter: str(process.env.NEXT_PUBLIC_AMPS_QUOTER),
     bonds: str(process.env.NEXT_PUBLIC_AMPS_BONDS),
     bondsLens: str(process.env.NEXT_PUBLIC_AMPS_BONDS_LENS),
-    staking: str(process.env.NEXT_PUBLIC_AMPS_STAKING),
+    router: str(process.env.NEXT_PUBLIC_AMPS_ROUTER),
     registry: str(process.env.NEXT_PUBLIC_AMPS_REGISTRY),
     registryLens: str(process.env.NEXT_PUBLIC_AMPS_REGISTRY_LENS),
     hook: str(process.env.NEXT_PUBLIC_AMPS_HOOK),
     oracleGate: str(process.env.NEXT_PUBLIC_AMPS_ORACLE_GATE),
     timelock: str(process.env.NEXT_PUBLIC_AMPS_TIMELOCK),
+  },
+  /**
+   * The genesis Continuous Clearing Auctions. Separate from `addresses` because they are not part
+   * of the running protocol: they exist once, sell the entry-pool tranche, and are then finished.
+   */
+  auctions: {
+    usdg: str(process.env.NEXT_PUBLIC_AMPS_AUCTION_USDG),
+    eth: str(process.env.NEXT_PUBLIC_AMPS_AUCTION_ETH),
   },
   flags: {
     acrossZap: flag(process.env.NEXT_PUBLIC_FLAG_ACROSS_ZAP),

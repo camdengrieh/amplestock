@@ -3,10 +3,13 @@ pragma solidity 0.8.30;
 
 import {AmpsHook} from "../../src/hook/AmpsHook.sol";
 import {IAmpsQuoter} from "../../src/interfaces/IAmpsQuoter.sol";
+import {IPoolRegistry} from "../../src/interfaces/IPoolRegistry.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
+import {PoolConfig} from "../../src/types/Types.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
@@ -36,6 +39,10 @@ contract Phase3Ghosts {
     AmpsQuoter internal immutable QUOTER;
     IPoolManager internal immutable POOL_MANAGER;
 
+    /// @dev The v4 swap router every handler action trades through, and therefore the `sender` the hook keys the
+    ///      rotation credit by. I26 is a claim about *that* account's credit, so the ghost has to name it.
+    address internal immutable ROUTER;
+
     /// @dev The account that deployed this contract and may name its writers, once each.
     address internal immutable DEPLOYER;
 
@@ -57,6 +64,9 @@ contract Phase3Ghosts {
     uint256 public creatorPaid;
     /// @notice AMPS wei the AMPS-side fee split has passed through, across every compound.
     uint256 public feesSplit;
+    /// @notice Counter-asset units paid to the creator across every compound, summed over every counter (I31).
+    ///         Not a dimensioned quantity — it exists so the campaign can prove the counter leg is exercised.
+    uint256 public creatorCounterPaid;
     /// @notice AMPS wei moved out of the entry pools by rollout, in the current rolling day (I32).
     uint256 public rolloutMoved;
     /// @notice The largest ladder length ever observed in any pool (I39's bound).
@@ -77,6 +87,18 @@ contract Phase3Ghosts {
     bool public hookEverHeldValue;
     /// @notice Set the moment a removal of liquidity is refused (I18).
     bool public removalEverBlocked;
+    /// @notice Set the moment one compound pays the creator more than `creatorBps(t) / ampsFeeBps` of that call's
+    ///         AMPS-side fees (I31). The bound is per compound, not only in aggregate.
+    bool public creatorEverOverpaid;
+    /// @notice Set the moment a compound pays the creator anything at all — in AMPS or in the counter — once the
+    ///         30-day schedule has run out (I31).
+    bool public creatorEverPaidAfterDecay;
+    /// @notice Set the moment a compound leaves any AMPS-side fee unburned after the creator's slice (I33): since
+    ///         revision 6 `burned >= ampsFees - creatorAmps` at every compound.
+    bool public feeAmpsEverSurvivedACompound;
+    /// @notice Set the moment a compound raises a pool's committed ask inventory (I10): the AMPS-side fees are
+    ///         burned, never re-laddered, so no `compound` may ever grow the ask side.
+    bool public compoundEverPlacedAnAsk;
     /// @notice Per-action call counters, so the campaign can prove it was not vacuous.
     mapping(bytes32 action => uint256 count) public actionCount;
     /// @notice Total actions attempted.
@@ -105,6 +127,7 @@ contract Phase3Ghosts {
     /// @param hook_ The real `AmpsHook`.
     /// @param quoter_ The periphery quoter.
     /// @param poolManager_ The v4 PoolManager.
+    /// @param router_ The v4 swap router the handlers trade through.
     /// @param pools_ Every pool the campaign drives, hub first.
     constructor(
         AmpsVault vault_,
@@ -112,6 +135,7 @@ contract Phase3Ghosts {
         AmpsHook hook_,
         AmpsQuoter quoter_,
         IPoolManager poolManager_,
+        address router_,
         PoolId[] memory pools_
     ) {
         VAULT = vault_;
@@ -119,6 +143,7 @@ contract Phase3Ghosts {
         HOOK = hook_;
         QUOTER = quoter_;
         POOL_MANAGER = poolManager_;
+        ROUTER = router_;
         DEPLOYER = msg.sender;
         for (uint256 i; i < pools_.length; ++i) {
             pools.push(pools_[i]);
@@ -144,7 +169,7 @@ contract Phase3Ghosts {
         actionCount[name] += 1;
         supplyAtOpen = AMPS.totalSupply();
         // I26: the rotation credit is transient, so it is zero at the start of every transaction, always.
-        if (HOOK.rotationCredit() != 0) creditEverLeaked = true;
+        if (HOOK.rotationCredit(ROUTER) != 0) creditEverLeaked = true;
         // I13: the hook holds nothing, ever.
         if (AMPS.balanceOf(address(HOOK)) != 0) hookEverHeldValue = true;
         if (POOL_MANAGER.balanceOf(address(HOOK), uint256(uint160(address(AMPS)))) != 0) hookEverHeldValue = true;
@@ -188,12 +213,63 @@ contract Phase3Ghosts {
         mintedVesting += ampsOut;
     }
 
-    /// @notice Records a compound's AMPS-side fee split and the creator's slice of it (I31).
+    /// @notice Records one compound's split: the creator's slice in each currency, the burn, and whether the
+    ///         call grew the ask side (I10, I31, I33).
     /// @param ampsFees The AMPS-side fees the compound collected.
-    /// @param creatorDelta The AMPS the creator was paid out of them.
-    function noteCompound(uint256 ampsFees, uint256 creatorDelta) external onlyWriter {
+    /// @param burned The AMPS the compound burned: the fee remainder plus the buyback.
+    /// @param creatorAmps The AMPS the creator was paid out of the fees.
+    /// @param creatorCounter The counter units the creator was paid, in kind or as a claim.
+    /// @param askGrew Whether the pool's committed ask inventory rose across the call.
+    function noteCompound(uint256 ampsFees, uint256 burned, uint256 creatorAmps, uint256 creatorCounter, bool askGrew)
+        external
+        onlyWriter
+    {
         feesSplit += ampsFees;
-        creatorPaid += creatorDelta;
+        creatorPaid += creatorAmps;
+        creatorCounterPaid += creatorCounter;
+
+        uint256 feeBps = HOOK.ampsFeeBps();
+        uint256 creatorBps = VAULT.creatorBpsAt(block.timestamp);
+        if (creatorBps > feeBps) creatorBps = feeBps;
+
+        // I31, per compound and per currency: the payout is `creatorBps / ampsFeeBps` of that currency's fees,
+        // which is `creatorBps` of the volume that produced them. The `+ feeBps` is the flooring residue.
+        if (creatorAmps * feeBps > ampsFees * creatorBps + feeBps) creatorEverOverpaid = true;
+        if (creatorBps == 0 && (creatorAmps != 0 || creatorCounter != 0)) creatorEverPaidAfterDecay = true;
+
+        // I33: every AMPS-side fee after the creator's slice is burned, so the burn is at least the remainder.
+        if (creatorAmps + burned < ampsFees) feeAmpsEverSurvivedACompound = true;
+
+        // I10: the fee AMPS is burned, never re-laddered.
+        if (askGrew) compoundEverPlacedAnAsk = true;
+    }
+
+    /// @notice The creator's whole holding of `poolId`'s counter asset: the idle ERC-20 balance plus the ERC-6909
+    ///         claim the in-kind fallback pays in when the token refuses the transfer.
+    /// @dev Read by `Phase3VaultHandler` either side of a `compound`, which is the only path that moves it.
+    /// @param poolId The pool.
+    /// @return held The creator's holding, in the counter's own units.
+    function creatorCounterHolding(PoolId poolId) external view returns (uint256 held) {
+        address registry = VAULT.registry();
+        if (registry == address(0)) return 0;
+        PoolConfig memory config = IPoolRegistry(registry).poolConfig(poolId);
+        if (config.counter == address(0)) return 0;
+        address creator = VAULT.creator();
+        return
+            IERC20(config.counter).balanceOf(creator)
+                + POOL_MANAGER.balanceOf(creator, uint256(uint160(config.counter)));
+    }
+
+    /// @notice The committed ask inventory of one pool: the sum of `PlacementRecord.amount` over its live ask
+    ///         cells, which is what a re-ladder would grow.
+    /// @param poolId The pool.
+    /// @return total The committed AMPS.
+    function askAmountTotal(PoolId poolId) external view returns (uint256 total) {
+        uint256 n = VAULT.ladderLength(poolId);
+        for (uint256 i; i < n; ++i) {
+            (,,,,, bool above,, uint128 amount,,) = VAULT.ladderAt(poolId, i);
+            if (above) total += amount;
+        }
     }
 
     /// @notice Rolls the 24-hour rollout window if it has expired, and returns whether a rollout may be recorded
@@ -307,7 +383,7 @@ contract Phase3Ghosts {
     // Internals
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev I16 on one quote: the total is `base + dyn`, `sellFeeBps` is inside its band, and neither side
+    /// @dev I16 on one quote: the total is `base + dyn`, `ampsFeeBps` is inside its band, and neither side
     ///      exceeds the protocol ceiling.
     ///
     ///      The cap is deliberately *not* compared against `quote.dynCapBps`: §12.1 ruling K says the word the
@@ -317,7 +393,7 @@ contract Phase3Ghosts {
     function _checkFee(IAmpsQuoter.PoolQuote memory quote) private {
         if (quote.degraded != 0) return;
         uint256 ceiling = uint256(HOOK.TOTAL_FEE_BPS_MAX()) * Constants.PIPS_PER_BPS;
-        if (quote.sellFeeBps < 100 || quote.sellFeeBps > 600) feeEverMalformed = true;
+        if (quote.ampsFeeBps < 100 || quote.ampsFeeBps > 600) feeEverMalformed = true;
         if (uint256(quote.buyFeePips) > ceiling) feeEverMalformed = true;
         if (uint256(quote.sellFeePips) > ceiling) feeEverMalformed = true;
     }

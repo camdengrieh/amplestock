@@ -140,14 +140,12 @@ test('every start value sits inside its hard band', () => {
   const inBand = (v: number, b: {min: number; max: number}, what: string): void => {
     assert.ok(v >= b.min && v <= b.max, `${what}: ${v} outside [${b.min}, ${b.max}]`)
   }
-  inBand(p.fees.sellFeeBps, p.fees.sellFeeBpsBand, 'sellFeeBps')
+  inBand(p.fees.ampsFeeBps, p.fees.ampsFeeBpsBand, 'ampsFeeBps')
   inBand(p.fees.buyFeeBpsEntry, p.fees.buyFeeBpsEntryBand, 'buyFeeBpsEntry')
   inBand(p.fees.buyFeeBpsSpoke, p.fees.buyFeeBpsSpokeBand, 'buyFeeBpsSpoke')
   inBand(p.fees.buyFeeBpsSpokeHighVol, p.fees.buyFeeBpsSpokeBand, 'buyFeeBpsSpokeHighVol')
   assert.ok(p.fees.redeemFeeBps <= p.fees.redeemFeeBpsCap, 'redeemFeeBps over cap')
-  assert.ok(p.fees.burnBps <= p.fees.burnBpsCap, 'burnBps over cap')
-  assert.ok(p.staking.stakerBps <= p.staking.stakerBpsCap, 'stakerBps over cap')
-  inBand(p.staking.rewardStreamSeconds, p.staking.rewardStreamSecondsBand, 'rewardStreamSeconds')
+  assert.ok(p.fees.creatorFeeBps <= p.fees.ampsFeeBps, 'creatorFeeBps over the AMPS fee it is carved out of')
   inBand(p.bonds.dBaseBps, p.bonds.discountBandBps, 'dBaseBps')
   inBand(p.bonds.dMinBps, p.bonds.discountBandBps, 'dMinBps')
   inBand(p.bonds.dMaxBps, p.bonds.discountBandBps, 'dMaxBps')
@@ -163,6 +161,33 @@ test('every start value sits inside its hard band', () => {
   inBand(p.ladder.seedHalvings, p.ladder.halvingsBand, 'seedHalvings')
   inBand(p.ladder.bondBidHalvings, p.ladder.halvingsBand, 'bondBidHalvings')
   assert.ok(p.rollout.rolloutBpsPerDay <= p.rollout.rolloutBpsPerDayCap, 'rolloutBpsPerDay over cap')
+})
+
+test('the fee model is revision 6: AMPS fee both ways, pass-through only, no staking', () => {
+  const p = config.launchParameters
+  const fees = p.fees as Record<string, unknown>
+
+  // Staking is gone: no staker slice of a compound, and no burn share either — the AMPS-side
+  // remainder is burned in full, so a governed `burnBps` would be a lever over nothing.
+  assert.equal('staking' in p, false, 'launchParameters.staking must not exist')
+  assert.equal('burnBps' in fees, false, 'fees.burnBps must not exist')
+  assert.equal('burnBpsCap' in fees, false, 'fees.burnBpsCap must not exist')
+  assert.equal('sellFeeBps' in fees, false, 'the sell fee was renamed ampsFeeBps')
+
+  // The AMPS fee is charged both ways, so the pass-through fee a rotation hop pays must be
+  // strictly cheaper than it — otherwise `AmpsRouter.rotate` would price a rotation as two exits.
+  assert.equal(p.fees.ampsFeeBps, 500)
+  assert.ok(p.fees.buyFeeBpsEntry < p.fees.ampsFeeBps, 'the pass-through entry fee must undercut the AMPS fee')
+  assert.ok(p.fees.buyFeeBpsSpokeHighVol < p.fees.buyFeeBpsEntry, 'a spoke hop is cheaper than an entry hop')
+
+  // The redemption floor sits between the two: dearer than a rotation hop, cheaper than a market exit.
+  assert.equal(p.fees.redeemFeeBps, 250)
+  assert.ok(p.fees.redeemFeeBps > p.fees.buyFeeBpsEntry && p.fees.redeemFeeBps < p.fees.ampsFeeBps)
+
+  // 1% of volume, decaying to zero at 30 days: at launch that is 100/500 = one fifth of the fees
+  // collected in *every* currency, which is what the vault divides by `ampsFeeBps` to reach.
+  assert.equal(p.fees.creatorFeeBps, 100)
+  assert.equal(p.fees.creatorFeeDecaySeconds, 30 * 24 * 60 * 60)
 })
 
 test('session haircuts are ordered Regular <= Pre-Post <= Overnight <= Closed', () => {

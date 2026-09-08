@@ -94,7 +94,7 @@ nonces and splitting them would mean re-deriving the same predictions four times
 | `00_Preflight` | `script/00_Preflight.s.sol` | the on-chain pre-flight; reads only |
 | `01_MineAmps` | `script/01_MineAmps.s.sol`, `script/mine-amps.py` | the AMPS CREATE2 salt |
 | — | `script/02_Libraries.s.sol` | the four linked vault libraries (two passes) |
-| `02_Token` + `03_Vault` + `07_Bonds` + `08_Staking` | `script/03_Core.s.sol` | the timelock, the token, the vault, the hook, the registry, the whole periphery, the set-once wiring |
+| `02_Token` + `03_Vault` + `07_Bonds` | `script/03_Core.s.sol` | the timelock, the token, the vault, the hook, the registry, the whole periphery — `AmpsQuoter` and `AmpsRouter` included — and the set-once wiring |
 | `04_MineHook` | `script/04_MineHook.s.sol` | the hook salt; `03_Core` mines the same salt inline, and this stays as the standalone re-check CI runs after every dependency bump |
 | `05_Registry` | `script/05_Registry.s.sol` | the 32 pools and 30 bond markets |
 | — | `script/09_Phase3Wire.s.sol` | the Phase 3 pointer moves and the gate (§5) |
@@ -102,8 +102,12 @@ nonces and splitting them would mean re-deriving the same predictions four times
 | `06_Genesis` | `script/11_GenesisPlacement.s.sol` | `genesis()` and the §3.3 ladders |
 | — | `script/12_Verify.s.sol` | the Blockscout verification commands |
 
-`03_Vault`, `07_Bonds` and `08_Staking` are aliases for parts of `03_Core`; `06_Genesis` is an alias for
-`11_GenesisPlacement`. The file names do not change.
+`03_Vault` and `07_Bonds` are aliases for parts of `03_Core`; `06_Genesis` is an alias for `11_GenesisPlacement`.
+The file names do not change. **`08_Staking` is gone**: plan revision 6 removed staking from the protocol, so
+there is no `AmpsStaking` to deploy and no `staking` vault pointer to wire. What revision 6 added in its place is
+`AmpsRouter`, deployed by `03_Core` with `(poolManager, amps, registry, weth)`, recorded under `core.router` in
+`deployments.json` and overridable at run time by `AMPS_ROUTER`; it is immutable, ownerless and holds no funds, so
+replacing it is a deploy plus one `AmpsHook.setRouter` proposal.
 
 ---
 
@@ -214,7 +218,7 @@ prediction is **asserted** rather than trusted: if anything slips a transaction 
 `AddressPrediction` instead of deploying a token bound to an address that will never hold a vault. There is no
 recovery from getting this wrong other than starting again with a fresh salt, which is why the assertion exists.
 
-`03_Core` also does **§9.1 step 1**: the set-once vault pointers (`registry`, `bonds`, `staking`, `bountyPot`,
+`03_Core` also does **§9.1 step 1**: the set-once vault pointers (`registry`, `bonds`, `bountyPot`,
 `feedRegistry`) plus `marketReference` → `AmpsHook` and `positionValuer` → `LadderPositionValuer`, the gate's DST
 table and NYSE holiday bitmap, `FeedRegistry.setOracleGate`, and `grantRole(CANCELLER_ROLE, guardian)` on the
 timelock. It deliberately **leaves `vault.oracleGate` unset** — a gate that is absent is exactly as permissive as
@@ -274,7 +278,7 @@ WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false \
   forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC $LIBS
 ```
 
-Seven calls, in this order:
+Eight calls, in this order:
 
 | # | Move | Delay class |
 |---|---|---|
@@ -282,11 +286,19 @@ Seven calls, in this order:
 | 2 | `vault.positionValuer → LadderPositionValuer` | 7 d |
 | 3 | `vault.ladderPolicy → LadderPolicy` | 7 d |
 | 4 | `vault.rolloutPolicy → RolloutPolicy` | 7 d |
-| 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 48 h |
-| 6 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
-| 7 | `vault.oracleGate → OracleGate` | 7 d |
+| 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 7 d |
+| 6 | `AmpsHook.setRouter(AmpsRouter)` | 7 d |
+| 7 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
+| 8 | `vault.oracleGate → OracleGate` | 7 d |
 
-Moves 1 and 2 are already made by `03_Core`, so on a fresh deployment this run makes 3–7 and skips the rest —
+**Call 6 is revision 6's, and its position in the order is deliberate.** Until it executes, `AmpsHook.router()` is
+the zero address and no hop in any pool can be priced pass-through: every swap, in both directions, pays
+`ampsFeeBps`. That is the safe direction to be wrong in — a rotation is merely dear before the wiring lands, never
+mispriced — so there is no window in which the exemption is granted to something that is not the router. Verify it
+afterwards with `cast call $HOOK "router()(address)"` against `deployments.json`'s `core.router`; the dApp's Rotate
+surface reads the same pointer and warns if the two disagree.
+
+Moves 1 and 2 are already made by `03_Core`, so on a fresh deployment this run makes 3–8 and skips the rest —
 the script is idempotent per pointer. `WIRE_REDEPLOY_GATE=false` is the flag for a deployment where `03_Core`
 already deployed the gate against `AmpsHook`; `true` deploys a fresh one and re-installs the calendar, which is
 the shape a *later* gate replacement takes. Call 7 goes last, after `checkBootstrap` has confirmed the pools

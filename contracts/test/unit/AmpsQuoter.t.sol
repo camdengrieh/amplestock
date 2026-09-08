@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
 import {IAmpsBonds} from "../../src/interfaces/IAmpsBonds.sol";
+import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsQuoter} from "../../src/interfaces/IAmpsQuoter.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
@@ -184,8 +185,12 @@ abstract contract QuoterFixture is V4TestBase, IUnlockCallback {
         hookStub.setTwapWindow(Constants.TWAP_WINDOW_DEFAULT);
         hookStub.initPool(usdgPool, PoolClass.ENTRY, 6, TICK_SPACING, BUY_FEE_BPS);
         hookStub.initPool(stockPool, PoolClass.SPOKE, 18, TICK_SPACING, BUY_FEE_BPS);
-        hookStub.setFlatFees(usdgPool, BUY_FEE_BPS, SELL_FEE_BPS);
-        hookStub.setFlatFees(stockPool, BUY_FEE_BPS, SELL_FEE_BPS);
+        // The fixture's pool hook is `StubAmpsHook`, which charges 30 bp to buy, 500 bp to sell and 30 bp on a
+        // credited sell. The read stub is told exactly that, so a wei-exact comparison against a real swap tests
+        // the quoter's arithmetic rather than a mock's opinion. The pass-through legs stand in for the two hops
+        // of an `AmpsRouter.rotate`, which is what `quoteRotation` prices.
+        hookStub.setFlatFees(usdgPool, BUY_FEE_BPS, SELL_FEE_BPS, BUY_FEE_BPS);
+        hookStub.setFlatFees(stockPool, BUY_FEE_BPS, SELL_FEE_BPS, BUY_FEE_BPS);
         hookStub.setObservation(usdgPool, _tickOf(usdgPool), _tickOf(usdgPool), Constants.TWAP_WINDOW_DEFAULT);
         hookStub.setObservation(stockPool, _tickOf(stockPool), _tickOf(stockPool), Constants.TWAP_WINDOW_DEFAULT);
         hookStub.setTicks(usdgPool, _tickOf(usdgPool), _tickOf(usdgPool));
@@ -414,10 +419,12 @@ contract AmpsQuoterTest is QuoterFixture {
         assertEq(quote.outerRailTicks, Constants.OUTER_RAIL_MIN_TICKS, "rail");
         assertEq(quote.dynCapBps, Constants.DYN_CAP_NORMAL_BPS, "cap");
 
-        assertEq(quote.buyFeeBps, BUY_FEE_BPS, "buy base");
-        assertEq(quote.sellFeeBps, SELL_FEE_BPS, "sell base");
-        assertEq(quote.buyFeePips, BUY_FEE_PIPS, "buy pips");
-        assertEq(quote.sellFeePips, SELL_FEE_PIPS, "sell pips");
+        assertEq(quote.buyFeeBps, BUY_FEE_BPS, "the pass-through base");
+        assertEq(quote.ampsFeeBps, SELL_FEE_BPS, "the AMPS fee");
+        assertEq(quote.buyFeePips, BUY_FEE_PIPS, "ordinary buy pips");
+        assertEq(quote.sellFeePips, SELL_FEE_PIPS, "ordinary sell pips");
+        assertEq(quote.passThroughBuyFeePips, BUY_FEE_PIPS, "rotation hop 1 pips");
+        assertEq(quote.passThroughSellFeePips, BUY_FEE_PIPS, "rotation hop 2 pips");
         assertEq(quote.dynBps, 0, "no dynamic part at rest");
         assertFalse(quote.refuseBuy, "buy allowed");
         assertFalse(quote.refuseSell, "sell allowed");
@@ -573,6 +580,52 @@ contract AmpsQuoterTest is QuoterFixture {
         assertEq(quote.fairTick, -1200, "the gate's fair tick");
         assertEq(uint8(quote.session), uint8(Session.OVERNIGHT), "the gate's session");
         assertEq(quote.degraded & 0x01, 0x01, "and bit 0 says where the rest went");
+    }
+
+    /// @notice The selector `AmpsQuoter` hand-encodes is `IAmpsHook.quoteFee`, and that is the five-argument form.
+    /// @dev The quoter reaches the hook through a bounded `staticcall`, so the selector is assembled rather than
+    ///      called through the interface, and a call to a selector nothing implements simply fails — which the
+    ///      quoter reports as a degraded bit rather than a revert. That is exactly the failure this pins: the
+    ///      selector must be the one `IAmpsHook` declares, and `IAmpsHook` must declare only this one shape.
+    function test_theHookSelectorIsTheOneTheInterfaceDeclares() public view {
+        assertEq(
+            IAmpsHook.quoteFee.selector,
+            bytes4(keccak256("quoteFee(bytes32,bool,bool,uint256,bool)")),
+            "the five-argument form"
+        );
+        // And it is live: a quote that could not reach the hook would raise bit 0, and this one does not.
+        IAmpsQuoter.PoolQuote memory quote = quoter.quotePool(usdgPool);
+        assertEq(quote.degraded & 0x01, 0, "the hook answered");
+        assertGt(quote.passThroughBuyFeePips, 0, "and the pass-through leg came back");
+    }
+
+    /// @notice The four fee legs are four separate questions: the pass-through pair follows `buyFeeBps` and the
+    ///         ordinary pair follows `ampsFeeBps`, and moving one does not move the other.
+    function test_quotePool_theFourFeeLegsAreIndependent() public {
+        hookStub.setFlatFees(usdgPool, 500, 500, 7);
+
+        IAmpsQuoter.PoolQuote memory quote = quoter.quotePool(usdgPool);
+        assertEq(quote.buyFeePips, SELL_FEE_PIPS, "an ordinary buy pays the AMPS fee");
+        assertEq(quote.sellFeePips, SELL_FEE_PIPS, "and so does an ordinary sell");
+        assertEq(quote.passThroughBuyFeePips, uint24(7) * Constants.PIPS_PER_BPS, "hop 1 pays the pass-through fee");
+        assertEq(quote.passThroughSellFeePips, uint24(7) * Constants.PIPS_PER_BPS, "and so does hop 2");
+        assertEq(quote.buyFeeBps, 7, "the reported pass-through base");
+        assertEq(quote.ampsFeeBps, 500, "and the reported AMPS fee");
+    }
+
+    /// @notice A hook that cannot answer one leg zeroes all four, so bit 0 never leaves a caller with three good
+    ///         numbers and one silent zero.
+    function test_quotePool_aHalfAnsweringHookZeroesEveryFeeLeg() public {
+        proxies[SOURCE_HOOK].setMode(QuoterFaultProxy.Mode.REVERT_EMPTY);
+
+        IAmpsQuoter.PoolQuote memory quote = quoter.quotePool(usdgPool);
+        assertEq(quote.degraded & 0x01, 0x01, "bit 0 raised");
+        assertEq(quote.buyFeePips, 0, "buy leg zeroed");
+        assertEq(quote.sellFeePips, 0, "sell leg zeroed");
+        assertEq(quote.passThroughBuyFeePips, 0, "pass-through buy leg zeroed");
+        assertEq(quote.passThroughSellFeePips, 0, "pass-through sell leg zeroed");
+        assertFalse(quote.refuseBuy, "and the quoter fails open");
+        assertFalse(quote.refuseSell, "on both directions");
     }
 
     /// @notice A ring that does not cover the window is bit 5 and a zero `P_mkt`, which is a young pool rather
@@ -917,6 +970,7 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
         hookStub.setFee(
             usdgPool,
             true,
+            false,
             QuoterHookStub.FeeAnswer({feePips: 75_000, baseBps: SELL_FEE_BPS, dynBps: 250, refuse: false})
         );
         (, uint24 feePips,,) = quoter.quoteSellWithCredit(usdgPool, 1000e18, 1000e18);
@@ -928,6 +982,7 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
         hookStub.setFee(
             usdgPool,
             true,
+            false,
             QuoterHookStub.FeeAnswer({feePips: 999_999, baseBps: SELL_FEE_BPS, dynBps: type(uint16).max, refuse: false})
         );
         (, uint24 feePips,,) = quoter.quoteSellWithCredit(usdgPool, 1000e18, 0);

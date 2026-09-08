@@ -116,6 +116,16 @@ interface IAmpsBonds {
     /// @param newPolicy The new policy.
     event PolicyChanged(address indexed previousPolicy, address indexed newPolicy);
 
+    /// @notice Emitted when a residual balance of a market's collateral is forwarded to the vault at the end of a
+    ///         bond, which is how the shell keeps `sweepClean` (I12) without asserting it.
+    /// @dev Collateral moves bonder -> PoolManager inside `depositBonded` and never rests in the bond shell, so
+    ///      any balance seen here arrived by donation. Forwarding it hands it to the vault's own sweep as a claim;
+    ///      the event is emitted only when the transfer actually reported success, so a token whose `transfer`
+    ///      reverts or answers `false` leaves its dust behind silently rather than closing the market.
+    /// @param collateral The token forwarded.
+    /// @param amount The amount forwarded, in the collateral's own decimals.
+    event CollateralForwarded(address indexed collateral, uint256 amount);
+
     /// @notice Emitted when the vault role is handed on during a migration.
     /// @param previousVault The old vault.
     /// @param newVault The new vault.
@@ -190,7 +200,10 @@ interface IAmpsBonds {
 
     /// @notice Prices a hypothetical bond without taking it.
     /// @dev Never reverts for a known market: a closed or gated market returns `ampsOut == 0` with a `reason`, so
-    ///      the dApp and `AmpsQuoter` can render the whole board in one multicall.
+    ///      the dApp and `AmpsQuoter` can render the whole board in one multicall. The reasons are short strings:
+    ///      `marketClosed`, `amountTooLarge`, `vaultDown`, `gateRefused`, `staleCheckpoint`, `noNav`,
+    ///      `unconfirmedNav`, `noPool`, `noTwap`, `noPrice`, `policyRefused`, `floorViolated`, `capacityFull`
+    ///      and `zeroAmount`.
     /// @param marketId The market.
     /// @param amountIn The deposit, in the collateral's raw units.
     /// @return ampsOut The AMPS wei the bonder would receive, after the capacity clamp.
@@ -359,6 +372,11 @@ interface IAmpsBonds {
     ///      the collateral straight from `msg.sender` into the PoolManager → `AmpsVault.mintVesting` mints
     ///      `ampsOut` to this contract → position written → event.
     ///      The bonder approves the **vault**, not this contract.
+    /// @dev Reverts with `UnconfirmedNav` when the vault reports the NAV in its last checkpoint as built from an
+    ///      answer that was stale or held behind an unconfirmed jump. The haircut cannot cover that case: it
+    ///      widens the *numerator* of the accretion floor on the collateral being bonded, while a held-back
+    ///      answer on any vault asset understates the *denominator* every market divides by. `quote` reports it
+    ///      as `reason == "unconfirmedNav"`.
     /// @param marketId The market to buy from.
     /// @param amountIn The deposit, in the collateral's raw units.
     /// @param minAmpsOut The caller's slippage bound.

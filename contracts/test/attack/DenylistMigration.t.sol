@@ -3,7 +3,7 @@ pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
-import {NotGuardian} from "../../src/types/Errors.sol";
+import {NotGuardian, NotVault} from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {Phase3Fixture} from "../integration/Phase3Fixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -84,13 +84,44 @@ contract DenylistMigrationTest is Phase3Fixture {
         }
         assertGt(movedAssets, 0, "the standby holds the estate as ERC-6909 claims");
 
-        // The four `onlyVault` roles moved in the same transaction.
+        // Every `onlyVault` role moved in the same transaction — all five of them, not the three the handover
+        // used to cover. `PoolRegistry` matters as much as the token roles: it is the contract that asks a vault to
+        // open a pool, so a standby the registry does not recognise inherits the estate and can never grow it.
         assertEq(amps.vault(), STANDBY, "AMPS minting");
         assertEq(bonds.vault(), STANDBY, "AmpsBonds");
-        assertEq(staking.vault(), STANDBY, "AmpsStaking");
         assertEq(pot.vault(), STANDBY, "BountyPot");
+        assertEq(registry.vault(), STANDBY, "PoolRegistry");
 
         assertGt(navBefore, 0, "and the migration recorded the NAV it moved");
+    }
+
+    /// @notice The registry handover is the vault's alone: the timelock cannot perform it, and neither can the
+    ///         guardian. It exists for `emergencyMigrate` and for nothing else.
+    function test_onlyTheVaultMayHandTheRegistryOn() public {
+        vm.prank(TIMELOCK);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, TIMELOCK));
+        registry.setVault(STANDBY);
+
+        vm.prank(GUARDIAN);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, GUARDIAN));
+        registry.setVault(STANDBY);
+
+        assertEq(registry.vault(), address(vault), "the registry still names the live vault");
+    }
+
+    /// @notice **An unmovable wei is not a veto.** The token the guardian is fleeing is exactly the token that
+    ///         refuses to move, so an evacuation that asserted a clean sweep — or that used `safeTransfer` for the
+    ///         idle leg — could be blocked forever by donating one wei and then denylisting the vault.
+    function test_anIdleWeiOfTheBlockedTokenDoesNotVetoTheMigration() public {
+        stocks[0].mint(address(vault), 1);
+        _denylistTheVault(0);
+
+        vm.prank(GUARDIAN);
+        vault.emergencyMigrate(STANDBY);
+
+        assertEq(stocks[0].balanceOf(address(vault)), 1, "the issuer's wei stayed frozen where the issuer put it");
+        assertEq(amps.vault(), STANDBY, "and the evacuation completed regardless");
+        assertEq(registry.vault(), STANDBY, "registry included");
     }
 
     /// @notice The predicate also fires on the softer signal: two Stock Tokens whose self-transfer probe fails,
@@ -117,6 +148,32 @@ contract DenylistMigrationTest is Phase3Fixture {
             paid += amounts[i];
         }
         assertGt(paid, 0, "the floor paid out with the vault denylisted");
+    }
+
+    /// @notice The harder version of the same claim: the issuer **pauses** the token outright, so the redeemer's
+    ///         `take` reverts too. The floor still completes, pays every other asset as ERC-20, and hands the
+    ///         paused one over as an ERC-6909 claim the token cannot interfere with.
+    function test_redemptionKeepsWorkingWithAConstituentPaused() public {
+        stocks[0].pause();
+        giveShares(ALICE, 100e18);
+
+        vm.prank(ALICE);
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(100e18, ALICE);
+
+        uint256 healthyPaid;
+        for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == address(stocks[0])) {
+                assertEq(
+                    poolManager.balanceOf(ALICE, uint256(uint160(tokens[i]))),
+                    amounts[i],
+                    "the paused constituent was handed over as a claim"
+                );
+                continue;
+            }
+            assertEq(IERC20(tokens[i]).balanceOf(ALICE), amounts[i], "every healthy asset was paid in full");
+            healthyPaid += amounts[i];
+        }
+        assertGt(healthyPaid, 0, "one paused constituent cost only itself");
     }
 
     /// @dev Blocks the vault on spoke `i`'s token, which is what the issuer does in the incident this exists for.

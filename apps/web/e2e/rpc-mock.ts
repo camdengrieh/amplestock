@@ -20,9 +20,6 @@ import {
   ampsAbi,
   ampsBondsAbi,
   ampsBondsLensAbi,
-  ampsQuoterAbi,
-  ampsStakingAbi,
-  ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
@@ -40,9 +37,21 @@ import {
   type Hex,
 } from 'viem'
 
+// The mock has to encode the exact struct the app will decode, so it reads the *same* ABIs the app
+// does — `@amplestocks/abis`, generated from the revision-6 Foundry artefacts. A `PoolQuote`
+// encoded from a different tuple would decode into a different one, silently.
+import {
+  ampsHookAbi,
+  ampsQuoterAbi,
+  ampsRouterAbi,
+  ampsVaultAbi,
+} from '@amplestocks/abis/generated'
+
+import {ccaAbi, chainlinkAggregatorAbi} from '../lib/abi/cca'
 import {E2E, MULTICALL3} from './addresses'
 
 const WAD = 10n ** 18n
+const Q96 = 1n << 96n
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const POOL_WETH = `0x${'11'.repeat(32)}` as Hex
 const POOL_USDG = `0x${'22'.repeat(32)}` as Hex
@@ -54,6 +63,8 @@ const WETH9 = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'
 const NVDA = '0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC'
 const AAPL = '0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9'
+/** The USDG/USD aggregator `@amplestocks/config` names for 4663. */
+const USDG_USD_FEED = '0x61B7e5650328764B076A108EFF5fa7282a1B9aD2'
 
 const ABIS: Record<string, Abi> = {
   [E2E.amps.toLowerCase()]: ampsAbi as unknown as Abi,
@@ -61,7 +72,14 @@ const ABIS: Record<string, Abi> = {
   [E2E.quoter.toLowerCase()]: ampsQuoterAbi as unknown as Abi,
   [E2E.bonds.toLowerCase()]: ampsBondsAbi as unknown as Abi,
   [E2E.bondsLens.toLowerCase()]: ampsBondsLensAbi as unknown as Abi,
-  [E2E.staking.toLowerCase()]: ampsStakingAbi as unknown as Abi,
+  [E2E.router.toLowerCase()]: ampsRouterAbi as unknown as Abi,
+  [E2E.hook.toLowerCase()]: ampsHookAbi as unknown as Abi,
+  [E2E.auctionUsdg.toLowerCase()]: ccaAbi as unknown as Abi,
+  [E2E.auctionEth.toLowerCase()]: ccaAbi as unknown as Abi,
+  // The auction currency is an ordinary ERC-20, and the surface asks it for its own symbol and
+  // decimals rather than assuming either. `ampsAbi` is an ERC-20 superset, which is enough here.
+  [USDG.toLowerCase()]: ampsAbi as unknown as Abi,
+  [USDG_USD_FEED.toLowerCase()]: chainlinkAggregatorAbi as unknown as Abi,
   [E2E.registry.toLowerCase()]: poolRegistryAbi as unknown as Abi,
   [E2E.registryLens.toLowerCase()]: poolRegistryLensAbi as unknown as Abi,
   [E2E.oracleGate.toLowerCase()]: oracleGateAbi as unknown as Abi,
@@ -82,10 +100,14 @@ function poolQuote(overrides: Record<string, unknown> = {}) {
     fairTick: 100,
     innerBandTicks: 200,
     outerRailTicks: 2_000,
+    // Revision 6's four legs: an ordinary buy and an ordinary sell both pay `ampsFeeBps`; both
+    // hops of a protocol-router rotation pay the pool's pass-through base.
     buyFeeBps: 30,
-    sellFeeBps: 500,
-    buyFeePips: 3_000,
+    ampsFeeBps: 500,
+    buyFeePips: 50_000,
     sellFeePips: 50_000,
+    passThroughBuyFeePips: 3_000,
+    passThroughSellFeePips: 3_000,
     dynBps: 0,
     dynCapBps: 300,
     refuseSell: false,
@@ -114,7 +136,8 @@ const QUOTES = [
     counter: NVDA,
     poolClass: 2,
     buyFeeBps: 5,
-    buyFeePips: 500,
+    passThroughBuyFeePips: 500,
+    passThroughSellFeePips: 500,
     bondQX18: 8n * WAD,
     bondDiscountBps: 1_250,
     bondCapacityLeft: 50n * WAD,
@@ -125,7 +148,8 @@ const QUOTES = [
     counter: AAPL,
     poolClass: 2,
     buyFeeBps: 5,
-    buyFeePips: 500,
+    passThroughBuyFeePips: 500,
+    passThroughSellFeePips: 500,
     // One degraded pool, so the surfaces have to render an unavailable field somewhere.
     degraded: 0b100000,
     pMktX18: 0n,
@@ -154,6 +178,7 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
   [E2E.quoter.toLowerCase()]: {
     quoteAll: [QUOTES],
     quotePool: [QUOTES[0]],
+    // Both hops at the pools' pass-through base (5 bp = 500 pips), and the credit hop 1 created.
     quoteRotation: [8n * WAD, 500, 500, 10n * WAD],
     bondQuote: [8n * WAD, 1_250, 50n * WAD, true, 0],
     quoteExactIn: [95n * WAD, 50_000, false, 0],
@@ -164,12 +189,28 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     previewNavPerShareX18: [WAD],
     totalAssetsUsd18: [5_000n * WAD],
     inventoryAmps: [4_750n * WAD],
-    redeemFeeBps: [100],
-    burnBps: [1_000],
-    stakerBps: [3_000],
+    redeemFeeBps: [250],
+    REDEEM_FEE_BPS_MAX: [500],
+    CREATOR_FEE_BPS: [100],
+    CREATOR_DECAY_SECONDS: [2_592_000n],
     genesisTimestamp: [1_800_000_000],
     liveCells: [14],
     initialized: [true],
+    rolloutBpsPerDay: [200],
+    ROLLOUT_BPS_PER_DAY_MAX: [1_000],
+    entryFloorBps: [3_000],
+    refUpRateBps: [1_000],
+    refDivergenceBps: [500],
+    twapWindow: [1_800],
+    spokeSeedBps: [100],
+    ladderDoublings: [10],
+    ladderTiltX18: [1_250_000_000_000_000_000n],
+    assetCount: [3n],
+    creator: ['0x00000000000000000000000000000000000c0001'],
+    timelock: [E2E.timelock],
+    guardian: ['0x00000000000000000000000000000000000c0002'],
+    deployThresholdUsd18: [1_000n * WAD],
+    ladderLength: [12n],
     previewRedeem: [[WETH9, USDG, NVDA], [990_000_000_000_000_000n, 1_980_000n, 2_970_000_000_000_000_000n], 2n * WAD],
     creatorBpsAt: [50],
     positionValuer: [E2E.valuer],
@@ -179,24 +220,106 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     amountsOf: [1_662n * WAD, 2n * WAD],
     referenceSqrtPriceX96: [79_228_162_514_264_337_593_543_950_336n],
   },
+  [USDG.toLowerCase()]: {
+    symbol: ['USDG'],
+    decimals: [6],
+    totalSupply: [1_000_000n * 10n ** 6n],
+  },
+  [USDG_USD_FEED.toLowerCase()]: {
+    // A stablecoin is not a dollar: the auction's USD column is this answer, not an assumption.
+    latestRoundData: [1n, 100_010_000n, 1_800_000_000n, 1_800_000_000n, 1n],
+    decimals: [8],
+  },
   [E2E.amps.toLowerCase()]: {
     totalSupply: [5_000n * WAD],
     balanceOf: [100n * WAD],
     decimals: [18],
     symbol: ['AMPS'],
   },
-  [E2E.staking.toLowerCase()]: {
-    totalAssets: [1_000n * WAD],
-    totalSupply: [1_000n * WAD],
-    pendingRewards: [12n * WAD],
-    releasedRewards: [3n * WAD],
-    streamEnd: [1_800_086_400],
-    streamSecondsRemaining: [43_200],
-    rewardStreamSeconds: [86_400],
-    totalNotified: [40n * WAD],
-    balanceOf: [25n * WAD],
+  [E2E.hook.toLowerCase()]: {
+    // The AMPS fee, read straight from the hook: the base on both directions of every pool.
+    ampsFeeBps: [500],
+    AMPS_FEE_BPS_MIN: [100],
+    AMPS_FEE_BPS_MAX: [600],
+    TOTAL_FEE_BPS_MAX: [2_600],
+    // The pass-through base — what a rotation hop pays, and nothing else.
+    buyFeeBps: [30],
+    // The router the hook honours. It matches the configured address, so Rotate shows no mismatch;
+    // the mismatch path is covered by the component test instead, where it can be forced.
+    router: [E2E.router],
+  },
+  [E2E.auctionUsdg.toLowerCase()]: {
+    currency: [USDG],
+    token: [E2E.amps],
+    totalSupply: [3_325n * WAD],
+    startBlock: [12_000n],
+    endBlock: [20_000n],
+    claimBlock: [21_000n],
+    // 1 USDG per AMPS on the Q96 grid, at the currency's own 6 decimals.
+    clearingPrice: [(Q96 * 10n ** 6n) / WAD],
+    floorPrice: [(Q96 * 10n ** 5n) / WAD],
+    tickSpacing: [(Q96 * 10n ** 4n) / WAD],
+    nextActiveTickPrice: [(Q96 * 11n * 10n ** 5n) / WAD],
+    MAX_BID_PRICE: [(Q96 * 10n ** 8n) / WAD],
+    currencyRaised: [2_500_000_000n],
+    totalCleared: [2_500n * WAD],
+    remainingSupply: [825n * WAD],
+    isGraduated: [true],
+    lastCheckpointedBlock: [12_340n],
+    step: [{mps: 1_250, startBlock: 12_000n, endBlock: 20_000n}],
+    latestCheckpoint: [
+      {
+        clearingPrice: (Q96 * 10n ** 6n) / WAD,
+        currencyRaisedAtClearingPriceQ96X7: 0n,
+        cumulativeMpsPerPrice: 0n,
+        cumulativeMps: 7_500_000,
+        prev: 12_000n,
+        next: 0n,
+      },
+    ],
+    fundsRecipient: [E2E.vault],
+    tokensRecipient: [E2E.vault],
+    validationHook: [ZERO_ADDRESS],
+    nextBidId: [3n],
+    requiredDemandQ96: [500n * Q96],
+    requiredDemandQ96AtNextActiveTick: [500n * Q96],
+  },
+  [E2E.auctionEth.toLowerCase()]: {
+    currency: [ZERO_ADDRESS],
+    token: [E2E.amps],
+    totalSupply: [1_662n * WAD],
+    startBlock: [12_000n],
+    endBlock: [20_000n],
+    claimBlock: [21_000n],
+    clearingPrice: [Q96 / 4_000n],
+    floorPrice: [Q96 / 40_000n],
+    tickSpacing: [Q96 / 400_000n],
+    nextActiveTickPrice: [Q96 / 3_900n],
+    MAX_BID_PRICE: [Q96],
+    currencyRaised: [WAD / 2n],
+    totalCleared: [1_000n * WAD],
+    remainingSupply: [662n * WAD],
+    isGraduated: [false],
+    lastCheckpointedBlock: [12_340n],
+    step: [{mps: 1_250, startBlock: 12_000n, endBlock: 20_000n}],
+    fundsRecipient: [E2E.vault],
+    tokensRecipient: [E2E.vault],
+    validationHook: [ZERO_ADDRESS],
+    nextBidId: [1n],
   },
   [E2E.bonds.toLowerCase()]: {
+    vestSeconds: [43_200],
+    epochSeconds: [21_600],
+    minAccretionBps: [50],
+    dailyCapBps: [200],
+    VEST_SECONDS_MIN: [3_600],
+    VEST_SECONDS_MAX: [604_800],
+    DISCOUNT_BPS_MIN: [500],
+    DISCOUNT_BPS_MAX: [2_500],
+    MIN_ACCRETION_BPS_MAX: [500],
+    CAP_BPS_PER_EPOCH_MAX: [200],
+    DAILY_CAP_BPS_MAX: [500],
+    hSessionBps: [0],
     dailyIssuance: [40n * WAD, 100n * WAD],
     quote: [8n * WAD, 8n * WAD, 1_250, false, 50n * WAD, `0x${'00'.repeat(32)}`],
     marketCount: [2],
@@ -238,6 +361,32 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     indexFloorBps: [166],
     hubPoolId: [POOL_USDG],
     wethPoolId: [POOL_WETH],
+    BUY_FEE_BPS_ENTRY_MIN: [5],
+    BUY_FEE_BPS_ENTRY_MAX: [100],
+    BUY_FEE_BPS_SPOKE_MIN: [1],
+    BUY_FEE_BPS_SPOKE_MAX: [50],
+    MAX_CONSTITUENTS: [64],
+    // The realised weight, next to the registry's target. They differ on purpose: the rollout
+    // moves inventory on a daily cap, so the two are never the same figure.
+    currentWeightBps: [4_200],
+    poolIdOf: [POOL_NVDA],
+    constituent: [
+      {
+        token: NVDA,
+        status: 1,
+        decimals: 18,
+        targetWeightBps: 5_000,
+        rolloutWeightBps: 2_000,
+        hSessionOverrideBps: 0,
+        hSessionOverrideSet: false,
+        caFreezeOverride: false,
+        marketId: 1,
+        feed: ZERO_ADDRESS,
+        freezeUntil: 0,
+        addedAt: 1_800_000_000,
+        retiredAt: 0,
+      },
+    ],
     // The responder is argument-blind, so every pool answers with the same key. That is enough for
     // a smoke test, which asserts that the surface *has* a key rather than which one.
     poolKey: [
@@ -253,6 +402,7 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
   [E2E.registryLens.toLowerCase()]: {
     activeConstituents: [[1, 2]],
     indexWeights: [[1, 2], [5_000, 5_000], 10_000n],
+    weightBoundsFor: [166, 5_000],
   },
 }
 

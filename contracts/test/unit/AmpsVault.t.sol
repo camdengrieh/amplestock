@@ -11,6 +11,7 @@ import {
     NotBonds,
     NotCreator,
     NotGuardian,
+    NotInitialized,
     NotPoolManager,
     NotRegistry,
     NotTimelock,
@@ -127,34 +128,37 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice `genesis` freezes the wiring: the four set-once pointers refuse afterwards, the upgradeable ones do not.
+    /// @dev Every replacement here is a *contract* address, and has to be: `setPolicyPointer` refuses a codeless
+    ///      pointer before it looks at the slot at all. That guard is what stops one mistyped `oracleGate` write
+    ///      from bricking the only call that could undo it — see `unit/VaultGateResilience.t.sol`.
     function test_genesis_freezesWiring() public {
         runGenesis();
+        address replacement = address(new MockStockToken("Replacement", "REPL"));
 
         vm.startPrank(TIMELOCK);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("registry"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("registry"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("bonds"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("bonds"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("staking"), address(0xBEEF));
-        vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("bountyPot"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("bountyPot"), replacement);
 
         // Pointer-upgradeable slots stay open; `marketReference` is re-pointed once, to the hook, in Phase 3.
         vault.setPolicyPointer(bytes32("oracleGate"), address(gate));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));
         vault.setPolicyPointer(bytes32("positionValuer"), address(valuer));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));
-        vault.setPolicyPointer(bytes32("ladderPolicy"), address(0x1ADDE5));
-        vault.setPolicyPointer(bytes32("rolloutPolicy"), address(0x2011));
+        vault.setPolicyPointer(bytes32("ladderPolicy"), replacement);
+        vault.setPolicyPointer(bytes32("rolloutPolicy"), replacement);
         vm.stopPrank();
     }
 
     /// @notice An unknown pointer name is rejected rather than silently ignored.
+    /// @dev With a contract address, so that the codeless-pointer guard does not answer first.
     function test_setPolicyPointer_rejectsUnknownSlot() public {
         vm.prank(TIMELOCK);
         vm.expectRevert(abi.encodeWithSelector(IAmpsVault.UnknownPointerSlot.selector, bytes32("nope")));
-        vault.setPolicyPointer(bytes32("nope"), address(0xBEEF));
+        vault.setPolicyPointer(bytes32("nope"), address(feeds));
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -474,6 +478,13 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice Redeeming everything drains the vault to dust and leaves NAV/share finite (I22).
+    /// @notice Redeeming the entire supply leaves the vault empty and every read still finite: I22 is about the
+    ///         denominator never being zero, and `VIRTUAL_SHARES` still guarantees that.
+    /// @dev What an empty vault *reports* changed: NAV/share is now zero rather than `1e18 / VIRTUAL_SHARES`.
+    ///      $0.001 is an artefact of the virtual-share guard, not a price — there are no shares for `A` to be per
+    ///      — and `PoolRegistry` reads `pRefX18() == 0` as "no checkpoint yet, anchor at $1.00", which is the
+    ///      behaviour a supply-less vault should have. The property under test is that nothing reverts or divides
+    ///      by zero, and it still holds.
     function test_redeem_fullSupplyLeavesNavFinite() public {
         runGenesis();
         giveShares(ALICE, Constants.POL_SHARES);
@@ -484,7 +495,9 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.redeemProRata(Constants.S0, ALICE);
 
         assertEq(amps.totalSupply(), 0, "every share is gone");
-        assertGt(vault.previewNavPerShareX18(), 0, "NAV/share is still finite and non-zero");
+        assertEq(vault.previewNavPerShareX18(), 0, "no shares, no NAV per share, and no division by zero");
+        (address[] memory tokens, uint256[] memory amounts,) = vault.previewRedeem(1e18);
+        assertEq(tokens.length, amounts.length, "and the preview still answers rather than reverting");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -638,10 +651,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRedeemFeeBps(10);
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
-        vault.setBurnBps(10);
-        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
-        vault.setStakerBps(10);
-        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRefUpRateBps(200);
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRefDivergenceBps(200);
@@ -665,8 +674,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
     /// @notice The launch values are what the constructor writes.
     function test_launchParameters() public view {
         assertEq(vault.redeemFeeBps(), Constants.REDEEM_FEE_BPS_DEFAULT, "redeemFeeBps");
-        assertEq(vault.burnBps(), Constants.BURN_BPS_DEFAULT, "burnBps");
-        assertEq(vault.stakerBps(), Constants.STAKER_BPS_DEFAULT, "stakerBps");
         assertEq(vault.refUpRateBps(), Constants.REF_UP_RATE_BPS_DEFAULT, "refUpRateBps");
         assertEq(vault.refDivergenceBps(), Constants.REF_DIVERGENCE_BPS_DEFAULT, "refDivergenceBps");
         assertEq(vault.twapWindow(), Constants.TWAP_WINDOW_DEFAULT, "twapWindow");
@@ -697,24 +704,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
             )
         );
         vault.setRedeemFeeBps(Constants.REDEEM_FEE_BPS_MAX + 1);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OutOfBand.selector, bytes32("burnBps"), uint256(Constants.BURN_BPS_MAX) + 1, 0, Constants.BURN_BPS_MAX
-            )
-        );
-        vault.setBurnBps(Constants.BURN_BPS_MAX + 1);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OutOfBand.selector,
-                bytes32("stakerBps"),
-                uint256(Constants.STAKER_BPS_MAX) + 1,
-                0,
-                Constants.STAKER_BPS_MAX
-            )
-        );
-        vault.setStakerBps(Constants.STAKER_BPS_MAX + 1);
 
         vault.setRefUpRateBps(Constants.REF_UP_RATE_BPS_MIN);
         vault.setRefUpRateBps(Constants.REF_UP_RATE_BPS_MAX);
@@ -887,8 +876,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.S0(), Constants.S0, "S0");
         assertEq(vault.VIRTUAL_SHARES(), Constants.VIRTUAL_SHARES, "VIRTUAL_SHARES");
         assertEq(vault.REDEEM_FEE_BPS_MAX(), Constants.REDEEM_FEE_BPS_MAX, "REDEEM_FEE_BPS_MAX");
-        assertEq(vault.BURN_BPS_MAX(), Constants.BURN_BPS_MAX, "BURN_BPS_MAX");
-        assertEq(vault.STAKER_BPS_MAX(), Constants.STAKER_BPS_MAX, "STAKER_BPS_MAX");
         assertEq(vault.REF_UP_RATE_BPS_MIN(), Constants.REF_UP_RATE_BPS_MIN, "REF_UP_RATE_BPS_MIN");
         assertEq(vault.REF_UP_RATE_BPS_MAX(), Constants.REF_UP_RATE_BPS_MAX, "REF_UP_RATE_BPS_MAX");
         assertEq(vault.REF_DIVERGENCE_BPS_MIN(), Constants.REF_DIVERGENCE_BPS_MIN, "REF_DIVERGENCE_BPS_MIN");
@@ -958,6 +945,30 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.emergencyMigrate(address(0));
     }
 
+    /// @notice **A codeless standby vault is refused** (audit fix wave 2, finding 6).
+    ///
+    /// @dev The standby is the address `emergencyMigrate` hands the whole estate and all six `onlyVault` roles to,
+    ///      in a guardian call with no timelock behind it. Every one of those roles is `onlyVault`, so an EOA or a
+    ///      mistyped address there is not a mistake anybody can undo — nobody can hand the roles back. This is the
+    ///      same guard `setPolicyPointer` already applies to every pointer the vault calls, and zero is simply the
+    ///      codeless case rather than a second check.
+    function test_setStandbyVaultRefusesACodelessTarget() public {
+        runGenesis();
+        address eoa = address(0xE0A);
+        assertEq(eoa.code.length, 0, "an ordinary address has no code");
+
+        vm.startPrank(TIMELOCK);
+        vm.expectRevert(ZeroAddress.selector);
+        vault.setStandbyVault(eoa);
+        vm.expectRevert(ZeroAddress.selector);
+        vault.setStandbyVault(address(0));
+
+        // A contract is accepted, and the fixture's own standby is one.
+        vault.setStandbyVault(STANDBY);
+        vm.stopPrank();
+        assertEq(vault.standbyVault(), STANDBY, "a target with code is registered");
+    }
+
     /// @notice `initializePool` is registry-only and registers the pool's counter asset when it succeeds.
     function test_initializePool_onlyRegistryAndRegistersTheCounter() public {
         runGenesis();
@@ -1008,12 +1019,21 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @notice With no gate wired the vault is healthy by default, which is how it is reachable before the gate
-    ///         pointer is set at deployment.
+    ///         pointer is set at deployment. The two permissionless upkeep selectors still refuse, but for the
+    ///         *other* reason — there is nothing to keep alive before {genesis} — and not because of the gate.
+    /// @dev A bare vault also reports a NAV/share of **zero** rather than `1e18 / VIRTUAL_SHARES`: with no shares
+    ///      outstanding there is nothing for `A` to be per, and $0.001 is an artefact of the virtual-share guard
+    ///      that `PoolRegistry` would take for a real reference price.
     function test_unwiredGateIsTreatedAsHealthy() public {
         AmpsVault bare = new AmpsVault(address(amps), address(poolManager), TIMELOCK, GUARDIAN);
+
+        vm.expectRevert(NotInitialized.selector);
         bare.touch();
+        vm.expectRevert(NotInitialized.selector);
         bare.checkpoint();
-        assertEq(bare.previewNavPerShareX18(), (0 + 1) * 1e18 / Constants.VIRTUAL_SHARES, "empty but finite");
+
+        assertEq(bare.previewNavPerShareX18(), 0, "no shares, no NAV per share");
+        assertEq(bare.pRefX18(), 0, "and no reference price for the registry to anchor at");
     }
 
     /// @notice A collateral the registry has never heard of still gets valued, through the ERC-20 `decimals()`
@@ -1112,7 +1132,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
 
         assertEq(amps.vault(), STANDBY, "Amps role handed on");
         assertEq(bondsRole.vault(), STANDBY, "AmpsBonds role handed on");
-        assertEq(stakingRole.vault(), STANDBY, "AmpsStaking role handed on");
         assertEq(potRole.vault(), STANDBY, "BountyPot role handed on");
     }
 
@@ -1157,7 +1176,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @dev The `navPerShareBefore` and `navPerShareAfter` of the recorded `Migrated` event.
-    function _migratedNav() private returns (uint256 navBefore, uint256 navAfter) {
+    function _migratedNav() private view returns (uint256 navBefore, uint256 navAfter) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].topics.length != 2 || logs[i].topics[0] != IAmpsVault.Migrated.selector) continue;

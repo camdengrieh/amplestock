@@ -3,7 +3,7 @@ import {describe, expect, it} from 'vitest'
 import {
   budgetLeftUsd18,
   clampBaseFee,
-  compoundWorkValueUsd18,
+  compoundWork,
   meetsChost,
   quoteBounty,
   splitAmpsFees,
@@ -133,53 +133,62 @@ describe('the measured reporting the vault does now', () => {
 })
 
 describe('splitAmpsFees mirrors section 3.6 step 5', () => {
-  it('creator, then stakers, then burn, then re-ladder', () => {
-    // 1,000 AMPS of sell fees at genesis: creator 100/500 = 20%, stakers 30% of the rest, burn 10% of that.
-    const split = splitAmpsFees(1_000n * WAD, 100, 500, 3_000, 1_000)
+  it('pays the creator its share of the volume and burns every wei of the rest', () => {
+    // 1,000 AMPS of fees at genesis. The hook charged 500 bp of volume to collect them and the
+    // creator's schedule is 100 bp of that same volume, so the slice is 100/500 = one fifth.
+    const split = splitAmpsFees(1_000n * WAD, 100, 500)
     expect(split.creatorCut).toBe(200n * WAD)
-    expect(split.stakerCut).toBe(240n * WAD)
-    expect(split.burnCut).toBe(56n * WAD)
-    expect(split.relaid).toBe(504n * WAD)
-    expect(split.creatorCut + split.stakerCut + split.burnCut + split.relaid).toBe(1_000n * WAD)
+    expect(split.burnCut).toBe(800n * WAD)
+    // Nothing is streamed and nothing is re-laddered: the two add to the whole.
+    expect(split.creatorCut + split.burnCut).toBe(1_000n * WAD)
   })
 
-  it('pays the creator nothing once the 30-day schedule has expired', () => {
-    const split = splitAmpsFees(1_000n * WAD, 0, 500, 3_000, 1_000)
+  it('burns the whole collection once the 30-day schedule has expired', () => {
+    const split = splitAmpsFees(1_000n * WAD, 0, 500)
     expect(split.creatorCut).toBe(0n)
-    expect(split.stakerCut).toBe(300n * WAD)
+    expect(split.burnCut).toBe(1_000n * WAD)
   })
 
-  it('caps the creator slice at the sell fee itself', () => {
-    // creatorBps 100 against a 100 bp sell fee is the whole AMPS-side fee, and never more.
-    const split = splitAmpsFees(1_000n * WAD, 100, 100, 3_000, 1_000)
+  it('follows a governed fee change, so the payout stays the same share of volume', () => {
+    // Cut the fee to 300 bp and the same 100 bp schedule is a third of a smaller collection: 100 bp
+    // of volume either way, which is the identity the divisor exists to preserve.
+    const split = splitAmpsFees(600n * WAD, 100, 300)
+    expect(split.creatorCut).toBe(200n * WAD)
+    expect(split.burnCut).toBe(400n * WAD)
+  })
+
+  it('caps the creator slice at the whole of the AMPS-side fees', () => {
+    // `creatorBps` 100 against a 100 bp fee is everything the AMPS side collected, and never more.
+    const split = splitAmpsFees(1_000n * WAD, 100, 100)
     expect(split.creatorCut).toBe(1_000n * WAD)
-    expect(split.relaid).toBe(0n)
+    expect(split.burnCut).toBe(0n)
   })
 
   it('is exact on zero fees', () => {
-    expect(splitAmpsFees(0n, 100, 500, 3_000, 1_000)).toEqual({
-      creatorCut: 0n,
-      stakerCut: 0n,
-      burnCut: 0n,
-      relaid: 0n,
-    })
+    expect(splitAmpsFees(0n, 100, 500)).toEqual({creatorCut: 0n, burnCut: 0n})
   })
 })
 
 describe('compound work value', () => {
-  it('counts the fees plus the bought-back inventory, at the reference price', () => {
-    const ampsFees = 100n * WAD
-    const split = splitAmpsFees(ampsFees, 100, 500, 3_000, 1_000)
-    const boughtBack = 40n * WAD
-    const value = compoundWorkValueUsd18(ampsFees, split.burnCut + boughtBack, split, 2n * WAD)
-    expect(value).toBe(280n * WAD) // (100 + 40) AMPS x $2
+  it('values what `compound` burned, at the reference price', () => {
+    // 100 AMPS of fees: 20 to the creator, 80 burned, plus 40 bought back and burned on top.
+    const work = compoundWork(100n * WAD, 120n * WAD, 100, 500, 2n * WAD)
+    expect(work.creatorCut).toBe(20n * WAD)
+    expect(work.feeBurn).toBe(80n * WAD)
+    expect(work.boughtBack).toBe(40n * WAD)
+    // (80 + 40) AMPS x $2. The creator's 20 left the protocol and is not work the keeper created;
+    // counting `ampsFees + boughtBack` instead would bill it as if it had.
+    expect(work.workValueUsd18).toBe(240n * WAD)
   })
 
-  it('never goes negative when `burned` is only the fee slice', () => {
-    const ampsFees = 100n * WAD
-    const split = splitAmpsFees(ampsFees, 100, 500, 3_000, 1_000)
-    expect(compoundWorkValueUsd18(ampsFees, split.burnCut, split, WAD)).toBe(100n * WAD)
-    expect(compoundWorkValueUsd18(0n, 0n, splitAmpsFees(0n, 100, 500, 3_000, 1_000), WAD)).toBe(0n)
+  it('reports no buyback when `burned` is only the fee slice, and never goes negative', () => {
+    const work = compoundWork(100n * WAD, 80n * WAD, 100, 500, WAD)
+    expect(work.boughtBack).toBe(0n)
+    expect(work.workValueUsd18).toBe(80n * WAD)
+
+    // A `creatorBps` read one block off the execution can leave `burned` under the modelled burn.
+    expect(compoundWork(100n * WAD, 70n * WAD, 100, 500, WAD).boughtBack).toBe(0n)
+    expect(compoundWork(0n, 0n, 100, 500, WAD).workValueUsd18).toBe(0n)
   })
 })
 

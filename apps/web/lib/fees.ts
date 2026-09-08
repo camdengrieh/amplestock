@@ -26,34 +26,34 @@ export function mulDivRoundingUp(a: bigint, b: bigint, d: bigint): bigint {
  *
  * ```
  * c    = min(credit, amountIn)
- * base = buyFeeBps + ceilDiv((sellFeeBps - buyFeeBps) * (amountIn - c), amountIn)
+ * base = buyFeeBps + ceilDiv((ampsFeeBps - buyFeeBps) * (amountIn - c), amountIn)
  * ```
  *
  * Rounded **up**, so a credit never rounds a fee down in the swapper's favour. Three consequences
  * the UI states plainly rather than burying:
  *
  * - a fully credited sell pays the *buy* fee of the pool it sells into, not zero;
- * - an uncredited sell pays `sellFeeBps`;
- * - an **exact-output** sell consumes no credit at all and pays `sellFeeBps` in full, which is why
+ * - an uncredited sell pays `ampsFeeBps`;
+ * - an **exact-output** sell consumes no credit at all and pays `ampsFeeBps` in full, which is why
  *   the router always builds hop 2 as `SWAP_EXACT_IN`.
  *
  * The credit lives in EIP-1153 transient storage: it exists only inside the transaction that
  * created it and can never be carried across transactions.
  */
-export function blendedSellFeeBps(params: {
-  sellFeeBps: number
+export function blendedAmpsFeeBps(params: {
+  ampsFeeBps: number
   buyFeeBps: number
   amountIn: bigint
   credit: bigint
 }): number {
-  const {sellFeeBps, buyFeeBps, amountIn, credit} = params
-  if (sellFeeBps < buyFeeBps) {
-    throw new Error('blendedSellFeeBps: sellFeeBps < buyFeeBps is unreachable on chain (bands [100,600] vs [1,100])')
+  const {ampsFeeBps, buyFeeBps, amountIn, credit} = params
+  if (ampsFeeBps < buyFeeBps) {
+    throw new Error('blendedAmpsFeeBps: ampsFeeBps < buyFeeBps is unreachable on chain (bands [100,600] vs [1,100])')
   }
-  if (amountIn <= 0n) return sellFeeBps
+  if (amountIn <= 0n) return ampsFeeBps
   const c = credit < amountIn ? credit : amountIn
-  if (c <= 0n) return sellFeeBps
-  const delta = BigInt(sellFeeBps - buyFeeBps)
+  if (c <= 0n) return ampsFeeBps
+  const delta = BigInt(ampsFeeBps - buyFeeBps)
   const blended = BigInt(buyFeeBps) + mulDivRoundingUp(delta, amountIn - c, amountIn)
   return Number(blended)
 }
@@ -121,7 +121,7 @@ export function feeAmount(amount: bigint, feePips: number): bigint {
 export function rotationFeePips(params: {
   hop1BuyFeeBps: number
   hop2BuyFeeBps: number
-  sellFeeBps: number
+  ampsFeeBps: number
   /** AMPS out of hop 1 — the credit hop 2 will consume. */
   ampsFromHop1: bigint
   /** AMPS into hop 2. Equal to `ampsFromHop1` for a pure rotation. */
@@ -132,8 +132,8 @@ export function rotationFeePips(params: {
   hop2DynCapBps?: number
 }): {hop1FeePips: number; hop2FeePips: number; hop2BaseBps: number; creditUsed: bigint} {
   const creditUsed = creditConsumed(params.ampsIntoHop2, params.ampsFromHop1)
-  const hop2BaseBps = blendedSellFeeBps({
-    sellFeeBps: params.sellFeeBps,
+  const hop2BaseBps = blendedAmpsFeeBps({
+    ampsFeeBps: params.ampsFeeBps,
     buyFeeBps: params.hop2BuyFeeBps,
     amountIn: params.ampsIntoHop2,
     credit: params.ampsFromHop1,
@@ -179,4 +179,56 @@ export function bpsOf(amount: bigint, bps: number): bigint {
 /** The amount net of a bps fee, rounded down — the direction `redeemProRata` uses. */
 export function netOfBps(amount: bigint, bps: number): bigint {
   return (amount * (BPS - BigInt(bps))) / BPS
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reading the two bases out of a quote
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The **AMPS fee** in bps, out of a quote: the protocol's own fee, and the base on **both**
+ * directions of every pool.
+ *
+ * On chain it is `AmpsHook.ampsFeeBps()`, banded `[100, 600]` by the hook's own compiled
+ * constants, and `IAmpsQuoter.PoolQuote.ampsFeeBps` is read straight off the sell leg of
+ * `quoteFee(..., passThrough = false)`. Entering the index and leaving it are the same trade seen
+ * from two sides, so a fee charged on one side alone is a fee a round trip halves.
+ */
+export function ampsFeeBpsOf(quote: {ampsFeeBps: number}): number {
+  return quote.ampsFeeBps
+}
+
+/**
+ * The **pass-through base fee** in bps: 30 bp in an entry pool, 5–10 bp in a spoke.
+ *
+ * On chain this is `AmpsHook.buyFeeBps(poolId)`, and under revision 6 it is not what an ordinary
+ * buy pays: it is the price of moving *through* a pool, charged only on a hop where the hook sees
+ * `sender == router()` and `hookData == ROUTER_ROTATE`. Every other swap, in either direction,
+ * pays {ampsFeeBpsOf} instead.
+ */
+export function poolBaseFeeBpsOf(quote: {buyFeeBps: number}): number {
+  return quote.buyFeeBps
+}
+
+/**
+ * What an ordinary swap pays, in pips, in the direction given — the net-trade total, with the
+ * dynamic component and the clamps already applied by the quoter, which is the authority.
+ */
+export function directFeePipsOf(quote: {buyFeePips: number; sellFeePips: number}, side: 'buy' | 'sell'): number {
+  return side === 'buy' ? quote.buyFeePips : quote.sellFeePips
+}
+
+/**
+ * What one hop of an `AmpsRouter.rotate` would pay through this pool, in pips.
+ *
+ * `'buy'` is hop 1 and `'sell'` is hop 2 — the latter priced as an exact-input sell fully covered
+ * by the credit hop 1 created, which is what `rotate` always builds. Unreachable through any other
+ * route: it is disclosure of the alternative price, never a quote for a swap the caller can make
+ * by hand.
+ */
+export function passThroughFeePipsOf(
+  quote: {passThroughBuyFeePips: number; passThroughSellFeePips: number},
+  hop: 'buy' | 'sell',
+): number {
+  return hop === 'buy' ? quote.passThroughBuyFeePips : quote.passThroughSellFeePips
 }

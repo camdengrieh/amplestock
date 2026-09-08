@@ -127,6 +127,10 @@ contract OracleGate is IOracleGate {
     /// @dev Words in an ABI-encoded `(uint256, uint32, bool)`: the feed registry's answer triple.
     uint256 private constant ANSWER_WORDS = 3;
 
+    /// @dev Words in an ABI-encoded `FeedStatus`: nine static fields, so the struct is encoded inline with no
+    ///      offset word. This contract reads 0 `answerUsd8`, 1 `updatedAt`, 5 `fresh` and 7 `unconfirmed`.
+    uint256 private constant STATUS_WORDS = 9;
+
     // -------------------------------------------------------------------------------------------------------------
     // Storage (slot layout per `docs/phase2-state-model.md` §1.5)
     // -------------------------------------------------------------------------------------------------------------
@@ -906,10 +910,13 @@ contract OracleGate is IOracleGate {
             address token;
             bool caFreezeOverride;
             (token, caFreezeOverride, hSessionOverrideSet, hSessionOverrideBps) = _constituent(constituentId);
-            (uint256 answerUsd8, uint32 answerUpdatedAt, bool fresh) = _feedAnswer(token, gate.session);
+            (uint256 answerUsd8, uint32 answerUpdatedAt, bool fresh, bool unconfirmed) =
+                _feedAnswer(token, gate.session);
             gate.answerUsd8 = answerUsd8 > type(uint64).max ? type(uint64).max : uint64(answerUsd8);
             gate.answerUpdatedAt = answerUpdatedAt;
-            gate.feedStale = !fresh;
+            // An unconfirmed answer is a stale one for every consumer of this snapshot: layer C is telling the
+            // gate it does not yet stand behind the number it just handed over.
+            gate.feedStale = !fresh || unconfirmed;
             (gate.corporateFreeze,) = _corporateAction(token, caFreezeOverride, poolId);
         }
 
@@ -923,6 +930,14 @@ contract OracleGate is IOracleGate {
         }
 
         gate.hSessionBps = hSessionOverrideSet ? hSessionOverrideBps : hSessionBps(gate.session);
+        // A stale or unconfirmed feed keeps the bond market open (Decision 10) but must never price it at the
+        // regular session's 0 bp: the collateral valuation the accretion floor is built on is exactly the number
+        // layer C has just disowned. The weekend haircut is the floor, because a feed that stopped answering is
+        // the same exposure as a market that stopped trading. A per-constituent override is subject to it too.
+        if (gate.feedStale) {
+            uint16 closedBps = hSessionBps(Session.CLOSED);
+            if (gate.hSessionBps < closedBps) gate.hSessionBps = closedBps;
+        }
 
         bool frozen =
             _protocolFrozen() || (constituentId != 0 && _constituentFrozen(constituentId)) || gate.corporateFreeze;
@@ -984,18 +999,36 @@ contract OracleGate is IOracleGate {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Layer C, through a bounded call so a mis-pointed registry degrades rather than reverts.
-    /// @dev `latestAnswerIn` first, `latestAnswer` second. Handing the registry the session this contract has
-    ///      already computed keeps `OracleGate -> FeedRegistry -> OracleGate` off every path the hook pays for;
-    ///      the fallback exists so that a layer-C pointer which answers the older read but not the session-scoped
-    ///      one still degrades to a working answer rather than to "no answer at all".
+    /// @dev `feedStatusIn` first, then `latestAnswerIn`, then `latestAnswer`. Handing the registry the session this
+    ///      contract has already computed keeps `OracleGate -> FeedRegistry -> OracleGate` off every path the hook
+    ///      pays for; the two fallbacks exist so that a layer-C pointer which answers only an older read still
+    ///      degrades to a working answer rather than to "no answer at all".
+    /// @dev **Why the full status and not the answer triple.** `latestAnswerIn` reports the freshness bound and
+    ///      nothing else, so a jump the two-confirmation rule is holding back reads as a perfectly current price.
+    ///      The status struct carries `unconfirmed` alongside `fresh`, and this contract treats the two the same
+    ///      way: an answer nothing has confirmed is not a price the protocol may act on, so {_snapshot} folds it
+    ///      into `feedStale`, which degrades the gate and widens the bond haircut. A registry too old to answer
+    ///      {IFeedRegistry.feedStatusIn} reports `unconfirmed == false` here, which is the pre-existing behaviour.
+    /// @return answerUsd8 The answer, 8 decimals, or zero when layer C could not be read at all.
+    /// @return updatedAt When that answer was published.
+    /// @return fresh Whether it is inside the session-scaled freshness bound.
+    /// @return unconfirmed Whether the two-confirmation rule is holding a jump behind it.
     function _feedAnswer(address token, Session session)
         internal
         view
-        returns (uint256 answerUsd8, uint32 updatedAt, bool fresh)
+        returns (uint256 answerUsd8, uint32 updatedAt, bool fresh, bool unconfirmed)
     {
-        if (token == address(0)) return (0, 0, false);
+        if (token == address(0)) return (0, 0, false, false);
         address feeds = _feedRegistry;
         (bool ok, bytes memory data) = _read(
+            feeds,
+            PROBE_GAS * 8,
+            abi.encodeWithSelector(IFeedRegistry.feedStatusIn.selector, token, uint8(session)),
+            STATUS_WORDS
+        );
+        if (ok) return (_wordAt(data, 0), _u32At(data, 1), _wordAt(data, 5) != 0, _wordAt(data, 7) != 0);
+
+        (ok, data) = _read(
             feeds,
             PROBE_GAS * 4,
             abi.encodeWithSelector(IFeedRegistry.latestAnswerIn.selector, token, uint8(session)),
@@ -1006,8 +1039,8 @@ contract OracleGate is IOracleGate {
                 feeds, PROBE_GAS * 8, abi.encodeWithSelector(IFeedRegistry.latestAnswer.selector, token), ANSWER_WORDS
             );
         }
-        if (!ok) return (0, 0, false);
-        return (_wordAt(data, 0), _u32At(data, 1), _wordAt(data, 2) != 0);
+        if (!ok) return (0, 0, false, false);
+        return (_wordAt(data, 0), _u32At(data, 1), _wordAt(data, 2) != 0, false);
     }
 
     /// @dev Layer D: the hook's own multiplier-step detector, four bounded probes into the Stock Token, and the
@@ -1078,7 +1111,7 @@ contract OracleGate is IOracleGate {
         (bool haveAmps, uint256 ampsUsd18) = _ampsPriceViaPool(_hubPoolId(), session);
         if (!haveAmps) return (false, 0);
 
-        (uint256 counterUsd8,,) = _feedAnswer(counter, session);
+        (uint256 counterUsd8,,,) = _feedAnswer(counter, session);
         if (counterUsd8 == 0) return (false, 0);
 
         (bool haveFair, bytes memory data) = _read(
@@ -1119,7 +1152,7 @@ contract OracleGate is IOracleGate {
         (bool haveTick, int24 meanTick) = _twapTick(poolId);
         if (!haveTick) return (false, 0);
 
-        (uint256 counterUsd8,,) = _feedAnswer(counter, session);
+        (uint256 counterUsd8,,,) = _feedAnswer(counter, session);
         if (counterUsd8 == 0) return (false, 0);
 
         (bool havePrice, bytes memory data) = _read(
@@ -1337,6 +1370,15 @@ contract OracleGate is IOracleGate {
     }
 
     /// @dev Arms or clears the layer-E timer for one pool and reports any effective state change.
+    ///
+    /// @dev **Only a *readable* reading moves the timer, in either direction.** Arming has always required
+    ///      `ok`: a deviation that cannot be measured is not evidence of divergence. Clearing required only
+    ///      `!outside`, which an unreadable reading also satisfies — so anyone could disarm a sustained
+    ///      divergence by making one of the reads fail (an unobserved pool, a hub whose counter feed had just
+    ///      gone stale, a market reference briefly unreadable) and then poking, resetting a timer that
+    ///      `divergenceSustainSeconds` had nearly matured. The two directions now use the same evidence
+    ///      standard: unknown leaves the timer exactly where it is, and the verdict is unaffected either way —
+    ///      {state} recomputes the deviation on every read, so an armed timer alone never holds a pool closed.
     function _updateDivergence(PoolId poolId) internal {
         if (PoolId.unwrap(poolId) == bytes32(0)) return;
         Session session = sessionAt(block.timestamp);
@@ -1347,7 +1389,7 @@ contract OracleGate is IOracleGate {
         if (outside && since == 0) {
             _divergedSince[poolId] = uint32(block.timestamp);
             emit DivergenceLatched(poolId, deviationBps, true);
-        } else if (!outside && since != 0) {
+        } else if (ok && !outside && since != 0) {
             delete _divergedSince[poolId];
             emit DivergenceLatched(poolId, deviationBps, false);
         }

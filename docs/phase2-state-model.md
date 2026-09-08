@@ -13,16 +13,19 @@ but is not implemented until the hook exists.
 answer converted through `PriceLib`; `X18` is 1e18 fixed point; `usd8`/`usd18` are 8- and 18-decimal USD; bps are
 basis points of `Constants.BPS` = 10,000.
 
-Contracts and their mutability: `Amps`, `AmpsVault`, `AmpsBonds`, `AmpsStaking`, `PoolRegistry`, `BountyPot`,
-`AmpsHook`, `AmpsQuoter` are **immutable bytecode**. `OracleGate`, `FeedRegistry`, `BondPolicy`, `LadderPolicy`,
+Contracts and their mutability: `Amps`, `AmpsVault`, `AmpsBonds`, `PoolRegistry`, `BountyPot`, `AmpsHook`,
+`AmpsQuoter` and `AmpsRouter` are **immutable bytecode**. (`AmpsStaking` was on that list until plan revision 6
+removed staking from the protocol; `AmpsRouter` is what revision 6 added in its place, and it holds no funds
+between transactions and has no owner.) `OracleGate`, `FeedRegistry`, `BondPolicy`, `LadderPolicy`,
 `FeePolicy`, `RolloutPolicy` and the Phase 2 `IPositionValuer` are **pointer-upgradeable** behind the 7-day
 timelock and hold no funds.
 
 Deployment order and why the wiring is not all immutable: `Amps`'s constructor takes the vault and the vault's
 constructor takes AMPS, so the AMPS address is CREATE2-mined first (`script/01_MineAmps`) and passed to the vault
-as an *immutable* before `Amps` itself is deployed at that address. `PoolRegistry`, `AmpsBonds`, `AmpsStaking`,
-`BountyPot` and `AmpsHook` each take the vault in *their* constructors, so the vault holds them as **set-once**
-storage pointers, frozen by the `genesis()` latch.
+as an *immutable* before `Amps` itself is deployed at that address. `PoolRegistry`, `AmpsBonds`, `BountyPot` and
+`AmpsHook` each take the vault in *their* constructors, so the vault holds them as **set-once** storage pointers,
+frozen by the `genesis()` latch. `AmpsRouter` names no vault at all — it reads the registry and the PoolManager
+and nothing else — so it is deployed independently and reached only by `AmpsHook.setRouter`.
 
 ## 1. Storage layouts
 
@@ -41,8 +44,8 @@ slot 1   uint128 pMktX18                   [  0..127]   Checkpoint word 1
          uint32  checkpointBlock           [160..191]
          (free)                            [192..255]
 slot 2   uint16  redeemFeeBps              [  0.. 15]   the whole governed numeric set, one SLOAD
-         uint16  burnBps                   [ 16.. 31]
-         uint16  stakerBps                 [ 32.. 47]
+         (reserved)                        [ 16.. 47]   burnBps and stakerBps lived here until revision 6;
+                                                        declared rather than implied so the layout is stable
          uint16  refUpRateBps              [ 48.. 63]
          uint16  refDivergenceBps          [ 64.. 79]
          uint32  twapWindow                [ 80..111]
@@ -58,7 +61,11 @@ slot 3   address creator                   [  0..159]
          bool    initialized               [192..199]   the genesis latch, one-way
          bool    wiringFrozen              [200..207]   set by genesis(); set-once pointers refuse afterwards
          (free)                            [208..255]
-slot 4-7   address registry / bonds / staking / bountyPot        set-once, frozen by genesis()
+slot 4,5,7 address registry / bonds / bountyPot                  set-once, frozen by genesis()
+slot 6     (reserved)                                            the xAMPS staking vault lived here until
+                                                                 revision 6; kept as a hole so slots 7+ do not
+                                                                 move under a standby vault written against
+                                                                 this layout
 slot 8     address marketReference                               pointer-upgradeable (7 d) through setPolicyPointer,
                                                                  exactly like slots 9-13: a mock in Phase 2, pointed
                                                                  at AmpsHook in Phase 3, and re-pointable again after
@@ -110,24 +117,18 @@ cached copies: the gate pointer is 7-day upgradeable and the haircut table belon
 calendar, so each has exactly one home.
 ```
 
-### 1.3 `AmpsStaking`
+### 1.3 (removed) `AmpsStaking`
 
-OZ `ERC20` + `ERC4626` occupy slots 0-4 (`_balances`, `_allowances`, `_totalSupply`, `_name`, `_symbol`); `asset`
-and the decimals offset are immutable.
+Plan revision 6 removed staking from the protocol. There is no xAMPS share token, no reward stream, no
+`stakerBps` and no `notifyReward`, and the vault's slot 6 and the `[16..47]` band of slot 2 are reserved holes
+where they used to live. The AMPS side of every fee is **burned** at `compound()` after the creator's slice
+(`docs/phase3-state-model.md` §3.6), and the counter-asset side stays as bids in the pool that earned it. Nothing
+is distributed to anybody, so there is nothing for a share price to accrue to.
 
-```
-slot 5   address vault                     [  0..159]   reassigned only by setVault (migration)
-         uint32  rewardStreamSeconds       [160..191]
-         uint32  streamEnd                 [192..223]
-         uint32  lastAccrualAt             [224..255]
-slot 6   uint128 pendingRewards            [  0..127]   notified but not yet released
-         uint128 rewardRatePerSecond       [128..255]
-slot 7   uint256 totalNotified                          cumulative, for the realised-APR view
-```
-
-`totalAssets() = amps.balanceOf(address(this)) - pendingRewards`. That single line is what makes the
-compound-sandwich worthless and I36 true: a notified tranche is invisible to the share price until the stream has
-released it, and a donation to the contract raises `totalAssets` for everyone rather than for the donor.
+The invariant that used to live here (I36: `totalAssets` never decreasing except by withdrawals, rewards released
+never exceeding rewards notified, only the vault notifying, `stakerBps <= 5000`) is **deleted** rather than
+restated. What made the compound-sandwich worthless was the stream; what makes it worthless now is that there is
+no stream and no claim on one.
 
 ### 1.4 `PoolRegistry`
 
@@ -211,9 +212,9 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsBonds` | `setMarketOpen` | timelock, **or `PoolRegistry`** | 48 h |
 | `AmpsBonds` | every other `set*` (the `h_session` table lives in `OracleGate`) | timelock | 48 h |
 | `AmpsBonds` | `setVault` | vault | — |
-| `AmpsStaking` | `deposit`/`mint`/`withdraw`/`redeem`, `accrue` | **P** | — |
-| `AmpsStaking` | `notifyReward`, `setVault` | vault | — |
-| `AmpsStaking` | `setRewardStreamSeconds` | timelock | 48 h |
+| `AmpsRouter` | `buy`, `sell`, `rotate` | **P** | — |
+| `AmpsRouter` | *(nothing else)* — no owner, no setter, no pause, no fee | — | — |
+| `AmpsHook` | `setRouter` | timelock | 7 d |
 | `PoolRegistry` | every read | **P** | — |
 | `PoolRegistry` | `addConstituent`, `retire`, `reinstate`, `reconfigure`, `setIndexWeights`, `registerEntryPool`, `withdrawRetiredBids` | timelock | 7 d |
 | `OracleGate` | `poke`, `pokePool`, `pokePools`, `pokeConstituent` | **P** (unpaid) | — |
@@ -224,7 +225,7 @@ slot 4   address vault                                   reassigned only by migr
 | `BountyPot` | `pay` | vault | — |
 | `BountyPot` | `sweep`, every `set*` | timelock | 48 h |
 | `AmpsHook` | `resetHighWater`, `armSurge` | vault | — |
-| `AmpsHook` | `setSellFeeBps`, `setBuyFeeBps`, `setMaxTickMovePerBlock` / `setFeePolicy` | timelock | 48 h / 7 d |
+| `AmpsHook` | `setAmpsFeeBps`, `setBuyFeeBps`, `setMaxTickMovePerBlock` / `setFeePolicy` | timelock | 48 h / 7 d |
 
 The guardian's entire power is: cancel a timelock operation, freeze one constituent or the protocol (disable-only,
 expiring within 7 days), and trigger `emergencyMigrate` when the on-chain denylist predicate holds. It can move no
@@ -279,12 +280,14 @@ bond
     vault.checkpointData() -> navPerShareX18 (this block's) + staleness check (always 0 here; it guards quote())
     marketReference.twapTick30m(spokePool) -> m
     feedRegistry.latestAnswer(collateral)  -> P_i (stale is allowed; it feeds q_floor with the haircut)
-    policy.quote(input) -> ampsOut, q, discount;  require(q <= qFloor recomputed in the shell)
+    policy.quote(input) -> q, discount;  require(q <= qFloor recomputed in the shell)
+    ampsOut = amountIn18 * q / 1e18   recomputed in the shell; the policy's own ampsOut is never minted (audit fix 15)
+    haircut = max(hSessionBps, hSession[CLOSED]) when the collateral answer is not fresh or unconfirmed (audit fix 9)
     clamp ampsOut to per-epoch then global daily capacity   (the AMPS out is clamped; the deposit is not)
     require(ampsOut >= minAmpsOut)
     positions[to].push(VestingPosition{principal: ampsOut, start: now, vestSeconds, marketId})
     vault.mintVesting(address(bonds), ampsOut)         -> Amps.mint; T rises immediately (I30)
-    emit Bond; sweepClean assert
+    emit Bond; any collateral dust on the shell is forwarded to the vault best-effort (never asserted; audit fix 1)
     -- the deposit is an interaction ahead of the shell's effects; both locks are held across it and any revert
        below it unwinds the settle, so the order buys the fresh NAV without a reentrancy surface
 
@@ -302,9 +305,17 @@ redeem  (structurally ungated)
     Amps.burn(msg.sender, shares)                      effects before interactions
     for each pool (Phase 3): remove floor(L_p * shares / T) from every PlacementRecord
     for each asset j != AMPS: pay floor(b_j * shares / T) * (BPS - redeemFeeBps) / BPS
+      -- redeemFeeBps: 250 bp at launch (revision 6 raised it from 100), governed at 48 h, hard cap 500
     burn the AMPS released from the vault's own inventory   -> T falls by MORE than `shares`
-    emit Redeem, Burn("redeemInventory"); sweepClean assert
-    -- no _requireHealthy, no gate, no oracle, no guardian, no pause
+    payout (VaultRedeemLib.payout): try the ERC-20 unlock under gasleft() - REDEEM_PAYOUT_RESERVE_GAS, per asset
+      take{gas: 4 x STOCK_TOKEN_PROBE_GAS} -> claim on refusal; on ANY failure (a hostile transfer opening a
+      foreign delta included) a second claims-only unlock pays every claim part; idle ERC-20 parts after the
+      unlock, best-effort and capped (an unmovable idle wei is not paid)
+    emit Redeem, Burn("redeemInventory"); sweepClean (per token: sync + capped transfer outside any unlock, then
+                                                          a try-wrapped per-token unlock for settle + mint;
+                                                          `SweepResidue` instead of a revert)
+    -- no _requireHealthy, no gate, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
+       as an ERC-6909 claim the redeemer takes later, so one issuer can never block the floor (audit fixes 2, 3)
 
 checkpoint  (permissionless, unpaid)
   anyone -> vault.checkpoint()
@@ -314,11 +325,14 @@ checkpoint  (permissionless, unpaid)
     pMkt = PriceLib(hub TWAP, USDG answer);  pRef = max(nav, rateLimited(pMkt))
     write Checkpoint; emit NavCheckpoint, RefCheckpoint
 
-notifyReward  (inside compound, Phase 3)
-  vault.compound(poolId)
-    -> Amps.transfer(staking, stakerCut); staking.notifyReward(stakerCut)
-         accrue(); pending += amount; streamEnd = now + rewardStreamSeconds
-         rewardRatePerSecond = pending / rewardStreamSeconds
+compound's fee split  (inside compound, Phase 3; `docs/phase3-state-model.md` §3.6)
+  anyone -> vault.compound(poolId)
+    collect fees in both currencies inside one unlock
+    creatorCounter = counterFees * creatorBps(t) / ampsFeeBps   -> paid in kind, best effort, claim fallback
+    creatorAmps    = ampsFees   * creatorBps(t) / ampsFeeBps   -> Amps.transfer(creator, ...)
+    Amps.burn(self, ampsFees - creatorAmps)                     -> the whole AMPS-side remainder, plus the buyback
+    place (counterFees - creatorCounter) as bids in the SAME pool, below the tick
+    -- no staking call and no re-ladder: revision 6 removed both. Nothing is distributed to anybody.
 
 lifecycle  (every action leaves NAV/share unchanged: I37)
   timelock -> registry.addConstituent(params)
@@ -392,11 +406,14 @@ deficit   = clamp( (w_target - w_current) * 1e18 / w_target, 0, 1e18 )          
 fill      = clamp( issuedThisEpoch * 1e18 / capacity, 0, 1e18 )                             UP
 d         = clamp( dBase + kWeight*deficit/1e18 - kFill*fill/1e18, dMin, dMax )              DOWN
 qMarket   = m * BPS / (BPS - d)                                                             DOWN
-qFloorNum = collateralPriceUsd18 * (BPS - hSessionBps) / BPS                                DOWN
+hEff      = fresh ? hSessionBps : max(hSessionBps, hSession[CLOSED])   -- `fresh` is false while an answer is
+                                                                        -- stale OR held back (unconfirmed)
+qFloorNum = collateralPriceUsd18 * (BPS - hEff) / BPS                                      DOWN
 qFloorDen = navPerShareX18 * (BPS + minAccretionBps) / BPS                                  UP
 qFloor    = qFloorNum * 1e18 / qFloorDen                                                    DOWN
+-- precondition: !vault.navUnconfirmed(), else revert UnconfirmedNav (quote: reason "unconfirmedNav")
 q         = min(qMarket, qFloor)
-ampsOut   = amountIn18 * q / 1e18                                                           DOWN
+ampsOut   = amountIn18 * q / 1e18                                                           DOWN (recomputed by the shell)
 ```
 
 Every direction favours the protocol, which is what makes I27 (`NAV/share after a bond >= NAV/share before`) exact
@@ -409,9 +426,20 @@ registry answers the target weight**, so the deficit is exactly zero on every ma
 vault's valuation of that spoke's position divided by the whole index, and Phase 2 ships `ZeroPositionValuer`, so
 there is no position to value and any other answer would be invented. Zero is also the protocol-favourable reading —
 a smaller deficit is a smaller discount and less AMPS issued for the same collateral — so an input that is unknowable
-in Phase 2 cannot dilute anyone. Phase 3 sources the numerator from the vault's valuation with no ABI change and no
-new bond bytecode. A registry that cannot answer must never be able to close a bond market, which is why the read is
-a bounded probe and not a plain call.
+in Phase 2 cannot dilute anyone. **The registry now answers the realised weight when it can** (second remediation wave): `PoolRegistry.currentWeightBps`
+reads `AmpsVault.spokeWeightBps(constituentId)` — the spoke's counter-side position valued at the reference price plus
+its idle and claim balances, over the **last checkpointed** `A` (`navPerShareX18 x (T + VIRTUAL_SHARES)`; a live walk
+would cost ~150k gas per valued pool and fail every probe budget at 32 pools while passing in a small fixture) —
+through a bounded 2M-gas probe and falls back to the target weight on any failure. The read costs one spoke's
+valuation plus a feed answer (~200k gas), so the rollout schedule's deficit boost is live (`VaultRolloutLib` reads it
+under `COMPOSITE_READ_GAS`, 400k). The bond shell probes the registry under the same `COMPOSITE_READ_GAS` budget
+(`AmpsBonds._tryCurrentWeightBps`): under the old 50k token-probe cap the read sat at the budget edge and `quote()`
+and `bond()` could see different deficits depending on warm storage, so the budget is the one that makes the read
+succeed whenever it is readable at all. **The `k_w` under-weight preference is therefore live**: a name held below its
+target weight gets a wider discount, exactly as the formula says, and a registry that cannot answer still prices
+`deficit == 0`. The ABI and the bond bytecode do not change when it lands. A registry
+that cannot answer must never be able to close a bond market, which is why the read is a bounded probe and not a
+plain call.
 
 `qFloor` is computed from the **last Chainlink answer**, never from the pool: that caps what TWAP manipulation can
 buy (the best a spoke-dumper can do is remove their own discount) and bounds weekend-gap exposure to `hSessionBps`
@@ -422,9 +450,20 @@ the market until the epoch rolls and does not revert the quote view. **The clamp
 collateral**: the shell settles the whole `amountIn` and issues the capped `ampsOut`, so an over-capacity bond hands
 over its entire deposit for the capped issue unless `minAmpsOut` refuses it. `quote()` discloses the clamp and the
 dApp must always pass the quoted amount as `minAmpsOut`; the protocol side of an over-capacity bond is a large
-accretion, never a loss. The shell recomputes `qFloor` itself and rejects any `q` above it with
-`AccretionFloorViolated`, so a hostile or buggy `BondPolicy` pointer can refuse to price but can never issue a
-dilutive bond.
+accretion, never a loss. The shell recomputes `qFloor` itself, rejects any `q` above it with
+`AccretionFloorViolated`, and derives `ampsOut` from `q` itself rather than minting the policy's quantity, so a
+hostile or buggy `BondPolicy` pointer can refuse to price but can never issue a dilutive bond (audit fix 15).
+**The floor's denominator must itself be confirmed (re-audit finding 7).** The registry reports the *lower* of a
+held-back jump's two levels, which is conservative for the collateral numerator but understates `A` — and so
+`navPerShareX18`, the denominator of every market's floor — whenever the held-back asset is one the vault holds.
+The checkpoint therefore records `navUnconfirmed` (any priced asset `!fresh || unconfirmed`), `_price` reverts
+`UnconfirmedNav()` and `quote()` reports `reason == "unconfirmedNav"` while it is set. The shell reads the flag
+through a bounded probe that fails open: a vault that cannot answer prices as before, so no single failing read can
+halt bonds protocol-wide.
+
+`collateralPriceUsd18` is the registry's answer with its freshness flag consumed: a stale or unconfirmed answer
+widens the haircut to the `CLOSED` value in both the shell and the gate (audit fix 9), and the registry itself
+reports the *lower* of a held-back jump's two levels (`FeedRegistry` NatSpec, audit fixes 13–14).
 
 **Which NAV the price reads.** `navPerShareX18` comes from `vault.checkpointData()`, and the shell settles the
 collateral *before* it prices (§3). `depositBonded` writes a checkpoint under the bond gate policy immediately before
@@ -452,7 +491,15 @@ Exactly two external state-changing functions are exempt from `_requireHealthy`:
 
 "Ungated" is a property of the *code path*, not of a flag. Neither path may contain a reference to `oracleGate`,
 `guardian`, `standbyVault`, a freeze timestamp, a pause bool, `feedRegistry`, or any price. Both still take the
-transient reentrancy lock — a lock nobody else can hold, released in the same transaction, is not a gate.
+transient reentrancy lock — a lock nobody else can hold, released in the same transaction, is not a gate. The
+redemption path does call every registered token (balances, the payout, the exit sweep), and each of those calls
+is bounded and best-effort: an unreadable balance is skipped, a refused payout becomes an ERC-6909 claim for the
+redeemer, a refused absorb is left as `SweepResidue`, and every call carries a gas stipend so a token that burns gas
+instead of reverting cannot starve what follows it (measured: one gas-burning constituent plus a 1-wei donation
+costs a redemption 732k gas against 351k clean, two stipends' worth). The sweep runs each token's `transfer` outside
+any unlock, so a token that re-enters the PoolManager hits `ManagerLocked` instead of opening a foreign delta inside
+the vault's own unlock, and the payout falls back to a claims-only unlock if the ERC-20 unlock fails for any reason.
+A third party can degrade a redemption; nothing can revert it (audit fixes 2, 3; re-audit findings 1, 3, 5).
 
 ### 7.1 The vault has two gate policies, not one
 
@@ -462,7 +509,7 @@ transient reentrancy lock — a lock nobody else can hold, released in the same 
 |---|---|---|---|
 | `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
 | `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
-| either policy, gate pointer **reverts** | every gated selector | nothing | everything (fail-open, see below) |
+| either policy, gate pointer **reverts, is codeless or answers malformed** | every gated selector | nothing | everything (fail-open through a bounded hand-decoded read; `setPolicyPointer` refuses a codeless target — audit fix 18) |
 
 The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
 `h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
@@ -505,17 +552,28 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
 ## 8. Migration surface
 
-* **Standby vault.** `setStandbyVault(address)` — timelock, 14 days. Registering it moves nothing.
+* **Standby vault.** `setStandbyVault(address)` — timelock, 14 days. Registering it moves nothing; a codeless
+  address is refused (re-audit lead).
 * **Predicate.** `emergencyMigrate(standby)` is guardian-callable with no delay, and reverts with
   `MigrationPredicateNotMet` unless, checked on-chain at call time: `IStockToken(token).isBlocked(vault) == true`
   for at least one registered constituent, **or** a bounded 1-wei self-transfer probe reverts for at least two
   constituents. Every probe is a `staticcall`/`call` capped at `Constants.STOCK_TOKEN_PROBE_GAS`.
 * **What moves.** Per pool, inside one `unlock`: remove liquidity -> `take` as ERC-6909 claims -> transfer the
   claims PoolManager-internally to the standby vault -> the standby re-adds at the same ticks. The R1 bleed cap is
-  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call.
-* **What follows in the same transaction.** `Amps.setVault`, `AmpsBonds.setVault`, `AmpsStaking.setVault` and
-  `BountyPot`'s vault pointer. All four are `onlyVault`, which is why they can be handed on atomically and why
-  nobody else can hand them on at all.
+  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call. The idle ERC-20 leg of `evacuate`
+  is a gas-capped best-effort transfer (re-audit finding 5), so a gas-burning constituent cannot starve the roles
+  handed over after it.
+* **What follows in the same transaction.** `VaultNavLib.handover` moves **five** roles: `Amps.setVault`,
+  `AmpsBonds.setVault`, `BountyPot.setVault`, `PoolRegistry.setVault` and a best-effort, gas-bounded
+  `AmpsHook.setVault` (the hook's `vault` is storage since audit fix 12). All five are `onlyVault`, which is why
+  they can be handed on atomically and why nobody else can hand them on at all; the hook leg is best-effort so a
+  hook without the setter can never veto an evacuation. A sixth leg handed `AmpsStaking` on until plan revision 6
+  removed staking; the registry and the hook are the other two contracts that name a vault, and leaving either
+  behind would let a standby fail to open a pool while the old hook still trusted the evacuated shell.
+* **What the migration does not have to move.** `AmpsRouter` names no vault: it reads the PoolManager and the
+  registry, both of which survive a migration unchanged, so an evacuation does not touch it. What *would* need
+  attention is `AmpsHook.setRouter` if a migration ever replaced the hook, which it does not — the hook is
+  immutable and is handed on, not redeployed.
 * **What does not move.** Vesting positions stay in `AmpsBonds`, whose bytecode is immutable and whose `claim`
   never reads the vault, so a migration cannot strand a vest.
 
@@ -529,8 +587,10 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
   slot arithmetic.
 * Every governed setter throws `OutOfBand(bytes32 parameter, value, min, max)` with the parameter's name as a
   short string, and reads its bound from `Constants`. Do not restate a bound as a literal.
-* Every external function asserts `sweepClean` at exit: the ERC-20 balance of every registered asset on the vault,
-  the hook and `AmpsBonds` must be zero.
+* Every external function sweeps at exit: any ERC-20 balance of a registered asset on the vault is absorbed into
+  ERC-6909 claims best-effort and residue is emitted as `SweepResidue`, never asserted; `AmpsBonds` forwards
+  collateral dust to the vault. I12 is therefore "no *movable* asset rests as ERC-20", which a donation of a
+  paused token cannot break (audit fixes 1, 3).
 
 ## 9.1 Bootstrap ordering: the gate and the first pool are circular
 
@@ -541,7 +601,7 @@ initialised hook pool has no observations at all, so with the gate already wired
 cannot acquire without existing. The Phase 2 integration fixture resolves it the only way the contracts allow, and
 the deploy runbook (`script/05_Registry`, `script/06_Genesis`) must use the same order:
 
-1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`) and the
+1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `bountyPot`) and the
    pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave `oracleGate` unset**
    (`_requireGate` returns when the pointer is zero);
 2. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate);

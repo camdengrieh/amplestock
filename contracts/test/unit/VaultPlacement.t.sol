@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {
     CellBudgetExceeded,
+    HighWaterResetFailed,
     InsufficientInventory,
     NavBleedExceeded,
     NotTimelock,
@@ -14,11 +16,14 @@ import {
 } from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {VaultPlacementLib} from "../../src/vault/VaultPlacementLib.sol";
+import {VaultRedeemLib} from "../../src/vault/VaultRedeemLib.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @title VaultPlacementTest
 /// @notice `docs/phase3-state-model.md` §8.1's row for this file: the genesis ladders of §3.3 to the wei,
@@ -562,6 +567,91 @@ contract VaultPlacementTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // The `Placement` log
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The finding this closes.** `Placed.highestTick` was grown from its zero value
+    ///         (`if (lower + width > highestTick)`) while every tick an Amplestocks pool ever places at is
+    ///         **negative** — AMPS is `currency0` and one AMPS buys far less than one unit of any counter asset —
+    ///         so no cell ever compared greater and every `Placement` reported a top of tick 0: an indexer reading
+    ///         the log saw a ladder running from its real floor up to $18 quadrillion. Both bounds are seeded by
+    ///         the first cell instead.
+    function test_thePlacementLogCarriesTheLaddersRealTopAndBottom() public {
+        vm.recordLogs();
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+
+        (uint8 buckets, int24 lowerTick, int24 upperTick) = _lastPlacement(hubPool);
+        int24 width = cellWidth();
+
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        assertEq(uint256(buckets), records.length, "one bucket per record");
+        assertLt(lowerTick, 0, "every Amplestocks tick is negative, which is what broke the old comparison");
+        assertLt(upperTick, 0, "the top included");
+        assertEq(lowerTick, records[0].lowerTick, "the log's floor is the lowest cell's floor");
+        assertEq(upperTick, lowerTick + int24(uint24(buckets)) * width, "and its top is the highest cell's top");
+
+        // And it really is the maximum over the cells, not merely the last one written.
+        for (uint256 i; i < records.length; ++i) {
+            assertGe(upperTick, records[i].upperTick, "no cell reaches above the reported top");
+            assertLe(lowerTick, records[i].lowerTick, "and none below the reported floor");
+        }
+    }
+
+    /// @notice The same for a bid ladder, which runs *down* from the anchor: the floor is the last cell placed and
+    ///         the top the first, so a seeded `lowestTick` matters as much as a seeded `highestTick`.
+    function test_thePlacementLogCarriesBothBoundsForABidLadderToo() public {
+        vm.recordLogs();
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, false, SEED_USDG);
+
+        (uint8 buckets, int24 lowerTick, int24 upperTick) = _lastPlacement(hubPool);
+        assertEq(upperTick, lowerTick + int24(uint24(buckets)) * cellWidth(), "contiguous, floor to top");
+        assertLe(upperTick, PriceLib.alignTick(tickOf(hubPool), TICK_SPACING, false), "I9: the whole ladder is a bid");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The transient staging buffer
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The transient slot `VaultPlacementLib` stages placed cells in is the one `Constants` declares, and
+    ///         that constant really is the hash of the string it names.
+    /// @dev **The finding this closes.** The library carried a hand-written literal
+    ///      (`0x1f0c2fd9…a190`) whose comment claimed it was `keccak256("amplestocks.vault.PLACEMENT_STAGE")`. It
+    ///      was not that hash at all — it was an invented number — so the buffer sat outside the namespace every
+    ///      other vault slot is derived from and the next slot anyone derived from that string would have landed
+    ///      somewhere else entirely. This is the drift guard on the replacement, and it mirrors
+    ///      `test/unit/RotationCredit.t.sol`'s guard on the hook's `ROTATION_CREDIT_SLOT`.
+    function test_theStagingBufferSlotIsTheHashItClaimsToBe() public pure {
+        assertEq(
+            uint256(Constants.PLACEMENT_STAGE_SLOT),
+            0xc6581d9946980dd7ee72e915a5cc531936e37fb4d55c38fe9dc446b32f47d8d7,
+            "the value VaultPlacementLib.STAGE_SLOT resolves to"
+        );
+        assertEq(
+            Constants.PLACEMENT_STAGE_SLOT,
+            keccak256("amplestocks.vault.PLACEMENT_STAGE"),
+            "and the string it is derived from"
+        );
+    }
+
+    /// @notice And the buffer — four words a cell, `GRID_CELLS` cells — does not overlap any other transient or
+    ///         hashed slot the vault uses.
+    function test_theStagingBufferDoesNotCollideWithTheVaultsOtherSlots() public pure {
+        uint256 base = uint256(Constants.PLACEMENT_STAGE_SLOT);
+        uint256 span = 4 * uint256(Constants.GRID_CELLS);
+        uint256[4] memory others = [
+            VaultRedeemLib.REENTRANCY_LOCK,
+            VaultRedeemLib.UNLOCK_ACTION,
+            VaultRedeemLib.NAV_BEFORE,
+            VaultRedeemLib.LIVE_CELLS_SLOT
+        ];
+        for (uint256 i; i < others.length; ++i) {
+            assertTrue(others[i] < base || others[i] >= base + span, "outside the staging buffer");
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Gas
     // -------------------------------------------------------------------------------------------------------------
 
@@ -588,5 +678,217 @@ contract VaultPlacementTest is PlacementFixture {
         uint256 used = before - gasleft();
         emit log_named_uint("place: ten merged ask cells", used);
         assertLt(used, 3_000_000, "a merge is cheaper than a fresh ladder");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Audit remediation, second wave (2026-09-07)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **The re-audit finding on the anchor's rounding, measured and bounded rather than "fixed".**
+    ///
+    ///         `_referenceTick` hands {VaultPlacementLib-_cells} `PriceLib.fairTick`, which aligns **down** onto
+    ///         the tick spacing, and `_cells` then ceils onto the doubling grid; the two roundings point in
+    ///         opposite directions, so the first ask cell's lower bound can sit up to `tickSpacing - 1` ticks
+    ///         below the exact reference. That is true, and this test pins exactly how far: **at most one tick
+    ///         spacing, on the first cell only**, with every other cell a whole doubling clear of it.
+    ///
+    ///         It is not closed by anchoring at the reference (aligned up, or unrounded — the two agree here)
+    ///         because at genesis the exact reference sits *inside* cell `m = 0`: the grid origin is
+    ///         `alignDown(openingTick)` and the opening tick is the reference tick (§12 ruling C). Anchoring
+    ///         above it makes `_ceilDiv` return 1, so the ladder would start at `m = 1` — no protocol-owned ask
+    ///         anywhere between `P_ref` and `2 x P_ref`, at genesis and after every `compound`. The grid cannot be
+    ///         moved to dodge the choice either: snapping the *opening* up puts cell `m = -1`'s upper bound above
+    ///         the reference, and the valuer writes a straddled **bid**'s AMPS half off at zero (I5), which is a
+    ///         hard R1 revert on the seed bids. One side of the origin cell must straddle, and the design picks
+    ///         the side where the mis-valuation over-states `A` and therefore cannot trip R1.
+    function test_i32_theStraddleOfTheFirstAskCellIsBoundedByOneTickSpacing() public {
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+
+        // `raw` is the exact reference tick, before either alignment: the greatest tick whose price is at or below
+        // `P_ref / P_counter`. `refTick` is the same number snapped down onto the spacing — the `tickOf` §3.7's
+        // statement of I32 names, and the anchor the ladder is built from.
+        int24 raw = TickMath.getTickAtSqrtPrice(PriceLib.ampsPerCounterToSqrtPriceX96(vault.pRefX18(), USDG_USD8, 6));
+        int24 refTick = PriceLib.fairTick(vault.pRefX18(), USDG_USD8, 6, TICK_SPACING);
+        assertLe(refTick, raw, "the anchor is the reference aligned down");
+
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        assertGt(records.length, 0, "the ladder went in");
+
+        int24 lowest = type(int24).max;
+        for (uint256 i; i < records.length; ++i) {
+            if (!records[i].above) continue;
+            // I32 in the form §3.7 states it: `lowerTick >= tickOf(P_ref / P_counter)`, `tickOf` aligned down.
+            assertGe(records[i].lowerTick, refTick, "no ask below the reference cell");
+            if (records[i].lowerTick < lowest) lowest = records[i].lowerTick;
+        }
+
+        // And the whole of the residue, to the tick. `_cells` returns the first grid cell at or above the anchor,
+        // and the anchor is at most `tickSpacing - 1` ticks under `raw`, so the first cell's lower bound can never
+        // be further under the exact reference than one tick spacing — whatever the pool's grid origin is and
+        // wherever `P_ref` has moved to since it opened.
+        assertLt(raw - lowest, TICK_SPACING, "the straddle is under one tick spacing");
+
+        // Every other cell is a whole doubling clear of it, so the residue is one cell's business and no other's.
+        for (uint256 i; i < records.length; ++i) {
+            if (!records[i].above || records[i].lowerTick == lowest) continue;
+            assertGe(records[i].lowerTick, lowest + cellWidth(), "every other ask cell is a doubling higher");
+        }
+    }
+
+    /// @notice And the stricter reading is one argument away: `PriceLib.fairTick`'s five-argument form snaps the
+    ///         same reference **up**, so switching `_referenceTick` to it is a one-token change should the
+    ///         orchestrator rule that the straddle above must go — at the cost the test before this one names.
+    function test_theAnchorCanBeSnappedUpOnDemand() public view {
+        uint256 pRef = vault.pRefX18();
+        int24 raw = TickMath.getTickAtSqrtPrice(PriceLib.ampsPerCounterToSqrtPriceX96(pRef, USDG_USD8, 6));
+        int24 down = PriceLib.fairTick(pRef, USDG_USD8, 6, TICK_SPACING);
+        int24 up = PriceLib.fairTick(pRef, USDG_USD8, 6, TICK_SPACING, true);
+
+        assertEq(down, PriceLib.fairTick(pRef, USDG_USD8, 6, TICK_SPACING, false), "the four-argument form floors");
+        assertLe(down, raw, "and is at or below the reference");
+        assertGe(up, raw, "the five-argument form is at or above it");
+        assertLe(up - down, TICK_SPACING, "and the two are never more than one spacing apart");
+        assertEq(up % TICK_SPACING, int24(0), "both land on the spacing");
+        assertEq(down % TICK_SPACING, int24(0), "both land on the spacing");
+    }
+
+    /// @notice **The finding this closes.** `_placeLadder` read the counter asset's balance with a typed
+    ///         `IERC20.balanceOf`, so a Stock Token whose `balanceOf` reverts bricked every placement into its
+    ///         pool. The read is a bounded, hand-decoded `staticcall` now and an unreadable answer is zero, so the
+    ///         placement proceeds on the ERC-6909 claim the bond settled — which is where bonded collateral lives.
+    ///
+    /// @dev **Cross-slice, and the assertion says which slice.** `AmpsVault.place` takes its R1 pre-image before
+    ///      it delegates, and `VaultNavLib.totalAssetsUsd18` still reads this same balance with a typed
+    ///      `IERC20.balanceOf` — a read this slice does not own and the vault slice is hardening alongside it. So
+    ///      on the placement library alone the call may still stop, one frame *earlier* than it used to. What is
+    ///      pinned here either way is that nothing in `VaultPlacementLib` is what stops it: with the NAV read
+    ///      hardened the ladder goes in off the claim balance, and without it the only thing left is the token's
+    ///      own `BalanceUnavailable` out of the NAV pre-image — never `InsufficientInventory`, which is what a
+    ///      placement library that had read a zero balance and then trusted it would raise.
+    function test_aStockTokenWhoseBalanceOfRevertsDoesNotBrickItsPlacement() public {
+        uint256 settled = bondDeposit(address(stocks[0]), 100e18);
+        assertEq(claimOf(address(stocks[0])), settled, "the collateral arrived as an ERC-6909 claim");
+
+        stocks[0].setBalanceOfReverts(true);
+
+        vm.prank(TIMELOCK);
+        try vault.place(spokePools[0], false, settled) returns (uint256 placed) {
+            assertGt(placed, 0, "the bid ladder went in on the claim balance alone");
+        } catch (bytes memory reason) {
+            assertEq(
+                reason,
+                abi.encodeWithSelector(MockStockToken.BalanceUnavailable.selector),
+                "the only typed balance read left on this path is VaultNavLib's NAV pre-image"
+            );
+        }
+
+        stocks[0].setBalanceOfReverts(false);
+    }
+
+    /// @notice **The finding this closes.** `modifyLiquidity` returns `callerDelta = principal + feesAccrued`, so
+    ///         merging into a cell that already holds liquidity netted that cell's unclaimed fees into the
+    ///         settlement — the AMPS side went straight back into the ladder without the creator, staker and burn
+    ///         slices of §3.6 step 5. `compound` collects first and was never affected; `place`, `rollout` and
+    ///         `deployBonded` did not, and every pool that had traded since its last `compound` recycled its own
+    ///         AMPS-side fees at the next placement. The collect-and-split now happens on the way in.
+    function test_placingIntoACellWithAccruedAmpsFeesPaysTheCreatorStakerAndBurnSlices() public {
+        placeGenesisLadders();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        // A round trip through the hub's ladder: the sell pays its 500 bp in AMPS, which accrues to the cells it
+        // crosses and is left there, unclaimed, because nothing has compounded since.
+        buyAmps(hubPool, address(usdg), 100e6);
+        sellAmps(hubPool, amps.balanceOf(BOB) / 2);
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        uint256 creatorBefore = amps.balanceOf(CREATOR);
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
+        uint256 supplyBefore = amps.totalSupply();
+
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, 10e18);
+
+        assertGt(amps.balanceOf(CREATOR) - creatorBefore, 0, "the creator's AMPS slice was paid");
+        assertGt(usdg.balanceOf(CREATOR) - creatorUsdgBefore, 0, "and the counter slice with it");
+        assertLt(amps.totalSupply(), supplyBefore, "and every wei of the AMPS-side remainder was burned");
+        assertSweepClean("place into a cell with accrued fees");
+    }
+
+    /// @notice And the second half of the same fix: with the fees collected on the way in, the placement's own
+    ///         settlement is principal and nothing else, so a second placement in the same state finds nothing
+    ///         left to split.
+    function test_theSecondPlacementFindsNoFeesLeftToSplit() public {
+        placeGenesisLadders();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        buyAmps(hubPool, address(usdg), 100e6);
+        sellAmps(hubPool, amps.balanceOf(BOB) / 2);
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, 10e18);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        uint256 creatorBefore = amps.balanceOf(CREATOR);
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, 10e18);
+        assertEq(amps.balanceOf(CREATOR), creatorBefore, "no trade, no fee, no slice");
+    }
+
+    /// @notice **The finding this closes.** An ask is placed strictly above the tick, so it satisfies
+    ///         `tick <= lowerTick` — half of the buyback-burn predicate — from the moment it is opened; the only
+    ///         thing keeping it out of the burn is the high-water reset the placement performs. That reset was a
+    ///         typed `try ... catch {}`, so a market reference that refuses it left a stale mark standing and the
+    ///         next permissionless `compound` burned never-sold POL. The reset is a bounded, hand-decoded call
+    ///         and an ask placement that cannot perform it reverts.
+    function test_anAskPlacementRefusesToLeaveAStaleHighWaterMarkStanding() public {
+        hook.setResetHighWaterReverts(true);
+
+        vm.prank(TIMELOCK);
+        vm.expectPartialRevert(HighWaterResetFailed.selector);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+    }
+
+    /// @notice The subtler half: a market reference that *returns* but returns nothing where an `int24` was
+    ///         declared. A typed `try` reads that as a successful call; the hand-decoded probe measures the
+    ///         returndata and refuses it.
+    function test_aSilentHighWaterResetIsRefusedToo() public {
+        hook.setResetHighWaterSilent(true);
+
+        vm.prank(TIMELOCK);
+        vm.expectPartialRevert(HighWaterResetFailed.selector);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+    }
+
+    /// @notice And a bid keeps the best-effort behaviour, because a bid sits below the tick and can never satisfy
+    ///         the burn predicate's second half: there is no stale mark for it to be endangered by.
+    function test_aBidPlacementIsUnaffectedByAFailingHighWaterReset() public {
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        hook.setResetHighWaterReverts(true);
+        vm.prank(TIMELOCK);
+        assertEq(vault.place(hubPool, false, SEED_USDG), SEED_USDG, "the seed bids still go in");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev The last `Placement` for `poolId` in the recorded logs. `vm.recordLogs()` must have been armed first.
+    function _lastPlacement(PoolId poolId) private view returns (uint8 buckets, int24 lowerTick, int24 upperTick) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Placement.selector) continue;
+            if (entry.topics[1] != PoolId.unwrap(poolId)) continue;
+            (, uint8 cells,,,, int24 lower, int24 upper) =
+                abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
+            return (cells, lower, upper);
+        }
+        revert("no Placement");
     }
 }

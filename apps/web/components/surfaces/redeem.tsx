@@ -5,18 +5,15 @@ import * as React from 'react'
 import {useAccount, useReadContract, useSimulateContract} from 'wagmi'
 import type {Address} from 'viem'
 
-import {FieldRow, Stat, StatGrid} from '@/components/common/stat'
 import {NotDeployed, SurfaceHeading} from '@/components/common/states'
 import {TxButton, TxError, TxSuccess} from '@/components/common/tx'
 import {Value} from '@/components/common/value'
-import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
-import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
-import {Input} from '@/components/ui/input'
+import {AmountField} from '@/components/ledger/amount-field'
+import {AssetMark, DataRow, RowGroup} from '@/components/ledger/primitives'
 import {Label} from '@/components/ui/label'
-import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
-import {usePreviewRedeem, useVaultSnapshot} from '@/hooks/use-vault'
-import {useTx} from '@/hooks/use-tx'
 import {symbolForCounter} from '@/hooks/use-pools'
+import {useTx} from '@/hooks/use-tx'
+import {usePreviewRedeem, useVaultSnapshot} from '@/hooks/use-vault'
 import {activeChainId} from '@/lib/chains'
 import {abis, addressOf, contract} from '@/lib/contracts'
 import {NOTES} from '@/lib/copy'
@@ -29,53 +26,50 @@ import {buildRedeemPreview, redeemValueUsd18, redemptionShareBps, type RedeemPre
  *
  * `previewRedeem` reads balances only — no oracle, no gate, no price — so this table is what the
  * vault would actually hand over, not a valuation of it. The fee is broken out per line rather
- * than folded invisibly into the payout.
+ * than folded invisibly into the payout, and the percentage in the column head is the live
+ * `redeemFeeBps` rather than a number written down anywhere in this app.
  */
 export function RedeemPreviewTable({preview}: {preview: RedeemPreview | null}) {
   if (!preview) {
     return (
-      <Card data-testid="redeem-preview">
-        <CardHeader>
-          <CardTitle>What you would receive</CardTitle>
-        </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">Enter an amount of AMPS to preview the payout.</CardContent>
-      </Card>
+      <div data-testid="redeem-preview">
+        <RowGroup label="You receive, pro rata" aside="One transaction">
+          <p className="py-4 text-[15px] text-dim">Enter an amount of AMPS to preview the payout.</p>
+        </RowGroup>
+      </div>
     )
   }
   return (
-    <Card data-testid="redeem-preview">
-      <CardHeader>
-        <CardTitle>What you would receive</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Asset</TableHead>
-              <TableHead>Gross</TableHead>
-              <TableHead>Fee ({formatBps(preview.redeemFeeBps)})</TableHead>
-              <TableHead>You receive</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {preview.lines.map((line) => (
-              <TableRow key={line.token} data-testid={`redeem-line-${line.symbol}`}>
-                <TableCell className="font-medium">{line.symbol}</TableCell>
-                <TableCell>{formatAmount(line.grossAmount, line.decimals)}</TableCell>
-                <TableCell>{formatAmount(line.feeAmount, line.decimals)}</TableCell>
-                <TableCell>{formatAmount(line.amount, line.decimals)}</TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-        <FieldRow
+    <div data-testid="redeem-preview">
+      <RowGroup
+        label="You receive, pro rata"
+        aside={`${preview.lines.length} lines · 1 tx · Fee (${formatBps(preview.redeemFeeBps)})`}
+      >
+        {preview.lines.map((line) => (
+          <div
+            key={line.token}
+            className="grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3.5 border-b border-hair py-3"
+            data-testid={`redeem-line-${line.symbol}`}
+          >
+            <AssetMark symbol={line.symbol} size={24} />
+            <span className="flex min-w-0 items-baseline gap-2.5">
+              <span className="font-mono text-[13px] tracking-[0.05em]">{line.symbol}</span>
+              <span className="truncate text-[15px] text-dim">
+                gross {formatAmount(line.grossAmount, line.decimals)} · fee{' '}
+                {formatAmount(line.feeAmount, line.decimals)}
+              </span>
+            </span>
+            <span className="ledger-value">{formatAmount(line.amount, line.decimals)}</span>
+          </div>
+        ))}
+        <DataRow
           label="Inventory AMPS burned alongside"
-          hint="Released protocol-owned inventory is burned too, so total supply falls by more than you redeem"
+          note="Released protocol-owned inventory is burned too, so total supply falls by more than you redeem."
         >
           <Value>{formatAmount(preview.inventoryBurned, 18)} AMPS</Value>
-        </FieldRow>
-      </CardContent>
-    </Card>
+        </DataRow>
+      </RowGroup>
+    </div>
   )
 }
 
@@ -96,12 +90,14 @@ export function RedeemSurface() {
   })
   const totalSupply = supplyQuery.data as bigint | undefined
 
-  const redeemFeeBps = Number((snapshot.data?.[4]?.result as number | undefined) ?? 0)
-  const checkpoint = snapshot.data?.[0]?.result as {navPerShareX18: bigint} | undefined
+  // Live, every load. The launch value moves and this interface never writes a percentage down.
+  const redeemFeeBps = snapshot.redeemFeeBps
+  const redeemFeeBpsMax = snapshot.redeemFeeBpsMax
+  const checkpoint = snapshot.checkpoint
 
   const previewModel = React.useMemo<RedeemPreview | null>(() => {
     const data = preview.data as readonly [readonly Address[], readonly bigint[], bigint] | undefined
-    if (!data || shares === 0n) return null
+    if (!data || shares === 0n || redeemFeeBps === undefined) return null
     return buildRedeemPreview({
       shares,
       redeemFeeBps,
@@ -135,84 +131,106 @@ export function RedeemSurface() {
 
   if (!vault) {
     return (
-      <div className="space-y-6">
-        <SurfaceHeading title="Redeem" lede="The floor: pro-rata in every asset the vault holds." />
+      <div className="space-y-10">
+        <SurfaceHeading
+          kicker="The floor"
+          title="Redeem"
+          lede="The floor: pro-rata in every asset the vault holds."
+        />
         <NotDeployed what="Redeem" />
       </div>
     )
   }
 
   const floorUsd =
-    checkpoint && shares > 0n
+    checkpoint && shares > 0n && redeemFeeBps !== undefined
       ? redeemValueUsd18({shares, navPerShareX18: checkpoint.navPerShareX18, redeemFeeBps})
       : undefined
 
   return (
-    <div className="space-y-6" data-testid="redeem-surface">
+    <div className="space-y-11" data-testid="redeem-surface">
       <SurfaceHeading
+        kicker="The floor, as a transaction"
         title="Redeem"
-        lede="Burn AMPS, take a pro-rata slice of every asset the vault holds, less the redemption fee. This path reads no oracle and no gate, and no governance action can block it."
+        lede="Burn AMPS, receive a slice of every asset the vault holds, less the redemption fee. No oracle, no gate, no pause."
       />
-      <Alert variant="info">
-        <AlertTitle>What redemption pays</AlertTitle>
-        <AlertDescription>
-          <p>{NOTES.redemptionFloor}</p>
-          <p className="mt-2">
-            It pays assets, not cash. What they are worth is whatever they are worth when you sell them, which may be
-            less than the NAV figure shown here.
-          </p>
-        </AlertDescription>
-      </Alert>
 
-      <StatGrid>
-        <Stat
-          label="NAV per share"
-          value={checkpoint ? formatUsd18(checkpoint.navPerShareX18, 4) : undefined}
-          unavailable={!checkpoint}
-        />
-        <Stat label="Redemption fee" value={formatBps(redeemFeeBps)} hint="Hard cap 5% in the contract" />
-        <Stat
-          label="Value at NAV, net of fee"
-          value={floorUsd !== undefined ? formatUsd18(floorUsd) : undefined}
-          unavailable={floorUsd === undefined}
-          hint="Arithmetic on the vault’s own balances, not a price"
-        />
-        <Stat
-          label="Share of total supply"
-          value={totalSupply !== undefined && shares > 0n ? formatBps(redemptionShareBps(shares, totalSupply)) : undefined}
-          unavailable={totalSupply === undefined || shares === 0n}
-          hint="Total supply falls by more than this: the released inventory AMPS is burned too"
-        />
-      </StatGrid>
+      <div className="grid gap-x-14 gap-y-12 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        <div>
+          <Label htmlFor="redeem-amount" className="mb-3.5">
+            You burn
+          </Label>
+          <AmountField
+            id="redeem-amount"
+            data-testid="redeem-amount"
+            value={amountText}
+            onChange={setAmountText}
+            unit="AMPS"
+          />
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Redeem</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="redeem-amount">AMPS to redeem</Label>
-              <Input
-                id="redeem-amount"
-                data-testid="redeem-amount"
-                inputMode="decimal"
-                placeholder="0.0"
-                value={amountText}
-                onChange={(e) => setAmountText(e.target.value)}
-              />
-            </div>
+          <div className="mt-1.5">
+            <DataRow
+              label={`Redemption fee${redeemFeeBps !== undefined ? ` (${formatBps(redeemFeeBps)})` : ''}`}
+              labelClassName="text-[15px] text-dim"
+              note={NOTES.redemptionFee}
+            >
+              <Value unavailable={redeemFeeBps === undefined} reason="The vault could not be read">
+                {redeemFeeBps !== undefined ? formatBps(redeemFeeBps) : null}
+              </Value>
+            </DataRow>
+            <DataRow
+              label="Ceiling hardcoded in the vault"
+              labelClassName="text-[15px] text-dim"
+              note="Governance can move the fee inside this and no further."
+            >
+              <Value unavailable={redeemFeeBpsMax === undefined} reason="The vault could not be read">
+                {redeemFeeBpsMax !== undefined ? formatBps(redeemFeeBpsMax) : null}
+              </Value>
+            </DataRow>
+            <DataRow label="NAV per share" labelClassName="text-[15px] text-dim">
+              <Value unavailable={!checkpoint} reason="The vault checkpoint could not be read">
+                {checkpoint ? formatUsd18(checkpoint.navPerShareX18, 4) : null}
+              </Value>
+            </DataRow>
+            <DataRow
+              label="Your share of the vault"
+              labelClassName="text-[15px] text-dim"
+              note="Total supply falls by more than this: the released inventory AMPS is burned too."
+            >
+              <Value unavailable={totalSupply === undefined || shares === 0n}>
+                {totalSupply !== undefined && shares > 0n ? formatBps(redemptionShareBps(shares, totalSupply)) : null}
+              </Value>
+            </DataRow>
+            <DataRow
+              label="Value at NAV, net of fee"
+              labelClassName="text-[15px] text-dim"
+              note="Arithmetic on the vault’s own balances, not a price."
+            >
+              <Value unavailable={floorUsd === undefined}>
+                {floorUsd !== undefined ? formatUsd18(floorUsd) : null}
+              </Value>
+            </DataRow>
+          </div>
+
+          <div className="mt-[26px]">
             <TxButton
               phase={tx.phase}
-              label="Redeem"
+              label={shares > 0n ? `Burn ${amountText} AMPS` : 'Burn AMPS'}
               {...(tx.blockedReason ? {blockedReason: tx.blockedReason} : {})}
               onClick={() => void tx.send()}
               data-testid="redeem-submit"
             />
+          </div>
+          <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.55] text-dim">
+            This path is structurally ungated. It still has to be included in a block — if the sequencer refuses your
+            transaction, no property of the contract helps you.
+          </p>
+          <div className="mt-6 space-y-6">
             <TxError error={tx.error} />
             {tx.hash ? <TxSuccess hash={tx.hash} explorerUrl={explorerTxUrl(activeChainId, tx.hash)} /> : null}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
+
         <RedeemPreviewTable preview={previewModel} />
       </div>
     </div>

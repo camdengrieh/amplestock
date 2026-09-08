@@ -156,6 +156,19 @@ interface IPoolRegistry {
     /// @param weightsBps The new weights, parallel to `ids`.
     event IndexWeightsSet(uint16[] ids, uint16[] weightsBps);
 
+    /// @notice Emitted by {setVault} when the vault role moves to the standby during an emergency migration.
+    /// @param previousVault The vault that handed the role on: the only address that could.
+    /// @param newVault The standby vault.
+    event VaultChanged(address indexed previousVault, address indexed newVault);
+
+    /// @notice Emitted by {retireConstituent} and {reinstateConstituent} when the constituent's bond market is no
+    ///         longer attached to it on `AmpsBonds`, so the open/closed flag was not touched.
+    /// @dev `AmpsBonds.removeCollateral` detaches a market from its collateral, after which `setMarketOpen` refuses
+    ///      it forever. Skipping the call rather than making it is what keeps a reinstatement possible.
+    /// @param constituentId The constituent.
+    /// @param marketId The market id the registry still records for it.
+    event BondMarketDetached(uint16 indexed constituentId, uint16 marketId);
+
     /// @notice The constituent set is full.
     /// @param max `MAX_CONSTITUENTS`.
     error ConstituentSetFull(uint16 max);
@@ -226,11 +239,17 @@ interface IPoolRegistry {
     ///      `k_w x (targetWeightBps - currentWeightBps) / targetWeightBps`, so a name the protocol is under-weight
     ///      in buys its collateral at a bigger discount than one it already holds enough of.
     ///
-    /// @dev **Phase 2 answers the target weight.** The realised weight is a function of the vault's valuation of
-    ///      each spoke's position, and Phase 2 ships `ZeroPositionValuer`, so there is no realised weight to
-    ///      report and every ratio would be `0/0`. Returning the target makes the deficit exactly zero — the
-    ///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued
-    ///      for the same collateral. Phase 3 sources it from the vault's valuation with no ABI change here.
+    /// @dev **The registry does not compute it; the vault does.** The realised weight is the value of that
+    ///      spoke's counter-side holdings — its position decomposed at the reference price, plus the idle and
+    ///      claim balances of the Stock Token — over `A`, and the asset enumeration, the reference price and the
+    ///      feed answers all live in `AmpsVault`. This view reads `IAmpsVault.spokeWeightBps` through a bounded
+    ///      `staticcall` and **falls back to the constituent's target weight** whenever the vault cannot answer:
+    ///      a revert, a short or out-of-range answer, or a caller that handed this view less gas than the walk
+    ///      needs. The target makes the deficit exactly zero — the protocol-favourable direction, since a smaller
+    ///      deficit means a smaller discount and less AMPS issued for the same collateral.
+    ///
+    /// @dev Phase 2 answered the target unconditionally, because it shipped `ZeroPositionValuer` and there was no
+    ///      position to value; with the Phase 3 valuer wired the deficit term is live.
     ///
     /// @dev **Callers must tolerate this reverting.** `AmpsBonds` reads it through a bounded `staticcall` and
     ///      treats any failure — a revert, an out-of-range answer, a registry that predates this function — as
@@ -357,4 +376,13 @@ interface IPoolRegistry {
     ///         paid out by redemption. **Only timelock (7 d).**
     /// @param constituentId The retired constituent.
     function withdrawRetiredBids(uint16 constituentId) external;
+
+    /// @notice Hands the vault role to `newVault`. **Only the current vault**, and therefore only from inside
+    ///         `AmpsVault.emergencyMigrate` — no governance path reaches it.
+    /// @dev The registry names a vault in three places that matter: it is the address it asks to open a pool, the
+    ///      address it reads `pRefX18` and `bonds` from, and the address the hook is told to accept. Leaving it
+    ///      pointing at an evacuated shell would mean the standby could never register a pool, which is why the
+    ///      migration moves it alongside AMPS, `AmpsBonds`, `BountyPot` and the hook.
+    /// @param newVault The standby vault. Must be non-zero.
+    function setVault(address newVault) external;
 }

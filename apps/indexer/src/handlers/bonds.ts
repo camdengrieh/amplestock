@@ -57,6 +57,7 @@ ponder.on('AmpsBonds:CollateralAdded', async ({event, context}) => {
       collateralClassLabel: collateralClassLabel(event.args.class),
       constituentId: event.args.constituentId,
       open: false,
+      detached: false,
       dBaseBps: 0,
       dMinBps: 0,
       dMaxBps: 0,
@@ -71,6 +72,7 @@ ponder.on('AmpsBonds:CollateralAdded', async ({event, context}) => {
       bondCount: 0,
       lastBondAt: 0n,
       lastDiscountBps: 0,
+      forwardedCollateral: 0n,
       createdAt: event.block.timestamp,
     })
     .onConflictDoUpdate(() => ({
@@ -79,6 +81,22 @@ ponder.on('AmpsBonds:CollateralAdded', async ({event, context}) => {
       collateralDecimals: Number(decimals),
       collateralClass: event.args.class,
       collateralClassLabel: collateralClassLabel(event.args.class),
+      constituentId: event.args.constituentId,
+      // Re-adding the collateral re-attaches the market: `marketIdOf(collateral)` names it again.
+      detached: false,
+    }))
+
+  // The reverse of `bondMarket.collateral`, and the mirror of `AmpsBonds.marketIdOf`.
+  // `CollateralForwarded` names only the collateral, so this is how it finds its market.
+  await context.db
+    .insert(schema.collateralIndex)
+    .values({
+      id: event.args.collateral.toLowerCase() as `0x${string}`,
+      marketId: event.args.marketId,
+      constituentId: event.args.constituentId,
+    })
+    .onConflictDoUpdate(() => ({
+      marketId: event.args.marketId,
       constituentId: event.args.constituentId,
     }))
 
@@ -92,10 +110,54 @@ ponder.on('AmpsBonds:CollateralAdded', async ({event, context}) => {
   }
 })
 
+/**
+ * `removeCollateral` **detaches** the market rather than deleting it: `marketIdOf(collateral)` stops
+ * naming it, and `setMarketOpen` refuses a detached market for the rest of the contract's life. The
+ * row therefore stays — its issuance history is still true — and is flagged, which is the same
+ * fact `PoolRegistry.BondMarketDetached` reports from the registry's side.
+ */
 ponder.on('AmpsBonds:CollateralRemoved', async ({event, context}) => {
   const id = event.args.marketId.toString()
   const market = await context.db.find(schema.bondMarket, {id})
-  if (market !== null) await context.db.update(schema.bondMarket, {id}).set({open: false})
+  if (market !== null) {
+    await context.db.update(schema.bondMarket, {id}).set({open: false, detached: true})
+  }
+  await context.db.delete(schema.collateralIndex, {
+    id: event.args.collateral.toLowerCase() as `0x${string}`,
+  })
+})
+
+/**
+ * Residual collateral forwarded to the vault at the exit of `bond()`.
+ *
+ * The collateral moves bonder -> PoolManager inside the bond and never rests on the shell, so this
+ * balance is zero in every honest flow — but "zero" is not enforceable, because anybody may
+ * `transfer` a wei to the shell at any time. Asserting it turned a 1-wei donation into a permanent
+ * denial of service on that market; forwarding is the same invariant with no such edge, and the
+ * outcome is a log rather than a revert reason. A non-zero amount here therefore means somebody
+ * donated to the bonds shell, nothing more, and it is recorded as the informational fact it is:
+ * one `parameterChange` row for the history, the latest value in `parameterState`, and the running
+ * total on the market itself.
+ */
+ponder.on('AmpsBonds:CollateralForwarded', async ({event, context}) => {
+  const collateral = event.args.collateral.toLowerCase() as `0x${string}`
+  const indexed = await context.db.find(schema.collateralIndex, {id: collateral})
+  // `0` is the protocol's own sentinel for "no market" (`AmpsBonds.marketIdOf`), so an unindexed
+  // collateral lands in its own bucket rather than being silently attributed to a real market.
+  const marketId = indexed === null ? 0 : indexed.marketId
+
+  await recordParameter(context, event, 'bonds', 'collateralForwarded', {
+    newValue: event.args.amount,
+    marketId,
+  })
+
+  if (marketId === 0) return
+  const id = marketId.toString()
+  const market = await context.db.find(schema.bondMarket, {id})
+  if (market === null) return
+  await context.db
+    .update(schema.bondMarket, {id})
+    .set({forwardedCollateral: market.forwardedCollateral + event.args.amount})
 })
 
 ponder.on('AmpsBonds:MarketOpenSet', async ({event, context}) => {
@@ -235,7 +297,7 @@ ponder.on('AmpsBonds:Bond', async ({event, context}) => {
     bondIssuedTotal: row.bondIssuedTotal + event.args.ampsOut,
   }))
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
-    bondIssued: row.bondIssued + event.args.ampsOut,
+    bondIssuedAmps: row.bondIssuedAmps + event.args.ampsOut,
   }))
   void pRef
 })

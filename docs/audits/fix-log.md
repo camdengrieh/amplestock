@@ -1,0 +1,151 @@
+# Fix log — 2026-09-07 review
+
+Disposition of every finding and lead in [`amplestock-pashov-ai-audit-report-20260907-045500.md`](amplestock-pashov-ai-audit-report-20260907-045500.md). "Fixed" means the change is in the remediation slice on this branch with the named regression test; the state-model rulings AC–AP in `docs/phase3-state-model.md` §12.5 record the behavioural consequences.
+
+## Findings
+
+| # | Conf. | Finding | Disposition | Where | Test |
+|---|---|---|---|---|---|
+| 1 | 92 | `AmpsBonds._issue` donation bricks a market | **Fixed** — dust is forwarded to the vault best-effort, never asserted; `CollateralForwarded` | `AmpsBonds._issue` | `AmpsBonds.t.sol::test_collateralDonationCannotBrickTheMarket` |
+| 2 | 90 | `_payOut` blocked by one paused/denylisting token | **Fixed** — `try take` → fallback `pm.transfer` of the ERC-6909 claim; idle leg best-effort | `VaultRedeemLib._payOut`, `_payout` | `VaultRedeem.t.sol::test_aPausedConstituentDoesNotStopTheFloor`, `…DenylistsTheVault…`, `…BalanceOfReverts…` |
+| 3 | 88 | `sweepClean` unguarded calls on the ungated path | **Fixed** — bounded balance probes, per-token best-effort absorb, `SweepResidue` instead of `SweepDirty`; `_assertSweepZero` removed | `VaultRedeemLib.sweepClean`, `_absorb`, `AmpsVault` | `VaultRedeem.t.sol::test_aDonatedWeiOfAFrozenTokenDoesNotBrickTheOtherEntryPoints`, `VaultAttacks.t.sol::test_aReentrantStockTokenCannotStopTheFloorAndGainsNothing` |
+| 4 | 85 | `_burnback` liquidates bid cells | **Fixed** — burn only `upperTick <= highWater && tick <= lowerTick`; mark reset after every ask placement | `VaultPlacementLib._burnback`, `_placeLadder` | `VaultCompound.t.sol::test_i33_bidsLaidByCompoundSurviveASmallDowntick`, `…anAskFullySoldAndFullyBoughtBackIsBurned`, `…LeavesAPartiallyBoughtBackCellAlone`, `…aRolloutPlacedAskUnderAStaleMarkIsNotBurned` |
+| 5 | 85 | Zero-work `compound` side effects | **Fixed** — surge, mark reset and cooldown gated on work done | `VaultPlacementLib.compound` | `VaultCompound.t.sol::test_aZeroWorkCompoundLeavesTheSurgeTheMarkAndTheCooldownAlone`, `…CannotDenyTheNextPlacement` |
+| 6 | 85 | Creator slice divides realised fees by the base sell fee | **Fixed (bounded)** — divisor floored at `AMPS_FEE_BPS_DEFAULT` (≤ 1/5 of fees); the ≤ 1.6x dynamic-fee over-statement is documented and accepted | `VaultPlacementLib._split` | `VaultCompound.t.sol::test_theCreatorSliceIsCappedWhenTheSellFeeIsCutToItsFloor` |
+| 7 | 85 | Pre-genesis `checkpoint()` writes `P_ref = 1e15` | **Fixed** — `checkpoint`/`touch` revert `NotInitialized` pre-genesis; `_navPerShare` is 0 at zero supply | `AmpsVault` | `VaultGateResilience.t.sol::VaultPreGenesisTest` (5 tests) |
+| 8 | 82 | `evacuate` idle leg / sweep assert brick migration | **Fixed** — best-effort idle transfer, no sweep assertion on the migration path | `VaultNavLib.evacuate`, `AmpsVault.emergencyMigrate` | `VaultMigration.t.sol::test_aBlockedTokenWithAnIdleWeiDoesNotStopTheEvacuation`, `…PausedToken…`, `…BalanceOfReverts…` |
+| 9 | 80 | Bonds price a held-back/stale answer with a calendar haircut | **Fixed** — registry reports `min(held, candidate)` while held; gate treats `unconfirmed` as stale and floors the haircut at `CLOSED`; the shell consumes `fresh` | `FeedRegistry._read`, `OracleGate._snapshot/checkBond`, `AmpsBonds._price/_collect` | `AmpsBonds.t.sol::test_heldBackJumpPricesAtTheMinimumWithTheWiderHaircut`, `…staleFeedIsNeverPricedAtAZeroHaircut`, `OracleGate.t.sol::test_degraded_unconfirmedAnswerIsTreatedAsStale` |
+| 10 | 80 | `deployBonded` ignores constituent status | **Fixed** — `status != ACTIVE ⇒ return 0` | `VaultRolloutLib.deployBonded` | `VaultRollout.t.sol::test_deployBondedRefusesARetiredConstituent`, `…Frozen…` |
+| 11 | 78 | `migrationPredicate` decodes a dirty bool | **Fixed** — hand-decoded word in both probes | `VaultNavLib.migrationPredicate`, `_selfTransferProbe` | `VaultMigration.t.sol::test_theMigrationPredicateSurvivesANonCanonicalBool` |
+| 12 | 78 | `emergencyMigrate` skips the hook and registry roles | **Fixed** — `PoolRegistry.setVault`, `AmpsHook.setVault` (storage `vault`), `VaultNavLib.handover` moves six roles | `AmpsVault`, `VaultNavLib`, `PoolRegistry`, `AmpsHook` | `VaultMigration.t.sol::test_theHandoverMovesAllSixRoles`, `AmpsHook.t.sol::test_setVaultMovesEveryVaultOnlyEntryPoint`, `DenylistMigration.t.sol` |
+| 13 | 78 | Expired pending jump confirms any candidate | **Fixed** — both branches require agreement with the pending level | `FeedRegistry._jumpConfirmed` | `FeedRegistry.t.sol::test_jump_agedPendingDoesNotConfirmAnUnrelatedRound` |
+| 14 | 75 | Jump rule disarms on a stale latch | **Fixed** — stateless previous-round evaluation (`getRoundData(roundId-1/2)`) when the latch is older than a heartbeat | `FeedRegistry._evaluate`, `_probeRound` | `FeedRegistry.t.sol::test_jump_statelessPath*` (5 tests) |
+| 15 | 75 | Shell mints the policy's `ampsOut` | **Fixed** — `ampsOut` recomputed from `q` in `_price` and `_quote` | `AmpsBonds._price`, `_quote` | `AmpsBonds.t.sol::test_policyCannotInflateAmpsOutBehindABoundedPrice` |
+| 16 | 75 | `compound` re-lays asks at the live tick | **Fixed** — reference anchor, like every other placement | `VaultPlacementLib.compound` | `VaultCompound.t.sol::test_i32_compoundAnchorsTheRelaidAskLadderAtTheReferenceNotTheTick` |
+| 17 | 75 | Rotation credit shared across senders | **Fixed** — credit keyed by `sender`; `rotationCredit(address)` | `AmpsHook`, `IAmpsHook` | `RotationCredit.t.sol::test_oneSendersBuyDoesNotDiscountAnothersSell`, `…TheCreditIsBookedToTheRouterBothHopsShare` |
+| 18 | 72 | Typed `try` on the gate does not fail open | **Fixed** — bounded hand-decoded reads in `_requireGate`/`_poke` and in `VaultNavLib`'s checkpoint reads; `setPolicyPointer` refuses codeless targets | `AmpsVault`, `VaultNavLib` | `VaultGateResilience.t.sol::VaultGateResilienceTest` (10 tests) |
+| 19 | 70 | Saturated multiplier cache vs full-width probe | **Fixed** — compare saturated with saturated | `AmpsHook._detectMultiplierStep` | `AmpsHookObservations.t.sol::test_aMultiplierBeyondUint64ArmsItsStepOnceAndResolves`, `…ArmsNothingOnAnyRefresh` |
+| 20 | 70 | `Placed.highestTick` unseeded | **Fixed** | `VaultPlacementLib._executePlace` | `VaultPlacement.t.sol::test_thePlacementLogCarriesTheLaddersRealTopAndBottom` |
+
+## Leads
+
+| Lead | Disposition |
+|---|---|
+| Watchdog restamped before it is read (`checkpoint`/`poke`) | Accepted as designed (a checkpoint clears a passed outage); a post-outage cool-down is a candidate for v1.5 |
+| Management gate follows the equity calendar (`CLOSED ⇒ DEGRADED`) | Accepted: placements pause when equities are closed; the timelock keeps the gate's own setters and can batch `unfreezeProtocol` + `setPolicyPointer`; recorded as a user decision item |
+| Third-party growth of a bonder's position array | Accepted (griefing of `claimAll`/lens only; per-id `claim` unaffected; ~5M gas per grief) |
+| Unpriceable registered asset + dust reverts NAV | Deploy-order property (`_installFeed` precedes `addConstituent`); left as a runbook check |
+| Reference-basis valuation of straddled cells | Bounded to one cell by fix 16's anchor; disclosed through `premium`; accepted |
+| Stale high-water mark / valuation-basis bleed inside `_burnback` | Fixed by the mark reset on every ask placement and the fully-crossed rule (fix 4) |
+| Bid re-ladder can straddle the reference and fail R1 | Open; observed only in geometry, not in a test; monitor on testnet |
+| `spokeHasDepth` hard-coded false | Fixed — derived from the spoke's bid records (`VaultRollout.t.sol::test_aSpokeWithBidDepthGetsTheUndiscountedShare`) |
+| Rollout charged/paid on `moved` not `placed` | Fixed — window and bounty on `placed`; remainder idle and reported (`…test_theWindowAndTheBountyAreChargedOnWhatWasPlacedNotOnWhatMoved`) |
+| `STAGE_SLOT` literal not its stated hash | Fixed — `Constants.PLACEMENT_STAGE_SLOT`, pinned by `VaultPlacement.t.sol::test_theStagingBufferSlotIsTheHashItClaimsToBe` |
+| Keeper gas allowance overpays on a near-zero-basefee chain | Accepted (bounded by the daily ceiling and `chost`); revisit in Phase 4 tuning |
+| Bond capacity self-inflates / reset window | Accepted (~0.5 % of the cap) |
+| Full collateral settled before the capacity clamp | Accepted; the dApp always passes the quoted amount as `minAmpsOut` (ruling Q) |
+| `quote` vs `bond` diverge on weekends | Accepted for now (the view refuses on a stale checkpoint); candidate for a recomputed-NAV quote in v1.5 |
+| `removeCollateral` then `reinstateConstituent` reverts | Fixed — `_setMarketOpen` skips a detached market (`PoolRegistry.t.sol::test_reinstate_survivesARemovedCollateral`) |
+| `quote` panics on a huge `amountIn` | Fixed — `reason = "amountTooLarge"` (`AmpsBonds.t.sol::test_quoteRefusesAnAmountItCannotNormalise`) |
+| Divergence breaker unincentivised / clearable | Accepted; the keeper runbook adds a `pokePool` and `refreshMany` timer; `qFloor` and `_requireConverged` hold independently |
+| Layer F implemented twice with different overflow behaviour | Accepted (every caller wraps the gate's version) |
+| Entry-class bonds skip the freshness layer | Accepted while both entry markets are closed; must be revisited before opening them (v2) |
+| Guardian freeze blocks governance's escape | Accepted (timelock batch) |
+| Zero-amount self-transfer probes | Accepted; out-of-scope token behaviour |
+| `marketReference` "exactly once more" unenforced | Accepted; NatSpec to be corrected with the next interface change |
+| Downward `P_ref` asymmetry loosens the bond floor | Accepted (cost of the hub push under the truncation cap and the fee wall) |
+| Registry writes the hook never reads (`poolClass`/`buyFeeBps`) | Accepted; `AmpsHook.setBuyFeeBps` is the live setter; a `setPoolClass` is a candidate for the next hook revision |
+| `spokeSeedBps` / registry `place` privilege dead | Accepted; a new constituent receives depth through rollout |
+| One `minDelay` for three timelock classes | Accepted; tiers are signing policy (runbooks) |
+| One-sided multiplier-step detector | Accepted; the gate's own `oraclePaused`/`effectiveAt` probes cover the downward case |
+| Gate probe gas budget | To be measured on 46630 before launch |
+| `-amountSpecified` panic, stream step release, `setFeed` delete-before-probe, re-entrant `sync`, batched `extsload` length, groundwork-library gaps | Accepted (unreachable at launch parameters or covered elsewhere) |
+
+# Fix log — second wave (re-audit 2026-09-07 13:30)
+
+Disposition of every finding and lead in [`amplestock-pashov-ai-audit-report-20260907-133000.md`](amplestock-pashov-ai-audit-report-20260907-133000.md), the re-audit of the tree after the first wave (`bc0e6bb`). The second-wave slice on this branch carries the fixes; rulings AQ–AZ in `docs/phase3-state-model.md` §12.5 record the behavioural consequences.
+
+## Findings
+
+| # | Conf. | Finding | Disposition | Where | Test |
+|---|---|---|---|---|---|
+| 1 | 90 | `_payOut` forwards all gas to the token | **Fixed** — `take{gas: STOCK_TOKEN_PROBE_GAS * 4}` with the claim fallback; the ERC-20 payout unlock is itself `try`-wrapped with a reserve and falls back to a claims-only unlock; idle parts are paid after the unlock through bounded best-effort calls | `VaultRedeemLib.payout`, `_payOut`, `ACTION_PAYOUT_CLAIMS`, `Constants.REDEEM_PAYOUT_RESERVE_GAS` | `VaultHostileToken.t.sol` (gas-burning `transfer`, foreign-delta `transfer`, reverting `balanceOf`: `redeemProRata` pays tokens or claims within `hostile*2 < clean*5`; measured 732,189 vs 351,045 gas) |
+| 2 | 90 | `totalAssetsUsd18` bare `balanceOf` on the NAV path | **Fixed** — bounded hand-decoded balance probe (unreadable ⇒ zero) in `totalAssetsUsd18`, `inventoryAmps`, `_placeLadder`/`_settle`, `deployBonded` | `VaultNavLib.totalAssetsUsd18`, `inventoryAmps`, `_idleBalance`; `VaultPlacementLib._placeLadder`, `VaultRolloutLib.deployBonded` (`_probeBalance`) | `VaultNavResilience.t.sol` (checkpoint/compound survive a reverting `balanceOf`); `VaultPlacement.t.sol::test_aStockTokenWhoseBalanceOfRevertsDoesNotBrickItsPlacement`, `VaultRollout.t.sol::test_deployBondedSurvivesAStockTokenWhoseBalanceOfReverts` |
+| 3 | 88 | `_absorb`: unbounded `_tryTransfer`; token call inside the vault's own unlock | **Fixed** — `sync` + the bounded token transfer run outside the unlock; `settle` is gas-capped inside it; the absorb unlock is `try`-wrapped; `_tryTransfer` carries a stipend | `VaultRedeemLib.sweepClean`, `_absorb`, `_settleAbsorbed`, `_tryTransfer` | `VaultHostileToken.t.sol` (per-token absorb; a token opening a foreign delta from `transfer` no longer reverts the entry point); residual documented in `_absorb`: a token that accepts the transfer and then refuses `balanceOf` inside `settle` leaves its own dust uncredited |
+| 4 | 85 | `_issue` dust forward: typed `balanceOf`, uncapped transfer, `abi.decode(bool)` | **Fixed** — bounded hand-decoded balance probe, `{gas: STOCK_TOKEN_PROBE_GAS * 4}`, first-word-non-zero success test | `AmpsBonds._issue`, `_probeBalance`, `_firstWord` | `AmpsBonds.t.sol::test_anUnreadableCollateralBalanceDoesNotBrickTheMarket`, `…aGasBurningCollateralTransferCannotConsumeTheBond`, `…aNonCanonicalTransferAnswerIsAcceptedNotDecoded` (`MockHostileCollateral`) |
+| 5 | 82 | `_tryMoveIdle` forwards all gas during evacuation | **Fixed** — stipend on the transfer, matching `_selfTransferProbe` | `VaultNavLib._tryMoveIdle` | `VaultHostileToken.t.sol` (evacuation with a gas-burning constituent completes and hands over) |
+| 6 | 80 | Rollout charges the window on `placed`, harvests `moved` | **Fixed** — the window is charged on `moved`; the unplaced remainder is re-placed into the entry pools' asks (or left idle and disclosed); `place` takes no cooldown on zero work | `VaultRolloutLib.rollout` (window on `moved`, remainder re-placed as `"rollback"`, source cooldown written once after it), `VaultPlacementLib.place` | `VaultRollout.t.sol::test_theWindowIsChargedOnWhatMovedAndTheBountyOnWhatWasPlaced`, `…theUnplacedRemainderGoesBackIntoTheEntryPools`, `…i32_repeatedRolloutsAtASaturatedCellBudgetStayInsideTheDailyAllowance` |
+| 7 | 75 | Held-back answer understates the NAV denominator | **Fixed** — the checkpoint records `navUnconfirmed` (any priced asset `!fresh \|\| unconfirmed`); `AmpsBonds._price` refuses (`UnconfirmedNav`) and `_quote` reports `unconfirmedNav` | `VaultNavLib.answer`, `totalAssetsUsd18` (returns `unconfirmed`), `AmpsVault._checkpoint` (slot 21 `_navUnconfirmed`), `AmpsBonds._price`/`_collect`/`_navUnconfirmed` | `VaultNavResilience.t.sol` (`navUnconfirmed` set by a held-back or stale priced asset), `VaultLayout.t.sol` (slot 21); `AmpsBonds.t.sol::test_bondRefusesANavBuiltOnAnUnconfirmedAnswer`, `…aVaultThatCannotAnswerNavUnconfirmedStillPrices`, `AmpsBonds.fuzz.t.sol::testFuzz_anUnconfirmedNavRefusesEveryBond` |
+| 8 | 75 | `fresh` does not fold `unconfirmed` | **Fixed** — `status.fresh` is false while `unconfirmed`; `_evaluate` runs the stateless path with no latch | `FeedRegistry._read`, `_evaluate` | `FeedRegistry.t.sol::test_jump_aHeldBackAnswerIsNeverFresh`, `…statelessPathRunsWithNothingLatched`, `…nothingLatchedAndNoHistoryIsStillAdopted` |
+| 9 | 75 | Hook probe budgets below the gate's cost | **Fixed** — `GATE_PROBE_GAS` raised to 1,000,000 with the measurement documented; `closedHours` read under it; a spoke's `fairTick` falls back to `twap30m` when the snapshot fails | `AmpsHook._snapshotInto`, `_readGate`, `_refreshGate` | `HookGateProbeBudget.t.sol` (3 tests: `closedHours` 51,005 gas on the 2032 holiday weekend, 77,390 worst case), `AmpsHookObservations.t.sol::test_aSpokeFallsBackToItsOwnTwapWhenTheSnapshotFails`, `…aSpokeWithNoCoverageKeepsItsLastFairTick…`, `…aHealthyGateStillOwnsASpokesFairTick` |
+| 10 | 75 | High-water mark reset from the truncated tick | **Fixed** — `resetHighWater` floors the mark at the raw tick (`min(lastTruncatedTick, lastTick)`) | `AmpsHook.resetHighWater`, `TruncatedOracleLib.resetHighWater(floorTick)` | `AmpsHookObservations.t.sol::test_theHighWaterResetIsFlooredAtTheRawTick`, `…AnnouncesTheMarkItArmed`, `TruncatedOracleLib.t.sol::test_resetHighWaterIsFlooredAtTheRawTick`, `testFuzz_resetHighWaterNeverExceedsEitherInput` |
+| 11 | 75 | One wei of counter fee counts as work | **Fixed** — surge and mark reset only on an AMPS-side event; cooldown only when something was placed | `VaultPlacementLib.compound` | `VaultCompound.t.sol::test_aCounterFeeOnlyCompoundResetsNoMark` (residual: the bid re-ladder's own `_armSurge` still arms on any counter placement, a design property recorded as a lead) |
+| 12 | 75 | `place` writes the cooldown on zero work | **Fixed** — cooldown written only when `placed != 0` | `VaultPlacementLib.place` | `VaultRollout.t.sol::test_aDeployBondedThatPlacesNothingDoesNotTakeThePoolsCooldown` |
+| 13 | 70 | Credit shared within one settlement contract | **Accepted (ruling)** — a batching settlement contract that pairs an entry with an exit is a rotation-equivalent flow and pays two buy fees on the matched size; NatSpec rewritten to say so. Superseded by plan revision 6 (router-only pass-through) | `AmpsHook`, `IAmpsHook.rotationCredit` | — |
+
+## Leads
+
+| Lead | Disposition |
+|---|---|
+| Typed `try` on pointer targets outside the vault (`VaultNavLib.referenceOverridden`/`marketPrice`/`answer`; `VaultPlacementLib`, `VaultRolloutLib` feed/hook/policy reads) | **Fixed** — `VaultNavLib`: bounded hand-decoded reads under `GATE_READ_GAS`/`FEED_READ_GAS`/`MARKET_READ_GAS` (`VaultNavResilience.t.sol`: short, out-of-range and dirty answers degrade the checkpoint instead of reverting); `VaultPlacementLib`/`VaultRolloutLib`: every pointer read carries a budget, with `latestAnswer` and `currentWeightBps` under the generous `COMPOSITE_READ_GAS` (400k) because a failed read there skips `_requireConverged` and drops the anchor to the live tick, so a tight cap would trade liveness for safety |
+| `_resetHighWater` may fail silently on an ask placement | **Fixed** — bounded hand-decoded call; a failed or silent reset on an ask placement reverts `HighWaterResetFailed`, bids keep best-effort (`VaultPlacement.t.sol::test_anAskPlacementRefusesToLeaveAStaleHighWaterMarkStanding`, `…aSilentHighWaterResetIsRefusedToo`, `…aBidPlacementIsUnaffectedByAFailingHighWaterReset`) |
+| Merging into a cell with accrued fees skips the split | **Fixed** — `_collectAndSplit` runs at the top of `place`, so a merge settles principal only (`VaultCompound.t.sol::test_placingIntoACellWithAccruedAmpsFeesPaysTheCreatorStakerAndBurnSlices`, `…theSecondPlacementFindsNoFeesLeftToSplit`). Residual: `rollout`'s harvest still realises the entry pools' accrued AMPS fees without the split (needs a public collect entry point; revisit in revision 6, where the AMPS side is burned) |
+| `_writeRecords` overwrites `record.above` on a merge | Open — record semantics under a side flip; revisit with revision 6's split rewrite |
+| Placement anchor aligns down while the grid ceils | **Accepted (ruling AX)** — aligning the anchor up would start the ask ladder at cell 1, leaving no protocol ask between `P_ref` and `2 × P_ref` (the grid origin is the opening tick, so the reference sits inside cell 0 by construction; snapping the origin up instead makes a straddled *bid*, whose AMPS half `A` writes off, a hard R1 revert on the seed). §3.7's I32 uses the aligned-down `fairTick`; the residue is < 1 tick spacing on the first cell only (`VaultPlacement.t.sol::test_i32_theStraddleOfTheFirstAskCellIsBoundedByOneTickSpacing`); `PriceLib.fairTick(…, roundUp)` exists for a future ruling |
+| A fully crossed bid is burned as a buyback | Accepted — a crossed bid holds bought-back AMPS; burning it is the buyback rule |
+| Migration may not fit one transaction at a full constituent set | Open — part of the constituent-cap decision (user-owned); measured pieces recorded in the report |
+| `currentWeightBps` returns the target weight | **Partly fixed** — `VaultNavLib.spokeWeightBps` / `AmpsVault.spokeWeightBps` value the spoke at the reference price over the last checkpointed `A` and `PoolRegistry.currentWeightBps` reads it through a 2M-gas bounded probe with the target weight as fallback (`PoolRegistry.t.sol` +5, `MockVaultForRegistry` fault modes, `VaultNavResilience.t.sol::VaultSpokeWeightTest`). The denominator is the checkpoint by design: a live walk (~150k per valued pool) failed the rollout path's 400k budget in production while passing in fixtures, which is how `VaultRollout.t.sol`'s two share tests caught it at the fold. Both consumers read it under `COMPOSITE_READ_GAS` (the bond shell's 50k cap sat at the budget edge and made `quote()` and `bond()` disagree, `Phase2Integration.test_c_bondAtPremiumDiscountBinds`), so the deficit term is live in the rollout schedule and in bond pricing; `docs/phase2-state-model.md` §5 |
+| `config.marketId` not refreshed after remove + add collateral | **Fixed** — `_setMarketOpen` resolves the live market through a bounded `marketIdOf` probe and adopts it (`PoolRegistry.t.sol`); retiring with no `bonds` pointer now reverts `ZeroAddress` instead of silently skipping |
+| `retiredAt` not cleared on reinstatement; `freezeUntil` never written | **Fixed** (`reinstateConstituent` clears `retiredAt`); `freezeUntil` remains a read-only field (disclosure) |
+| Index weight sum enforced only in `setIndexWeights` | Open — the sum is re-proposed at the next weight update |
+| Unreadable deviation clears the layer-E timer | **Fixed** — the timer clears only on a readable in-band reading (`OracleGate.t.sol::test_divergence_anUnreadableDeviationLeavesTheTimerAlone`) |
+| Jump rule disarmed without a latch; no time escape without a keeper | **Fixed** (stateless path with no latch); the keeper `refreshMany` job covers the hold |
+| `_quote` overflow guard 1e18x too strict | **Fixed** — `_mulDivWadOverflows` mirrors `FullMath.mulDiv`'s own condition (`AmpsBonds.t.sol::test_quoteRefusesAnAmountItCannotNormalise`) |
+| Typed `try` in the quote surface (`_collect`, `_tryPointers`, `_haircutFor`) | **Fixed** — codeless pointers read as absent before every typed read (`AmpsBonds.t.sol::test_quoteTreatsACodelessPointerAsAbsent`) |
+| `setStandbyVault` has no code check; `Migrated` silent on a failed hook leg | **Fixed** (code check; `AmpsVault.t.sol` codeless standby refused); the `Migrated` event still does not name a failed hook leg — disclosure only |
+| `_requireWiringOpen` dead guard | **Fixed** — removed |
+| `_updateVariance` NatSpec inverted | **Fixed** — NatSpec corrected in `AmpsHook` and `HookStateLib` |
+| Credit per sender, not per pool class | Superseded by revision 6 (router-only pass-through) |
+| `AmpsQuoter._quote` premium on a zero `pRefX18` | Open — masked by the degraded bit; revisit in the revision-6 quoter slice |
+| Off-grid anchor reverts the placement | Accepted — reachable only through a mis-configured `gridBaseTick` |
+| `_propose` reports a stale window | **Fixed** with finding 6 |
+| Bounty over-counts a two-hop upkeep | Accepted — bounded by the 3x gas cap and the daily ceiling |
+
+---
+
+## Revision 6 — the code paths earlier findings applied to, and what happened to them
+
+Plan revision 6 (user directive, 2026-09-07) rewrote the fee model: `ampsFeeBps` on **both** directions of every
+pool, the pass-through fee granted only to `AmpsRouter.rotate`, the creator paid in kind out of each currency at
+`compound()`, the whole AMPS-side remainder burned, no staking. Several earlier findings and leads were about code
+that revision 6 **deleted**. This section records which, so that a reader of the two audit reports can tell a fix
+from a removal — and so that nobody re-fixes something that no longer exists.
+
+### Removed, not fixed
+
+| Earlier item | What happened |
+|---|---|
+| **The staking sandwich** (first-wave design note; doc invariant I36) — `AmpsStaking.totalAssets()` excluded `pendingRewards` so a same-block stake/unstake around `compound` could not capture a notified tranche, and I36 constrained the stream. | **The contract is gone.** There is no `AmpsStaking`, no xAMPS, no `notifyReward` and no reward stream, so there is no tranche to sandwich and nothing for a share price to accrue to. `AmpsVault` slot 6 and slot 2's `[16..47]` band are reserved holes where `staking` and `stakerBps`/`burnBps` lived. **I36 is deleted** rather than restated (`docs/phase3-state-model.md` §8.2); `docs/phase2-state-model.md` §1.3 records the removal in place of the old layout. `test/invariant/Phase2.invariant.t.sol` says so at the top of the file. |
+| **`burnBps` as a governed share** (finding 6's neighbourhood; decision 6) — the burn was `(ampsFees − creatorCut − stakerCut) × burnBps / BPS`, bounded `≤ 2500`. | **There is no parameter left to bound.** The whole AMPS-side remainder is burned after the creator's slice, so the burn is a whole share rather than a fraction of one. `BURN_BPS_*` and `STAKER_BPS_*` are removed from `Constants`, from the launch parameter table, from the governance surface and from `docs/launch-runbook.md` §7's 48-hour list. |
+| **Finding 6 — the creator divisor floor (ruling AG)**: `divisor = max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT)`, so a fee cut could not enlarge the creator's slice past a fifth of AMPS-side fees. | **Removed with the thing it protected.** The creator is now paid `creatorBps(t)/ampsFeeBps` of **each currency's** fees, and `creatorBps(t) ≤ ampsFeeBps` is structural: the schedule starts at 100 bp and the fee's band floor is 100 bp. I31 becomes per-currency. What survives is the accepted over-statement: `ampsFees` was collected at `base + dyn`, so the realised slice exceeds the schedule by up to `(base + dynCap)/base` (1.6× under `GREEN`), still documented rather than tracked per swap. |
+| **Ruling AI — `compound` re-ladders at the reference anchor** (finding 16), and the re-ladder anchor generally. | **`compound` places no asks at all.** Step 6 of §3.6 is gone; the AMPS side is burned. That is what turns I10 into an equality (ask inventory is the genesis POL tranche less sales and rollout moves) and removes the only path on which a compound could re-sell AMPS the protocol had just bought back. The anchor rules still bind `place`, `rollout` and `deployBonded`, which are the placements that lay asks. |
+| **Lead — `rollout`'s harvest realises accrued AMPS fees without the split** ("revisit in revision 6, where the AMPS side is burned"). | **Moot.** The split's AMPS half is now "burn the remainder", so an unsplit realisation leaves AMPS in the vault's own inventory rather than skipping a distribution to somebody. It is still not ideal — the creator's slice of those fees is not taken — and stays recorded as a lead against a future public collect entry point. |
+| **Lead — the bid re-ladder's placement surge on a dust counter fee**, and finding 11's zero-work gating. | **Tightened by the rewrite.** `compound`'s surge and high-water reset are now gated on exactly `burned != 0`, an AMPS-side fact, because the fee burn takes the whole AMPS-side remainder and the buyback is the other half of the same condition. One wei of counter-side fee can no longer arm `SURGE_MAX_BPS`. The cooldown still follows what was actually placed. |
+| **Lead AZ — the rotation credit shared within one settlement contract** ("rotation-equivalent flow", accepted under revision 5). | **Closed by construction.** A credit is granted only on a hop where `sender == AmpsHook.router()` **and** `hookData == ROUTER_ROTATE`, and spent only on such a hop's exact-input sell. No ordinary buy — the protocol router's own `buy` included — mints anything to discount with, so a batching settlement contract can no longer pair a stranger's entry with its own exit. I26 is restated to say so. |
+| **Lead — `_writeRecords` overwrites `record.above` on a merge** ("revisit with revision 6's split rewrite"). | **Still open, and narrower.** `compound` no longer writes ask records, so the side-flip case is now reachable only through a bid cell that a rollout or a governance `place` later re-uses as an ask. Recorded as a lead against `VaultPlacementLib._writeRecords`. |
+
+### Still open, unchanged by revision 6
+
+`AmpsQuoter._quote`'s premium on a zero `pRefX18` (masked by the degraded bit — the revision-6 quoter slice
+touched the fee legs, not the premium); the index weight sum enforced only in `setIndexWeights`; the migration's
+single-transaction fit at a full constituent set (part of the user-owned constituent-cap decision); the `Migrated`
+event not naming a failed hook leg; the bounty's two-hop over-count.
+
+### New surface revision 6 adds, and what it will need audited
+
+`AmpsRouter` (`contracts/src/periphery/AmpsRouter.sol`) is new, immutable, ownerless and feeless. The properties
+an audit should attack: that both hops of `rotate` settle inside one `unlock` and hop 2 sells exactly hop 1's
+realised output; that the zero-AMPS-delta assertion cannot be bypassed; that the best-effort sweep cannot be used
+to strand or steal a caller's residue; that `hop1 != hop2` is enforced; that native-value handling is confined to
+the WETH leg; and — the one that matters most — that nothing but `rotate` ever puts `Constants.ROUTER_ROTATE` on
+a hop, since the hook's whole exemption rests on that.

@@ -77,7 +77,7 @@ error LengthMismatch();
 error IndexOutOfRange(uint256 index, uint256 length);
 
 /// @notice A governed parameter was set outside its hard band. Every setter in the protocol throws exactly this.
-/// @param parameter The parameter name, as a short string (`bytes32("sellFeeBps")`), so the revert is readable
+/// @param parameter The parameter name, as a short string (`bytes32("ampsFeeBps")`), so the revert is readable
 ///                  without an ABI and the governance drill can assert on which parameter failed.
 /// @param value The rejected value.
 /// @param min The inclusive lower bound from `Constants`.
@@ -235,3 +235,67 @@ error InsufficientInventory(uint256 requested, uint256 available);
 /// @param requested The amount the move asked for.
 /// @param available The amount that limit allowed.
 error RolloutLimitExceeded(bytes32 limit, uint256 requested, uint256 available);
+
+/// @notice The NAV a bond would have been priced against was built from an oracle answer nothing stands behind:
+///         the vault's last checkpoint valued at least one priced asset from a stale or held-back answer.
+/// @dev Thrown by `AmpsBonds.bond`. The registry reports the *lower* of a held-back jump's two levels, so a
+///      held-back up-jump on any single vault asset understates `A` and therefore `navPerShareX18` — which is the
+///      denominator of the bond accretion floor. Bonds on *every other* collateral would then price against a NAV
+///      below the live one and mint below true NAV, so the whole pricing path refuses until the vault has
+///      checkpointed a NAV every priced asset was confirmed and fresh for. The haircut is the wrong instrument
+///      here: it widens on the collateral being bonded, while this is a defect in the denominator common to all
+///      of them. `quote()` reports it as `reason == "unconfirmedNav"` rather than reverting.
+error UnconfirmedNav();
+
+/// @notice An ask placement could not reset the pool's high-water mark, so the mark it would have left behind is
+///         older than the AMPS the placement just laid.
+///
+/// @dev **Why this is a revert and not a shrug** (audit fix, 2026-09-07). `VaultPlacementLib._burnback` selects a
+///      cell for the buyback burn when `upperTick <= highWater && tick <= lowerTick`. An ask is placed strictly
+///      *above* the tick, so a freshly laid ask cell satisfies the second half from birth; the only thing keeping
+///      it out of the burn is the mark being reset to the live tick by the placement that laid it (§3.5's
+///      ordering rule). If that reset is swallowed — a mis-pointed or replaced market reference, a target with no
+///      code, a short or malformed answer a typed `try` cannot tell from a real one — the next permissionless
+///      `compound` burns never-sold protocol-owned inventory. Undoing a keeper's placement costs one wasted call;
+///      burning unsold POL is unrecoverable, so the placement reverts. Bid-only placements are unaffected and
+///      keep the best-effort behaviour, because a bid is never a burn candidate under the first half of the rule.
+/// @param poolId The pool, as `PoolId.unwrap`.
+error HighWaterResetFailed(bytes32 poolId);
+
+// -----------------------------------------------------------------------------------------------------------------
+// `AmpsRouter` (`src/periphery/AmpsRouter.sol`)
+// -----------------------------------------------------------------------------------------------------------------
+
+/// @notice The call arrived after the deadline the caller signed for. Every `AmpsRouter` entry point takes one:
+///         a swap that sits in the mempool across a session change is a different trade from the one quoted.
+/// @param deadline The deadline supplied.
+/// @param timestamp The block timestamp that passed it.
+error DeadlineExpired(uint256 deadline, uint256 timestamp);
+
+/// @notice `AmpsRouter.rotate` was asked to use one pool for both hops. Buying AMPS and selling it straight back
+///         into the same pool is not a rotation: it is a round trip that moves the tick out and back, and pricing
+///         it at two pass-through fees would make the pool pay for the caller's own noise.
+/// @param poolId The pool named twice, as `PoolId.unwrap`.
+error SameHop(bytes32 poolId);
+
+/// @notice A rotation's two hops did not net to zero AMPS inside the unlock. Asserted before anything is settled,
+///         so a router that ever held AMPS across a `rotate` reverts rather than banking it.
+/// @param delta The router's residual AMPS delta on the PoolManager.
+error AmpsResidual(int256 delta);
+
+/// @notice Native value was sent to an entry point that cannot use it: the pool's counter asset is not WETH, or
+///         `msg.value` did not match the input amount the caller asked to swap.
+/// @param value The `msg.value` received.
+error UnexpectedValue(uint256 value);
+
+/// @notice An ETH transfer out of the router failed. Only reachable on the `unwrap` leg, and only when the
+///         recipient rejects the payment; the caller's answer is to take WETH instead.
+/// @param to The intended recipient.
+/// @param amount The amount, in wei.
+error NativeTransferFailed(address to, uint256 amount);
+
+/// @notice `unwrap` was asked for, or native value was sent, on a pool whose counter asset is not the wrapped
+///         native token the router was deployed against. Wrapping and unwrapping are WETH-leg conveniences and
+///         mean nothing on a USDG or stock leg.
+/// @param counter The pool's counter asset.
+error NotWrappedNative(address counter);

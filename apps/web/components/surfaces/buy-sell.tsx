@@ -6,24 +6,32 @@ import {useAccount, useSimulateContract} from 'wagmi'
 import type {Address, Hex} from 'viem'
 
 import {PolDepthNote, RotationCreditNote, SwapQuoteView} from './swap-panels'
-import {TxButton, TxError, TxSuccess} from '@/components/common/tx'
 import {NotDeployed, SurfaceHeading} from '@/components/common/states'
+import {TxButton, TxError, TxSuccess} from '@/components/common/tx'
+import {AmountField} from '@/components/ledger/amount-field'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {Button} from '@/components/ui/button'
-import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card'
-import {Input} from '@/components/ui/input'
 import {Label} from '@/components/ui/label'
-import {Tabs, TabsContent, TabsList, TabsTrigger} from '@/components/ui/tabs'
-import {useTx} from '@/hooks/use-tx'
+import {Select} from '@/components/ui/select'
+import {Tabs, TabsList, TabsTrigger} from '@/components/ui/tabs'
+import {useAmpsFee} from '@/hooks/use-hook-params'
 import {usePoolDirectory} from '@/hooks/use-pools'
 import {useExactInQuote, useWouldRevert} from '@/hooks/use-quotes'
+import {useTx} from '@/hooks/use-tx'
 import {activeChainId} from '@/lib/chains'
-import {explorerTxUrl, referenceBook} from '@/lib/deployment'
 import {addressOf} from '@/lib/contracts'
+import {explorerTxUrl, referenceBook} from '@/lib/deployment'
 import {featureFlags} from '@/lib/flags'
 import {parseAmount} from '@/lib/format'
 import {isTradeable} from '@/lib/quoter'
-import {deadlineFromNow, encodeSingleHop, minOutFromSlippage, poolKeyFromQuote, routeToRequest, universalRouterExecuteAbi} from '@/lib/route'
+import {
+  deadlineFromNow,
+  encodeSingleHop,
+  minOutFromSlippage,
+  poolKeyFromQuote,
+  routeToRequest,
+  universalRouterExecuteAbi,
+} from '@/lib/route'
 
 type Side = 'buy' | 'sell'
 
@@ -37,8 +45,9 @@ const DEFAULT_SLIPPAGE_BPS = 50
  * would break the AMPS-is-currency0 invariant every pool is built on. `AMPS/USDG` is the
  * settlement leg.
  *
- * The sell fee and the rotation-credit rule are stated on the surface, not hidden in a tooltip:
- * they are the two things a user is most likely to be surprised by.
+ * Revision 6 changed the fee and this surface says so on its face: the AMPS fee is charged in both
+ * directions, and the pool's base fee is charged on top only for a pass-through. A single hop pays
+ * the AMPS fee and nothing else, whichever way it is going.
  */
 export function BuySellSurface() {
   const {address, isConnected} = useAccount()
@@ -50,6 +59,7 @@ export function BuySellSurface() {
 
   const book = referenceBook(activeChainId)
   const amps = addressOf('amps')
+  const fee = useAmpsFee()
 
   const selected = React.useMemo(
     () => entryPools.find((p) => p.poolId === poolId) ?? entryPools[0],
@@ -58,8 +68,7 @@ export function BuySellSurface() {
   const hook = addressOf('hook')
   // One `quoteAll()` is enough to route: `PoolQuote` carries the pool's own `tickSpacing`, and the
   // other two `PathKey` fields are invariant across all 32 pools.
-  const poolKey =
-    selected && amps && hook ? poolKeyFromQuote(selected.quote, {amps, hooks: hook}) : null
+  const poolKey = selected && amps && hook ? poolKeyFromQuote(selected.quote, {amps, hooks: hook}) : null
   const isWethPool = selected?.symbol === 'WETH'
   const counterDecimals = selected?.symbol === 'USDG' ? 6 : 18
   const inputDecimals = side === 'buy' ? counterDecimals : 18
@@ -138,10 +147,11 @@ export function BuySellSurface() {
 
   if (!directoryEnabled) {
     return (
-      <div className="space-y-6">
+      <div className="space-y-10">
         <SurfaceHeading
+          kicker="Entry pools"
           title="Buy / Sell"
-          lede="AMPS against WETH or USDG. The sell fee and the rotation-credit rule are stated here rather than discovered later."
+          lede="AMPS against WETH or USDG. Fees are exact and read from the hook; the output is a curve simulation at this instant."
         />
         <NotDeployed what="Buy / Sell" />
       </div>
@@ -149,74 +159,70 @@ export function BuySellSurface() {
   }
 
   return (
-    <div className="space-y-6" data-testid="buy-sell-surface">
+    <div className="space-y-11" data-testid="buy-sell-surface">
       <SurfaceHeading
+        kicker="Entry pools"
         title="Buy / Sell"
-        lede="AMPS against WETH or USDG. Fees come from AmpsQuoter and are exact; the output comes from V4Quoter and is a curve simulation."
+        lede="AMPS against WETH or USDG. Fees are exact and read from the hook; the output is a curve simulation at this instant."
       />
-      <RotationCreditNote />
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Swap</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Tabs value={side} onValueChange={(v) => setSide(v as Side)}>
-              <TabsList>
-                <TabsTrigger value="buy" data-testid="tab-buy">
-                  Buy AMPS
-                </TabsTrigger>
-                <TabsTrigger value="sell" data-testid="tab-sell">
-                  Sell AMPS
-                </TabsTrigger>
-              </TabsList>
-              <TabsContent value={side} />
-            </Tabs>
 
-            <div className="space-y-2">
-              <Label htmlFor="pool">Pool</Label>
-              <select
-                id="pool"
-                data-testid="pool-select"
-                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
-                value={selected?.poolId ?? ''}
-                onChange={(e) => setPoolId(e.target.value as Hex)}
-              >
-                {isLoading ? <option>Loading…</option> : null}
-                {entryPools.map((pool) => (
-                  <option key={pool.poolId} value={pool.poolId}>
-                    AMPS / {pool.symbol}
-                  </option>
-                ))}
-              </select>
-            </div>
+      <div className="grid gap-x-14 gap-y-12 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        <div>
+          <Tabs value={side} onValueChange={(v) => setSide(v as Side)}>
+            <TabsList>
+              <TabsTrigger value="buy" data-testid="tab-buy">
+                Buy AMPS
+              </TabsTrigger>
+              <TabsTrigger value="sell" data-testid="tab-sell">
+                Sell AMPS
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
 
-            {isWethPool ? (
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={useNativeEth}
-                  onChange={(e) => setUseNativeEth(e.target.checked)}
-                  data-testid="native-eth-toggle"
-                />
-                <span>
-                  Use native ETH (the router wraps and unwraps around the WETH leg — the pool itself is AMPS/WETH)
-                </span>
-              </label>
-            ) : null}
+          <Label htmlFor="pool" className="mb-2 mt-[26px]">
+            Pool
+          </Label>
+          <Select
+            id="pool"
+            data-testid="pool-select"
+            value={selected?.poolId ?? ''}
+            onChange={(e) => setPoolId(e.target.value as Hex)}
+          >
+            {isLoading ? <option>Loading…</option> : null}
+            {entryPools.map((pool) => (
+              <option key={pool.poolId} value={pool.poolId}>
+                AMPS / {pool.symbol}
+              </option>
+            ))}
+          </Select>
 
-            <div className="space-y-2">
-              <Label htmlFor="amount">{side === 'buy' ? `Pay (${selected?.symbol ?? '—'})` : 'Sell (AMPS)'}</Label>
-              <Input
-                id="amount"
-                data-testid="amount-input"
-                inputMode="decimal"
-                placeholder="0.0"
-                value={amountText}
-                onChange={(e) => setAmountText(e.target.value)}
+          <Label htmlFor="amount" className="mb-2 mt-[22px]">
+            {side === 'buy' ? `Pay (${selected?.symbol ?? '—'})` : 'Sell (AMPS)'}
+          </Label>
+          <AmountField
+            id="amount"
+            data-testid="amount-input"
+            value={amountText}
+            onChange={setAmountText}
+            unit={side === 'buy' ? (selected?.symbol ?? '') : 'AMPS'}
+          />
+
+          {isWethPool ? (
+            <label className="mt-4 flex items-start gap-2.5 text-[14px] leading-[1.5] text-dim">
+              <input
+                type="checkbox"
+                className="mt-[3px] h-4 w-4 shrink-0 accent-[var(--ink)]"
+                checked={useNativeEth}
+                onChange={(e) => setUseNativeEth(e.target.checked)}
+                data-testid="native-eth-toggle"
               />
-            </div>
+              <span>
+                Use native ETH — the router wraps and unwraps around the WETH leg. The pool itself is AMPS/WETH.
+              </span>
+            </label>
+          ) : null}
 
+          <div className="mt-[26px]">
             <TxButton
               phase={tx.phase}
               label={side === 'buy' ? 'Buy AMPS' : 'Sell AMPS'}
@@ -224,12 +230,16 @@ export function BuySellSurface() {
               onClick={() => void tx.send()}
               data-testid="swap-submit"
             />
+          </div>
+          <div className="mt-5 space-y-6">
             <TxError error={tx.error} />
             {tx.hash ? <TxSuccess hash={tx.hash} explorerUrl={explorerTxUrl(activeChainId, tx.hash)} /> : null}
-          </CardContent>
-        </Card>
+            <PolDepthNote symbol={selected?.symbol ?? ''} />
+            <AcrossZapEntry />
+          </div>
+        </div>
 
-        <div className="space-y-4">
+        <div className="space-y-[26px]">
           <SwapQuoteView
             side={side}
             quote={quote}
@@ -238,9 +248,10 @@ export function BuySellSurface() {
             {...(rail.verdict ? {railVerdict: rail.verdict} : {})}
             amountOutDecimals={side === 'buy' ? 18 : counterDecimals}
             amountOutSymbol={side === 'buy' ? 'AMPS' : (selected?.symbol ?? '')}
+            {...(fee.ampsFeeBps !== undefined ? {liveAmpsFeeBps: fee.ampsFeeBps} : {})}
+            ampsFeeBand={fee.band}
           />
-          <PolDepthNote symbol={selected?.symbol ?? ''} />
-          <AcrossZapEntry />
+          <RotationCreditNote />
         </div>
       </div>
     </div>
@@ -257,17 +268,17 @@ export function AcrossZapEntry({enabled = featureFlags.acrossZap}: {enabled?: bo
   const book = referenceBook(activeChainId)
   if (!enabled) return null
   return (
-    <Alert variant="info" data-testid="across-zap">
+    <Alert data-testid="across-zap">
       <AlertTitle>Bridge USDC into USDG</AlertTitle>
       <AlertDescription>
         <p>
           The USD leg of this app settles in USDG. Bridged USDC can be swapped into USDG through Across before buying.
         </p>
-        <p className="mt-2 text-xs text-muted-foreground">
+        <p className="font-mono text-[13px]">
           Not implemented yet. The SpokePool this would call is{' '}
-          <code className="font-mono">{book?.acrossSpokePool ?? 'not configured for this chain'}</code>.
+          {book?.acrossSpokePool ?? 'not configured for this chain'}.
         </p>
-        <Button className="mt-3" variant="outline" size="sm" disabled data-testid="across-zap-button">
+        <Button variant="outline" size="sm" disabled data-testid="across-zap-button">
           Zap USDC → USDG (not enabled)
         </Button>
       </AlertDescription>

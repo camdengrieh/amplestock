@@ -5,11 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "amplestocks-quant"
 version = "0.0.0"
-description = "Phase 0B quantitative gate for Amplestocks: ladder/rollout backtests and parameter sweeps"
+description = "Phase 0B quantitative gate for Amplestocks: ladder/rollout backtests, parameter sweeps and launch-constituent selection"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Amplestocks contributors"}]
+# `amplestocks_quant.constituents` deliberately uses only the standard library: a launch-set run
+# has to work from a clean `python3` on an operator's laptop. numpy/pandas are for the backtests.
 dependencies = [
   "numpy>=2.0",
   "pandas>=2.2",
@@ -23,6 +25,10 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amplestocks_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 100

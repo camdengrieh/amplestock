@@ -68,7 +68,7 @@ interface IBountyPot {
     function token() external view returns (address tokenAddress);
 
     /// @notice The 48-hour timelock: the only address that may {sweep} or move a parameter.
-    /// @dev Immutable in the implementation, for the same reason as in `AmpsStaking`: there is no governance path
+    /// @dev Immutable in the implementation, for the same reason as in `AmpsBonds`: there is no governance path
     ///      that can re-point the parameter setters at a new owner, only a migration.
     /// @return timelockAddress The timelock address.
     function timelock() external view returns (address timelockAddress);
@@ -183,7 +183,7 @@ interface IBountyPot {
 
     /// @notice Hands the vault role on. **Only vault**, so a migration moves it atomically in the same transaction
     ///         that moves the liquidity, exactly as `Amps.setVault`, `AmpsBonds.setVault` and
-    ///         `AmpsStaking.setVault` do.
+    ///         `PoolRegistry.setVault` do.
     /// @param newVault The new vault.
     function setVault(address newVault) external;
 }

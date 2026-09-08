@@ -200,10 +200,38 @@ jobs:
   # -------------------------------------------------------------------------------------------
   # Licence gate: no BUSL/AGPL/GPL reachable from contracts/src/**, no missing SPDX headers
   # -------------------------------------------------------------------------------------------
+  quant:
+    name: quant (constituent pipeline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The constituent pipeline is stdlib-only by design (it must run from a clean python3 on an
+      # operator's laptop); pytest and ruff are the package's only dev dependencies. The suite
+      # blocks sockets, so a fixture run that reached for the network would fail here.
+      - name: Install the package with its dev tools
+        run: pip install -e 'packages/quant[dev]'
+
+      - name: Tests (fixtures only, no network)
+        run: python -m pytest packages/quant -q
+
+      - name: Lint
+        run: ruff check packages/quant/src packages/quant/tests packages/quant/tools
+
+  # The gate compiles the whole tree (tests included) with `--build-info` from a cold cache, which
+  # took 20-24 minutes on 4d18a1f and was CANCELLED by `timeout-minutes: 25` with solc still running.
+  # A cancelled job fails the roll-up, so the budget carries the same margin as the build steps.
   licence-gate:
     name: licence gate
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
@@ -393,7 +421,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [contracts, invariants, licence-gate, node, hook-address, broadcast-test]
+    needs: [contracts, invariants, licence-gate, node, hook-address, broadcast-test, quant]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed
@@ -404,10 +432,12 @@ jobs:
           echo "node=${{ needs.node.result }}"
           echo "hook-address=${{ needs.hook-address.result }}"
           echo "broadcast-test=${{ needs.broadcast-test.result }}"
+          echo "quant=${{ needs.quant.result }}"
           failed=0
           for r in "${{ needs.contracts.result }}" "${{ needs.invariants.result }}" \
                    "${{ needs.licence-gate.result }}" "${{ needs.node.result }}" \
-                   "${{ needs.hook-address.result }}" "${{ needs.broadcast-test.result }}"; do
+                   "${{ needs.hook-address.result }}" "${{ needs.broadcast-test.result }}" \
+                   "${{ needs.quant.result }}"; do
             case "$r" in
               success|skipped) ;;
               cancelled) echo "::error::a required job was CANCELLED — it did not finish, so this head is not green"; failed=1 ;;

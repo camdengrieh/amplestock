@@ -75,6 +75,9 @@ interface IMarketReference {
     /// @dev Drives the buyback burn (I33): AMPS sitting in a bucket whose upper bound the high-water mark has
     ///      crossed is bought-back inventory, and is withdrawn and burned at the next `compound` rather than
     ///      re-placed.
+    /// @dev A reset re-arms the mark at `min(lastTruncatedTick, lastRawTick)` rather than at the truncated tick
+    ///      alone, so a mark left over from a rate-limited fall cannot cover asks the pool has never traded
+    ///      through; it climbs on truncated ticks from there. See `IAmpsHook.resetHighWater`.
     /// @param poolId The pool to consult.
     /// @return tick The high-water truncated tick.
     function highWaterTick(PoolId poolId) external view returns (int24 tick);

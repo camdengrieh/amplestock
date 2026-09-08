@@ -56,7 +56,7 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     address public immutable vault;
 
     /// @notice The live sell fee, in bps. `VaultPlacementLib` divides the creator's share by this.
-    uint16 public sellFeeBps = 500;
+    uint16 public ampsFeeBps = 500;
 
     /// @dev Per-pool state.
     mapping(PoolId => Obs) internal _obs;
@@ -64,11 +64,21 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     /// @dev The observation window `twapTick30m` answers over.
     uint32 internal _window = 1800;
 
+    /// @notice While armed, {resetHighWater} reverts — a market reference that refuses the vault's write.
+    bool public resetHighWaterReverts;
+
+    /// @notice While armed, {resetHighWater} returns with no returndata at all — a market reference whose ABI
+    ///         has drifted from the one the vault was compiled against.
+    bool public resetHighWaterSilent;
+
     /// @notice Emitted by {armSurge}, so a test can assert the placement armed the surge it was supposed to.
     event SurgeArmed(PoolId indexed poolId, uint16 surgeBps, bytes32 reason);
 
     /// @notice Emitted by {resetHighWater}.
     event HighWaterReset(PoolId indexed poolId, int24 previousHighWaterTick, int24 newHighWaterTick);
+
+    /// @notice Thrown by {resetHighWater} while {resetHighWaterReverts} is armed.
+    error HighWaterUnavailable();
 
     error Currency0NotAmps();
     error FeeNotDynamic();
@@ -119,10 +129,21 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     }
 
     /// @notice Resets the pool's high-water mark to the live tick. **Vault only.**
+    ///
+    /// @dev The two fault modes exist for the ask-side reset test: `resetHighWaterReverts` is a mis-pointed or
+    ///      role-refusing market reference, and `resetHighWaterSilent` is the subtler one — a target that returns
+    ///      *nothing* where an `int24` was declared, which a typed `try` decodes as a successful call with a
+    ///      garbage answer and the vault's hand-decoded probe catches on the returndata length.
     /// @param poolId The pool.
     /// @return previousHighWaterTick The mark that was in force.
     function resetHighWater(PoolId poolId) external returns (int24 previousHighWaterTick) {
         if (msg.sender != vault) revert NotVault(msg.sender);
+        if (resetHighWaterReverts) revert HighWaterUnavailable();
+        if (resetHighWaterSilent) {
+            assembly ("memory-safe") {
+                return(0, 0)
+            }
+        }
         Obs storage o = _obs[poolId];
         previousHighWaterTick = o.highWater;
         (, int24 tick,,) = poolManager.getSlot0(poolId);
@@ -162,6 +183,18 @@ contract PlacementHookStub is BaseHook, IMarketReference {
         return _obs[poolId].highWaterResetCount;
     }
 
+    /// @notice Arms {resetHighWater} to revert, so a test can prove an ask placement refuses to leave a stale
+    ///         mark standing.
+    function setResetHighWaterReverts(bool value) external {
+        resetHighWaterReverts = value;
+    }
+
+    /// @notice Arms {resetHighWater} to answer with empty returndata, which a typed `try` cannot tell from a
+    ///         real answer.
+    function setResetHighWaterSilent(bool value) external {
+        resetHighWaterSilent = value;
+    }
+
     /// @notice Forces the high-water mark, so a test can put a cell on either side of it without a real pump.
     function setHighWaterTick(PoolId poolId, int24 tick) external {
         _obs[poolId].highWater = tick;
@@ -177,8 +210,8 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     }
 
     /// @notice Sets the live sell fee the creator slice is measured against.
-    function setSellFeeBps(uint16 value) external {
-        sellFeeBps = value;
+    function setAmpsFeeBps(uint16 value) external {
+        ampsFeeBps = value;
     }
 
     /// @notice Sets a pool's buy fee, in bps.
@@ -269,7 +302,7 @@ contract PlacementHookStub is BaseHook, IMarketReference {
     {
         Obs storage o = _obs[key.toId()];
         if (!o.observed) revert PoolNotInitializedHere();
-        uint24 pips = params.zeroForOne ? uint24(sellFeeBps) * 100 : uint24(o.buyFeeBps) * 100;
+        uint24 pips = params.zeroForOne ? uint24(ampsFeeBps) * 100 : uint24(o.buyFeeBps) * 100;
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, pips | LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 

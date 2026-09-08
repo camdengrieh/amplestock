@@ -137,6 +137,14 @@ interface IOracleGate {
     /// @dev Only the corporate-action freeze, a guardian freeze and the divergence breaker close a market. A stale
     ///      feed or a closed session does **not**: the haircut widens instead, which is the 24/7 bond decision.
     ///
+    /// @dev **A degraded feed is never a 0 bp haircut.** `GateSnapshot.feedStale` is `!fresh || unconfirmed` — an
+    ///      answer past its session-scaled bound, *or* one the feed registry's two-confirmation rule is holding
+    ///      behind an unresolved jump. Whenever it is set the returned haircut is raised to at least
+    ///      `hSessionBps(Session.CLOSED)`, the weekend-gap bound, because a feed that stopped answering carries the
+    ///      same exposure as a market that stopped trading. The floor applies to a per-constituent override too,
+    ///      and it is the *only* thing that overrides one. {checkBond} and {snapshot} report the same raised
+    ///      number, so the bond shell's independent re-derivation of the accretion floor agrees with the gate's.
+    ///
     /// @dev **`constituentId == 0` is the protocol-wide check `ENTRY`-class bond markets take**, not an error and
     ///      not an unknown constituent. WETH and USDG are collateral without being index constituents, so there is
     ///      no per-constituent state to consult: id 0 reads the guardian's protocol freeze and the session
@@ -161,6 +169,8 @@ interface IOracleGate {
 
     /// @notice Reverting form of {isBondAllowed}. `constituentId == 0` is the same protocol-wide `ENTRY`-class
     ///         check described there, and is a valid input.
+    /// @dev Carries {isBondAllowed}'s stale-feed haircut floor: a stale or unconfirmed feed is priced at no less
+    ///      than `hSessionBps(Session.CLOSED)`, never at the regular session's 0 bp.
     /// @param constituentId The constituent, or 0.
     /// @return hSessionBps The haircut to apply.
     function checkBond(uint16 constituentId) external view returns (uint16 hSessionBps);
@@ -228,8 +238,10 @@ interface IOracleGate {
     function refDivergenceBps() external view returns (uint16 value);
 
     /// @notice Layer E: when the deviation first left the band for a pool, or 0 while it is inside it.
-    /// @dev Armed and cleared by the permissionless {pokePool}. The effective `DIVERGED` verdict re-checks the
-    ///      *current* deviation as well, so an armed timer nobody clears cannot hold a pool closed on its own.
+    /// @dev Armed and cleared by the permissionless {pokePool}, and only ever on a deviation that could actually
+    ///      be read: a poke whose reading fails leaves the timer exactly where it is, in either direction. The
+    ///      effective `DIVERGED` verdict re-checks the *current* deviation as well, so an armed timer nobody
+    ///      clears cannot hold a pool closed on its own.
     /// @param poolId The pool.
     /// @return since The arming timestamp.
     function divergedSince(PoolId poolId) external view returns (uint32 since);
@@ -338,7 +350,10 @@ interface IOracleGate {
 
     /// @notice Stamps layer A and re-evaluates the sustained-divergence timer for one pool. **Permissionless and
     ///         unpaid.**
-    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation returns.
+    /// @dev Arms `divergedSince` when the deviation is outside the band and clears it when the deviation is read
+    ///      as back inside it. A deviation that cannot be read at all — an unobserved pool, an unreadable
+    ///      reference, a hub counter with no answer — is not evidence either way and moves nothing, so the
+    ///      sustain timer cannot be reset by arranging for one of the reads to fail.
     /// @param poolId The pool to re-evaluate.
     function pokePool(PoolId poolId) external;
 

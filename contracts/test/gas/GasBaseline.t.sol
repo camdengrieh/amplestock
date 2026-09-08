@@ -109,7 +109,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         "recording + 20%, which is this project's CI contract. afterSwap <= 55,000 stands as an absolute ceiling "
         "and is asserted; ruling 3's 22,000 beforeSwap ceiling is superseded by the recording, because the "
         "decomposition is structural rather than codegen (200 / 1,000 / 5,000 / 20,000 optimizer runs are within "
-        "~300 gas of each other): three cold packed words 6,300, the hook's slot 0 (sellFeeBps + the policy "
+        "~300 gas of each other): three cold packed words 6,300, the hook's slot 0 (ampsFeeBps + the policy "
         "pointer) 2,100, the cold IFeePolicy account 2,600, the policy's own arithmetic ~2,300, the cold hook "
         "account 2,600, and ~9,000 of hook execution dominated by encoding the 20-field FeeInput. Section 1.7 had "
         "assumed two extra cold SLOADs and a 4,000-gas policy call; shrinking FeeInput is a Phase 4/6 tuning "
@@ -220,6 +220,13 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
 
         vm.prank(TIMELOCK);
         ampsHook.setFeePolicy(address(policy));
+        // Revision 6: a hop is pass-through only when the PoolManager reports `sender == hook.router()` and the
+        // hop carries `Constants.ROUTER_ROTATE`. This fixture measures the hook, not the router, so the generic
+        // v4 router is *named* as the protocol router and the rotation below sets the flag on both hops — which
+        // makes the two rotation measurements the same code path they have always measured (a pass-through buy,
+        // then a fully credited pass-through sell) while every other measurement stays an ordinary swap.
+        vm.prank(TIMELOCK);
+        ampsHook.setRouter(address(swapRouter));
         // The rail is a two-comparison check whatever its value, and this fixture is about gas, not refusals: a
         // wide rail keeps a measurement from being lost to a legitimate `BeyondRail` half way through the run.
         policy.setRailOverride(200_000);
@@ -616,8 +623,8 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         hm.swapOneHopBuy = this.oneHopBuyEntryReal();
         assertEq(
             _swapFees(vm.getRecordedLogs())[0],
-            uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS,
-            "one-hop buy fee"
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            "an ordinary buy pays the AMPS fee (revision 6)"
         );
 
         vm.recordLogs();
@@ -625,7 +632,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         hm.swapOneHopSell = this.oneHopSellEntryReal();
         assertEq(
             _swapFees(vm.getRecordedLogs())[0],
-            uint24(Constants.SELL_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
             "a lone sell pays the full sell fee"
         );
 
@@ -634,16 +641,21 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         hm.swapTwoHopRotation = this.rotationEntryReal(STOCK_IN);
         uint24[] memory fees = _swapFees(vm.getRecordedLogs());
         assertEq(fees.length, 2, "two-hop must emit two Swap events");
-        assertEq(fees[0], uint24(Constants.BUY_FEE_BPS_SPOKE_DEFAULT) * Constants.PIPS_PER_BPS, "hop 1: spoke buy");
-        assertEq(fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "hop 2: credited");
+        assertEq(
+            fees[0], uint24(Constants.BUY_FEE_BPS_SPOKE_DEFAULT) * Constants.PIPS_PER_BPS, "hop 1: spoke pass-through"
+        );
+        assertEq(
+            fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "hop 2: credited, entry"
+        );
 
         vm.recordLogs();
         _warpOneSecond();
         hm.swapBuyThenSell = this.roundTripEntryReal();
         fees = _swapFees(vm.getRecordedLogs());
         assertEq(fees.length, 2, "round trip must emit two Swap events");
-        assertEq(fees[0], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "buy leg");
-        assertEq(fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "credited sell leg");
+        // Revision 6: an unflagged buy earns no credit, so the round trip is two ordinary swaps at the AMPS fee.
+        assertEq(fees[0], uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "buy leg");
+        assertEq(fees[1], uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "uncredited sell leg");
     }
 
     /// @notice Self-call entry point: one swap of each shape, so nothing below pays a first-touch cost a live
@@ -680,6 +692,10 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
             zeroForOne: false, amountSpecified: -int256(USDG_IN), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
         });
         BalanceDelta buyDelta = toBalanceDelta(int128(int256(AMPS_IN)), -int128(int256(USDG_IN)));
+        // The flag that makes a hop pass-through. `beforeSwap`'s cheapest path is an unflagged swap (it never
+        // reads `router`), and its dearest is a flagged, credited exact-input sell, so the two measurements below
+        // bracket the real cost: `beforeSwapBuy` unflagged, `beforeSwapCreditedSell` flagged.
+        bytes memory rotateFlag = abi.encode(Constants.ROUTER_ROTATE);
 
         // The key and the two addresses are hoisted into memory *before* any sample: they live in this test
         // contract's storage, and a cold `SLOAD` of the harness's own state is not the hook's cost.
@@ -703,7 +719,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         _coolReal();
         vm.prank(address(poolManager));
         start = gasleft();
-        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, "");
+        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, rotateFlag);
         afterSwap_ = start - gasleft();
 
         // The other `afterSwap`: the one swap per pool per `gateCacheSeconds` that also refreshes the gate cache
@@ -712,17 +728,21 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         _coolReal();
         vm.prank(address(poolManager));
         start = gasleft();
-        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, "");
+        hookLocal.afterSwap(routerLocal, key, buy, buyDelta, rotateFlag);
         afterSwapWithGateRefresh = start - gasleft();
 
         // The credited sell comes last: it is the only measurement that leaves transient state behind.
-        uint256 creditBefore = ampsHook.rotationCredit();
+        uint256 creditBefore = ampsHook.rotationCredit(address(swapRouter));
         _coolReal();
         vm.prank(address(poolManager));
         start = gasleft();
-        hookLocal.beforeSwap(routerLocal, key, sell, "");
+        hookLocal.beforeSwap(routerLocal, key, sell, rotateFlag);
         beforeSwapCreditedSell = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), creditBefore - AMPS_IN, "a credited sell consumes exactly amountIn");
+        assertEq(
+            ampsHook.rotationCredit(address(swapRouter)),
+            creditBefore - AMPS_IN,
+            "a credited sell consumes exactly amountIn"
+        );
     }
 
     /// @notice Self-call entry point: one exact-input buy through the router.
@@ -735,7 +755,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     /// @notice Self-call entry point: one exact-input sell through the router, with no credit to spend.
     function oneHopSellEntryReal() external returns (uint256 gasUsed) {
         require(msg.sender == address(this), "self-call only");
-        assertEq(ampsHook.rotationCredit(), 0, "a lone sell starts with no credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "a lone sell starts with no credit");
         _coolReal();
         gasUsed = _sellRealUsdg(AMPS_IN);
     }
@@ -747,7 +767,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         uint256 start = gasleft();
         _rotateRealStockToUsdg(amountIn);
         gasUsed = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), 0, "hop 2 must consume the whole credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "hop 2 must consume the whole credit");
     }
 
     /// @notice Self-call entry point: the same-transaction buy-then-sell round trip.
@@ -760,7 +780,7 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
         uint256 ampsOut = amps.balanceOf(address(this)) - balanceBefore;
         swapRouter.swapExactTokensForTokens(ampsOut, 0, true, usdgKeyReal, "", address(this), type(uint256).max);
         gasUsed = start - gasleft();
-        assertEq(ampsHook.rotationCredit(), 0, "the round trip consumes the whole credit");
+        assertEq(ampsHook.rotationCredit(address(swapRouter)), 0, "an unflagged round trip creates no credit");
     }
 
     function _buyRealUsdg(uint256 amountIn) private returns (uint256 gasUsed) {
@@ -776,20 +796,21 @@ contract GasBaselineTest is V4TestBase, IUnlockCallback {
     }
 
     function _rotateRealStockToUsdg(uint256 amountIn) private {
+        bytes memory rotateFlag = abi.encode(Constants.ROUTER_ROTATE);
         PathKey[] memory path = new PathKey[](2);
         path[0] = PathKey({
             intermediateCurrency: Currency.wrap(AMPS_ADDRESS),
             fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
             tickSpacing: TICK_SPACING,
             hooks: IHooks(address(ampsHook)),
-            hookData: ""
+            hookData: rotateFlag
         });
         path[1] = PathKey({
             intermediateCurrency: Currency.wrap(USDG_ADDRESS),
             fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
             tickSpacing: TICK_SPACING,
             hooks: IHooks(address(ampsHook)),
-            hookData: ""
+            hookData: rotateFlag
         });
         swapRouter.swapExactTokensForTokens(
             amountIn, 0, Currency.wrap(address(stockReal)), path, address(this), type(uint256).max

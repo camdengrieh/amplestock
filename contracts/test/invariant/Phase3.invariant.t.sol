@@ -22,7 +22,8 @@ import {console} from "forge-std/console.sol";
 
 /// @title Phase3InvariantTest
 /// @notice `docs/phase3-state-model.md` §8.2, run against the fully wired Phase 3 stack rather than against mocks:
-///         I9, I11, I13, I15, I16, I18, I19, I26, I29, I31, I32, I33, I34, I35 and I39, plus the live-cell budget
+///         I9, I10, I11, I13, I15, I16, I18, I19, I26, I29, I31, I32, I33, I34, I35 and I39, plus the live-cell
+///         budget
 ///         of §12 ruling E and its exactness, `AmpsQuoter`'s totality, and a non-vacuity check that every action
 ///         in the space actually executed.
 ///
@@ -44,7 +45,7 @@ contract Phase3InvariantTest is Phase3Fixture {
         // One shared ghost book, two handlers. The action space of §8.2 is unchanged; it is split across two
         // contracts because a single handler carrying all of it plus the bookkeeping was 31,203 B of runtime,
         // past EIP-170 - which `forge build --sizes` gates and Medusa's geth enforces at deploy time.
-        ghosts = new Phase3Ghosts(vault, amps, hook, quoter, poolManager, allPools());
+        ghosts = new Phase3Ghosts(vault, amps, hook, quoter, poolManager, address(swapRouter), allPools());
         handler = new Phase3Handler(_wiring(), ghosts);
         vaultHandler = new Phase3VaultHandler(vault, amps, ghosts, KEEPER, constituentIds, allPools());
         ghosts.authorize(address(handler));
@@ -98,6 +99,21 @@ contract Phase3InvariantTest is Phase3Fixture {
         );
         assertEq(ghosts.mintedObserved(), ghosts.mintedVesting(), "I10, I33: every wei minted came from AmpsBonds");
         assertEq(amps.vault(), address(vault), "and the vault is still the only minter");
+    }
+
+    /// @notice I33 as revision 6 states it: every AMPS-side fee a `compound` collects is burned once the
+    ///         creator's slice is out, so `burned >= ampsFees - creatorAmps` at every single call — there is no
+    ///         staker stream and no re-ladder left for a wei of it to escape through.
+    function invariant_I33_everyAmpsSideFeeAfterTheCreatorIsBurned() public view {
+        assertFalse(ghosts.feeAmpsEverSurvivedACompound(), "the AMPS-side remainder is burned at every compound");
+        assertGe(ghosts.burnedTotal(), ghosts.feesSplit() - ghosts.creatorPaid(), "and in aggregate too");
+    }
+
+    /// @notice I10's re-ladder clause: `compound` never places an ask. Ask inventory is genesis POL less what the
+    ///         market bought, what the buyback burned and what `rollout` moved — a permissionless call can never
+    ///         add to it, which is what makes the ask side a finite, auditable quantity.
+    function invariant_I10_compoundNeverPlacesAnAsk() public view {
+        assertFalse(ghosts.compoundEverPlacedAnAsk(), "no compound grew a pool's ask inventory");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -210,12 +226,12 @@ contract Phase3InvariantTest is Phase3Fixture {
     }
 
     /// @notice I16: every fee decomposes as `base + dyn` with `base` the pool's own buy fee or the protocol sell
-    ///         fee, `sellFeeBps` inside `[100, 600]`, `dyn` inside the state's cap, and the total under
+    ///         fee, `ampsFeeBps` inside `[100, 600]`, `dyn` inside the state's cap, and the total under
     ///         `TOTAL_FEE_BPS_MAX`.
     function invariant_I16_everyFeeDecomposes() public view {
         assertFalse(ghosts.feeEverMalformed(), "every fee decomposed inside its bands");
-        assertGe(hook.sellFeeBps(), 100, "sellFeeBps floor");
-        assertLe(hook.sellFeeBps(), 600, "sellFeeBps ceiling");
+        assertGe(hook.ampsFeeBps(), 100, "ampsFeeBps floor");
+        assertLe(hook.ampsFeeBps(), 600, "ampsFeeBps ceiling");
     }
 
     /// @notice I18: the deployed hook carries no `BEFORE_REMOVE_LIQUIDITY` bit, so a removal cannot be blocked -
@@ -249,20 +265,26 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I26: the rotation credit is zero at the start of every transaction, structurally.
     function invariant_I26_rotationCreditIsZeroAtEveryBoundary() public view {
         assertFalse(ghosts.creditEverLeaked(), "no credit ever survived a transaction boundary");
-        assertEq(hook.rotationCredit(), 0, "and it is zero now");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and it is zero now");
     }
 
     // -------------------------------------------------------------------------------------------------------------
     // The flywheel
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice I31: the creator was never paid more than `creatorBps(t) / sellFeeBps` of the AMPS-side fees, and
-    ///         the schedule is monotone non-increasing and zero after thirty days.
+    /// @notice I31: the creator was never paid more than `creatorBps(t) / ampsFeeBps` of the fees **in either
+    ///         currency**, per compound and in aggregate; nothing at all once the schedule has run out; and the
+    ///         schedule itself is monotone non-increasing and exactly zero from day thirty.
+    ///
+    /// @dev The per-compound, per-currency bound is checked as it happens, in `Phase3Ghosts.noteCompound`: an
+    ///      aggregate bound alone would let one call overpay and a later one make the sum come out right.
     function invariant_I31_creatorPayoutIsBounded() public view {
+        assertFalse(ghosts.creatorEverOverpaid(), "no compound paid the creator more than its share of the fees");
+        assertFalse(ghosts.creatorEverPaidAfterDecay(), "and none paid anything at all after day thirty");
         assertLe(
-            ghosts.creatorPaid() * uint256(hook.sellFeeBps()),
-            ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.sellFeeBps()),
-            "creatorPaid <= ampsFees * creatorBps / sellFeeBps, summed"
+            ghosts.creatorPaid() * uint256(hook.ampsFeeBps()),
+            ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.ampsFeeBps()),
+            "creatorPaid <= ampsFees * creatorBps / ampsFeeBps, summed"
         );
         assertEq(
             vault.creatorBpsAt(uint256(vault.genesisTimestamp()) + Constants.CREATOR_DECAY_SECONDS),
@@ -383,7 +405,7 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I16.
     /// @return ok Whether every fee decomposed inside its bands.
     function medusa_feesAlwaysDecompose() public view returns (bool ok) {
-        return !ghosts.feeEverMalformed() && hook.sellFeeBps() >= 100 && hook.sellFeeBps() <= 600;
+        return !ghosts.feeEverMalformed() && hook.ampsFeeBps() >= 100 && hook.ampsFeeBps() <= 600;
     }
 
     /// @notice I18.
@@ -395,14 +417,14 @@ contract Phase3InvariantTest is Phase3Fixture {
     /// @notice I26.
     /// @return ok Whether the rotation credit ever survived a transaction boundary.
     function medusa_rotationCreditIsTransient() public view returns (bool ok) {
-        return !ghosts.creditEverLeaked() && hook.rotationCredit() == 0;
+        return !ghosts.creditEverLeaked() && hook.rotationCredit(address(swapRouter)) == 0;
     }
 
     /// @notice I31.
     /// @return ok Whether the creator payout stayed inside its share of the AMPS-side fees.
     function medusa_creatorPayoutIsBounded() public view returns (bool ok) {
-        return ghosts.creatorPaid() * uint256(hook.sellFeeBps())
-            <= ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.sellFeeBps());
+        return ghosts.creatorPaid() * uint256(hook.ampsFeeBps())
+            <= ghosts.feesSplit() * uint256(Constants.CREATOR_FEE_BPS) + uint256(hook.ampsFeeBps());
     }
 
     /// @notice I32.
@@ -544,7 +566,6 @@ contract Phase3InvariantTest is Phase3Fixture {
             amps: amps,
             hook: hook,
             bonds: bonds,
-            staking: staking,
             pot: pot,
             gate: gate,
             registry: registry,

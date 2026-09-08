@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsQuoter} from "../../src/interfaces/IAmpsQuoter.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
@@ -150,13 +151,15 @@ contract Phase3FlywheelTest is Phase3Fixture {
     ///         * `totalSupply` falls, because the AMPS the vault buys back below the high-water mark is burned
     ///           (I33) and nothing mints outside `AmpsBonds` (I10);
     ///         * the vault's USDG holding equals the seed plus exactly the counter asset the round trip left
-    ///           behind — every USDG the buyers paid in, less every USDG the sellers took out. That residue is the
-    ///           fee take plus the ladder's own convexity, and there is no third term.
+    ///           behind — every USDG the buyers paid in, less every USDG the sellers took out and less the
+    ///           creator's slice of the counter-side fees (I31, the one leg that leaves the protocol). That
+    ///           residue is the fee take plus the ladder's own convexity, and there is no fourth term.
     function test_pumpThenDumpBurnsSupplyAndLeavesSeedPlusFees() public {
         uint256 supplyBefore = amps.totalSupply();
         uint256 navBefore = vault.previewNavPerShareX18();
         uint256 usdgSupplyBefore = usdg.totalSupply();
         uint256 managerUsdgBefore = usdg.balanceOf(address(poolManager));
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
         assertEq(usdg.balanceOf(BOB), 0, "the pumper starts with nothing");
 
         // Pump: the whole move is bought out of the ask ladder, one rail-limited step at a time.
@@ -179,10 +182,12 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // behind: `inbound - outbound`, which is the fee take plus the ladder's own convexity and nothing else.
         uint256 minted = usdg.totalSupply() - usdgSupplyBefore;
         uint256 returned = usdg.balanceOf(BOB);
+        uint256 creatorTook = usdg.balanceOf(CREATOR) - creatorUsdgBefore;
+        assertGt(creatorTook, 0, "the compound paid the creator their slice of the counter-side fees");
         assertEq(
             usdg.balanceOf(address(poolManager)),
-            managerUsdgBefore + minted - returned,
-            "the vault's USDG is exactly the seed plus the round trip's residue"
+            managerUsdgBefore + minted - returned - creatorTook,
+            "the vault's USDG is exactly the seed plus the round trip's residue, less the creator's slice"
         );
         assertGt(minted, returned, "and the residue is positive: the round trip paid, it did not earn");
         assertSweepClean("pump then dump");
@@ -192,32 +197,26 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // compound
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice §3.6 step 5, in order and to the wei, on fees earned by real swaps through the real hook:
-    ///         `creatorCut = ampsFees * min(creatorBps(t), sellFeeBps) / sellFeeBps`, then `stakerBps` of the
-    ///         remainder, then exactly `burnBps` of what is left, then the rest re-laddered.
-    function test_compoundPaysCreatorThenStakerThenBurnsBurnBps() public {
+    /// @notice §3.6 step 5 as revision 6 states it, to the wei, on fees earned by real swaps through the real
+    ///         hook: `creatorAmps = ampsFees * min(creatorBps(t), ampsFeeBps) / ampsFeeBps`, and every wei that is
+    ///         left is burned. No staker leg, no `burnBps`, no re-ladder.
+    function test_compoundPaysCreatorThenBurnsTheWholeRemainder() public {
         _tradeForAmpsFees();
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(KEEPER);
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
         assertGt(ampsFees, 0, "the sells really paid a fee in AMPS");
 
-        uint256 sellFeeBps = hook.sellFeeBps();
+        uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
-        uint256 creatorCut = ampsFees * creatorBps / sellFeeBps;
-        uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
-        uint256 burnCut = (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
-        uint256 relaid = ampsFees - creatorCut - stakerCut - burnCut;
+        uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
 
         assertEq(amps.balanceOf(CREATOR) - creatorBefore, creatorCut, "the creator's slice, to the wei");
-        assertEq(amps.balanceOf(address(staking)) - stakingBefore, stakerCut, "the stakers' slice, to the wei");
-        assertGe(supplyBefore - amps.totalSupply(), burnCut, "at least burnBps of the remainder was burned");
-        assertEq(creatorCut + stakerCut + burnCut + relaid, ampsFees, "the split is exhaustive");
-        assertGt(relaid, 0, "and something went back into the ladder");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "`burned` is exactly what left the supply");
+        assertGe(burned, ampsFees - creatorCut, "and the whole AMPS-side remainder is in it");
         assertGt(burned, 0, "the compound burned AMPS");
     }
 
@@ -282,142 +281,216 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // The rotation credit, end to end through the real hook
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice A one-transaction `stock -> AMPS -> stock` rotation pays the **buy** fee on both hops: hop 2's base
-    ///         is `buyFeeBps[hop2]`, not `sellFeeBps`, because the credit hop 1 created covers the whole sell.
+    /// @notice A one-transaction `stock -> AMPS -> stock` rotation **through the protocol router** pays the
+    ///         pass-through fee on both hops: hop 1's base is `buyFeeBps[hop1]` and hop 2's blended base is
+    ///         `buyFeeBps[hop2]`, because the credit hop 1 created covers the whole of hop 2's sell.
+    ///
+    /// @dev **Revision 6: the shape is what earns the price, and only one contract can build it.** A hop is
+    ///      pass-through only when the PoolManager reports `sender == AmpsHook.router()` *and* the hop carries
+    ///      `Constants.ROUTER_ROTATE`. {Phase3Fixture-routerRotate} is that shape; the same two swaps through the
+    ///      ordinary v4 router are two ordinary swaps and pay `ampsFeeBps` twice, which is what
+    ///      {test_rotationCredit_buyThenSellPaysTheAmpsFeeTwice} measures.
+    ///
+    /// @dev **Bases, not totals.** The fixture runs the production `FeePolicy`, so a realised fee is `base + dyn`
+    ///      with `dyn` set by the live deviation, variance and session. Hop 1 is therefore checked by
+    ///      differencing two quotes of the *same* state — the dynamic parts cancel — and hop 2 by the
+    ///      `RotationCreditConsumed` event, which reports the blended base the hook actually charged.
     function test_rotationCredit_stockToAmpsToStockPaysBuyPlusBuy() public {
         deepenSpokes(600e18);
         seedSpokeBids(1);
-        (uint16 base1, uint16 base2, uint256 creditAfter) = this.rotationEntry();
-        assertEq(base1, registry.poolConfig(spokePools[0]).buyFeeBps, "hop 1 pays the spoke's buy fee");
-        assertEq(base2, registry.poolConfig(spokePools[1]).buyFeeBps, "hop 2 pays the other spoke's buy fee");
-        assertEq(creditAfter, 0, "and the rotation consumed the credit it created");
+
+        uint16 hop1PassThrough = registry.poolConfig(spokePools[0]).buyFeeBps;
+        uint16 hop2PassThrough = registry.poolConfig(spokePools[1]).buyFeeBps;
+        uint256 amountIn = 0.01e18;
+
+        (uint24 ordinaryPips, uint16 ordinaryBase,,) = hook.quoteFee(spokePools[0], false, true, amountIn, false);
+        (uint24 rotationPips, uint16 rotationBase,,) = hook.quoteFee(spokePools[0], false, true, amountIn, true);
+        assertEq(ordinaryBase, hook.ampsFeeBps(), "an ordinary hop 1 would pay the AMPS fee");
+        assertEq(rotationBase, hop1PassThrough, "hop 1 of a rotation pays the spoke's pass-through fee");
+        assertEq(
+            ordinaryPips - rotationPips,
+            uint24(hook.ampsFeeBps() - hop1PassThrough) * Constants.PIPS_PER_BPS,
+            "and the whole difference is the base: the dynamic part is untouched"
+        );
+
+        vm.recordLogs();
+        (uint256 amountOut, uint256 ampsThrough) = routerRotate(spokePools[0], spokePools[1], ALICE, amountIn);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint24[] memory fees = swapFees(logs);
+        assertEq(fees.length, 2, "two hops");
+        assertEq(fees[0], rotationPips, "hop 1 charged exactly the flagged quote");
+        (uint256 consumed, uint16 blendedBase) = _lastCreditConsumed(logs);
+        assertEq(blendedBase, hop2PassThrough, "hop 2's blended base is the other spoke's pass-through fee");
+        assertEq(consumed, ampsThrough, "and it spent exactly the AMPS hop 1 realised (I26)");
+
+        assertGt(amountOut, 0, "the rotation delivered the other constituent");
+        assertEq(hook.rotationCredit(address(ampsRouter)), 0, "the rotation consumed the credit it created");
     }
 
-    /// @notice A one-transaction buy-then-larger-sell pays the sell fee on exactly the uncredited excess: the base
-    ///         is `buyFee + ceil((sellFee - buyFee) * (amountIn - credit) / amountIn)`, strictly between the two.
-    function test_rotationCredit_buyThenLargerSellPaysSellOnTheExcessOnly() public {
-        (uint16 baseBlended, uint256 creditUsed, uint256 amountIn) = this.buyThenLargerSellEntry();
+    /// @notice A one-transaction ordinary buy then sell pays `ampsFeeBps` **twice**. Under revision 5 the buy
+    ///         minted a credit any sell in the same transaction could spend; it no longer mints anything, so a
+    ///         round trip is two entries into the index priced as two entries into the index.
+    ///
+    /// @dev This is the pair to {test_rotationCredit_stockToAmpsToStockPaysBuyPlusBuy}: one transaction, the
+    ///      same hook, two swaps through AMPS — the only difference is the shape, and the shape is the whole
+    ///      price.
+    function test_rotationCredit_buyThenSellPaysTheAmpsFeeTwice() public {
+        (uint16 buyBase, uint16 sellBase, uint256 creditAfterBuy) = this.buyThenSellEntry();
+        assertEq(creditAfterBuy, 0, "an ordinary buy mints no credit at all");
+        assertEq(buyBase, hook.ampsFeeBps(), "so the buy pays the AMPS fee");
+        assertEq(sellBase, hook.ampsFeeBps(), "and the sell after it pays the AMPS fee too");
+    }
+
+    /// @notice The blend survives for the one caller that can reach it: a **pass-through** sell larger than the
+    ///         credit funding it pays `buyFee` on the covered part and `ampsFeeBps` on the excess, rounded up.
+    ///
+    /// @dev `AmpsRouter.rotate` cannot build this shape — hop 2 sells exactly what hop 1 realised, read off the
+    ///      swap's own `BalanceDelta` — so it is priced rather than executed, through
+    ///      `AmpsQuoter.quoteSellWithCredit`, which is the API a partially covered sell exists to be quoted by.
+    ///      The claim is I16's decomposition: the blended base is strictly between the two bases and lands on the
+    ///      delta form to the basis point.
+    function test_rotationCredit_aPassThroughSellLargerThanItsCreditBlendsTheExcess() public view {
+        uint256 credit = 1e18;
+        uint256 amountIn = credit * 4;
         uint16 buyFee = registry.poolConfig(hubPool).buyFeeBps;
-        uint16 sellFee = hook.sellFeeBps();
+        uint16 sellFee = hook.ampsFeeBps();
 
-        uint256 expected =
-            uint256(buyFee) + (uint256(sellFee - buyFee) * (amountIn - creditUsed) + amountIn - 1) / amountIn;
-        assertEq(uint256(baseBlended), expected, "the blend is the delta form, rounded up");
-        assertGt(baseBlended, buyFee, "and it is strictly above the buy fee");
-        assertLt(baseBlended, sellFee, "and strictly below the sell fee");
+        (,, uint16 dynBps,) = hook.quoteFee(hubPool, true, true, amountIn, false);
+        (, uint24 feePips,,) = quoter.quoteSellWithCredit(hubPool, amountIn, credit);
+        uint256 blendedBase = feePips / Constants.PIPS_PER_BPS - dynBps;
+
+        uint256 expected = uint256(buyFee) + (uint256(sellFee - buyFee) * (amountIn - credit) + amountIn - 1) / amountIn;
+        assertEq(blendedBase, expected, "the blend is the delta form, rounded up");
+        assertGt(blendedBase, buyFee, "and it is strictly above the pass-through fee");
+        assertLt(blendedBase, sellFee, "and strictly below the AMPS fee");
     }
 
-    /// @notice An exact-**output** sell consumes no credit and pays `sellFeeBps` in full, even with a credit
-    ///         sitting in the same transaction.
+    /// @notice An exact-**output** sell pays `ampsFeeBps` in full and spends no credit — both when there is no
+    ///         credit to spend, which is what an ordinary buy in the same transaction now leaves, and when the
+    ///         sell is flagged as a router hop, which is the only way to ask for the pass-through price at all.
+    ///
+    /// @dev Two claims, because revision 6 moved the ground under the first one. An ordinary buy no longer mints
+    ///      a credit, so "the exact-output sell did not spend one" is trivially true of it; the load-bearing half
+    ///      is that even the pass-through pricing refuses an exact-output sell, so a router that tried to build a
+    ///      rotation out of one would gain nothing.
     function test_rotationCredit_exactOutputSellPaysTheFullSellFee() public {
         (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) = this.exactOutputSellEntry();
-        assertGt(creditBefore, 0, "there was a credit to spend");
-        assertEq(creditAfter, creditBefore, "an exact-output sell spends none of it");
-        assertEq(baseBps, hook.sellFeeBps(), "and pays the sell fee in full");
+        assertEq(creditBefore, 0, "an ordinary buy leaves no credit behind to spend");
+        assertEq(creditAfter, creditBefore, "and the exact-output sell neither created nor spent one");
+        assertEq(baseBps, hook.ampsFeeBps(), "so it pays the sell fee in full");
+
+        (, uint16 flaggedBase,,) = hook.quoteFee(hubPool, true, false, 0, true);
+        assertEq(flaggedBase, hook.ampsFeeBps(), "and it pays it in full even when priced as a router hop");
     }
 
     /// @notice I26's structural half: the credit is transient, so a buy in one transaction leaves nothing behind
     ///         for a sell in the next.
     function test_rotationCredit_noCreditSurvivesTheTransaction() public {
         buyAmps(hubPool, ALICE, 1e6);
-        assertEq(hook.rotationCredit(), 0, "the credit is zero at every transaction boundary");
-        (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18);
-        assertEq(baseBps, hook.sellFeeBps(), "so the next transaction's sell pays the sell fee in full");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "the credit is zero at every transaction boundary");
+        (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18, false);
+        assertEq(baseBps, hook.ampsFeeBps(), "so the next transaction's sell pays the sell fee in full");
     }
 
-    /// @notice A 1-wei buy unlocks 1 wei of credit and not a basis point more: the blend is computed on the
-    ///         realised delta, so a dust buy cannot discount a real sell.
-    function test_rotationCredit_oneWeiBuyUnlocksOneWei() public {
+    /// @notice A 1-wei buy unlocks **nothing**: an ordinary buy — of any size, from anybody, through any router
+    ///         — mints no rotation credit at all, so the classic "manufacture a discount with dust, then exit
+    ///         against it" has no first step left.
+    function test_rotationCredit_aDustBuyUnlocksNothing() public {
         (uint256 credit, uint16 baseBps) = this.dustBuyEntry();
-        assertLe(credit, 2, "a 1-wei buy yields at most a wei or two of AMPS");
-        assertEq(baseBps, hook.sellFeeBps(), "and a 1 AMPS sell still pays the full sell fee");
+        assertEq(credit, 0, "a 1-wei ordinary buy creates no credit");
+        assertEq(baseBps, hook.ampsFeeBps(), "and a 1 AMPS sell still pays the full sell fee");
     }
 
     // -------------------------------------------------------------------------------------------------------------
     // Self-call entry points — one transaction each, so the transient credit survives across the hops
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice One transaction: buy AMPS in spoke 0, then sell all of it into spoke 1.
-    /// @return base1 Hop 1's base fee component.
-    /// @return base2 Hop 2's base fee component.
-    /// @return creditAfter The credit left when both hops are done.
-    function rotationEntry() external returns (uint16 base1, uint16 base2, uint256 creditAfter) {
-        require(msg.sender == address(this), "self-call only");
-        (, base1,,) = hook.quoteFee(spokePools[0], false, true, 0.01e18);
-        uint256 ampsOut = buyAmps(spokePools[0], ALICE, 0.01e18);
-        assertEq(hook.rotationCredit(), ampsOut, "the credit is exactly the AMPS the buy realised (I26)");
-        (, base2,,) = hook.quoteFee(spokePools[1], true, true, ampsOut);
-        sellAmps(spokePools[1], ALICE, ampsOut);
-        creditAfter = hook.rotationCredit();
-    }
-
-    /// @notice One transaction: buy AMPS in the hub, then sell four times as much back into it.
-    /// @return baseBlended The blended base fee hop 2 pays.
-    /// @return creditUsed The credit the sell consumed.
-    /// @return amountIn The AMPS the sell put in.
-    function buyThenLargerSellEntry() external returns (uint16 baseBlended, uint256 creditUsed, uint256 amountIn) {
+    /// @notice One transaction through an ordinary router: buy AMPS in the hub, then sell four times as much
+    ///         back into it. Neither leg is a router rotation, so neither is pass-through.
+    /// @return buyBase The buy's base fee component.
+    /// @return sellBase The sell's base fee component, quoted after the buy has already happened.
+    /// @return creditAfterBuy The credit the buy left behind, which revision 6 makes zero.
+    function buyThenSellEntry() external returns (uint16 buyBase, uint16 sellBase, uint256 creditAfterBuy) {
         require(msg.sender == address(this), "self-call only");
         giveShares(ALICE, 20e18);
+        (, buyBase,,) = hook.quoteFee(hubPool, false, true, 1e6, false);
         uint256 ampsOut = buyAmps(hubPool, ALICE, 1e6);
-        creditUsed = hook.rotationCredit();
-        assertEq(creditUsed, ampsOut, "the credit is the realised AMPS");
+        creditAfterBuy = hook.rotationCredit(address(swapRouter));
 
-        amountIn = ampsOut * 4;
-        (, baseBlended,,) = hook.quoteFee(hubPool, true, true, amountIn);
+        uint256 amountIn = ampsOut * 4;
+        vm.prank(address(swapRouter));
+        (, sellBase,,) = hook.quoteFee(hubPool, true, true, amountIn, false);
         sellAmps(hubPool, ALICE, amountIn);
-        assertEq(hook.rotationCredit(), 0, "the larger sell consumed the whole credit");
     }
 
-    /// @notice One transaction: buy AMPS in the hub, then take an exact amount of USDG back out.
+    /// @notice One transaction: an ordinary buy of AMPS in the hub, then an exact amount of USDG taken back
+    ///         out. Neither leg is a router rotation, so the buy leaves no credit for the sell to spend.
     /// @return baseBps The base fee the exact-output sell pays.
     /// @return creditBefore The credit before it.
     /// @return creditAfter The credit after it.
     function exactOutputSellEntry() external returns (uint16 baseBps, uint256 creditBefore, uint256 creditAfter) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1e6);
-        creditBefore = hook.rotationCredit();
-        (, baseBps,,) = hook.quoteFee(hubPool, true, false, 0);
+        creditBefore = hook.rotationCredit(address(swapRouter));
+        (, baseBps,,) = hook.quoteFee(hubPool, true, false, 0, false);
         sellAmpsExactOut(hubPool, ALICE, 0.2e6);
-        creditAfter = hook.rotationCredit();
+        creditAfter = hook.rotationCredit(address(swapRouter));
     }
 
-    /// @notice One transaction: a 1-wei buy, then the fee a whole-AMPS sell would pay.
-    /// @return credit The credit the dust buy created.
+    /// @notice One transaction: a 1-wei ordinary buy, then the fee a whole-AMPS sell would pay.
+    /// @return credit The credit the dust buy created, which revision 6 makes zero.
     /// @return baseBps The base fee a 1 AMPS sell would pay against it.
     function dustBuyEntry() external returns (uint256 credit, uint16 baseBps) {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1);
-        credit = hook.rotationCredit();
-        (, baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18);
+        credit = hook.rotationCredit(address(swapRouter));
+        vm.prank(address(swapRouter));
+        (, baseBps,,) = hook.quoteFee(hubPool, true, true, 1e18, false);
+    }
+
+    /// @dev The last `RotationCreditConsumed` in `logs`: how much credit a pass-through sell spent, and the
+    ///      blended base it paid. The base is what the rotation tests care about, because a realised `Swap` fee
+    ///      also carries the live dynamic part and the hook publishes the decomposition here and nowhere else.
+    /// @param logs The recorded logs.
+    /// @return consumed The credit the sell spent, in AMPS wei.
+    /// @return blendedBps The base fee it paid, in bps.
+    function _lastCreditConsumed(Vm.Log[] memory logs) internal pure returns (uint256 consumed, uint16 blendedBps) {
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.topics.length == 0 || entry.topics[0] != IAmpsHook.RotationCreditConsumed.selector) continue;
+            return abi.decode(entry.data, (uint256, uint16));
+        }
+        revert("no RotationCreditConsumed");
     }
 
     // -------------------------------------------------------------------------------------------------------------
     // Fee band, quoter, and `afterSwap`
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice I16's hard half: `sellFeeBps` is enforced in-contract inside `[100, 600]`, by the hook itself.
+    /// @notice I16's hard half: `ampsFeeBps` is enforced in-contract inside `[100, 600]`, by the hook itself.
     function test_i16_sellFeeBandIsEnforcedInContract() public {
-        assertEq(hook.SELL_FEE_BPS_MIN(), 100, "the floor is a hundred basis points");
-        assertEq(hook.SELL_FEE_BPS_MAX(), 600, "and the ceiling six hundred");
+        assertEq(hook.AMPS_FEE_BPS_MIN(), 100, "the floor is a hundred basis points");
+        assertEq(hook.AMPS_FEE_BPS_MAX(), 600, "and the ceiling six hundred");
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(99), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(99), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(99);
+        hook.setAmpsFeeBps(99);
 
         vm.prank(TIMELOCK);
         vm.expectRevert(
-            abi.encodeWithSelector(OutOfBand.selector, bytes32("sellFeeBps"), uint256(601), uint256(100), uint256(600))
+            abi.encodeWithSelector(OutOfBand.selector, bytes32("ampsFeeBps"), uint256(601), uint256(100), uint256(600))
         );
-        hook.setSellFeeBps(601);
+        hook.setAmpsFeeBps(601);
 
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(600);
-        assertEq(hook.sellFeeBps(), 600, "the ceiling itself is accepted");
+        hook.setAmpsFeeBps(600);
+        assertEq(hook.ampsFeeBps(), 600, "the ceiling itself is accepted");
         vm.prank(TIMELOCK);
-        hook.setSellFeeBps(100);
-        assertEq(hook.sellFeeBps(), 100, "and so is the floor");
+        hook.setAmpsFeeBps(100);
+        assertEq(hook.ampsFeeBps(), 100, "and so is the floor");
     }
 
     /// @notice `AmpsQuoter.quotePool` reports exactly the fee the pool then charges, on both directions, in every
@@ -464,8 +537,10 @@ contract Phase3FlywheelTest is Phase3Fixture {
         wethFeed.setRevert(true);
         usdgFeed.setRevert(true);
         stocks[0].setOraclePaused(true);
-        vm.prank(TIMELOCK);
-        vault.setPolicyPointer(bytes32("oracleGate"), address(0xDEAD));
+        // The gate pointer is *forced* into §1.1 slot 9 rather than set: `setPolicyPointer` now refuses a
+        // codeless replacement, so "the gate has gone away entirely" is only reachable by writing the slot. The
+        // state being modelled is unchanged, and it is the one the assertions below are about.
+        vm.store(address(vault), bytes32(uint256(9)), bytes32(uint256(uint160(address(0xDEAD)))));
         warpBy(3 days);
 
         // Every leg still swaps, in both directions, with every downstream read broken.
@@ -499,7 +574,7 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // 3. Rotate spoke 0 into spoke 1 in one transaction.
         uint256 rotated = rotate(spokePools[0], spokePools[1], BOB, 0.01e18);
         assertGt(rotated, 0, "the rotation delivered the other stock");
-        assertEq(hook.rotationCredit(), 0, "and left no credit behind");
+        assertEq(hook.rotationCredit(address(swapRouter)), 0, "and left no credit behind");
 
         // 4. Bond, then claim over the vesting window.
         uint256 supplyBeforeBond = amps.totalSupply();
@@ -516,26 +591,20 @@ contract Phase3FlywheelTest is Phase3Fixture {
         assertEq(claimed, bonded, "the whole position vested");
         assertEq(amps.balanceOf(CAROL), bonded, "and landed on the buyer");
 
-        // 5. Stake, then receive the streamed staker slice of a compound.
-        vm.startPrank(CAROL);
-        amps.approve(address(staking), type(uint256).max);
-        uint256 shares = staking.deposit(bonded, CAROL);
-        vm.stopPrank();
-        assertGt(shares, 0, "xAMPS minted");
-
-        uint256 stakedAssetsBefore = staking.totalAssets();
+        // 5. Compound: the AMPS-side fee leaves the supply for good.
         _tradeForAmpsFees();
+        uint256 supplyBeforeCompound = amps.totalSupply();
         vm.prank(KEEPER);
-        vault.compound(hubPool);
-        warpBy(Constants.REWARD_STREAM_SECONDS_DEFAULT + 1);
-        assertGt(staking.totalAssets(), stakedAssetsBefore, "the staker slice streamed in");
+        (, uint256 burnedByCompound) = vault.compound(hubPool);
+        assertGt(burnedByCompound, 0, "the compound burned the AMPS-side fee");
+        assertEq(supplyBeforeCompound - amps.totalSupply(), burnedByCompound, "and `totalSupply` fell by exactly it");
 
         // 6. Sell AMPS and pay the sell fee.
         uint256 sellIn = amps.balanceOf(ALICE) / 4;
         vm.recordLogs();
         sellAmps(hubPool, ALICE, sellIn);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        assertGe(uint256(lastSwapFee(logs)) / 100, uint256(hook.sellFeeBps()), "the sell paid at least the sell fee");
+        assertGe(uint256(lastSwapFee(logs)) / 100, uint256(hook.ampsFeeBps()), "the sell paid at least the sell fee");
 
         // 7. Redeem pro-rata and get exactly `(1 - redeemFeeBps) * shares / T` of every non-AMPS balance.
         uint256 redeemShares = amps.balanceOf(ALICE);

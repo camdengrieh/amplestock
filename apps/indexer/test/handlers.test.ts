@@ -28,12 +28,17 @@ import {
   ADDRESSES,
   CALLER,
   COUNTER,
+  NEW_VAULT,
   POOL_ID,
   TOKEN,
+  bondMarketDetached,
+  collateralForwarded,
   makeContext,
   makeEvent,
   resetLogIndex,
   run,
+  sweepResidue,
+  vaultChanged,
   type TestContext,
 } from './support/events'
 import {registeredHandlers} from './support/registry'
@@ -76,19 +81,27 @@ beforeEach(() => {
   resetLogIndex()
 })
 
+/** A second registered pool, so a rotation has two hops to run between. */
+const POOL_ID_2 = '0x2222222222222222222222222222222222222222222222222222222222222222' as const
+const COUNTER_2 = '0x00000000000000000000000000000000000000c3' as const
+
 /** Register the pool the v4 handlers filter on. */
-async function registerPool(blockNumber = 10n): Promise<void> {
+async function registerPool(
+  blockNumber = 10n,
+  pool: {poolId?: `0x${string}`; counter?: `0x${string}`; buyFeeBps?: number} = {},
+): Promise<void> {
+  const poolId = pool.poolId ?? POOL_ID
   await run(
     'PoolRegistry:PoolRegistered',
     makeEvent({
       args: {
-        poolId: POOL_ID,
-        counter: COUNTER,
+        poolId,
+        counter: pool.counter ?? COUNTER,
         poolClass: 1,
         constituentId: 0,
         tickSpacing: 60,
         counterDecimals: 6,
-        buyFeeBps: 30,
+        buyFeeBps: pool.buyFeeBps ?? 30,
       },
       blockNumber,
       logIndex: 0,
@@ -99,7 +112,7 @@ async function registerPool(blockNumber = 10n): Promise<void> {
   await run(
     'PoolRegistry:PoolOpened',
     makeEvent({
-      args: {poolId: POOL_ID, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
+      args: {poolId, feed: '0x00000000000000000000000000000000000000f1', sqrtPriceX96: Q96},
       blockNumber,
       logIndex: 1,
       address: ADDRESSES.PoolRegistry,
@@ -110,7 +123,7 @@ async function registerPool(blockNumber = 10n): Promise<void> {
   await run(
     'PoolRegistry:PoolGridSet',
     makeEvent({
-      args: {poolId: POOL_ID, gridBaseTick: 0},
+      args: {poolId, gridBaseTick: 0},
       blockNumber,
       logIndex: 2,
       address: ADDRESSES.PoolRegistry,
@@ -136,9 +149,14 @@ describe('registration', () => {
       'AmpsVault:GateChanged',
       'AmpsVault:BondedDeposit',
       'AmpsVault:VestingMinted',
+      'AmpsVault:SweepResidue',
       'AmpsBonds:Bond',
       'AmpsBonds:Claim',
-      'AmpsStaking:RewardNotified',
+      'AmpsBonds:CollateralForwarded',
+      'AmpsBonds:CollateralRemoved',
+      'AmpsRouter:Bought',
+      'AmpsRouter:Sold',
+      'AmpsRouter:Rotated',
       'PoolRegistry:ConstituentAdded',
       'PoolRegistry:ConstituentRetired',
       'PoolRegistry:ConstituentReinstated',
@@ -147,11 +165,14 @@ describe('registration', () => {
       'PoolRegistry:PoolRegistered',
       'PoolRegistry:PoolOpened',
       'PoolRegistry:PoolGridSet',
+      'PoolRegistry:BondMarketDetached',
+      'PoolRegistry:VaultChanged',
       'PoolManager:Swap',
       'PoolManager:ModifyLiquidity',
       'PoolManager:Initialize',
       'AmpsHook:RebalanceNeeded',
       'AmpsHook:RotationCreditConsumed',
+      'AmpsHook:VaultChanged',
       'OracleGate:GateChanged',
       'FeedRegistry:AnswerLatched',
       'BountyPot:BountyPaid',
@@ -672,7 +693,18 @@ describe('rollout', () => {
 })
 
 describe('compound', () => {
-  it('records the four-way split and the NAV either side', async () => {
+  it('records the revision-6 split in both currencies and the NAV either side', async () => {
+    await registerPool()
+    // The counter legs are priced through the pool and then `P_ref`, so both have to exist.
+    await run(
+      'AmpsVault:RefCheckpoint',
+      makeEvent({
+        args: {pRefX18: WAD, pMktX18: WAD, rateLimited: false, navFloored: true},
+        blockNumber: 99n,
+        logIndex: 0,
+      }),
+      context,
+    )
     await run(
       'AmpsVault:NavCheckpoint',
       makeEvent({
@@ -695,16 +727,18 @@ describe('compound', () => {
       }),
       context,
     )
+    // 100 AMPS and 200 USDG (6 decimals) of fees, the creator's fifth of each, and the whole AMPS
+    // remainder burned: 100 - 20 = 80, plus a 5 AMPS buyback.
     await run(
       'AmpsVault:Compound',
       makeEvent({
         args: {
           poolId: POOL_ID,
           ampsFees: 100n * WAD,
-          creatorPaid: 20n * WAD,
-          stakerPaid: 24n * WAD,
-          burned: 5n * WAD,
-          relaid: 51n * WAD,
+          counterFees: 200_000_000n,
+          creatorAmps: 20n * WAD,
+          creatorCounter: 40_000_000n,
+          burned: 85n * WAD,
         },
         blockNumber: 200n,
         logIndex: 1,
@@ -716,16 +750,36 @@ describe('compound', () => {
     expect(compound!.navBeforeX18).toBe(WAD)
     expect(compound!.navAfterX18).toBe((WAD * 10_010n) / 10_000n)
     expect(compound!.navChangeBps).toBe(10)
-    expect(
-      (compound!.creatorPaid as bigint) +
-        (compound!.stakerPaid as bigint) +
-        (compound!.burned as bigint) +
-        (compound!.relaid as bigint),
-    ).toBe(100n * WAD)
+
+    // The AMPS side is exhausted by the creator slice and the burn: `burned` is that remainder
+    // plus the buyback, so it is the only figure that can exceed `ampsFees`.
+    expect(compound!.creatorAmps).toBe(20n * WAD)
+    expect(compound!.burned).toBe(85n * WAD)
+    expect((compound!.burned as bigint) + (compound!.creatorAmps as bigint)).toBeGreaterThan(
+      compound!.ampsFees as bigint,
+    )
+    // The counter side is carried raw *and* in USD; the creator's share of it is a fifth, the same
+    // fraction the AMPS side was cut at, because both come from `creatorBps / ampsFeeBps`.
+    expect(compound!.counterFees).toBe(200_000_000n)
+    expect(compound!.creatorCounter).toBe(40_000_000n)
+    expect(compound!.counterFeesUsd18).toBeGreaterThan(0n)
+    expect((compound!.creatorCounterUsd18 as bigint) * 5n).toBe(compound!.counterFeesUsd18 as bigint)
+
+    // Nothing on the row is a staker slice or a re-laid amount: neither exists.
+    expect(compound!.stakerPaid).toBeUndefined()
+    expect(compound!.relaid).toBeUndefined()
 
     const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
     expect(summary!.feesAmpsTotal).toBe(100n * WAD)
+    expect(summary!.feesCounterUsd18).toBe(compound!.counterFeesUsd18)
+    expect(summary!.creatorPaidAmpsTotal).toBe(20n * WAD)
+    expect(summary!.creatorPaidCounterUsd18).toBe(compound!.creatorCounterUsd18)
+    expect(summary!.burnedTotal).toBe(85n * WAD)
     expect(summary!.compoundCount).toBe(1)
+
+    const day = db.rows(schema.flywheelDay)[0]
+    expect(day!.creatorPaidAmps).toBe(20n * WAD)
+    expect(day!.creatorPaidCounterUsd18).toBe(compound!.creatorCounterUsd18)
 
     const [job] = db.rows(schema.keeperJob)
     expect(job!.job).toBe('compound')
@@ -761,10 +815,10 @@ describe('compound', () => {
         args: {
           poolId: POOL_ID,
           ampsFees: 1n,
-          creatorPaid: 0n,
-          stakerPaid: 0n,
-          burned: 0n,
-          relaid: 1n,
+          counterFees: 0n,
+          creatorAmps: 0n,
+          creatorCounter: 0n,
+          burned: 1n,
         },
         blockNumber: 200n,
         logIndex: 1,
@@ -822,10 +876,10 @@ describe('the ladder', () => {
     const cell = await db.find(schema.ladderCell, {id: `${POOL_ID}-0`})
     expect(cell).not.toBeNull()
     expect(cell!.above).toBe(true)
-    expect(cell!.cellIndex).toBe(8) // m = 0, GRID_MIN_M = -8
+    expect(cell!.bucketIndex).toBe(8) // m = 0, GRID_MIN_M = -8
     expect(cell!.ampsRemaining).toBeGreaterThan(0n)
-    expect(cell!.counterRaised).toBe(0n)
-    expect(cell!.fillBps).toBe(0)
+    expect(cell!.proceeds).toBe(0n)
+    expect(cell!.filledBps).toBe(0)
 
     const [placement] = db.rows(schema.placement)
     expect(placement!.cells).toBe(1)
@@ -906,8 +960,8 @@ describe('the ladder', () => {
 
     const after = await db.find(schema.ladderCell, {id: `${POOL_ID}-0`})
     expect(after!.ampsRemaining).toBeLessThan(before!.ampsRemaining as bigint)
-    expect(after!.counterRaised).toBeGreaterThan(0n)
-    expect(after!.fillBps).toBeGreaterThan(0)
+    expect(after!.proceeds).toBeGreaterThan(0n)
+    expect(after!.filledBps).toBeGreaterThan(0)
   })
 })
 
@@ -1012,6 +1066,42 @@ describe('swaps', () => {
     expect(pool!.rotationCreditedAmps).toBe(100n * WAD)
   })
 
+  it('charges the AMPS fee on a buy as well — revision 6 prices both directions the same', async () => {
+    // The counter asset goes in, AMPS comes out. Before revision 6 this was the "buy fee" and paid
+    // the pool's 30 bp; now `buyFeeBps` is the *pass-through* fee and only a rotation hop sees it,
+    // so an ordinary buy pays `ampsFeeBps` exactly as the matching sell does.
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: CALLER,
+          amount0: 95n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 45n,
+        logIndex: 0,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    const [swap] = db.rows(schema.swap)
+    expect(swap!.sell).toBe(false)
+    expect(swap!.baseFeeBps).toBe(500)
+    expect(swap!.dynamicFeeBps).toBe(0)
+    // A buy's fee is taken in the counter asset, so the AMPS-side figure stays zero and the
+    // counter-side one is what the pool kept.
+    expect(swap!.feeAmps).toBe(0n)
+    const pool = await db.find(schema.pool, {id: POOL_ID})
+    expect(pool!.sellFeeAmps).toBe(0n)
+    expect(pool!.buyFeeCounter).toBe(5n * 10n ** 6n)
+    expect(pool!.buyVolumeAmps).toBe(95n * WAD)
+  })
+
   it('splits the charged fee into base and dynamic', async () => {
     await run(
       'PoolManager:Swap',
@@ -1043,7 +1133,7 @@ describe('swaps', () => {
       'AmpsHook:HookParameterChanged',
       makeEvent({
         args: {
-          parameter: `0x${Buffer.from('sellFeeBps', 'utf8').toString('hex').padEnd(64, '0')}`,
+          parameter: `0x${Buffer.from('ampsFeeBps', 'utf8').toString('hex').padEnd(64, '0')}`,
           poolId: `0x${'00'.repeat(32)}`,
           previousValue: 500n,
           newValue: 300n,
@@ -1076,6 +1166,194 @@ describe('swaps', () => {
     const [swap] = db.rows(schema.swap)
     expect(swap!.baseFeeBps).toBe(300)
     expect(swap!.dynamicFeeBps).toBe(0)
+  })
+})
+
+describe('the protocol router', () => {
+  const ROUTER = ADDRESSES.AmpsRouter as `0x${string}`
+
+  beforeEach(async () => {
+    await registerPool(10n)
+    await registerPool(11n, {poolId: POOL_ID_2, counter: COUNTER_2, buyFeeBps: 5})
+    await run(
+      'AmpsVault:RefCheckpoint',
+      makeEvent({
+        args: {pRefX18: WAD, pMktX18: WAD, rateLimited: false, navFloored: true},
+        blockNumber: 15n,
+        logIndex: 1,
+      }),
+      context,
+    )
+  })
+
+  it('records a buy through the router as an entry, priced at the AMPS fee', async () => {
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: ROUTER,
+          amount0: 95n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 60n,
+        logIndex: 0,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    await run(
+      'AmpsRouter:Bought',
+      makeEvent({
+        args: {poolId: POOL_ID, payer: CALLER, to: CALLER, amountIn: 100n * 10n ** 6n, ampsOut: 95n * WAD},
+        blockNumber: 60n,
+        logIndex: 1,
+        txHash: TX,
+        address: ROUTER,
+      }),
+      context,
+    )
+
+    const [trade] = db.rows(schema.routerTrade)
+    expect(trade!.kind).toBe('buy')
+    // Routing an entry through the protocol's own front end must not make it cheaper.
+    expect(trade!.passThrough).toBe(false)
+    expect(trade!.ampsAmount).toBe(95n * WAD)
+    expect(trade!.feeCounter).toBe(5n * 10n ** 6n)
+    expect(trade!.feeAmps).toBe(0n)
+
+    const [swap] = db.rows(schema.swap)
+    expect(swap!.baseFeeBps).toBe(500)
+    // The stash is consumed exactly once, like the rotation credit before it.
+    expect(db.count(schema.pendingHop)).toBe(0)
+  })
+
+  it('prices both hops of a rotation at the pass-through fee, correcting hop 1 in place', async () => {
+    // Hop 1: buy AMPS in pool 1. Nothing in this log says it is a rotation, so it is decoded at the
+    // default base — `ampsFeeBps` — and left for `Rotated` to correct.
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: ROUTER,
+          amount0: 100n * WAD,
+          amount1: -100n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 4_000,
+        },
+        blockNumber: 61n,
+        logIndex: 0,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    const hop1SwapId = db.rows(schema.swap)[0]!.id as string
+    expect(db.rows(schema.swap)[0]!.baseFeeBps).toBe(500)
+
+    // Hop 2: the hook's `beforeSwap` credits the AMPS hop 1 realised and says so, so the sell is
+    // already decoded at the blended base — which for a fully covered hop is `buyFeeBps` outright.
+    await run(
+      'AmpsHook:RotationCreditConsumed',
+      makeEvent({
+        args: {poolId: POOL_ID_2, consumed: 100n * WAD, blendedFeeBps: 5},
+        blockNumber: 61n,
+        logIndex: 1,
+        txHash: TX,
+        address: ADDRESSES.AmpsHook,
+      }),
+      context,
+    )
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID_2,
+          sender: ROUTER,
+          amount0: -100n * WAD,
+          amount1: 99n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 500,
+        },
+        blockNumber: 61n,
+        logIndex: 2,
+        txHash: TX,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+
+    await run(
+      'AmpsRouter:Rotated',
+      makeEvent({
+        args: {
+          hop1: POOL_ID,
+          hop2: POOL_ID_2,
+          to: CALLER,
+          amountIn: 100n * 10n ** 6n,
+          ampsThrough: 100n * WAD,
+          amountOut: 99n * 10n ** 6n,
+        },
+        blockNumber: 61n,
+        logIndex: 3,
+        txHash: TX,
+        address: ROUTER,
+      }),
+      context,
+    )
+
+    // Hop 1's decomposition is corrected once `Rotated` names it: the base is the pool's own
+    // pass-through fee, and the residual over it is the dynamic part, which never moved.
+    const hop1 = await db.find(schema.swap, {id: hop1SwapId})
+    expect(hop1!.baseFeeBps).toBe(30)
+    expect(hop1!.dynamicFeeBps).toBe(10)
+    expect(hop1!.feeBps).toBe(40)
+
+    const [trade] = db.rows(schema.routerTrade)
+    expect(trade!.kind).toBe('rotate')
+    expect(trade!.passThrough).toBe(true)
+    expect(trade!.poolId).toBe(POOL_ID)
+    expect(trade!.hop2PoolId).toBe(POOL_ID_2)
+    expect(trade!.ampsAmount).toBe(100n * WAD)
+    expect(trade!.hop1BaseFeeBps).toBe(30)
+    expect(trade!.hop2BaseFeeBps).toBe(5)
+    // Hop 1 paid in its counter asset, hop 2 in AMPS: the two legs of one pass-through fee.
+    expect(trade!.feeCounter).toBe(400_000n)
+    expect(trade!.feeAmps).toBe((100n * WAD * 500n) / 1_000_000n)
+    expect(db.count(schema.pendingHop)).toBe(0)
+  })
+
+  it('leaves an ordinary swap out of the stash entirely', async () => {
+    await run(
+      'PoolManager:Swap',
+      makeEvent({
+        args: {
+          id: POOL_ID,
+          sender: CALLER,
+          amount0: -10n * WAD,
+          amount1: 9n * 10n ** 6n,
+          sqrtPriceX96: Q96,
+          liquidity: 10n ** 18n,
+          tick: 0,
+          fee: 50_000,
+        },
+        blockNumber: 62n,
+        logIndex: 0,
+        address: ADDRESSES.PoolManager,
+      }),
+      context,
+    )
+    expect(db.count(schema.pendingHop)).toBe(0)
   })
 })
 
@@ -1473,5 +1751,183 @@ describe('the bounty pot', () => {
     const [job] = db.rows(schema.keeperJob)
     expect(job!.job).toBe('compound')
     expect(job!.bountyPaidUsd18).toBe(WAD)
+  })
+})
+
+/**
+ * The four disclosures the audited contracts added, all of them the same shape: a fact a hostile or
+ * frozen counterparty could otherwise have turned into a permanent revert is now emitted instead.
+ * The indexer's job is therefore to make each of them *visible*, and — just as importantly — to
+ * leave NAV, the supply and the market's issuance history alone, because none of them moves money.
+ */
+describe('the disclosures that replaced reverts', () => {
+  /** `AmpsBonds.CollateralAdded`, which is what materialises the collateral to market index. */
+  async function addMarket(
+    marketId = 1,
+    collateral: `0x${string}` = TOKEN,
+    constituentId = 1,
+  ): Promise<void> {
+    await run(
+      'AmpsBonds:CollateralAdded',
+      makeEvent({
+        args: {marketId, collateral, class: 0, constituentId},
+        blockNumber: 50n,
+        logIndex: 0,
+        address: ADDRESSES.AmpsBonds,
+      }),
+      context,
+    )
+  }
+
+  it('raises a sweep-residue alert naming the token the vault could not absorb', async () => {
+    await run(
+      'PoolRegistry:ConstituentAdded',
+      makeEvent({
+        args: {constituentId: 1, token: TOKEN, poolId: POOL_ID, targetWeightBps: 500},
+        blockNumber: 60n,
+        logIndex: 0,
+        address: ADDRESSES.PoolRegistry,
+      }),
+      context,
+    )
+    await run(
+      'AmpsVault:SweepResidue',
+      sweepResidue({balance: 1n}, {blockNumber: 61n, logIndex: 3}),
+      context,
+    )
+
+    const alerts = db.rows(schema.alert).filter((a) => a.kind === 'sweep-residue')
+    expect(alerts).toHaveLength(1)
+    // Disclosure, not a breach: the residue is still backing, valued in `A` and paid out by
+    // redemption, so it pages at `warning` rather than `critical`.
+    expect(alerts[0]!.severity).toBe('warning')
+    expect(alerts[0]!.subject).toBe(TOKEN)
+    expect(alerts[0]!.id).toBe('000000000061-000003')
+    const detail = alerts[0]!.detail as Record<string, unknown>
+    expect(detail.balance).toBe('1')
+    expect(detail.constituentId).toBe(1)
+
+    // Nothing about the vault's money moved.
+    expect(db.count(schema.navCheckpoint)).toBe(0)
+    expect(db.count(schema.burnEvent)).toBe(0)
+  })
+
+  it('still records a residue for a token that is not one of ours', async () => {
+    const donated = '0x00000000000000000000000000000000000000f9' as const
+    await run(
+      'AmpsVault:SweepResidue',
+      sweepResidue({token: donated, balance: 7n}, {blockNumber: 62n, logIndex: 0}),
+      context,
+    )
+    const [alert] = db.rows(schema.alert)
+    expect(alert!.subject).toBe(donated)
+    expect((alert!.detail as Record<string, unknown>).constituentId).toBeNull()
+  })
+
+  it('attributes forwarded collateral to its market and accumulates it there', async () => {
+    await addMarket()
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({amount: 3n}, {blockNumber: 52n, logIndex: 4}),
+      context,
+    )
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({amount: 5n}, {blockNumber: 53n, logIndex: 2}),
+      context,
+    )
+
+    const market = await db.find(schema.bondMarket, {id: '1'})
+    expect(market!.forwardedCollateral).toBe(8n)
+    // A donation is not issuance: nothing else on the market moved.
+    expect(market!.totalCollateral).toBe(0n)
+    expect(market!.bondCount).toBe(0)
+
+    const state = await db.find(schema.parameterState, {id: 'bonds:collateralForwarded:1'})
+    expect(state!.value).toBe(5n)
+    expect(db.rows(schema.parameterChange)).toHaveLength(2)
+  })
+
+  it('buckets a forward whose collateral it cannot place under market 0', async () => {
+    await addMarket()
+    await run(
+      'AmpsBonds:CollateralForwarded',
+      collateralForwarded({collateral: COUNTER, amount: 9n}, {blockNumber: 54n, logIndex: 0}),
+      context,
+    )
+    expect((await db.find(schema.bondMarket, {id: '1'}))!.forwardedCollateral).toBe(0n)
+    const state = await db.find(schema.parameterState, {id: 'bonds:collateralForwarded:0'})
+    expect(state!.value).toBe(9n)
+  })
+
+  it('detaches a market when its collateral is removed, and forgets the reverse lookup', async () => {
+    await addMarket()
+    expect((await db.find(schema.collateralIndex, {id: TOKEN}))!.marketId).toBe(1)
+
+    await run(
+      'AmpsBonds:CollateralRemoved',
+      makeEvent({
+        args: {marketId: 1, collateral: TOKEN},
+        blockNumber: 55n,
+        logIndex: 0,
+        address: ADDRESSES.AmpsBonds,
+      }),
+      context,
+    )
+
+    const market = await db.find(schema.bondMarket, {id: '1'})
+    expect(market!.open).toBe(false)
+    expect(market!.detached).toBe(true)
+    // The market row survives — its issuance history is still true — but the lookup is gone, so a
+    // later forward of the same collateral cannot be attributed to a market that no longer owns it.
+    expect(await db.find(schema.collateralIndex, {id: TOKEN})).toBeNull()
+  })
+
+  it('records the registry finding the bond market already gone', async () => {
+    await addMarket()
+    await run(
+      'PoolRegistry:BondMarketDetached',
+      bondMarketDetached({constituentId: 1, marketId: 1}, {blockNumber: 56n, logIndex: 1}),
+      context,
+    )
+
+    expect((await db.find(schema.bondMarket, {id: '1'}))!.detached).toBe(true)
+    const [detached] = db.rows(schema.constituentEvent).filter((e) => e.kind === 'bondMarketDetached')
+    expect(detached!.constituentId).toBe(1)
+    expect(detached!.field).toBe('marketId')
+    expect(detached!.newValue).toBe(1n)
+    expect(detached!.id).toBe('000000000056-000001')
+  })
+
+  it('logs the detachment even when the market was never indexed', async () => {
+    await run(
+      'PoolRegistry:BondMarketDetached',
+      bondMarketDetached({constituentId: 4, marketId: 9}, {blockNumber: 57n, logIndex: 0}),
+      context,
+    )
+    expect(db.count(schema.bondMarket)).toBe(0)
+    expect(db.rows(schema.constituentEvent)).toHaveLength(1)
+  })
+
+  it('follows the vault pointer through the registry and the hook', async () => {
+    await run(
+      'PoolRegistry:VaultChanged',
+      vaultChanged('PoolRegistry', {}, {blockNumber: 80n, logIndex: 0}),
+      context,
+    )
+    await run(
+      'AmpsHook:VaultChanged',
+      vaultChanged('AmpsHook', {}, {blockNumber: 80n, logIndex: 1}),
+      context,
+    )
+
+    const registry = await db.find(schema.parameterState, {id: 'registry.pointer:vault'})
+    expect(registry!.addressValue).toBe(NEW_VAULT)
+    expect(registry!.previousAddress).toBe(ADDRESSES.AmpsVault)
+    const hook = await db.find(schema.parameterState, {id: 'hook.pointer:vault'})
+    expect(hook!.addressValue).toBe(NEW_VAULT)
+    // Same shape as the pointers `AmpsBonds` and `BountyPot` already emit, so the
+    // Governance page reads one table for all of them.
+    expect(db.rows(schema.parameterChange).filter((c) => c.name === 'vault')).toHaveLength(2)
   })
 })

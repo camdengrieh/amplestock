@@ -16,7 +16,7 @@ import {console} from "forge-std/console.sol";
 /// @title Phase2IntegrationTest
 /// @notice The Phase 2 exit criteria as end-to-end journeys over the real contracts: genesis and the NAV vector,
 ///         the bond/claim path at both a zero and a +30% premium, the rate-limited reference price, the ungated
-///         redemption floor under every failure mode at once, the staking stream, the constituent lifecycle, the
+///         redemption floor under every failure mode at once, the constituent lifecycle, the
 ///         predicate-gated migration drill, the keeper bounty and the gas shape of the four hot paths.
 ///
 /// @dev Every journey ends in {assertSweepClean}, which is invariant I12 stated at the integration level: no
@@ -412,7 +412,11 @@ contract Phase2IntegrationTest is Phase2Fixture {
             if (tokens[i] == address(usdg)) usdgIndex = i;
         }
         assertTrue(usdgIndex != type(uint256).max, "USDG is a redeemable asset");
-        assertEq(amounts[usdgIndex], ((usdgBefore * 200e18 / supply) * 9900) / Constants.BPS, "and it paid out");
+        assertEq(
+            amounts[usdgIndex],
+            ((usdgBefore * 200e18 / supply) * (Constants.BPS - Constants.REDEEM_FEE_BPS_DEFAULT)) / Constants.BPS,
+            "and it paid out"
+        );
         assertGt(usdg.balanceOf(BOB), 0, "the redeemer was paid with every oracle dead");
         assertLt(amps.totalSupply(), supply, "and the shares were burned");
 
@@ -441,77 +445,6 @@ contract Phase2IntegrationTest is Phase2Fixture {
         vm.prank(ALICE);
         assertEq(bonds.claimAll(ALICE), ampsOut - claimed, "and completes");
         assertSweepClean("d/claim-ungated");
-    }
-
-    // -------------------------------------------------------------------------------------------------------------
-    // (e) Staking
-    // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice The staker slice, paid the way `compound()` will pay it in Phase 3: the vault transfers the AMPS in
-    ///         and then calls `notifyReward` in the same transaction. The tranche is invisible at the instant it
-    ///         lands, releases linearly over 24 hours, and a sandwich around the notification earns nothing (I36).
-    function test_e_stakingStreamAndSandwich() public {
-        giveShares(ALICE, 1000e18);
-        giveShares(BOB, 1000e18);
-
-        vm.startPrank(ALICE);
-        amps.approve(address(staking), type(uint256).max);
-        staking.deposit(500e18, ALICE);
-        vm.stopPrank();
-        assertEq(staking.totalAssets(), 500e18, "the deposit is the whole of totalAssets");
-
-        // The vault's own slice of a notional 100 AMPS of sell fees.
-        uint256 fees = 100e18;
-        uint256 cut = fees * vault.stakerBps() / Constants.BPS;
-        assertEq(cut, 30e18, "stakerBps is 30% at launch");
-
-        // BOB sandwiches: in the same block as the notification.
-        vm.startPrank(BOB);
-        amps.approve(address(staking), type(uint256).max);
-        uint256 bobShares = staking.deposit(500e18, BOB);
-        vm.stopPrank();
-
-        uint256 assetsBefore = staking.totalAssets();
-        vm.startPrank(address(vault));
-        amps.transfer(address(staking), cut);
-        staking.notifyReward(cut);
-        vm.stopPrank();
-
-        assertEq(staking.totalAssets(), assetsBefore, "I36: a notified tranche is invisible until it vests");
-        assertEq(staking.pendingRewards(), cut, "the whole tranche is pending");
-        assertEq(staking.totalNotified(), cut, "and recorded");
-
-        vm.prank(BOB);
-        uint256 bobOut = staking.redeem(bobShares, BOB, BOB);
-        assertLe(bobOut, 500e18, "I36: the sandwich earns nothing");
-
-        // Half the stream later, half the tranche is in the share price.
-        warpBy(12 hours);
-        assertApproxEqRel(staking.pendingRewards(), cut / 2, 1e12, "half the stream is still pending");
-        assertApproxEqRel(staking.totalAssets(), 500e18 + cut / 2, 1e12, "and half has vested");
-
-        warpBy(12 hours + 1);
-        assertEq(staking.pendingRewards(), 0, "the stream ends");
-        assertEq(staking.totalAssets(), 500e18 + cut, "and the whole tranche is in the share price");
-        assertLe(staking.releasedRewards(), staking.totalNotified(), "I36: released <= notified");
-
-        uint256 aliceShares = staking.balanceOf(ALICE);
-        vm.prank(ALICE);
-        uint256 aliceOut = staking.redeem(aliceShares, ALICE, ALICE);
-        assertGt(aliceOut, 500e18, "the staker who was there for the stream keeps it");
-
-        assertSweepClean("e/staking");
-    }
-
-    /// @notice Only the vault may notify, and a notification that was not funded first reverts loudly rather than
-    ///         bricking `totalAssets`.
-    function test_e_notifyRewardIsVaultOnlyAndMustBeFunded() public {
-        vm.expectRevert();
-        staking.notifyReward(1e18);
-
-        vm.prank(address(vault));
-        vm.expectRevert();
-        staking.notifyReward(1e18);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -666,6 +599,8 @@ contract Phase2IntegrationTest is Phase2Fixture {
     function test_g_emergencyMigrationDrill() public {
         bondAs(ALICE, NVDA, 0.05e18, 0);
 
+        // A codeless standby is refused (audit fix wave 2, finding 6); one `STOP` makes the constant a contract.
+        vm.etch(STANDBY, hex"00");
         vm.prank(TIMELOCK);
         vault.setStandbyVault(STANDBY);
 
@@ -699,7 +634,6 @@ contract Phase2IntegrationTest is Phase2Fixture {
         assertEq(amps.balanceOf(STANDBY), polBefore, "the POL inventory moved too");
         assertEq(amps.vault(), STANDBY, "Amps.setVault");
         assertEq(bonds.vault(), STANDBY, "AmpsBonds.setVault");
-        assertEq(staking.vault(), STANDBY, "AmpsStaking.setVault");
         assertEq(pot.vault(), STANDBY, "BountyPot.setVault");
         assertSweepClean("g/migrated");
     }

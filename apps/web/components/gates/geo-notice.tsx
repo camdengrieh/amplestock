@@ -14,8 +14,10 @@ export function GeoUnverifiedNotice({unverified}: {unverified: boolean}) {
     <Alert variant="info" data-testid="geo-unverified">
       <AlertTitle>No location check on this deployment</AlertTitle>
       <AlertDescription>
-        This host provides no IP country signal, so your own attestation is the only jurisdiction check. This interface
-        is not available to residents of {BLOCKED_JURISDICTIONS.join(', ')}.
+        <p>
+          This host provides no IP country signal, so your own attestation is the only jurisdiction check. This
+          interface is not available to residents of {BLOCKED_JURISDICTIONS.join(', ')}.
+        </p>
       </AlertDescription>
     </Alert>
   )

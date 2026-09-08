@@ -64,9 +64,6 @@ library Constants {
     ///         to matter against a 5,000e18 supply. There is no genesis burn because there is no NAV mint.
     uint256 internal constant VIRTUAL_SHARES = 1e3;
 
-    /// @notice ERC-4626 decimals offset used by `AmpsStaking` (xAMPS), matching `VIRTUAL_SHARES = 10**3`.
-    uint8 internal constant STAKING_DECIMALS_OFFSET = 3;
-
     /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 47.5 AMPS per spoke.
     uint16 internal constant SPOKE_SEED_BPS_DEFAULT = 100;
 
@@ -81,14 +78,14 @@ library Constants {
     // Fees (48 h timelock)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Launch `sellFeeBps`: 5% on every AMPS-in swap in all 32 pools, less any rotation credit.
-    uint16 internal constant SELL_FEE_BPS_DEFAULT = 500;
+    /// @notice Launch `ampsFeeBps`: 5% on every AMPS-in swap in all 32 pools, less any rotation credit.
+    uint16 internal constant AMPS_FEE_BPS_DEFAULT = 500;
 
-    /// @notice Hard floor of `sellFeeBps`. 1%.
-    uint16 internal constant SELL_FEE_BPS_MIN = 100;
+    /// @notice Hard floor of `ampsFeeBps`. 1%.
+    uint16 internal constant AMPS_FEE_BPS_MIN = 100;
 
-    /// @notice Hard ceiling of `sellFeeBps`. 6%.
-    uint16 internal constant SELL_FEE_BPS_MAX = 600;
+    /// @notice Hard ceiling of `ampsFeeBps`. 6%.
+    uint16 internal constant AMPS_FEE_BPS_MAX = 600;
 
     /// @notice Launch buy fee in the two entry pools (`AMPS/WETH`, `AMPS/USDG`). 30 bp.
     uint16 internal constant BUY_FEE_BPS_ENTRY_DEFAULT = 30;
@@ -111,45 +108,19 @@ library Constants {
     /// @notice Hard ceiling of a spoke's buy fee.
     uint16 internal constant BUY_FEE_BPS_SPOKE_MAX = 50;
 
-    /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 1%, paid to the remaining holders.
-    uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 100;
+    /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 2.5%, paid to the remaining holders.
+    uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 250;
 
     /// @notice Hard ceiling of `redeemFeeBps`. 5%. There is no floor: governance may set it to zero.
     uint16 internal constant REDEEM_FEE_BPS_MAX = 500;
 
-    /// @notice Launch `burnBps`: 10% of the AMPS-side fees left after the creator and staker slices is burned.
-    uint16 internal constant BURN_BPS_DEFAULT = 1000;
-
-    /// @notice Hard ceiling of `burnBps`. 25%.
-    uint16 internal constant BURN_BPS_MAX = 2500;
-
-    /// @notice Launch `stakerBps`: 30% of the AMPS-side fees are streamed to xAMPS.
-    uint16 internal constant STAKER_BPS_DEFAULT = 3000;
-
-    /// @notice Hard ceiling of `stakerBps`. 50%.
-    uint16 internal constant STAKER_BPS_MAX = 5000;
-
-    /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `sellFeeBps`, never added on top.
+    /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `ampsFeeBps`, never added on top.
     /// @dev The whole schedule is immutable. There is no setter, no band and no governance path that can extend,
     ///      restart or enlarge it; only the current `creator` may reassign the destination address.
     uint16 internal constant CREATOR_FEE_BPS = 100;
 
     /// @notice The creator fee decays linearly to zero over 30 days from genesis, then is structurally zero.
     uint32 internal constant CREATOR_DECAY_SECONDS = 30 * ONE_DAY;
-
-    // -------------------------------------------------------------------------------------------------------------
-    // Staking (48 h timelock)
-    // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice Launch `rewardStreamSeconds`: notified rewards vest into xAMPS linearly over 24 h, which is what
-    ///         makes a stake/unstake sandwich around `compound()` worthless.
-    uint32 internal constant REWARD_STREAM_SECONDS_DEFAULT = 24 * ONE_HOUR;
-
-    /// @notice Hard floor of `rewardStreamSeconds`. 1 h.
-    uint32 internal constant REWARD_STREAM_SECONDS_MIN = ONE_HOUR;
-
-    /// @notice Hard ceiling of `rewardStreamSeconds`. 7 d.
-    uint32 internal constant REWARD_STREAM_SECONDS_MAX = 7 * ONE_DAY;
 
     // -------------------------------------------------------------------------------------------------------------
     // Bonds (48 h timelock for parameters, 7 d for the collateral set and the policy pointer)
@@ -362,6 +333,29 @@ library Constants {
     ///         placement by burning gas: the call is capped and a failure is read as "unknown", not as a revert.
     uint256 internal constant STOCK_TOKEN_PROBE_GAS = 50_000;
 
+    /// @notice Gas forwarded to a bounded **state-changing** call into a pointer-upgradeable target — the market
+    ///         reference's `resetHighWater` and `armSurge`, which the placement path makes on every ladder.
+    ///
+    /// @dev Four times {STOCK_TOKEN_PROBE_GAS}, the same multiple `VaultRedeemLib` forwards to `PoolManager.sync`.
+    ///      The real work is one cold `SSTORE` plus a `slot0` read (~30k); the budget is generous enough that no
+    ///      honest implementation can run out of it and small enough that a hostile one cannot burn the caller's
+    ///      whole allowance, which is what makes "the call failed" a meaningful answer rather than an out-of-gas
+    ///      of the placement itself.
+    uint256 internal constant MARKET_REFERENCE_WRITE_GAS = 4 * STOCK_TOKEN_PROBE_GAS;
+
+    /// @notice Gas forwarded to a bounded read of a **composite** pointer target: the feed registry's
+    ///         `latestAnswer`, which probes an aggregator and up to two historical rounds behind budgets of its
+    ///         own, and the pool registry's `currentWeightBps`, which values a whole constituent.
+    ///
+    /// @dev **Deliberately generous, and the asymmetry is the point.** A failed read here is read as "no answer",
+    ///      and on the placement path "no answer" *skips* a guard — `VaultPlacementLib._requireConverged` returns
+    ///      without checking and `_referenceTick` falls back to the live tick — so a budget tight enough to fail
+    ///      on an honest registry would turn a liveness cap into a safety hole. 400,000 is more than an order of
+    ///      magnitude above the worst honest read (one `latestRoundData` staticcall is ~10k, and the stateless
+    ///      jump rule adds at most two more plus the session arithmetic) and still bounds a hostile one, which is
+    ///      all a cap on a governance-installed pointer is for.
+    uint256 internal constant COMPOSITE_READ_GAS = 400_000;
+
     /// @notice The largest `uiMultiplier()` step the hook treats as a dividend reinvestment rather than a corporate
     ///         action. 2%: above this the constituent is frozen instead of fee-captured.
     uint16 internal constant DIVIDEND_STEP_BPS_MAX = 200;
@@ -444,9 +438,9 @@ library Constants {
     /// @notice Entry-pool outer rail, in ticks: +/-22% per window, so price discovery is never reverted inside it.
     int24 internal constant OUTER_RAIL_ENTRY_TICKS = 2000;
 
-    /// @notice The highest total fee the hook can ever return, in bps: `SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS`.
+    /// @notice The highest total fee the hook can ever return, in bps: `AMPS_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS`.
     ///         26% is far below `MAX_LP_FEE`, which is what invariant I16 asserts.
-    uint16 internal constant TOTAL_FEE_BPS_MAX = SELL_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS;
+    uint16 internal constant TOTAL_FEE_BPS_MAX = AMPS_FEE_BPS_MAX + DYN_CAP_ESCALATION_BPS;
 
     /// @notice The mined hook address must satisfy `address & 0x3FFF == HOOK_FLAGS`:
     ///         `BEFORE_INITIALIZE | AFTER_INITIALIZE | BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP`.
@@ -540,6 +534,21 @@ library Constants {
     ///      rather than enforced. Credited in `afterSwap` from the **realised** AMPS delta of a buy; consumed in
     ///      `beforeSwap` by an exact-input sell, blended and rounded up.
     bytes32 internal constant ROTATION_CREDIT_SLOT = keccak256("amplestocks.hook.ROTATION_CREDIT");
+
+    /// @notice The `hookData` flag the protocol router puts on both hops of a rotation, and the only thing that
+    ///         makes a swap hop *pass-through*: `keccak256("amplestocks.router.ROTATE")`.
+    /// @dev A hop is pass-through iff `sender == AmpsHook.router()` **and** `hookData` is exactly these 32 bytes.
+    ///      Both halves are load-bearing. The `sender` check is what stops anyone else from claiming the
+    ///      exemption, and the flag is what stops the router's *own* plain `buy` and `sell` — which pass empty
+    ///      `hookData` — from claiming it: a rotation is the only shape the exemption is priced for, and the
+    ///      router only ever sets this on the two hops of one `rotate` call.
+    /// @dev **Why a flag at all, when the sender check already narrows it to one contract.** A hop's fee is fixed
+    ///      in `beforeSwap`, before the swap runs, and the first hop of any route cannot know that a second
+    ///      follows. Making every router swap pass-through would hand the discount to a plain exit routed through
+    ///      the protocol's own front end; making none of them would mean the rotation the credit exists for could
+    ///      not be built at all. The flag lets the router say, at the moment it opens the unlock, which of the two
+    ///      it is building — and it is checkable by the hook without trusting anything the caller supplied.
+    bytes32 internal constant ROUTER_ROTATE = keccak256("amplestocks.router.ROTATE");
 
     // -------------------------------------------------------------------------------------------------------------
     // Ladder and rollout (48 h timelock; future placements only, never a reshape of existing positions)
@@ -692,7 +701,7 @@ library Constants {
     // Governance and keeper
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Fast timelock: fees, bands, bond parameters, ladder shape, rollout, staking, keeper. 48 h.
+    /// @notice Fast timelock: fees, bands, bond parameters, ladder shape, rollout, keeper. 48 h.
     uint32 internal constant TIMELOCK_FAST_SECONDS = 48 * ONE_HOUR;
 
     /// @notice Slow timelock: constituent lifecycle, collateral set, index weights, policy pointers. 7 d.
@@ -786,4 +795,30 @@ library Constants {
     ///         no floor, because setting the ceiling to zero is the governance path for pausing paid keeping
     ///         without pausing the jobs themselves.
     uint256 internal constant DAILY_CEILING_USD18_MAX = 100_000e18;
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Transient slots the vault derives (not governed; part of the layout, see `docs/phase2-state-model.md` §1.1)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Base of `VaultPlacementLib`'s transient staging buffer: four words per placed cell, {GRID_CELLS}
+    ///         cells, so the buffer occupies `[slot, slot + 4 x GRID_CELLS)`.
+    /// @dev Declared here for the same reason `ROTATION_CREDIT_SLOT` is: the library used to carry a hand-written
+    ///      literal whose comment claimed it was this hash and which in fact was not, so nothing tied the buffer
+    ///      to the namespace every other vault slot is derived from. `test/unit/VaultPlacement.t.sol` pins both
+    ///      the string and the value, exactly as `test/unit/RotationCredit.t.sol` does for the hook.
+    bytes32 internal constant PLACEMENT_STAGE_SLOT = keccak256("amplestocks.vault.PLACEMENT_STAGE");
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Gas reserves on the ungated redemption path (audit fix wave 2, finding 1)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Gas `VaultRedeemLib.payout` holds back from the ERC-20 payout `unlock` so that the claims-only
+    ///         fallback unlock is always affordable.
+    /// @dev The redemption floor pays every asset either as an ERC-20 or as an ERC-6909 claim, and the second is
+    ///      unblockable: it moves balances inside the PoolManager and touches no token contract. That guarantee is
+    ///      only real if the fallback can still be *paid for* after the first attempt has failed, so the first
+    ///      `unlock` is given `gasleft() - REDEEM_PAYOUT_RESERVE_GAS` and never the whole frame. 700,000 is an
+    ///      `unlock` (~3k) plus one `transfer` of an ERC-6909 balance (~5k warm, ~25k cold) for every asset the
+    ///      protocol can register ({MAX_CONSTITUENTS} plus the two entry counters), with room to spare.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_GAS = 700_000;
 }

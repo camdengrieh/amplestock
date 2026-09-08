@@ -7,23 +7,35 @@ import * as React from 'react'
 
 import {cn} from '@/lib/utils'
 
+/**
+ * Two buttons, taken from the design and no others.
+ *
+ * **Fill** (`default`) — `1px solid ink`, `--fill` ground, `--onfill` type, mono uppercase. It means
+ * "do the thing", and the design fades it to `opacity:0.82` on hover rather than changing colour.
+ * **Rule** (`outline`) — the same box with a transparent ground, which *inverts* on hover. That
+ * inversion is the design's only hover flourish and it is worth keeping exactly.
+ *
+ * `size="block"` is the full-width `padding:18px`, `11px / 0.18em` submit at the foot of every form.
+ * `size="default"` is the `10px / 0.14em` secondary at `padding:10px 20px`.
+ */
 const buttonVariants = cva(
-  'inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50',
+  'inline-flex items-center justify-center gap-2 whitespace-nowrap border font-mono uppercase transition-[background-color,color,opacity] disabled:cursor-not-allowed disabled:opacity-45',
   {
     variants: {
       variant: {
-        default: 'bg-primary text-primary-foreground hover:bg-primary/90',
-        destructive: 'bg-destructive text-white hover:bg-destructive/90',
-        outline: 'border border-border bg-transparent hover:bg-muted',
-        secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
-        ghost: 'hover:bg-muted',
-        link: 'text-primary underline-offset-4 hover:underline',
+        default: 'border-ink bg-fill text-onfill hover:opacity-[0.82]',
+        destructive: 'border-tone-bad bg-tone-bad text-paper hover:opacity-[0.82]',
+        outline: 'border-ink bg-transparent text-ink hover:bg-fill hover:text-onfill',
+        secondary: 'border-rule bg-transparent text-dim hover:border-ink hover:text-ink',
+        ghost: 'border-transparent bg-transparent text-dim hover:text-ink',
+        link: 'border-transparent bg-transparent text-ink underline decoration-rule underline-offset-4 hover:decoration-ink',
       },
       size: {
-        default: 'h-9 px-4 py-2',
-        sm: 'h-8 rounded-md px-3 text-xs',
-        lg: 'h-11 rounded-md px-6',
-        icon: 'h-9 w-9',
+        default: 'px-5 py-2.5 text-[10px] tracking-[0.14em]',
+        sm: 'px-3.5 py-1.5 text-[10px] tracking-[0.14em]',
+        block: 'w-full px-6 py-[18px] text-[11px] tracking-[0.18em]',
+        chip: 'px-2.5 py-1 text-[11px] tracking-[0.06em] normal-case',
+        icon: 'h-9 w-9 px-0 text-[10px] tracking-[0.14em]',
       },
     },
     defaultVariants: {variant: 'default', size: 'default'},

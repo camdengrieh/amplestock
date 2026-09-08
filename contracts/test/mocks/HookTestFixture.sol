@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {AmpsHook} from "../../src/hook/AmpsHook.sol";
+import {AmpsRouter} from "../../src/periphery/AmpsRouter.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {PoolClass, PoolConfig} from "../../src/types/Types.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
@@ -9,6 +10,7 @@ import {HookStubFeePolicy} from "./HookStubFeePolicy.sol";
 import {MockOracleGate} from "./MockOracleGate.sol";
 import {MockPoolRegistry} from "./MockPoolRegistry.sol";
 import {MockStockToken} from "./MockStockToken.sol";
+import {MockWeth9} from "./MockWeth9.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -71,6 +73,11 @@ abstract contract HookTestFixture is V4TestBase, IUnlockCallback {
     HookStubFeePolicy internal policy;
     AmpsHook internal hook;
 
+    /// @notice The protocol router, deployed and named to the hook by the timelock in {_deployFixture}.
+    /// @dev Every suite gets one, because revision 6 makes "who the sender is" part of the fee: a suite that
+    ///      never touches it is a suite whose swaps all pay `ampsFeeBps`, which is the correct answer for them.
+    AmpsRouter internal router;
+
     PoolKey internal usdgKey;
     PoolKey internal wethKey;
     PoolKey internal stockKey;
@@ -94,6 +101,12 @@ abstract contract HookTestFixture is V4TestBase, IUnlockCallback {
         amps = deployTokenAt(AMPS_ADDRESS, "Amplestocks", "AMPS", 18);
         usdg = deployTokenAt(USDG_ADDRESS, "Global Dollar", "USDG", 6);
         weth = deployTokenAt(WETH_ADDRESS, "Wrapped Ether", "WETH", 18);
+        // Overlay WETH9's `deposit`/`withdraw` on the same storage layout, so the router's wrap and unwrap legs
+        // can be exercised against the fixture's own `AMPS/WETH` pool. `MockWeth9` adds no state of its own, so
+        // the balances minted above survive the etch; the ether below backs the minted supply the way real WETH9
+        // holds one wei per wei in issue.
+        vm.etch(WETH_ADDRESS, address(new MockWeth9()).code);
+        vm.deal(WETH_ADDRESS, 100_000 ether);
 
         stock = new MockStockToken("Mock Stock Token", "STOCK");
         stock.mint(address(this), 10_000_000e18);
@@ -117,6 +130,11 @@ abstract contract HookTestFixture is V4TestBase, IUnlockCallback {
         vm.prank(TIMELOCK);
         hook.setFeePolicy(address(policy));
 
+        router = new AmpsRouter(poolManager, AMPS_ADDRESS, address(registry), WETH_ADDRESS);
+        vm.label(address(router), "AmpsRouter");
+        vm.prank(TIMELOCK);
+        hook.setRouter(address(router));
+
         usdgKey = _poolKey(USDG_ADDRESS);
         wethKey = _poolKey(WETH_ADDRESS);
         stockKey = _poolKey(address(stock));
@@ -127,6 +145,11 @@ abstract contract HookTestFixture is V4TestBase, IUnlockCallback {
         _registerEntry(usdgId, USDG_ADDRESS, 6);
         _registerEntry(wethId, WETH_ADDRESS, 18);
         _registerSpoke(stockId, address(stock), PoolClass.SPOKE);
+        // `AmpsRouter` resolves every pool through `IPoolRegistry.poolKey`, so the mock has to carry the keys as
+        // well as the configs.
+        registry.setPoolKey(usdgId, usdgKey);
+        registry.setPoolKey(wethId, wethKey);
+        registry.setPoolKey(stockId, stockKey);
         registry.setHubPoolId(usdgId);
         registry.setWethPoolId(wethId);
 
@@ -353,6 +376,33 @@ abstract contract HookTestFixture is V4TestBase, IUnlockCallback {
             amountIn, 0, Currency.wrap(counterIn), path, address(this), type(uint256).max
         );
         amountOut = MockERC20(counterOut).balanceOf(address(this)) - before;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // The protocol router
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @dev A rotation through the protocol router: `counterIn -> AMPS -> counterOut`, both hops flagged
+    ///      `Constants.ROUTER_ROTATE`, which is the one shape the hook prices at the pass-through fee.
+    function _routerRotate(PoolKey memory hop1, PoolKey memory hop2, uint256 amountIn)
+        internal
+        returns (uint256 amountOut, uint256 ampsThrough)
+    {
+        MockERC20(Currency.unwrap(hop1.currency1)).approve(address(router), type(uint256).max);
+        (amountOut, ampsThrough) =
+            router.rotate(hop1.toId(), hop2.toId(), amountIn, 0, address(this), false, type(uint256).max);
+    }
+
+    /// @dev A plain buy through the protocol router: empty `hookData`, so it pays the AMPS fee like any other.
+    function _routerBuy(PoolKey memory key, uint256 amountIn) internal returns (uint256 ampsOut) {
+        MockERC20(Currency.unwrap(key.currency1)).approve(address(router), type(uint256).max);
+        ampsOut = router.buy(key.toId(), amountIn, 0, address(this), type(uint256).max);
+    }
+
+    /// @dev A plain sell through the protocol router.
+    function _routerSell(PoolKey memory key, uint256 ampsIn) internal returns (uint256 amountOut) {
+        amps.approve(address(router), type(uint256).max);
+        amountOut = router.sell(key.toId(), ampsIn, 0, address(this), false, type(uint256).max);
     }
 
     /// @dev Runs `afterSwap` against the pool without moving it: same tick, zero delta, no router. This is how a

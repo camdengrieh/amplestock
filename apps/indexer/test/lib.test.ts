@@ -16,7 +16,7 @@ import {decodeAddressArray} from '../src/handlers/denylist'
 import {classifyAction, functionNameOf, isKeeperJob, selectorOf} from '../src/lib/actions'
 import {noopSink, serialiseAlert, setAlertSink, webhookSink, deliver} from '../src/lib/alerts'
 import {decodeBytes32String} from '../src/lib/bytes32'
-import {annualisedBps, ampsToUsd18, realisedLvrAmps, stakingAprBps} from '../src/lib/flywheel'
+import {annualisedBps, ampsToUsd18, counterToUsd18, realisedLvrAmps} from '../src/lib/flywheel'
 import {cellKey, creditKey, dayKey, dayStart, eventId, jobId, positionKey} from '../src/lib/ids'
 
 const WAD = 10n ** 18n
@@ -254,7 +254,15 @@ describe('flywheel arithmetic', () => {
     expect(annualisedBps(1n, 100n, 86_400n)).toBe(36_500)
     expect(annualisedBps(1n, 0n, 86_400n)).toBe(0)
     expect(annualisedBps(1n, 100n, 0n)).toBe(0)
-    expect(stakingAprBps(0n, 100n, 86_400n)).toBe(0)
+  })
+
+  it('prices a counter amount through the pool price and then P_ref', () => {
+    // 6-decimal counter, 200 units, at 2 counter per AMPS: 100 AMPS, at $3: $300.
+    expect(counterToUsd18(200_000_000n, 6, 2n * WAD, 3n * WAD)).toBe(300n * WAD)
+    // No pool price and no reference price both value at zero rather than dividing by zero.
+    expect(counterToUsd18(200_000_000n, 6, 0n, 3n * WAD)).toBe(0n)
+    expect(counterToUsd18(200_000_000n, 6, 2n * WAD, 0n)).toBe(0n)
+    expect(counterToUsd18(0n, 6, 2n * WAD, 3n * WAD)).toBe(0n)
   })
 })
 

@@ -30,7 +30,7 @@ contract StubAmpsHook is BaseHook {
     /// @dev Base buy fee, in pips (hundredths of a bip). 30 bp, the entry-pool bucket.
     uint24 internal constant BUY_FEE_PIPS = 3000;
 
-    /// @dev Base sell fee, in pips. 500 bp, the launch value of `sellFeeBps` inside the hard band [100, 600] bp.
+    /// @dev Base sell fee, in pips. 500 bp, the launch value of `ampsFeeBps` inside the hard band [100, 600] bp.
     uint24 internal constant SELL_FEE_PIPS = 50_000;
 
     /// @dev EIP-1153 slot holding the same-transaction rotation credit, in AMPS wei.

@@ -10,6 +10,7 @@ import {
     AlreadyInitialized,
     LengthMismatch,
     NotTimelock,
+    NotVault,
     OutOfBand,
     UnknownConstituent,
     UnknownPool,
@@ -1015,6 +1016,206 @@ contract PoolRegistryTest is PoolRegistryFixture {
         vm.expectRevert(abi.encodeWithSelector(UnknownConstituent.selector, uint16(7)));
         registry.reconfigureConstituent(7, empty);
         vm.stopPrank();
+    }
+
+    /// @notice **A removed collateral must not make reinstatement impossible.** `AmpsBonds.removeCollateral`
+    ///         detaches a market from its collateral and `setMarketOpen(id, true)` refuses a detached market
+    ///         forever, so a registry that reopened the market unconditionally turned "retire, then remove the
+    ///         collateral" into a one-way door: the name could never be brought back, at any point in the future,
+    ///         by any governance action, because the reinstatement reverted before it wrote anything.
+    ///
+    /// @dev The registry's own `config.marketId` is what it recorded when the constituent was added and is never
+    ///      cleared, so it is not evidence that the market is still attached. `AmpsBonds.marketIdOf(token)` is,
+    ///      and the flag is only the registry's to set while the two agree.
+    function test_reinstate_survivesARemovedCollateral() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        uint16 marketId = registry.constituent(id).marketId;
+        assertEq(marketId, 1, "the spoke opened market 1");
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+
+        // Governance removes the collateral from `AmpsBonds` while the name is out. The market is now detached.
+        bonds.removeCollateral(address(stocks[0]));
+        assertEq(bonds.marketIdOf(address(stocks[0])), 0, "the market is no longer attached to its collateral");
+
+        uint256 callsBefore = bonds.openCallCount();
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit IPoolRegistry.BondMarketDetached(id, marketId);
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+
+        ConstituentConfig memory back = registry.constituent(id);
+        assertEq(uint8(back.status), uint8(ConstituentStatus.ACTIVE), "the name came back");
+        assertEq(back.rolloutWeightBps, 250, "with its rollout weight");
+        assertEq(registry.activeConstituentCount(), 1, "n = 1");
+        assertEq(bonds.openCallCount(), callsBefore, "and the registry did not touch the detached market");
+    }
+
+    /// @notice Retirement takes the same care, so that a detached market cannot block a retirement either.
+    function test_retire_survivesARemovedCollateral() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        uint16 marketId = registry.constituent(id).marketId;
+
+        bonds.removeCollateral(address(stocks[0]));
+        uint256 callsBefore = bonds.openCallCount();
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit IPoolRegistry.BondMarketDetached(id, marketId);
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+
+        assertEq(uint8(registry.constituent(id).status), uint8(ConstituentStatus.RETIRED), "retired anyway");
+        assertEq(bonds.openCallCount(), callsBefore, "without calling the detached market");
+    }
+
+    /// @notice And an *attached* market is still opened and closed exactly as before: the guard is a check on the
+    ///         bonds side's own record, not a licence to stop maintaining the flag.
+    function test_retireAndReinstateStillDriveAnAttachedMarket() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+        assertFalse(bonds.marketOpen(1), "closed on retirement");
+
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+        assertTrue(bonds.marketOpen(1), "reopened on reinstatement");
+    }
+
+    /// @notice **A re-added collateral gets a new market id, and retirement has to close *that* market.**
+    ///
+    /// @dev Removing a collateral and adding it again is the ordinary way to retune a market's class or caps, and
+    ///      `AmpsBonds` issues a fresh id for it. Reading only the id the registry recorded when the constituent
+    ///      was added therefore made {retireConstituent} log `BondMarketDetached` and leave the live market
+    ///      **open** — the one outcome retirement exists to produce. The live id is adopted into the record and
+    ///      driven instead.
+    function test_retire_closesAReAddedMarketRatherThanDetachingSilently() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        assertEq(registry.constituent(id).marketId, 1, "market 1 on registration");
+
+        // Governance retunes the market: remove the collateral, add it again. `AmpsBonds` issues id 2.
+        bonds.removeCollateral(address(stocks[0]));
+        bonds.addCollateral(address(stocks[0]), CollateralClass.CONSTITUENT, 500, 100, 1500, 1000, true);
+        assertEq(bonds.marketIdOf(address(stocks[0])), 2, "the same collateral is now market 2");
+        assertTrue(bonds.marketOpen(2), "and it is open");
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+
+        assertFalse(bonds.marketOpen(2), "retirement closed the market that is actually attached");
+        assertEq(registry.constituent(id).marketId, 2, "and the registry adopted the live id");
+
+        // And the record it adopted is what the reinstatement then drives.
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+        assertTrue(bonds.marketOpen(2), "reopened the same market");
+    }
+
+    /// @notice Reinstatement clears `retiredAt`: a name that is back is not a name that was retired on some date.
+    /// @dev The stamp survived reinstatement, so every consumer of the record — the dApp, the index reports, any
+    ///      future schedule keyed off it — read a live constituent as one retired at that timestamp.
+    function test_reinstate_clearsTheRetirementStamp() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(id);
+        assertEq(registry.constituent(id).retiredAt, uint32(block.timestamp), "stamped on retirement");
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(TIMELOCK);
+        registry.reinstateConstituent(id, 250);
+
+        assertEq(registry.constituent(id).retiredAt, 0, "and cleared on the way back");
+        assertEq(uint8(registry.constituent(id).status), uint8(ConstituentStatus.ACTIVE), "active again");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The realised index weight (audit fix wave 2, finding 5)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice `currentWeightBps` reports what the **vault** values that spoke at, not the target it is aiming for.
+    ///
+    /// @dev Phase 2 answered the target outright, which made `AmpsBonds`'s index-deficit term
+    ///      `k_w x (target - current) / target` identically zero however far under-weight a name actually was —
+    ///      so the discount that is supposed to pay for rebalancing never widened, and neither did the rollout
+    ///      schedule that reads the same number. With the Phase 3 valuer wired there is a realised weight, and it
+    ///      comes from `IAmpsVault.spokeWeightBps`.
+    function test_currentWeightBps_reportsTheVaultsRealisedWeight() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        assertEq(registry.constituent(id).targetWeightBps, 500, "the target is 5%");
+
+        // The spoke is at half its target.
+        vault.setSpokeWeight(id, 250);
+        assertEq(registry.currentWeightBps(id), 250, "half the target weight, as the vault values it");
+
+        vault.setSpokeWeight(id, 500);
+        assertEq(registry.currentWeightBps(id), 500, "and at target when it is at target");
+    }
+
+    /// @notice A vault that cannot answer reads as "unknown", and unknown is the **target** weight — which prices
+    ///         `deficit == 0`, the protocol-favourable direction. Four ways to fail, one answer.
+    function test_currentWeightBps_fallsBackToTheTargetWhenTheVaultCannotAnswer() public {
+        _registerEntryPools();
+        (uint16 id,) = _add(0);
+        vault.setSpokeWeight(id, 250);
+
+        for (uint8 fault = 1; fault <= 4; ++fault) {
+            vault.setSpokeWeightFault(fault);
+            assertEq(registry.currentWeightBps(id), 500, "the target weight stands in for an unanswerable read");
+        }
+
+        vault.setSpokeWeightFault(0);
+        assertEq(registry.currentWeightBps(id), 250, "and the realised weight comes back when it can answer");
+    }
+
+    /// @notice An unknown id still answers zero rather than reverting, so a bond market on a name the registry
+    ///         never knew still prices.
+    function test_currentWeightBps_unknownIdIsZero() public {
+        _registerEntryPools();
+        assertEq(registry.currentWeightBps(99), 0, "no such constituent");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The vault handover (§8)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The registry names a vault, so an `emergencyMigrate` that did not move it left the standby holding
+    ///         the estate and unable to open a single pool with it. {setVault} is the handover, and its only
+    ///         caller is the vault: the timelock cannot reach it, which is what keeps the pointer set-once from
+    ///         every direction but an evacuation.
+    function test_setVault_onlyTheVaultMayHandTheRoleOn() public {
+        address standby = address(0x57A4DB1);
+
+        vm.prank(TIMELOCK);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, TIMELOCK));
+        registry.setVault(standby);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, STRANGER));
+        registry.setVault(standby);
+
+        vm.prank(address(vault));
+        vm.expectRevert(ZeroAddress.selector);
+        registry.setVault(address(0));
+
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit IPoolRegistry.VaultChanged(address(vault), standby);
+        vm.prank(address(vault));
+        registry.setVault(standby);
+        assertEq(registry.vault(), standby, "the role moved");
+
+        // And it moved for good: the old vault cannot take it back.
+        vm.prank(address(vault));
+        vm.expectRevert(abi.encodeWithSelector(NotVault.selector, address(vault)));
+        registry.setVault(address(vault));
     }
 
     /// @notice Retiring a constituent with no bond market leaves `AmpsBonds` alone.

@@ -11,8 +11,8 @@
  *     burned plus `KEEPER_GAS_OVERHEAD`, capped at `KEEPER_GAS_MAX`, priced at `block.basefee` clamped into
  *     `[KEEPER_BASEFEE_FLOOR_WEI, KEEPER_BASEFEE_CAP_WEI]` and at the ETH/USD answer the feed registry holds for
  *     the `AMPS/WETH` counter. This is what makes the pot's 3x cap predictable from the keeper's side.
- *  3. **`splitAmpsFees`** reproduces §3.6 step 5, so `compound`'s single `ampsFees` return can be decomposed and
- *     the buyback-burn component separated out of `burned`.
+ *  3. **`splitAmpsFees`** reproduces §3.6 step 5, so `compound`'s two return values can be decomposed and the
+ *     buyback-burn component separated out of `burned`.
  *
  * ## What changed, and what the keeper still has to do itself
  *
@@ -53,6 +53,15 @@ export const KEEPER_BASEFEE_FLOOR_WEI = 10_000_000n
 
 /** `Constants.KEEPER_BASEFEE_CAP_WEI`: 1 gwei. A spike beyond it is not the pot's to fund. */
 export const KEEPER_BASEFEE_CAP_WEI = 1_000_000_000n
+
+/**
+ * `Constants.AMPS_FEE_BPS_DEFAULT`: 500 bp, charged on **both** directions of every pool since revision 6.
+ *
+ * Only a fallback. The live value is `AmpsHook.ampsFeeBps()`, read once per scan into every `PoolSnapshot`,
+ * because it is the divisor that turns collected fees back into the volume the creator's points are a share of
+ * — and reading it rather than assuming it is what keeps that identity true across a governed fee change.
+ */
+export const AMPS_FEE_BPS_DEFAULT = 500
 
 /** The pot parameters {@link quoteBounty} needs. A subset of `PotSnapshot`, so the CRE mirror can build one. */
 export interface BountyParameters {
@@ -183,54 +192,81 @@ export function vaultGasAllowanceUsd18(measuredGas: bigint, baseFeeWei: bigint, 
   return gasCostUsd18(vaultGasUsed(measuredGas), clampBaseFee(baseFeeWei), ethUsd18)
 }
 
-/** The AMPS-side split of `compound`, §3.6 step 5. */
+/**
+ * The AMPS-side split of `compound`, §3.6 step 5.
+ *
+ * Two destinations, and only two. Revision 6 retired the staker leg and the re-ladder, so what the creator does
+ * not take is burned outright — there is no `stakerCut` and no `relaid` because there is nothing left for them
+ * to be.
+ */
 export interface AmpsFeeSplit {
   readonly creatorCut: bigint
-  readonly stakerCut: bigint
   readonly burnCut: bigint
-  readonly relaid: bigint
 }
 
 /**
  * `VaultPlacementLib._split`, in the order the contract applies it.
  *
  * `creatorBps` is `AmpsVault.creatorBpsAt(now)` — 100 bp at genesis decaying linearly to exactly zero at
- * `genesis + 30 days` — and the creator slice is `min(creatorBps, sellFeeBps) / sellFeeBps` of the AMPS-side
- * fees, so it is a share of the sell fee rather than a share of volume. A zero `sellFeeBps` cannot happen (the
- * hard band floor is 100 bp) but is handled anyway: no sell fee, no creator slice.
+ * `genesis + 30 days` — and the creator slice is `min(creatorBps, ampsFeeBps) / ampsFeeBps` of the fees
+ * collected in **each** currency. Because the hook charges `ampsFeeBps` on every net buy and every net sell,
+ * the fees a pool accrues in a currency are `ampsFeeBps` of the volume that produced them, so that quotient is
+ * exactly `creatorBps` of volume — which is what `CREATOR_FEE_BPS` promises. The divisor is read from the live
+ * hook rather than from the default, so the identity survives a governed fee change. A zero `ampsFeeBps` cannot
+ * happen (the hard band floor is 100 bp) but is handled anyway: no fee, no creator slice.
+ *
+ * This models the AMPS side, which is the only side `compound`'s return value describes. The counter side is
+ * split at the same ratio inside the unlock and is not returned at all.
  */
-export function splitAmpsFees(
-  ampsFees: bigint,
-  creatorBps: number,
-  sellFeeBps: number,
-  stakerBps: number,
-  burnBps: number,
-): AmpsFeeSplit {
-  if (ampsFees === 0n) return {creatorCut: 0n, stakerCut: 0n, burnCut: 0n, relaid: 0n}
+export function splitAmpsFees(ampsFees: bigint, creatorBps: number, ampsFeeBps: number): AmpsFeeSplit {
+  if (ampsFees === 0n) return {creatorCut: 0n, burnCut: 0n}
 
-  const creatorNumerator = BigInt(Math.min(creatorBps, sellFeeBps))
-  const creatorCut = sellFeeBps === 0 ? 0n : (ampsFees * creatorNumerator) / BigInt(sellFeeBps)
-  const afterCreator = ampsFees - creatorCut
-  const stakerCut = (afterCreator * BigInt(stakerBps)) / BPS
-  const afterStaker = afterCreator - stakerCut
-  const burnCut = (afterStaker * BigInt(burnBps)) / BPS
-  return {creatorCut, stakerCut, burnCut, relaid: afterStaker - burnCut}
+  const creatorNumerator = BigInt(Math.min(creatorBps, ampsFeeBps))
+  const creatorCut = ampsFeeBps === 0 ? 0n : (ampsFees * creatorNumerator) / BigInt(ampsFeeBps)
+  return {creatorCut, burnCut: ampsFees - creatorCut}
+}
+
+/** What a simulated `compound(poolId)` says it would do, decomposed. */
+export interface CompoundWork {
+  /** The creator's slice of the AMPS side, which leaves the protocol. */
+  readonly creatorCut: bigint
+  /** The fee burn: the whole AMPS-side remainder after that slice. */
+  readonly feeBurn: bigint
+  /** The AMPS the pool's own bids bought back, recovered from `burned`. */
+  readonly boughtBack: bigint
+  /** The AMPS side of the work value, at `P_ref`. A **lower bound** on what the vault will report. */
+  readonly workValueUsd18: bigint
 }
 
 /**
- * The USD value of the work a `compound(poolId)` would do.
+ * The work a `compound(poolId)` would do, from its two return values.
  *
- * `compound` returns `(ampsFees, burned)`. `burned` is the buyback burn **plus** the `burnBps` slice of the
- * fees, so subtracting the slice recovers the bought-back inventory, which is real work the fee figure does not
- * contain. Counter-side fees are not returned by the call and are therefore not counted: the measure is a lower
- * bound on the work, which is the safe direction for a dust guard.
+ * `compound` returns `(ampsFees, burned)`, and since revision 6 `burned` is the whole AMPS-side remainder after
+ * the creator slice **plus** the buyback burn. That sum is exactly the AMPS side of the vault's own measure
+ * (`ampsValueUsd18(burned)` in `VaultPlacementLib`), so the work value is `burned` at `P_ref` — *not*
+ * `ampsFees + boughtBack`, which double-counts the fee that funded the burn and counts the creator's slice as
+ * work when it is value leaving the protocol.
+ *
+ * The vault adds the counter it re-places on top of that, and the call does not return it, so this stays a
+ * lower bound on what the vault will report — the safe direction for a dust guard.
+ *
+ * The split is modelled anyway, because it is what separates the two components of `burned`: the fee burn is
+ * `ampsFees - creatorCut`, so whatever is left of `burned` is the bought-back inventory. Saturating, because a
+ * `creatorBps` read at a different block than the one the call would execute at can make the modelled fee burn
+ * a wei larger than the real one.
  */
-export function compoundWorkValueUsd18(
+export function compoundWork(
   ampsFees: bigint,
   burned: bigint,
-  split: AmpsFeeSplit,
+  creatorBps: number,
+  ampsFeeBps: number,
   pRefX18: bigint,
-): bigint {
-  const boughtBack = saturatingSub(burned, split.burnCut)
-  return ((ampsFees + boughtBack) * pRefX18) / WAD
+): CompoundWork {
+  const split = splitAmpsFees(ampsFees, creatorBps, ampsFeeBps)
+  return {
+    creatorCut: split.creatorCut,
+    feeBurn: split.burnCut,
+    boughtBack: saturatingSub(burned, split.burnCut),
+    workValueUsd18: (burned * pRefX18) / WAD,
+  }
 }

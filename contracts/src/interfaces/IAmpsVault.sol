@@ -51,7 +51,9 @@ import {Checkpoint, GateState} from "../types/Types.sol";
 ///      timelock hostile. Only chain-level censorship remains, and that is disclosed rather than mitigated.
 ///
 /// @dev **Every other external function** takes the EIP-1153 transient reentrancy lock, follows
-///      checks-effects-interactions, burns shares before any transfer out, and asserts `sweepClean` (I12) at exit.
+///      checks-effects-interactions, burns shares before any transfer out, and runs `sweepClean` (I12) at exit —
+///      which absorbs every idle ERC-20 balance it can move and emits {SweepResidue} for anything it cannot,
+///      rather than reverting, so that no donation of a hostile token can brick an entry point.
 interface IAmpsVault {
     /// @notice Arguments to {genesis}. Built by `script/06_Genesis` and executed once.
     /// @param teamVestingWallet The OZ `VestingWallet` that receives the 5% team tranche (2-month linear, no cliff).
@@ -161,14 +163,23 @@ interface IAmpsVault {
     event Rollout(uint16 indexed constituentId, PoolId indexed poolId, uint256 movedAmps, uint256 placedAmps);
 
     /// @notice Emitted on every `compound()`. **Phase 3.**
+    /// @dev The whole of plan revision 6's split, in one log line: the creator takes `creatorBps / ampsFeeBps` of
+    ///      the fees collected in **each** currency, every wei of the AMPS side that is left is burned, and the
+    ///      counter side that is left is re-placed as bids. There is no ask placement and no staker leg, so
+    ///      `ampsFees == creatorAmps + burnedFromFees` exactly, and `burned` is that plus the buyback burn.
     /// @param poolId The pool.
     /// @param ampsFees AMPS-side fees collected.
-    /// @param creatorPaid AMPS paid to the creator.
-    /// @param stakerPaid AMPS streamed to xAMPS.
+    /// @param counterFees Counter-side fees collected, in the counter's own decimals.
+    /// @param creatorAmps AMPS paid to the creator.
+    /// @param creatorCounter Counter paid to the creator, in kind or as an ERC-6909 claim.
     /// @param burned AMPS burned, buyback burn included.
-    /// @param relaid AMPS re-placed as asks above the market.
     event Compound(
-        PoolId indexed poolId, uint256 ampsFees, uint256 creatorPaid, uint256 stakerPaid, uint256 burned, uint256 relaid
+        PoolId indexed poolId,
+        uint256 ampsFees,
+        uint256 counterFees,
+        uint256 creatorAmps,
+        uint256 creatorCounter,
+        uint256 burned
     );
 
     /// @notice Emitted whenever the vault's view of a pool's gate state changes.
@@ -176,6 +187,19 @@ interface IAmpsVault {
     /// @param previousState The state before.
     /// @param newState The state after.
     event GateChanged(PoolId indexed poolId, GateState previousState, GateState newState);
+
+    /// @notice Emitted when `sweepClean` (I12) could not fold an idle ERC-20 balance into the vault's ERC-6909
+    ///         claims, so the balance is still sitting on the vault at function exit.
+    /// @dev **A log and not a revert, deliberately.** I12's absorb step is what stops a donation from becoming a
+    ///      griefing vector, but the absorb is an ERC-20 `transfer` and a paused or denylisting Stock Token can
+    ///      refuse it. Reverting on the residue would mean one wei of a hostile token, donated by anyone, bricks
+    ///      every entry point on the vault — `redeemProRata` included, which §7 says can never be gated. The
+    ///      residue is therefore disclosed rather than enforced: it stays part of the vault's holdings, is valued
+    ///      in `A`, is paid out by redemption when the token allows a transfer again, and is absorbed by the next
+    ///      sweep that succeeds.
+    /// @param token The asset left on the vault.
+    /// @param balance Its raw balance at the end of the sweep.
+    event SweepResidue(address indexed token, uint256 balance);
 
     /// @notice Emitted on every governed parameter change.
     /// @param parameter The parameter name as a short string.
@@ -265,10 +289,6 @@ interface IAmpsVault {
     /// @return bondsAddress The bonds address.
     function bonds() external view returns (address bondsAddress);
 
-    /// @notice The xAMPS staking vault.
-    /// @return stakingAddress The staking address.
-    function staking() external view returns (address stakingAddress);
-
     /// @notice The keeper bounty pot. Its balance is excluded from `A` (I21).
     /// @return bountyPotAddress The pot address.
     function bountyPot() external view returns (address bountyPotAddress);
@@ -346,6 +366,44 @@ interface IAmpsVault {
     ///         the invariant suite compare it against.
     /// @return value NAV/share, 18 decimals.
     function previewNavPerShareX18() external view returns (uint256 value);
+
+    /// @notice Whether the live checkpoint's `A` was computed from an answer the feed registry is deliberately
+    ///         holding below the market for at least one asset.
+    ///
+    /// @dev True when any asset that contributed to `A` was priced off a `!fresh` answer, or off one the registry
+    ///      reports as `unconfirmed` — the `min(heldLevel, candidate)` a >10% single-round move is held at until
+    ///      its second confirmation (`IFeedRegistry.latestAnswer`). Both understate `A`, so both understate
+    ///      `navPerShareX18`, which is the **denominator** of the bond floor: while this is true a bond on *any*
+    ///      collateral — including the ones whose own feeds are perfectly healthy — would mint AMPS below the
+    ///      protocol's true backing. `AmpsBonds` reads it through a bounded `staticcall` and refuses to price
+    ///      while it is set; a checkpoint against a confirmed answer clears it.
+    ///
+    /// @dev It describes the **checkpoint**, not the moment of the call: it is written by `checkpoint()` and by
+    ///      every path that checkpoints, and it is exactly as fresh as `checkpointData().timestamp`.
+    /// @return held Whether the checkpointed NAV rests on a held-back or stale answer.
+    function navUnconfirmed() external view returns (bool held);
+
+    /// @notice One spoke's **realised** share of the index, in bps of `A`: what `PoolRegistry.currentWeightBps`
+    ///         answers with and therefore the numerator of the bond discount's index-deficit term.
+    ///
+    /// @dev The counter side only — the value of the Stock Token the protocol holds for that name, as claims, as
+    ///      an idle balance and inside its pool position decomposed at the *reference* price (I7), never at
+    ///      `slot0`, so a swap cannot move a weight. The AMPS beside it is the share itself and is not part of any
+    ///      name's weight.
+    ///
+    /// @dev Zero rather than a revert whenever the answer would be invented: no registry, no such constituent, no
+    ///      usable feed answer, nothing held, or an `A` of zero. Zero prices `deficit == 0`, which is the
+    ///      protocol-favourable direction.
+    ///
+    /// @dev **Measured against the last checkpointed `A`** (`navPerShareX18 x (T + VIRTUAL_SHARES)`), not a live
+    ///      re-valuation of every asset: the live walk costs ~150k gas per valued pool, which no consumer's probe
+    ///      budget could carry at 32 pools, so the read would fail in production and fall back to the target
+    ///      weight while succeeding in a small fixture. Against the checkpoint the read is one spoke's valuation
+    ///      plus a feed answer (~200k gas) everywhere. A holding that landed after the last checkpoint is measured
+    ///      against the pre-landing `A` until the next placement, bond or `checkpoint()` refreshes it.
+    /// @param constituentId The 1-based constituent id.
+    /// @return weightBps The realised weight, in bps, never above `BPS`.
+    function spokeWeightBps(uint16 constituentId) external view returns (uint16 weightBps);
 
     /// @notice Protocol-held AMPS: `Amps.balanceOf(vault)` plus the vault's ERC-6909 AMPS claims plus AMPS inside
     ///         its positions. **Disclosure only** — it is never subtracted from the NAV denominator (I6), and it
@@ -455,17 +513,9 @@ interface IAmpsVault {
     // Reads — governed parameters
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The redemption fee, in bps. 100 at launch.
+    /// @notice The redemption fee, in bps. 250 at launch.
     /// @return value The parameter.
     function redeemFeeBps() external view returns (uint16 value);
-
-    /// @notice Share of AMPS-side fees burned at `compound()`, after the creator and staker slices. 1,000 at launch.
-    /// @return value The parameter.
-    function burnBps() external view returns (uint16 value);
-
-    /// @notice Share of AMPS-side fees streamed to xAMPS. 3,000 at launch.
-    /// @return value The parameter.
-    function stakerBps() external view returns (uint16 value);
 
     /// @notice Maximum upward move of `P_ref` per hour, in bps. 1,000 at launch.
     /// @return value The parameter.
@@ -533,14 +583,6 @@ interface IAmpsVault {
     /// @notice Hard ceiling of `redeemFeeBps`. 500.
     /// @return value The bound.
     function REDEEM_FEE_BPS_MAX() external view returns (uint16 value);
-
-    /// @notice Hard ceiling of `burnBps`. 2,500.
-    /// @return value The bound.
-    function BURN_BPS_MAX() external view returns (uint16 value);
-
-    /// @notice Hard ceiling of `stakerBps`. 5,000.
-    /// @return value The bound.
-    function STAKER_BPS_MAX() external view returns (uint16 value);
 
     /// @notice Hard floor of `refUpRateBps`. 100.
     /// @return value The bound.
@@ -669,10 +711,15 @@ interface IAmpsVault {
 
     /// @notice Recomputes `A`, NAV/share, `P_mkt` and `P_ref` and writes the checkpoint. **Permissionless and
     ///         unpaid** — no bounty, by design, so it can never be griefed for profit and never depends on the pot.
+    /// @dev Reverts `NotInitialized` before {genesis}. With no supply the NAV formula degenerates to
+    ///      `1e18 / VIRTUAL_SHARES` = $0.001, and `PoolRegistry` anchors every pool it opens at {pRefX18},
+    ///      substituting $1.00 only while that word is still zero — so one permissionless call in the launch
+    ///      window would have opened every pool registered afterwards a thousandfold below NAV, permanently.
     /// @return snapshot The checkpoint written.
     function checkpoint() external returns (Checkpoint memory snapshot);
 
     /// @notice Stamps the layer-A watchdog without recomputing NAV. **Permissionless and unpaid.**
+    /// @dev Reverts `NotInitialized` before {genesis}, for the same reason {checkpoint} does.
     function touch() external;
 
     // -------------------------------------------------------------------------------------------------------------
@@ -775,14 +822,6 @@ interface IAmpsVault {
     /// @param value The new fee, at most `REDEEM_FEE_BPS_MAX`.
     function setRedeemFeeBps(uint16 value) external;
 
-    /// @notice Sets the burn share. **Only timelock (48 h).**
-    /// @param value The new share, at most `BURN_BPS_MAX`.
-    function setBurnBps(uint16 value) external;
-
-    /// @notice Sets the staker share. **Only timelock (48 h).**
-    /// @param value The new share, at most `STAKER_BPS_MAX`.
-    function setStakerBps(uint16 value) external;
-
     /// @notice Sets the reference rate limit. **Only timelock (48 h).**
     /// @param value The new rate, inside `[REF_UP_RATE_BPS_MIN, REF_UP_RATE_BPS_MAX]`.
     function setRefUpRateBps(uint16 value) external;
@@ -826,7 +865,7 @@ interface IAmpsVault {
     /// @dev This is the vault's single pointer setter, and it serves two populations of slot:
     ///
     ///        - **Set-once wiring**, written before {genesis} and refused for ever afterwards: `bytes32("registry")`,
-    ///          `bytes32("bonds")`, `bytes32("staking")` and `bytes32("bountyPot")`. Each of those contracts takes
+    ///          `bytes32("bonds")` and `bytes32("bountyPot")`. Each of those contracts takes
     ///          the vault in *its* constructor, so the vault cannot hold them as immutables; {genesis} sets the
     ///          `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
     ///        - **Pointer-upgradeable policies**, replaceable at any time under the same 7-day delay:
@@ -853,16 +892,29 @@ interface IAmpsVault {
     // Mutative — emergency
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Migrates every position and every claim to the pre-registered standby vault, and hands the vault
-    ///         role on `Amps` and `AmpsBonds` in the same transaction. **Only guardian, no delay, predicate-gated.**
+    /// @notice Migrates every position and every claim to the pre-registered standby vault, and hands **every**
+    ///         vault role on in the same transaction. **Only guardian, no delay, predicate-gated.**
     ///
     /// @dev The predicate is checked **on-chain**: `isBlocked(vault) == true` for at least one constituent, or a
     ///      bounded 1-wei self-transfer probe failing for at least two constituents. Without it the call reverts
-    ///      with {MigrationPredicateNotMet}; the guardian cannot migrate at will.
+    ///      with {MigrationPredicateNotMet}; the guardian cannot migrate at will. Every answer the predicate reads
+    ///      is hand-decoded, so a Stock Token returning a non-canonical bool cannot brick the escape hatch.
     ///
     /// @dev Per pool, inside one `unlock`: remove liquidity -> `take` as ERC-6909 claims -> transfer the claims
     ///      PoolManager-internally to the standby vault -> the standby vault re-adds at the same ticks. The R1
     ///      bleed cap is relaxed to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call.
+    ///
+    /// @dev **The five roles.** `Amps`, `AmpsBonds`, `BountyPot` and `PoolRegistry` are handed over
+    ///      outright; `AmpsHook` is a best-effort bounded call, so a hook that cannot hand its pointer on cannot
+    ///      trap the estate in a denylisted vault. The registry matters as much as the token roles: it is the
+    ///      contract that asks a vault to open a pool, so a standby it does not recognise inherits the estate and
+    ///      can never grow it.
+    ///
+    /// @dev **Nothing on this path asserts a clean sweep, and the idle-balance leg cannot revert.** The token that
+    ///      refuses to move is by construction the token the guardian is fleeing; an evacuation a constituent
+    ///      could veto with one wei would not be an escape hatch at all. Claims move PoolManager-internally, which
+    ///      no token can block; an ERC-20 balance an issuer has frozen stays on the old shell, where it is as
+    ///      unreachable as it would be anywhere else.
     ///
     /// @param standby The standby vault. Must equal {standbyVault}.
     function emergencyMigrate(address standby) external;

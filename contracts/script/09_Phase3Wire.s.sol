@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import {AmpsHook} from "../src/hook/AmpsHook.sol";
 import {IAmpsBonds} from "../src/interfaces/IAmpsBonds.sol";
+import {IAmpsHook} from "../src/interfaces/IAmpsHook.sol";
 import {IAmpsVault} from "../src/interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../src/interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../src/interfaces/IMarketReference.sol";
@@ -21,7 +22,7 @@ import {console2} from "forge-std/console2.sol";
 /// @title Phase3Wire
 /// @notice The Phase 3 pointer moves, and the bootstrap ordering they have to happen inside.
 ///
-///         Six moves (`docs/phase3-state-model.md` §7 and §10 ruling 10):
+///         Seven moves (`docs/phase3-state-model.md` §7 and §10 ruling 10):
 ///
 ///         | # | Move | Delay |
 ///         |---|---|---|
@@ -29,8 +30,14 @@ import {console2} from "forge-std/console2.sol";
 ///         | 2 | `AmpsVault.positionValuer -> LadderPositionValuer` | 7 d |
 ///         | 3 | `AmpsVault.ladderPolicy -> LadderPolicy` | 7 d |
 ///         | 4 | `AmpsVault.rolloutPolicy -> RolloutPolicy` | 7 d |
-///         | 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 48 h |
-///         | 6 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
+///         | 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 7 d |
+///         | 6 | `AmpsHook.setRouter(AmpsRouter)` | 7 d |
+///         | 7 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
+///
+///         Move 6 is revision 6's: `AmpsHook.router()` is the pass-through exemption, and while it is
+///         `address(0)` every hop in every pool — a rotation included — pays `ampsFeeBps`. It is a pointer, so it
+///         goes in this batch at the pointer delay, and {checkBootstrap} refuses to let the gate pointer (and
+///         therefore genesis) move until it is set, so a launch cannot open trading with rotations mispriced.
 ///
 ///         plus the `OracleGate` redeploy: a fresh gate constructed with `AmpsHook` as its `marketReference`, so
 ///         it reads the hook's `poolState` for the corporate-action flag and keeps its own token probes as the
@@ -49,9 +56,9 @@ import {console2} from "forge-std/console2.sol";
 ///      freshly initialised pool has no observations, so with the gate already wired **no pool can be registered
 ///      and `genesis()` can never run**. The order is therefore:
 ///
-///        1. deploy everything; wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`)
-///           and `feedRegistry` / `positionValuer` / `marketReference`, and **leave `oracleGate` unset** — a gate
-///           that is absent is exactly as permissive as a gate that is `GREEN`;
+///        1. deploy everything, the `AmpsRouter` included; wire the vault's set-once pointers (`registry`,
+///           `bonds`, `bountyPot`) and `feedRegistry` / `positionValuer` / `marketReference`, and **leave
+///           `oracleGate` unset** — a gate that is absent is exactly as permissive as a gate that is `GREEN`;
 ///        2. register the 32 pools (`05_Registry`), each `vault.initializePool` passing with no gate;
 ///        3. wait until the hub's ring covers `twapWindow` — thirty minutes of blocks on Robinhood Chain;
 ///        4. point the vault at `OracleGate` and confirm `gate.state(0) == GREEN`;
@@ -103,7 +110,7 @@ contract Phase3Wire is Script {
     // Types
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice Everything the six moves and the gate redeploy need.
+    /// @notice Everything the seven moves and the gate redeploy need.
     struct Targets {
         address timelock;
         address guardian;
@@ -118,6 +125,7 @@ contract Phase3Wire is Script {
         address rolloutPolicy;
         address feePolicy;
         address bondPolicy;
+        address router;
     }
 
     /// @notice One timelock call, in `TimelockController.scheduleBatch` order.
@@ -177,7 +185,7 @@ contract Phase3Wire is Script {
         }
     }
 
-    /// @notice Performs the six pointer moves directly, as the timelock, optionally redeploying `OracleGate`
+    /// @notice Performs the seven pointer moves directly, as the timelock, optionally redeploying `OracleGate`
     ///         first. Idempotent: a pointer that already holds the target address is left alone.
     /// @dev The gate pointer is moved **last**, after {checkBootstrap} has confirmed the pools exist and the hub
     ///      ring covers `twapWindow`, and {assertGateGreen} then proves the vault is genuinely open for business.
@@ -234,6 +242,9 @@ contract Phase3Wire is Script {
         if (t.feePolicy != address(0) && AmpsHook(t.hook).feePolicy() != t.feePolicy) {
             Gov.send(ctx, t.hook, abi.encodeCall(AmpsHook.setFeePolicy, (t.feePolicy)));
         }
+        if (t.router != address(0) && IAmpsHook(t.hook).router() != t.router) {
+            Gov.send(ctx, t.hook, abi.encodeCall(AmpsHook.setRouter, (t.router)));
+        }
         if (t.bondPolicy != address(0) && t.bonds != address(0) && IAmpsBonds(t.bonds).policy() != t.bondPolicy) {
             Gov.send(ctx, t.bonds, abi.encodeCall(IAmpsBonds.setPolicy, (t.bondPolicy)));
         }
@@ -288,18 +299,24 @@ contract Phase3Wire is Script {
     // -----------------------------------------------------------------------------------------------------------
 
     /// @notice Asserts steps 1-3 of the §9.1 bootstrap: every pointer the vault needs before genesis is set, the
-    ///         pools are registered, and the hub pool's observation ring covers `twapWindow`.
+    ///         hook knows its router, the pools are registered, and the hub pool's observation ring covers
+    ///         `twapWindow`.
     /// @param t The addresses.
     /// @param expectedPools How many pools must already be registered.
     function checkBootstrap(Targets memory t, uint16 expectedPools) public view {
         IAmpsVault vault = IAmpsVault(t.vault);
         if (vault.registry() == address(0)) revert PointerUnset(bytes32("registry"));
         if (vault.bonds() == address(0)) revert PointerUnset(bytes32("bonds"));
-        if (vault.staking() == address(0)) revert PointerUnset(bytes32("staking"));
         if (vault.bountyPot() == address(0)) revert PointerUnset(bytes32("bountyPot"));
         if (vault.feedRegistry() == address(0)) revert PointerUnset(bytes32("feedRegistry"));
         if (vault.positionValuer() == address(0)) revert PointerUnset(SLOT_POSITION_VALUER);
         if (vault.marketReference() == address(0)) revert PointerUnset(SLOT_MARKET_REFERENCE);
+
+        // Revision 6: the hook's own pointer, checked here rather than after the fact. An unnamed router is not a
+        // broken deployment — every swap simply pays `ampsFeeBps` — but it makes a rotation cost two exits, which
+        // is the one price the index cannot open with. This runs before the gate pointer moves, so `genesis()`
+        // cannot be reached with the exemption still withdrawn.
+        if (IAmpsHook(t.hook).router() == address(0)) revert PointerUnset(bytes32("router"));
 
         IPoolRegistry registry = IPoolRegistry(vault.registry());
         uint16 pools = registry.poolCount();
@@ -322,14 +339,14 @@ contract Phase3Wire is Script {
     // Proposal building
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice The six moves as timelock calls, in the order they must execute.
+    /// @notice The seven moves as timelock calls, in the order they must execute.
     /// @dev The gate redeploy is not expressible as a proposal call — the gate has to exist before it can be
     ///      pointed at — so in proposal mode it is deployed out of band and its address passed in as `gate`.
     /// @param t The addresses.
     /// @param gate The `OracleGate` the vault should end up pointing at.
     /// @return calls The batch.
     function buildCalls(Targets memory t, address gate) public pure returns (Call[] memory calls) {
-        calls = new Call[](7);
+        calls = new Call[](8);
         calls[0] = Call({
             target: t.vault,
             value: 0,
@@ -361,12 +378,18 @@ contract Phase3Wire is Script {
             what: "hook.setFeePolicy(FeePolicy)"
         });
         calls[5] = Call({
+            target: t.hook,
+            value: 0,
+            data: abi.encodeCall(AmpsHook.setRouter, (t.router)),
+            what: "hook.setRouter(AmpsRouter)"
+        });
+        calls[6] = Call({
             target: t.bonds,
             value: 0,
             data: abi.encodeCall(IAmpsBonds.setPolicy, (t.bondPolicy)),
             what: "bonds.setPolicy(BondPolicy)"
         });
-        calls[6] = Call({
+        calls[7] = Call({
             target: t.vault,
             value: 0,
             data: abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_ORACLE_GATE, gate)),
@@ -378,7 +401,8 @@ contract Phase3Wire is Script {
     ///         for `calls`, ready for the proposer Safe.
     /// @param calls The batch.
     /// @param salt The proposal salt.
-    /// @param delay The delay in seconds — 7 days for this batch, because the slowest move in it is a 7-day one.
+    /// @param delay The delay in seconds — 7 days for this batch: every move in it is a pointer move, and the
+    ///        governance matrix puts pointers in the 7-day class.
     /// @return data The calldata.
     function scheduleBatchCalldata(Call[] memory calls, bytes32 salt, uint256 delay)
         public
@@ -428,7 +452,8 @@ contract Phase3Wire is Script {
             "$comment",
             "Written by script/09_Phase3Wire.s.sol. Hand `scheduleBatch` to the proposer Safe, wait out the "
             "7-day delay, then hand it `executeBatch` with the same salt. The OracleGate must be deployed before "
-            "the batch is scheduled, because call 7 points the vault at it."
+            "the batch is scheduled, because call 8 points the vault at it, and the AmpsRouter must be deployed "
+            "before it, because call 6 names it on the hook."
         );
         vm.serializeUint(root, "chainId", block.chainid);
         vm.serializeBytes32(root, "salt", salt);
@@ -461,7 +486,8 @@ contract Phase3Wire is Script {
             ladderPolicy: _address(json, ".core.ladderPolicy", "AMPS_LADDER_POLICY"),
             rolloutPolicy: _address(json, ".core.rolloutPolicy", "AMPS_ROLLOUT_POLICY"),
             feePolicy: _address(json, ".core.feePolicy", "AMPS_FEE_POLICY"),
-            bondPolicy: _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY")
+            bondPolicy: _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY"),
+            router: _address(json, ".core.router", "AMPS_ROUTER")
         });
     }
 

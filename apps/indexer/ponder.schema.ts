@@ -89,11 +89,9 @@ export const sharePoint = onchainTable(
     inventory: t.bigint().notNull(),
     /** AMPS still held by the team `VestingWallet`. */
     vesting: t.bigint().notNull(),
-    /** AMPS held by `AmpsStaking` (the xAMPS assets). */
-    staked: t.bigint().notNull(),
     /** AMPS held by `AmpsBonds` against unvested positions. */
     bondUnvested: t.bigint().notNull(),
-    /** `totalSupply - inventory - vesting - staked - bondUnvested`. */
+    /** `totalSupply - inventory - vesting - bondUnvested`. There is no staked class in revision 6. */
     circulating: t.bigint().notNull(),
     source: t.text().notNull(),
   }),
@@ -122,14 +120,20 @@ export const vaultSummary = onchainTable('vault_summary', (t) => ({
   premiumBps: t.integer().notNull(),
   inventory: t.bigint().notNull(),
   vesting: t.bigint().notNull(),
-  staked: t.bigint().notNull(),
   circulating: t.bigint().notNull(),
-  /** Cumulative AMPS collected as fees and split at `compound()`. */
+  /**
+   * The cumulative revision-6 fee split. A compound touches **two** currencies and treats them
+   * differently on purpose, so the totals are kept apart: the AMPS side is an amount, the counter
+   * side is a USD aggregate across up to thirty-two assets with different decimals, valued at the
+   * pool's own price and `P_ref` at the moment of collection.
+   */
   feesAmpsTotal: t.bigint().notNull(),
-  creatorPaidTotal: t.bigint().notNull(),
-  stakerPaidTotal: t.bigint().notNull(),
+  feesCounterUsd18: t.bigint().notNull(),
+  /** What the creator took, in each currency: AMPS by transfer, counter assets in kind. */
+  creatorPaidAmpsTotal: t.bigint().notNull(),
+  creatorPaidCounterUsd18: t.bigint().notNull(),
+  /** Cumulative AMPS burned at `compound()`: the whole fee remainder plus the buyback. */
   burnedTotal: t.bigint().notNull(),
-  relaidTotal: t.bigint().notNull(),
   /** Cumulative AMPS burned, by any reason, including redemption inventory. */
   burnedAllTotal: t.bigint().notNull(),
   bondIssuedTotal: t.bigint().notNull(),
@@ -247,7 +251,7 @@ export const placement = onchainTable(
  * One row per live grid cell per pool: the durable ladder record, rebuilt from the vault's own
  * `ModifyLiquidity` logs because `Placement` carries no per-cell data.
  *
- * `fillFraction`, `ampsRemaining` and `counterRaised` are recomputed from `liquidity`, the cell
+ * `filledBps`, `ampsRemaining` and `proceeds` are recomputed from `liquidity`, the cell
  * bounds and the pool's live `sqrtPriceX96` at every swap that touches the pool — a v4 position
  * converts in place as the price crosses it (§3.4), so this *is* the fill and the proceeds.
  */
@@ -258,7 +262,7 @@ export const ladderCell = onchainTable(
     id: t.text().primaryKey(),
     poolId: t.hex().notNull(),
     /** `m - GRID_MIN_M`, in `[0, GRID_CELLS)`. `-1` when the pool's grid origin is not yet known. */
-    cellIndex: t.integer().notNull(),
+    bucketIndex: t.integer().notNull(),
     /** `m`, the signed doubling index off the grid origin. */
     m: t.integer().notNull(),
     tickLower: t.integer().notNull(),
@@ -267,15 +271,16 @@ export const ladderCell = onchainTable(
     liquidity: t.bigint().notNull(),
     /** True while the cell is an ask; false once the price has converted it to a bid. */
     above: t.boolean().notNull(),
-    /** Cumulative token added over the cell's life, in the placed side's units. Disclosure only. */
-    principal: t.bigint().notNull(),
+    /** Cumulative token committed over the cell's life, in the placed side's units: AMPS wei for an
+     *  ask, counter raw units for a bid. Disclosure only. */
+    amount: t.bigint().notNull(),
     /** AMPS still sitting in the cell at the pool's live price. */
     ampsRemaining: t.bigint().notNull(),
     /** Counter units the cell holds at the live price: what the ask has raised so far. */
-    counterRaised: t.bigint().notNull(),
+    proceeds: t.bigint().notNull(),
     /** `1 - ampsRemaining / ampsAtPlacement`, in bps. 10,000 = fully consumed. */
-    fillBps: t.integer().notNull(),
-    /** The AMPS the cell held when it was last (re-)placed, the denominator of `fillBps`. */
+    filledBps: t.integer().notNull(),
+    /** The AMPS the cell held when it was last (re-)placed, the denominator of `filledBps`. */
     ampsAtPlacement: t.bigint().notNull(),
     placedAt: t.bigint().notNull(),
     updatedAt: t.bigint().notNull(),
@@ -305,7 +310,15 @@ export const liquidityChange = onchainTable(
   (table) => ({byPool: index().on(table.poolId)}),
 )
 
-/** Every `Compound`: the four-way split of the AMPS-side fees. */
+/**
+ * Every `Compound`: the revision-6 split, in both currencies.
+ *
+ * `Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`. The creator takes
+ * `creatorBps(t) / ampsFeeBps` of *each* currency in kind; the whole AMPS-side remainder is burned
+ * (`burned` is that remainder **plus** the buyback burn, which is why it can exceed `ampsFees`);
+ * and the counter-side remainder is re-placed as bids in the pool that earned it. There is no
+ * staker slice and nothing is re-laddered on the AMPS side.
+ */
 export const compoundEvent = onchainTable(
   'compound_event',
   (t) => ({
@@ -315,12 +328,18 @@ export const compoundEvent = onchainTable(
     txHash: t.hex().notNull(),
     poolId: t.hex().notNull(),
     caller: t.hex().notNull(),
-    /** AMPS-side fees realised by this compound. */
+    /** AMPS-side fees realised by this compound, gross. */
     ampsFees: t.bigint().notNull(),
-    creatorPaid: t.bigint().notNull(),
-    stakerPaid: t.bigint().notNull(),
+    /** Counter-side fees realised by this compound, gross, in the counter's own decimals. */
+    counterFees: t.bigint().notNull(),
+    /** The creator's slice of each side: AMPS wei, and counter units in the counter's decimals. */
+    creatorAmps: t.bigint().notNull(),
+    creatorCounter: t.bigint().notNull(),
+    /** AMPS burned: the whole AMPS-side remainder after the creator slice, plus the buyback. */
     burned: t.bigint().notNull(),
-    relaid: t.bigint().notNull(),
+    /** The counter legs in 18-decimal USD, so thirty-two assets can be summed. */
+    counterFeesUsd18: t.bigint().notNull(),
+    creatorCounterUsd18: t.bigint().notNull(),
     /** The creator slice in force, `CREATOR_FEE_BPS * max(0, 1 - (t - genesis)/decay)`. */
     creatorBps: t.integer().notNull(),
     /** NAV/share before and after, from the checkpoints either side. R1 allows a 2 bp bleed. */
@@ -330,6 +349,55 @@ export const compoundEvent = onchainTable(
     bountyPaidUsd18: t.bigint().notNull(),
   }),
   (table) => ({byPool: index().on(table.poolId), byBlock: index().on(table.blockNumber)}),
+)
+
+/**
+ * Every trade through `AmpsRouter`: `Bought`, `Sold` and `Rotated`.
+ *
+ * **Why this table exists at all, when every one of them also produced a v4 `Swap`.** The hook
+ * prices a hop at the pass-through fee (`pool.buyFeeBps`) only when the `PoolManager`'s caller is
+ * `AmpsHook.router()` *and* the hop declares the router's rotate flag in its `hookData`. Neither
+ * fact is in the `Swap` log: the flag is calldata, and the router's own `buy` and `sell` have the
+ * same `sender` as its `rotate` while paying `ampsFeeBps` like everybody else. So a rotation is a
+ * fact about the router's log, and the two hops of one are only identifiable from `Rotated`.
+ *
+ * The fee columns are read back off the `swap` rows the same transaction already wrote — what the
+ * pool actually charged, not what a rate implies — through `pending_hop`.
+ */
+export const routerTrade = onchainTable(
+  'router_trade',
+  (t) => ({
+    id: t.text().primaryKey(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+    logIndex: t.integer().notNull(),
+    /** `"buy"`, `"sell"` or `"rotate"`. */
+    kind: t.text().notNull(),
+    /** `buy`/`sell`: the pool traded. `rotate`: hop 1, the pool bought through. */
+    poolId: t.hex().notNull(),
+    /** `rotate` only: hop 2, the pool sold through. */
+    hop2PoolId: t.hex(),
+    /** The account whose asset was spent. `Rotated` does not name one, so it is the transaction's `from`. */
+    payer: t.hex().notNull(),
+    to: t.hex().notNull(),
+    /** Input in its own raw units, and output in its own. */
+    amountIn: t.bigint().notNull(),
+    amountOut: t.bigint().notNull(),
+    /** AMPS realised (`buy`), spent (`sell`) or passed through (`rotate`), in wei. */
+    ampsAmount: t.bigint().notNull(),
+    /** True for `rotate` and nothing else: the two hops were priced at the pass-through fee. */
+    passThrough: t.boolean().notNull(),
+    /** What the hops actually paid, from the `swap` rows: the counter-side leg and the AMPS-side leg. */
+    feeCounter: t.bigint().notNull(),
+    feeAmps: t.bigint().notNull(),
+    feeUsd18: t.bigint().notNull(),
+    /** The base each hop was priced at, in bps. `hop2BaseFeeBps` is the hook's blend when a credit
+     *  covered part of the sell; both are zero on a `buy` or a `sell`, which pay `ampsFeeBps`. */
+    hop1BaseFeeBps: t.integer().notNull(),
+    hop2BaseFeeBps: t.integer().notNull(),
+  }),
+  (table) => ({byPool: index().on(table.poolId), byKind: index().on(table.kind)}),
 )
 
 /**
@@ -457,7 +525,7 @@ export const swap = onchainTable(
     /** The fee v4 actually charged, in hundredths of a bp, and the same number in bps. */
     feePips: t.integer().notNull(),
     feeBps: t.integer().notNull(),
-    /** `sellFeeBps` or the pool's `buyFeeBps`, blended when a rotation credit applied. */
+    /** `ampsFeeBps` or the pool's `buyFeeBps`, blended when a rotation credit applied. */
     baseFeeBps: t.integer().notNull(),
     /** `feeBps - baseFeeBps`, floored at zero: `f_vol + f_dev + f_div + f_session + surge`. */
     dynamicFeeBps: t.integer().notNull(),
@@ -762,6 +830,14 @@ export const bondMarket = onchainTable(
     collateralClassLabel: t.text().notNull(),
     constituentId: t.integer().notNull(),
     open: t.boolean().notNull(),
+    /**
+     * `AmpsBonds` no longer attributes this market to its collateral — `removeCollateral` ran, so
+     * `marketIdOf(collateral) != marketId` and `setMarketOpen` refuses the market forever. Set by
+     * `AmpsBonds.CollateralRemoved` and confirmed from the registry's side by
+     * `PoolRegistry.BondMarketDetached`, which is the log `retireConstituent` /
+     * `reinstateConstituent` emit instead of reverting when they find the market gone.
+     */
+    detached: t.boolean().notNull(),
     dBaseBps: t.integer().notNull(),
     dMinBps: t.integer().notNull(),
     dMaxBps: t.integer().notNull(),
@@ -777,10 +853,27 @@ export const bondMarket = onchainTable(
     bondCount: t.integer().notNull(),
     lastBondAt: t.bigint().notNull(),
     lastDiscountBps: t.integer().notNull(),
+    /**
+     * Cumulative residual collateral `bond()` forwarded to the vault at its exit
+     * (`CollateralForwarded`), in the collateral's own decimals. Non-zero only when somebody
+     * donated to the bonds shell: the collateral itself never rests there.
+     */
+    forwardedCollateral: t.bigint().notNull(),
     createdAt: t.bigint().notNull(),
   }),
   (table) => ({byConstituent: index().on(table.constituentId), byOpen: index().on(table.open)}),
 )
+
+/** Collateral address -> market id: the reverse of `bondMarket.collateral`, and the mirror of
+ *  `AmpsBonds.marketIdOf`. `CollateralForwarded` names only the collateral, and `context.db` has a
+ *  `find` but no query side, so the lookup is materialised here exactly as `tokenIndex` is. A
+ *  `CollateralRemoved` detaches the market on-chain and deletes the row here. */
+export const collateralIndex = onchainTable('collateral_index', (t) => ({
+  /** The collateral address, lower-cased. */
+  id: t.hex().primaryKey(),
+  marketId: t.integer().notNull(),
+  constituentId: t.integer().notNull(),
+}))
 
 export const bondPurchase = onchainTable(
   'bond_purchase',
@@ -881,42 +974,6 @@ export const bondDay = onchainTable(
     avgDiscountBps: t.integer().notNull(),
   }),
   (table) => ({byMarket: index().on(table.marketId), byDay: index().on(table.day)}),
-)
-
-// -----------------------------------------------------------------------------------------------
-// Staking
-// -----------------------------------------------------------------------------------------------
-
-export const stakingState = onchainTable('staking_state', (t) => ({
-  id: t.text().primaryKey(),
-  staking: t.hex().notNull(),
-  totalAssets: t.bigint().notNull(),
-  totalSupply: t.bigint().notNull(),
-  /** `convertToAssets(1e18)`: xAMPS share price. */
-  sharePriceX18: t.bigint().notNull(),
-  rewardStreamSeconds: t.integer().notNull(),
-  streamEnd: t.bigint().notNull(),
-  rewardsTotal: t.bigint().notNull(),
-  /** Rewards notified in the trailing 24 h and the APR that implies. */
-  rewards24h: t.bigint().notNull(),
-  aprBps: t.integer().notNull(),
-  updatedAt: t.bigint().notNull(),
-  updatedBlock: t.bigint().notNull(),
-}))
-
-export const stakingReward = onchainTable(
-  'staking_reward',
-  (t) => ({
-    id: t.text().primaryKey(),
-    blockNumber: t.bigint().notNull(),
-    timestamp: t.bigint().notNull(),
-    txHash: t.hex().notNull(),
-    amount: t.bigint().notNull(),
-    streamEnd: t.bigint().notNull(),
-    /** xAMPS assets at the moment of notification, the APR denominator. */
-    totalAssets: t.bigint().notNull(),
-  }),
-  (table) => ({byBlock: index().on(table.blockNumber)}),
 )
 
 // -----------------------------------------------------------------------------------------------
@@ -1094,7 +1151,7 @@ export const alert = onchainTable(
     id: t.text().primaryKey(),
     blockNumber: t.bigint().notNull(),
     timestamp: t.bigint().notNull(),
-    /** `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action`. */
+    /** `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action` | `sweep-residue`. */
     kind: t.text().notNull(),
     severity: t.text().notNull(),
     subject: t.text().notNull(),
@@ -1125,8 +1182,34 @@ export const pendingCredit = onchainTable('pending_credit', (t) => ({
 }))
 
 /**
+ * One row per `Swap` whose `sender` was `AmpsRouter`, keyed `"<txHash>-<poolId>"`, so the router's
+ * own log can be joined to the fee the pool actually charged.
+ *
+ * The same shape and the same lifetime as {@link pendingCredit}: written by the `Swap` handler,
+ * read and deleted by the `Bought` / `Sold` / `Rotated` handler in the same transaction. v4 emits
+ * `Swap` from inside `unlock`, and the router emits its own log after `unlock` returns, so the row
+ * is always there by the time it is wanted. A router call that somehow left one behind is a row in
+ * a table nothing else reads, not a wrong number somewhere else.
+ */
+export const pendingHop = onchainTable('pending_hop', (t) => ({
+  /** `"<txHash>-<poolId>"`. */
+  id: t.text().primaryKey(),
+  /** The `swap` row this describes, so its fee decomposition can be corrected in place. */
+  swapId: t.text().notNull(),
+  sell: t.boolean().notNull(),
+  amountIn: t.bigint().notNull(),
+  feeAmount: t.bigint().notNull(),
+  feeBps: t.integer().notNull(),
+  baseFeeBps: t.integer().notNull(),
+  feeUsd18: t.bigint().notNull(),
+  ampsAmount: t.bigint().notNull(),
+  logIndex: t.integer().notNull(),
+  blockNumber: t.bigint().notNull(),
+}))
+
+/**
  * Whatever a handler needs to remember across events without a natural home: the last
- * `NavCheckpoint` values, the last observed `sellFeeBps`, the reconciliation cursor.
+ * `NavCheckpoint` values, the last observed `ampsFeeBps`, the reconciliation cursor.
  */
 export const indexerState = onchainTable('indexer_state', (t) => ({
   id: t.text().primaryKey(),
@@ -1135,21 +1218,34 @@ export const indexerState = onchainTable('indexer_state', (t) => ({
   updatedBlock: t.bigint().notNull(),
 }))
 
-/** Composite-keyed daily rollup of the whole flywheel, for the dashboard's headline series. */
+/**
+ * Composite-keyed daily rollup of the whole flywheel, for the dashboard's headline series.
+ *
+ * **Fee revenue is split by currency, not by direction.** The hook charges `ampsFeeBps` on every
+ * net buy *and* every net sell, and a fee is always taken in the swap's input currency — so a sell
+ * pays in AMPS and a buy pays in the counter asset. `feeAmps` is therefore the whole AMPS side (the
+ * side that is burned) and `feeCounterUsd18` the whole counter side (the side that is re-placed as
+ * bids), rather than "sell fee" and "buy fee".
+ */
 export const flywheelDay = onchainTable(
   'flywheel_day',
   (t) => ({
     day: t.bigint().notNull(),
-    /** Sell-fee revenue in AMPS wei and in 18-decimal USD. */
-    sellFeeAmps: t.bigint().notNull(),
-    sellFeeUsd18: t.bigint().notNull(),
-    buyFeeUsd18: t.bigint().notNull(),
-    bondIssued: t.bigint().notNull(),
+    /** Volume through the pools that day, both directions, in AMPS wei. */
+    sellVolumeAmps: t.bigint().notNull(),
+    buyVolumeAmps: t.bigint().notNull(),
+    /** The AMPS-side fee take, in wei and in 18-decimal USD at `P_ref`. */
+    feeAmps: t.bigint().notNull(),
+    feeAmpsUsd18: t.bigint().notNull(),
+    /** The counter-side fee take, in 18-decimal USD: thirty-two assets cannot be added as amounts. */
+    feeCounterUsd18: t.bigint().notNull(),
+    bondIssuedAmps: t.bigint().notNull(),
     bondAccretionUsd18: t.bigint().notNull(),
-    burned: t.bigint().notNull(),
-    stakerPaid: t.bigint().notNull(),
-    creatorPaid: t.bigint().notNull(),
-    relaid: t.bigint().notNull(),
+    /** AMPS burned that day, every reason included. */
+    burnedAmps: t.bigint().notNull(),
+    /** What the creator took, in each currency. */
+    creatorPaidAmps: t.bigint().notNull(),
+    creatorPaidCounterUsd18: t.bigint().notNull(),
     redeemedShares: t.bigint().notNull(),
     netSupplyChange: t.bigint().notNull(),
     realisedLvrUsd18: t.bigint().notNull(),

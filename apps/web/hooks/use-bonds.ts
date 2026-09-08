@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 'use client'
 
-import {useAccount, useReadContract} from 'wagmi'
+import {useAccount, useReadContract, useReadContracts} from 'wagmi'
 import type {Address} from 'viem'
 
 import {addressOf, contract} from '@/lib/contracts'
@@ -117,4 +117,74 @@ export function useDailyIssuance() {
   })
   const data = query.data as readonly [bigint, bigint] | undefined
   return {...query, issuance: data ? {issued: data[0], capacity: data[1]} : undefined}
+}
+
+/**
+ * The shell's global parameters, read rather than assumed.
+ *
+ * Vest length, epoch length, the minimum accretion and the daily cap are one value each on
+ * `AmpsBonds`, not per market, and every one of them is governed inside a band hardcoded in the
+ * contract. The board used to hardcode a 12-hour vest as a display default; it reads it now, and a
+ * read that fails renders as unavailable rather than as the number that used to be right.
+ */
+export function useBondParameters() {
+  const bonds = contract('bonds')
+  const query = useReadContracts({
+    contracts: bonds
+      ? ([
+          {...bonds, functionName: 'vestSeconds'},
+          {...bonds, functionName: 'epochSeconds'},
+          {...bonds, functionName: 'minAccretionBps'},
+          {...bonds, functionName: 'dailyCapBps'},
+          {...bonds, functionName: 'marketCount'},
+          {...bonds, functionName: 'VEST_SECONDS_MIN'},
+          {...bonds, functionName: 'VEST_SECONDS_MAX'},
+          {...bonds, functionName: 'DISCOUNT_BPS_MIN'},
+          {...bonds, functionName: 'DISCOUNT_BPS_MAX'},
+          {...bonds, functionName: 'MIN_ACCRETION_BPS_MAX'},
+          {...bonds, functionName: 'CAP_BPS_PER_EPOCH_MAX'},
+          {...bonds, functionName: 'DAILY_CAP_BPS_MAX'},
+        ] as const)
+      : [],
+    query: {enabled: bonds !== undefined, refetchInterval: 60_000},
+  })
+
+  const at = (i: number): number | undefined => {
+    const entry = query.data?.[i]
+    if (!entry || entry.status !== 'success' || entry.result === undefined) return undefined
+    return Number(entry.result as bigint | number)
+  }
+  const band = (lo: number, hi: number) => {
+    const min = at(lo)
+    const max = at(hi)
+    return min !== undefined && max !== undefined ? {min, max} : null
+  }
+
+  return {
+    ...query,
+    enabled: bonds !== undefined,
+    vestSeconds: at(0),
+    epochSeconds: at(1),
+    minAccretionBps: at(2),
+    dailyCapBps: at(3),
+    marketCount: at(4),
+    vestBand: band(5, 6),
+    discountBand: band(7, 8),
+    minAccretionBpsMax: at(9),
+    capBpsPerEpochMax: at(10),
+    dailyCapBpsMax: at(11),
+  }
+}
+
+/** The session haircut vector: Regular / Pre-post / Overnight / Closed, in bps. */
+export function useSessionHaircuts() {
+  const bonds = contract('bonds')
+  const query = useReadContracts({
+    contracts: bonds ? [0, 1, 2, 3].map((session) => ({...bonds, functionName: 'hSessionBps' as const, args: [session] as const})) : [],
+    query: {enabled: bonds !== undefined, refetchInterval: 60_000},
+  })
+  const haircuts = query.data?.map((entry) =>
+    entry.status === 'success' && entry.result !== undefined ? Number(entry.result) : undefined,
+  )
+  return {...query, enabled: bonds !== undefined, haircuts}
 }

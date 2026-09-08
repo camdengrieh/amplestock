@@ -77,6 +77,18 @@ const CATALOGUE: Readonly<Record<string, Omit<SurfacedError, 'name' | 'args'>>> 
     detail: 'The NAV checkpoint this path prices against is older than the maximum age it accepts.',
     action: 'Call checkpoint() from the Vault page — it is free and anyone may call it — then retry.',
   },
+  UnconfirmedNav: {
+    title: 'NAV is built on an unconfirmed answer',
+    detail:
+      'The vault’s last checkpoint valued at least one asset from a stale or held-back oracle answer, which understates NAV per share — the denominator of every bond floor. Bonds refuse to price against it.',
+    action: 'Wait for the feed to confirm (a keeper refresh or the next round), call checkpoint() from the Vault page, then retry. Redemption is unaffected.',
+  },
+  HighWaterResetFailed: {
+    title: 'High-water reset failed',
+    detail:
+      'An ask placement could not reset the pool’s high-water mark on the hook, which is what keeps freshly placed asks out of the buyback burn. The placement reverted rather than leave a stale mark standing.',
+    action: 'This is a wiring fault on the market reference, not a timing one. Nothing to retry; the operator has to look.',
+  },
   ConstituentFrozen: {
     title: 'Constituent frozen',
     detail: 'A guardian freeze or a corporate action covers this constituent. The freeze is disable-only and expires by itself.',
@@ -96,6 +108,51 @@ const CATALOGUE: Readonly<Record<string, Omit<SurfacedError, 'name' | 'args'>>> 
     title: 'Parameter outside its hard band',
     detail: 'A governed parameter was set outside the band hardcoded in the consuming contract. Bands cannot be widened.',
     action: '',
+  },
+
+  // `AmpsRouter` (`contracts/src/periphery/AmpsRouter.sol`). Every entry point takes a deadline and
+  // a minimum, holds nothing between transactions, and sweeps what it touched back to the caller.
+  DeadlineExpired: {
+    title: 'The deadline passed before the transaction landed',
+    detail:
+      'Every router entry point takes a deadline you sign for. A swap that sits in the mempool across a session change is a different trade from the one that was quoted, so it reverts rather than executing late. Nothing moved.',
+    action: 'Re-quote and sign again.',
+  },
+  SameHop: {
+    title: 'A rotation needs two different pools',
+    detail:
+      'Both hops named the same pool. Buying AMPS in a pool and selling it straight back into it is a round trip that moves the tick out and back, not a rotation — and pricing it at two pass-through fees would make that pool’s liquidity pay for the noise.',
+    action: 'Pick a different destination.',
+  },
+  AmpsResidual: {
+    title: 'The rotation did not consume its own AMPS',
+    detail:
+      'The router asserts its AMPS balance on the PoolManager is exactly zero before it settles anything, so a rotation that somehow failed to sell all of what it bought reverts rather than banking the difference. Nobody can end a rotate holding AMPS.',
+    action: 'Nothing to retry blindly — this is a safety assertion, not a timing one. Report it.',
+  },
+  UnexpectedValue: {
+    title: 'Ether sent where it cannot be used',
+    detail:
+      'Native value reached an entry point that cannot spend it: either the pool’s counter asset is not the wrapped native token, or the value sent did not match the input amount being swapped.',
+    action: 'Turn off "use native ETH" for this pool, or match the value to the amount exactly.',
+  },
+  NativeTransferFailed: {
+    title: 'The ETH payout was rejected',
+    detail:
+      'Unwrapping was requested and the recipient refused the ether. Only reachable on the WETH leg, and only when the destination is a contract that will not accept a plain transfer.',
+    action: 'Take WETH instead of native ETH, or send to an address that accepts ether.',
+  },
+  NotWrappedNative: {
+    title: 'Wrapping is a WETH-leg convenience only',
+    detail:
+      'Wrapping or unwrapping was asked for on a pool whose counter asset is not the wrapped native token the router was deployed against. It means nothing on a USDG or a stock leg.',
+    action: 'Turn wrapping off for this pool.',
+  },
+  UnknownPool: {
+    title: 'The registry does not know this pool',
+    detail:
+      'Every pool the router touches is resolved through PoolRegistry, so it cannot be pointed at a pool the protocol has not registered. An unregistered id is refused before anything is spent.',
+    action: 'Pick a pool from the list on this page; it is built from the registry.',
   },
 }
 

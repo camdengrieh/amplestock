@@ -9,10 +9,18 @@
  * the root entry resolves to an empty module under Turbopack. The subpath is declared in the
  * package's own `exports` map and points straight at the file.
  *
- * `@amplestocks/abis` is generated from the Foundry artefacts and committed, so this file needs no
- * hand-written ABI and cannot drift from the contracts. Every helper returns `undefined` rather
- * than a zero address when the contract is not deployed, which is what stops a surface from
- * issuing reads against `0x0` and rendering the answers as data.
+ * `@amplestocks/abis` is generated from the Foundry artefacts and committed, so an entry taken from
+ * it cannot drift from the contracts. Every helper returns `undefined` rather than a zero address
+ * when the contract is not deployed, which is what stops a surface from issuing reads against `0x0`
+ * and rendering the answers as data.
+ *
+ * **Every entry comes from the generated package again.** The four revision-6 ABIs this file used to
+ * import from `lib/abi/` were hand transcriptions, standing in while `@amplestocks/abis` still
+ * carried revision 5; the package has been regenerated from the revision-6 artefacts, so
+ * `ampsVaultAbi` carries the six-field `Compound` and no `staking()`, `ampsQuoterAbi` carries both
+ * pass-through legs of `PoolQuote` in the positions `lib/quoter.ts` decodes them from,
+ * `ampsHookAbi` carries `router()` / `setRouter` and the five-argument `quoteFee`, and
+ * `ampsRouterAbi` exists at all. The transcriptions are gone with them.
  */
 
 import {
@@ -21,7 +29,7 @@ import {
   ampsBondsLensAbi,
   ampsHookAbi,
   ampsQuoterAbi,
-  ampsStakingAbi,
+  ampsRouterAbi,
   ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
@@ -38,7 +46,8 @@ export const abis = {
   quoter: ampsQuoterAbi,
   bonds: ampsBondsAbi,
   bondsLens: ampsBondsLensAbi,
-  staking: ampsStakingAbi,
+  /** The protocol's own router: the only sender whose rotation hops are priced pass-through. */
+  router: ampsRouterAbi,
   registry: poolRegistryAbi,
   registryLens: poolRegistryLensAbi,
   hook: ampsHookAbi,

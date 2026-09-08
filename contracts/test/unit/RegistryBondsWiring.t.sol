@@ -227,14 +227,27 @@ contract RegistryBondsWiringTest is Test {
     // currentWeightBps, the other half of the registry surface `AmpsBonds` reads
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The real registry answers `currentWeightBps` with the target weight in Phase 2, so the bond
-    ///         discount's deficit term is exactly zero rather than unknown.
-    function test_currentWeightBpsIsTheTargetWeightInPhase2() public {
+    /// @notice The real registry answers `currentWeightBps` with the **vault's** realised weight, and falls back
+    ///         to the target — a deficit of exactly zero — whenever the vault cannot answer.
+    ///
+    /// @dev Audit fix wave 2, finding 5. Phase 2 answered the target unconditionally, which made the bond
+    ///      discount's index-deficit term identically zero however far under-weight a name was; the realised
+    ///      weight now comes from `IAmpsVault.spokeWeightBps` through a bounded, hand-decoded `staticcall`, and
+    ///      every way that read can fail prices `deficit == 0`, which is the protocol-favourable direction.
+    function test_currentWeightBpsIsTheVaultsRealisedWeight() public {
         (uint16 constituentId,) = _addNvda(true);
-
         uint16 target = registry.constituent(constituentId).targetWeightBps;
-        assertEq(registry.currentWeightBps(constituentId), target, "realised == target in Phase 2");
-        assertEq(IPoolRegistry(address(registry)).currentWeightBps(constituentId), target, "through the interface");
+
+        vault.setSpokeWeight(constituentId, target / 2);
+        assertEq(registry.currentWeightBps(constituentId), target / 2, "the realised weight, from the vault");
+        assertEq(IPoolRegistry(address(registry)).currentWeightBps(constituentId), target / 2, "through the interface");
+
+        // Every way the vault can fail to answer reads as the target, i.e. as no deficit at all.
+        for (uint8 fault = 1; fault <= 4; ++fault) {
+            vault.setSpokeWeightFault(fault);
+            assertEq(registry.currentWeightBps(constituentId), target, "an unanswerable vault prices deficit 0");
+        }
+        vault.setSpokeWeightFault(0);
 
         // An id that was never registered answers zero rather than reverting, so a bond on a stale market prices.
         assertEq(registry.currentWeightBps(9999), 0, "an unknown id is zero, not a revert");

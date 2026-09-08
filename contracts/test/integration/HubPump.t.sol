@@ -112,7 +112,7 @@ contract HubPumpTest is Phase3Fixture {
         uint16[6] memory inside;
         for (uint256 k; k < 6; ++k) {
             forceTick(hubPool, fair + band * int24(uint24(k)) / 5);
-            (,, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6);
+            (,, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6, false);
             assertFalse(refuse, "nothing inside the band is refused");
             inside[k] = dynBps;
         }
@@ -131,7 +131,7 @@ contract HubPumpTest is Phase3Fixture {
         uint16 cap = hook.poolState(hubPool).dynCapBps;
         for (int24 dev = band; dev <= rail; dev += 200) {
             forceTick(hubPool, fair + dev);
-            (uint24 pips, uint16 baseBps, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6);
+            (uint24 pips, uint16 baseBps, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6, false);
             assertFalse(refuse, "nothing inside the rail is refused");
             assertGe(dynBps, previous, "the fee never falls as the deviation grows");
             assertLe(dynBps, cap, "and never exceeds the dynamic cap (I16)");
@@ -152,7 +152,7 @@ contract HubPumpTest is Phase3Fixture {
         int24 fair = hook.fairTick(hubPool);
         forceTick(hubPool, fair + 1900);
 
-        (,, uint16 clipped,) = hook.quoteFee(hubPool, false, true, 1e6);
+        (,, uint16 clipped,) = hook.quoteFee(hubPool, false, true, 1e6, false);
         assertEq(clipped, Constants.DYN_CAP_NORMAL_BPS, "at the normal cap the wall is clipped at 300 bp");
 
         _mockGateCap(hubPool, Constants.DYN_CAP_ESCALATION_BPS, fair);
@@ -163,7 +163,7 @@ contract HubPumpTest is Phase3Fixture {
             "the hook cached the escalated cap"
         );
 
-        (,, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6);
+        (,, uint16 dynBps, bool refuse) = hook.quoteFee(hubPool, false, true, 1e6, false);
         assertFalse(refuse, "1,900 ticks is still inside the entry pool's 2,000-tick rail");
         assertGt(dynBps, Constants.DYN_CAP_NORMAL_BPS, "and the wall now shows above the normal cap");
         assertLe(dynBps, Constants.F_WALL_BPS, "bounded by F_WALL_BPS, which is the ramp's own ceiling");
@@ -187,8 +187,8 @@ contract HubPumpTest is Phase3Fixture {
         refreshGateCache(spoke);
         assertGt(hook.fairTick(spoke) - poolTick, rail, "the pool is beyond the rail, below its reference");
 
-        (,,, bool refuseBuy) = hook.quoteFee(spoke, false, true, 1e15);
-        (,,, bool refuseSell) = hook.quoteFee(spoke, true, true, 1e18);
+        (,,, bool refuseBuy) = hook.quoteFee(spoke, false, true, 1e15, false);
+        (,,, bool refuseSell) = hook.quoteFee(spoke, true, true, 1e18, false);
         assertFalse(refuseBuy, "below the reference, a buy is the improving direction and is never refused");
         assertTrue(refuseSell, "and a sell - which would widen the gap - is refused");
 
@@ -197,8 +197,8 @@ contract HubPumpTest is Phase3Fixture {
         refreshGateCache(spoke);
         assertGt(poolTick - hook.fairTick(spoke), rail, "the pool is beyond the rail, above its reference");
 
-        (,,, refuseBuy) = hook.quoteFee(spoke, false, true, 1e15);
-        (,,, refuseSell) = hook.quoteFee(spoke, true, true, 1e18);
+        (,,, refuseBuy) = hook.quoteFee(spoke, false, true, 1e15, false);
+        (,,, refuseSell) = hook.quoteFee(spoke, true, true, 1e18, false);
         assertTrue(refuseBuy, "above the reference the buy is the deviation-increasing direction");
         assertFalse(refuseSell, "and the sell is the one that is always allowed");
         vm.clearMockedCalls();
@@ -238,20 +238,28 @@ contract HubPumpTest is Phase3Fixture {
                 int24 rail = hook.outerRailTicks(ids[i]);
 
                 (uint24 buyPips, uint16 buyBase, uint16 buyDyn, bool refuseBuy) =
-                    hook.quoteFee(ids[i], false, true, 1e15);
+                    hook.quoteFee(ids[i], false, true, 1e15, false);
                 (uint24 sellPips, uint16 sellBase, uint16 sellDyn, bool refuseSell) =
-                    hook.quoteFee(ids[i], true, true, 1e18);
+                    hook.quoteFee(ids[i], true, true, 1e18, false);
 
                 if (dev <= rail) {
                     assertFalse(refuseBuy, "no buy is refused inside the rail");
                     assertFalse(refuseSell, "no sell is refused inside the rail");
                 }
-                // I16: the total is `base + dyn`, `base` is the pool's own buy fee or the sell fee, and neither
-                // side ever exceeds the protocol ceiling.
+                // I16: the total is `base + dyn`, and neither side ever exceeds the protocol ceiling. Revision 6
+                // makes `base` the same on both sides of an ordinary swap — entering the index and leaving it are
+                // one trade seen from two sides — so the pool's own `buyFeeBps` is no longer the buy base at all;
+                // it is the *pass-through* base, and only `AmpsRouter.rotate` is ever quoted at it.
                 assertEq(uint256(buyPips), uint256(buyBase + buyDyn) * Constants.PIPS_PER_BPS, "buy fee decomposes");
                 assertEq(uint256(sellPips), uint256(sellBase + sellDyn) * Constants.PIPS_PER_BPS, "sell decomposes");
-                assertEq(uint256(buyBase), uint256(registry.poolConfig(ids[i]).buyFeeBps), "buy base is the buy fee");
-                assertEq(uint256(sellBase), uint256(hook.sellFeeBps()), "sell base is the sell fee");
+                assertEq(uint256(buyBase), uint256(hook.ampsFeeBps()), "an ordinary buy pays the AMPS fee");
+                assertEq(uint256(sellBase), uint256(hook.ampsFeeBps()), "and so does an ordinary sell");
+                (, uint16 passThroughBase,,) = hook.quoteFee(ids[i], false, true, 1e15, true);
+                assertEq(
+                    uint256(passThroughBase),
+                    uint256(registry.poolConfig(ids[i]).buyFeeBps),
+                    "the pool's buy fee survives as the pass-through base, and nowhere else"
+                );
                 assertLe(uint256(buyBase + buyDyn), uint256(hook.TOTAL_FEE_BPS_MAX()), "and both stay under the cap");
                 assertLe(uint256(sellBase + sellDyn), uint256(hook.TOTAL_FEE_BPS_MAX()), "on both sides");
 

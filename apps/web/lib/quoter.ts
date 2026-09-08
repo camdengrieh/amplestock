@@ -73,10 +73,24 @@ export interface PoolQuote {
   fairTick: number
   innerBandTicks: number
   outerRailTicks: number
+  /** The **pass-through** base fee in bps: what one hop of a protocol-router rotation costs. */
   buyFeeBps: number
-  sellFeeBps: number
+  /** The base fee in bps on **both** directions of this pool for every other caller. */
+  ampsFeeBps: number
+  /** The net-trade total for an ordinary buy, in pips: `ampsFeeBps` plus the clamped dynamic part. */
   buyFeePips: number
+  /** The net-trade total for an ordinary sell, in pips. Same base, the sell direction's dynamic part. */
   sellFeePips: number
+  /**
+   * Hop 1 of an `AmpsRouter.rotate` through this pool, in pips: `buyFeeBps` plus the buy
+   * direction's clamped dynamic part. Unreachable through any other path.
+   */
+  passThroughBuyFeePips: number
+  /**
+   * Hop 2 of an `AmpsRouter.rotate` — an exact-input sell fully covered by the credit hop 1
+   * created: `buyFeeBps` plus the sell direction's clamped dynamic part.
+   */
+  passThroughSellFeePips: number
   dynBps: number
   dynCapBps: number
   refuseSell: boolean

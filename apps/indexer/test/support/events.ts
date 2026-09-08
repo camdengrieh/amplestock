@@ -17,7 +17,7 @@ export const ADDRESSES = {
   PoolRegistry: '0x00000000000000000000000000000000000000a3',
   AmpsHook: '0x00000000000000000000000000000000000038c0',
   AmpsBonds: '0x00000000000000000000000000000000000000a5',
-  AmpsStaking: '0x00000000000000000000000000000000000000a6',
+  AmpsRouter: '0x00000000000000000000000000000000000000a6',
   BountyPot: '0x00000000000000000000000000000000000000a7',
   OracleGate: '0x00000000000000000000000000000000000000a8',
   FeedRegistry: '0x00000000000000000000000000000000000000a9',
@@ -29,6 +29,8 @@ export const POOL_ID = '0x111111111111111111111111111111111111111111111111111111
 export const COUNTER = '0x00000000000000000000000000000000000000c1' as const
 export const TOKEN = '0x00000000000000000000000000000000000000c2' as const
 export const CALLER = '0x00000000000000000000000000000000000000d1' as const
+/** A second vault, for the `setVault` migration handovers. */
+export const NEW_VAULT = '0x00000000000000000000000000000000000000e1' as const
 
 let logIndex = 0
 
@@ -99,6 +101,71 @@ export function makeContext(reads: Record<string, unknown> = {}, db: FakeDb = cr
       Object.entries(ADDRESSES).map(([name, address]) => [name, {address}]),
     ),
   }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Named fixtures
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * The events the audited contracts added, each as a builder that fills in the emitting address and
+ * leaves the block, log index and arguments to the caller. They are named because every one of them
+ * is a *disclosure* — a residue, a forwarded donation, a detached market, a repointed vault — and a
+ * test that has to restate the emitter's address alongside the arguments reads as though the
+ * address were part of the fact.
+ */
+type Overrides = Omit<EventOptions, 'args' | 'address'>
+
+/** `AmpsVault.SweepResidue(token, balance)`: the exit sweep could not absorb an idle balance. */
+export function sweepResidue(
+  args: {token?: `0x${string}`; balance: bigint},
+  overrides: Overrides = {},
+) {
+  return makeEvent({
+    args: {token: args.token ?? TOKEN, balance: args.balance},
+    address: ADDRESSES.AmpsVault,
+    ...overrides,
+  })
+}
+
+/** `AmpsBonds.CollateralForwarded(collateral, amount)`: donated dust pushed on to the vault. */
+export function collateralForwarded(
+  args: {collateral?: `0x${string}`; amount: bigint},
+  overrides: Overrides = {},
+) {
+  return makeEvent({
+    args: {collateral: args.collateral ?? TOKEN, amount: args.amount},
+    address: ADDRESSES.AmpsBonds,
+    ...overrides,
+  })
+}
+
+/** `PoolRegistry.BondMarketDetached(constituentId, marketId)`: the market was gone from `AmpsBonds`. */
+export function bondMarketDetached(
+  args: {constituentId: number; marketId: number},
+  overrides: Overrides = {},
+) {
+  return makeEvent({
+    args: {constituentId: args.constituentId, marketId: args.marketId},
+    address: ADDRESSES.PoolRegistry,
+    ...overrides,
+  })
+}
+
+/** `VaultChanged(previousVault, newVault)`, emitted by `PoolRegistry`, `AmpsHook` and the rest. */
+export function vaultChanged(
+  emitter: keyof typeof ADDRESSES,
+  args: {previousVault?: `0x${string}`; newVault?: `0x${string}`} = {},
+  overrides: Overrides = {},
+) {
+  return makeEvent({
+    args: {
+      previousVault: args.previousVault ?? ADDRESSES.AmpsVault,
+      newVault: args.newVault ?? NEW_VAULT,
+    },
+    address: ADDRESSES[emitter],
+    ...overrides,
+  })
 }
 
 /** `await run('AmpsVault:NavCheckpoint', event, context)` — call a registered handler. */

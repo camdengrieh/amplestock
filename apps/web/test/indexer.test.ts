@@ -85,10 +85,14 @@ describe('IndexerClient', () => {
     expect(ENDPOINTS.ladderFill('0xabc')).toBe('/api/pools/0xabc/ladder')
     expect(ENDPOINTS.bondBoard).toBe('/api/bonds')
     expect(ENDPOINTS.bondPositions('0x1')).toBe('/api/bonds/positions/0x1')
-    expect(ENDPOINTS.stakingStats).toBe('/api/staking')
     expect(ENDPOINTS.flywheel).toBe('/api/flywheel')
     expect(ENDPOINTS.gateStatus).toBe('/api/gate')
     expect(ENDPOINTS.burnHistory).toBe('/api/burns')
+  })
+
+  it('has no staking endpoint — revision 6 removed staking', () => {
+    expect(Object.keys(ENDPOINTS)).not.toContain('stakingStats')
+    expect(JSON.stringify(ENDPOINTS)).not.toMatch(/staking/)
   })
 
   it('covers every panel the plan names for the dApp', () => {
@@ -97,12 +101,53 @@ describe('IndexerClient', () => {
       'navHistory',
       'ladderFill',
       'bondBoard',
-      'stakingStats',
       'flywheel',
       'gateStatus',
       'burnHistory',
+      'creatorFee',
     ] as const) {
       expect(ENDPOINTS[key]).toBeDefined()
     }
+  })
+})
+
+describe('the envelopes the /api layer actually answers', () => {
+  function clientReturning(body: unknown) {
+    return new IndexerClient({
+      baseUrl: 'https://indexer.invalid',
+      fetchImpl: (async () => jsonResponse(body)) as unknown as typeof fetch,
+    })
+  }
+
+  it('unwraps {points} into the rows a panel holds', async () => {
+    const result = await clientReturning({points: [{navPerShareX18: '1'}]}).navHistory()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data).toHaveLength(1)
+  })
+
+  it('unwraps {pools} the same way', async () => {
+    const result = await clientReturning({pools: [{id: '0x01'}]}).pools()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data[0]?.id).toBe('0x01')
+  })
+
+  it('reads an answered-but-empty envelope as empty, never as unavailable', async () => {
+    // "The indexer answered and there is nothing yet" and "the indexer did not answer" are
+    // different states, and only the second one may render the unavailable treatment.
+    const result = await clientReturning({}).navHistory()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data).toEqual([])
+  })
+
+  it('keeps the vault envelope whole, because the summary is only one of its three parts', async () => {
+    const result = await clientReturning({summary: {premiumBps: 12}, shares: null, reconciliation: null}).vaultSummary()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data.summary.premiumBps).toBe(12)
+  })
+
+  it('keeps the burn total beside the rows', async () => {
+    const result = await clientReturning({burns: [], total: '0', count: 0}).burnHistory()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data.count).toBe(0)
   })
 })

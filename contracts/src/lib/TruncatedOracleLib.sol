@@ -161,7 +161,8 @@ library TruncatedOracleLib {
     /// @param index               Index of the most recent **committed** observation.
     /// @param cardinality         Number of populated observations, 0 until `initialize`, capped at MAX_CARDINALITY.
     /// @param highWaterTick       Maximum truncated tick seen since the last `resetHighWater` (drives the buyback
-    ///                            burn).
+    ///                            burn). `resetHighWater` re-arms it at `min(lastTruncatedTick, floorTick)`, so the
+    ///                            mark a window starts from is on the raw clock even when the truncated tick lags.
     /// @param lastTruncatedTick   The truncated tick currently in force, i.e. the head observation's tick: in force
     ///                            from `headTimestamp` onward, which is what makes readings past the head exact.
     /// @param blockAnchorTick     The truncated tick as of the end of the previous written block: the anchor the
@@ -308,12 +309,29 @@ library TruncatedOracleLib {
         if (truncatedTick > s.highWaterTick) s.highWaterTick = truncatedTick;
     }
 
-    /// @notice Resets the per-pool high-water mark to the tick currently in force.
+    /// @notice Resets the per-pool high-water mark to `min(lastTruncatedTick, floorTick)`.
+    ///
     /// @dev    Called by the vault immediately after `compound` has withdrawn and burned the bought-back AMPS, so the
     ///         next compounding measures a fresh excursion. One SLOAD + one SSTORE on the head slot.
-    function resetHighWater(State storage s) internal {
+    ///
+    /// @dev    **Why the floor, and why it is the caller's raw tick.** The mark is compared by the vault against the
+    ///         *raw* tick bounds of the asks it re-lays, but `lastTruncatedTick` moves on the rate-limited clock this
+    ///         library imposes: after a fast downward move it can sit thousands of ticks **above** the pool. Resetting
+    ///         to it alone would leave a mark that already covers the asks the very next placement lays at the fallen
+    ///         price, and the compounding after that would withdraw and burn them as "bought back" - destroying
+    ///         inventory that was never sold. Taking the minimum against the caller's raw pool tick puts the mark back
+    ///         on the raw clock: the excursion the next window measures starts at or below where the pool actually is,
+    ///         so nothing can be counted as bought back before the price has genuinely risen through it. The floor can
+    ///         only ever lower the mark, so it cannot make the burn more aggressive than it was.
+    ///
+    /// @param  s         The pool's oracle state.
+    /// @param  floorTick The pool's raw current tick (`slot0.tick`); the mark is never left above it.
+    /// @return newHighWaterTick The mark now in force, returned so the caller need not read the slot back.
+    function resetHighWater(State storage s, int24 floorTick) internal returns (int24 newHighWaterTick) {
         if (s.cardinality == 0) revert NotInitialized();
-        s.highWaterTick = s.lastTruncatedTick;
+        int24 lastTruncated = s.lastTruncatedTick;
+        newHighWaterTick = floorTick < lastTruncated ? floorTick : lastTruncated;
+        s.highWaterTick = newHighWaterTick;
     }
 
     /// @notice Mean truncated tick over `[time - window, time]`.

@@ -34,10 +34,15 @@ export function poolQuote(overrides: Partial<PoolQuote> = {}): PoolQuote {
     fairTick: 100,
     innerBandTicks: 200,
     outerRailTicks: 2_000,
+    // Revision 6's four fee legs for an entry pool with no dynamic component: an ordinary buy and
+    // an ordinary sell both pay `ampsFeeBps` (500 bp = 50,000 pips), and both hops of a protocol-
+    // router rotation pay the pool's pass-through base (30 bp = 3,000 pips).
     buyFeeBps: 30,
-    sellFeeBps: 500,
-    buyFeePips: 3_000,
+    ampsFeeBps: 500,
+    buyFeePips: 50_000,
     sellFeePips: 50_000,
+    passThroughBuyFeePips: 3_000,
+    passThroughSellFeePips: 3_000,
     dynBps: 0,
     dynCapBps: 300,
     refuseSell: false,

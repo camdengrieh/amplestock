@@ -73,7 +73,8 @@ contract Phase3VaultHandler is CommonBase, StdCheats, StdUtils {
         GHOSTS.close();
     }
 
-    /// @notice Compounds one pool: collect, burn back, split, re-ladder.
+    /// @notice Compounds one pool: collect, pay the creator in both currencies, burn back, burn the AMPS-side
+    ///         remainder and re-place the counter side as bids.
     /// @param poolSeed Chooses the pool.
     function compound(uint256 poolSeed) external {
         GHOSTS.open("compound");
@@ -81,10 +82,18 @@ contract Phase3VaultHandler is CommonBase, StdCheats, StdUtils {
         uint256 navBefore = GHOSTS.navNow();
         uint256 pRefBefore = VAULT.pRefX18();
         uint256 creatorBefore = AMPS.balanceOf(VAULT.creator());
+        uint256 counterBefore = GHOSTS.creatorCounterHolding(poolId);
+        uint256 asksBefore = GHOSTS.askAmountTotal(poolId);
 
         vm.prank(KEEPER);
-        try VAULT.compound(poolId) returns (uint256 ampsFees, uint256) {
-            GHOSTS.noteCompound(ampsFees, AMPS.balanceOf(VAULT.creator()) - creatorBefore);
+        try VAULT.compound(poolId) returns (uint256 ampsFees, uint256 burned) {
+            GHOSTS.noteCompound(
+                ampsFees,
+                burned,
+                AMPS.balanceOf(VAULT.creator()) - creatorBefore,
+                GHOSTS.creatorCounterHolding(poolId) - counterBefore,
+                GHOSTS.askAmountTotal(poolId) > asksBefore
+            );
             GHOSTS.checkNav(navBefore, pRefBefore);
             GHOSTS.noteSuccess();
         } catch {}

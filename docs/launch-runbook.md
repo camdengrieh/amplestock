@@ -81,7 +81,23 @@ options.
 | Ask ladder | 10 doublings, tilt 1.25, cells `m = 0..9` ($1 → $1,024) |
 | Seed bids | 4 halvings, cells `m = -1..-4`, entry pools only |
 | Live cells after both phases | 328 = 32 × 10 asks + 2 × 4 bids |
-| Creator fee | 100 bp of sell volume out of the sell fee, decaying linearly to zero over 30 days. Immutable schedule; only the current `creator` may reassign the address |
+| Creator fee | 100 bp of **trade volume** — buys and sells alike — decaying linearly to zero over 30 days, paid **in kind** out of each currency's fees at `compound()`. Immutable schedule; only the current `creator` may reassign the address |
+
+**The fee parameters at launch (revision 6).** These are not options either, and the first row is the one that
+changed: the AMPS fee is the base on *both* directions of every pool.
+
+| Parameter | Launch value | Hard band | What it prices |
+|---|---|---|---|
+| `ampsFeeBps` | **500 bp** | [100, 600] | Every swap that touches AMPS, buying **and** selling. `AmpsHook.setAmpsFeeBps`, 48 h |
+| `buyFeeBps` (entry pools) | 30 bp | [5, 100] | The **pass-through** price of one hop of an `AmpsRouter.rotate`. Not what a buy pays |
+| `buyFeeBps` (spokes) | 5 bp, 10 bp for high-volatility names | [1, 50] | The same, per spoke |
+| `redeemFeeBps` | **250 bp** | ≤ 500 | Redemption, kept by the vault. `AmpsVault.setRedeemFeeBps`, 48 h |
+| Creator schedule | 100 bp of volume → 0 over 30 d | immutable | `creatorBps(t)/ampsFeeBps` of each currency's fees, in kind |
+| AMPS-side fee remainder | burned in full | — | No parameter: it is the whole remainder after the creator's slice |
+| Counter-side fee remainder | placed as bids in the pool that earned it | — | No parameter, and no cross-pool relay |
+
+There is **no `stakerBps` row, no `burnBps` row and no `rewardStreamSeconds` row**: revision 6 removed staking and
+made the burn a whole share rather than a governed fraction of one, so none of the three exists to set.
 
 Assert after step 10:
 
@@ -137,8 +153,15 @@ roughly a quarter, which is the intended pace: liquidity follows demonstrated vo
 **The team tranche vests itself.** 250 AMPS, OZ `VestingWallet`, 60 days linear, no cliff, no governance path to
 accelerate or claw back. Nothing to operate.
 
-**The creator fee expires by itself.** 100 bp of sell volume out of the sell fee, decaying linearly to zero over
-30 days from genesis. There is no setter, no band and no extension.
+**The creator fee expires by itself.** 100 bp of trade volume — buys and sells alike — decaying linearly to zero
+over 30 days from genesis, and paid in kind out of each currency's fees at `compound()`: AMPS by transfer,
+counter assets best-effort with an ERC-6909-claim fallback so a gated token can never block a compound. There is
+no setter, no band and no extension.
+
+**And nothing else is distributed at all.** After the creator's slice the whole AMPS side of every fee is burned,
+and the counter side stays as bids in the pool that earned it. There is no staking tranche to schedule, no reward
+stream to fund and no re-ladder to operate: the ask inventory is the genesis POL tranche and the rollout is the
+only thing that moves it.
 
 ---
 
@@ -193,8 +216,8 @@ them, so every proposal description states its class and every signer checks it.
 
 | Delay | Actions |
 |---|---|
-| 48 h | `sellFeeBps` [100, 600], buy fees, `redeemFeeBps` ≤ 500, `burnBps` ≤ 2500, `stakerBps` ≤ 5000, `rewardStreamSeconds` [1 h, 7 d], `refUpRateBps` [100, 5000]/h, TWAP window, `maxTickMovePerBlock`, `GRACE`/`GAP_SECONDS`, freshness multipliers, calendar tables, ladder tilt/doublings, rollout, every bond variable and per-market open/close, keeper `tip`/`chost`/caps, `BountyPot` funding |
-| 7 d | constituent add / retire / reinstate / reconfigure, index weights, bond collateral add / remove, and every policy pointer (`LadderPolicy`, `FeePolicy`, `RolloutPolicy`, `BondPolicy`, `OracleGate`, `FeedRegistry`) |
+| 48 h | `ampsFeeBps` [100, 600], the pass-through base fees (`buyFeeBps`, entry [5, 100] / spoke [1, 50]), `redeemFeeBps` ≤ 500, `refUpRateBps` [100, 5000]/h, TWAP window, `maxTickMovePerBlock`, `GRACE`/`GAP_SECONDS`, freshness multipliers, calendar tables, ladder tilt/doublings, rollout, every bond variable and per-market open/close, keeper `tip`/`chost`/caps, `BountyPot` funding |
+| 7 d | constituent add / retire / reinstate / reconfigure, index weights, bond collateral add / remove, every policy pointer (`LadderPolicy`, `FeePolicy`, `RolloutPolicy`, `BondPolicy`, `OracleGate`, `FeedRegistry`), and **`AmpsHook.setRouter`** — the pass-through exemption is a pointer like the others and moves at the same speed |
 | 14 d | standby vault registration (`AmpsVault.setStandbyVault`) |
 | none | guardian freezes and `emergencyMigrate` |
 
@@ -294,7 +317,9 @@ within one block — or a 1-wei self-transfer probe failing for a constituent.
 
 *Assess, immediately.* Is the blocked address the vault, the hook, `AmpsBonds`, or the PoolManager? Only the
 PoolManager is usefully denylistable in normal operation, because `sweepClean` (I12) means the protocol holds no
-stock ERC-20 balance between transactions. If a *protocol* address is blocked, escalate to evacuation.
+movable stock ERC-20 balance between transactions. A blocked vault degrades gracefully in the meantime: the exit
+sweep skips the token and emits `SweepResidue`, and a redemption pays that constituent as an ERC-6909 claim the
+redeemer takes later, so the floor keeps working. If a *protocol* address is blocked, escalate to evacuation.
 
 *Preconditions for evacuation.* The standby vault must already be registered — that is a **14-day** proposal, so
 it is registered at launch and re-registered whenever a new standby is built. `emergencyMigrate` refuses unless
@@ -303,11 +328,15 @@ self-transfer probe failing for at least two constituents. The guardian cannot m
 
 *Act.* Guardian Safe 2/4 calls `AmpsVault.emergencyMigrate(standby)`. In one `unlock` it unwinds every ladder,
 takes the assets as ERC-6909 claims, transfers them PoolManager-internally to the standby, which re-adds at the
-same ticks; `Amps.setVault(new)` and `AmpsBonds.setVault(new)` happen in the same transaction. The placement
+same ticks; `Amps.setVault(new)`, `AmpsBonds.setVault(new)`, `BountyPot.setVault(new)`,
+`PoolRegistry.setVault(new)` and a best-effort `AmpsHook.setVault(new)` — five roles, not six; the sixth handed
+`AmpsStaking` on until revision 6 removed staking — happen in the same transaction
+(`VaultNavLib.handover`), and the idle-ERC-20 leg of the evacuation is best-effort so an idle wei of the blocking
+token cannot veto it. The placement
 bleed cap is relaxed to 50 bp inside migration and only inside migration.
 
-*After.* Verify `Amps.vault()`, `AmpsBonds.vault()`, `AmpsStaking.vault()` and `BountyPot.vault()` all point at
-the standby; verify NAV/share moved by less than 50 bp; re-point the keeper and indexer; register a **new**
+*After.* Verify `Amps.vault()`, `AmpsBonds.vault()`, `BountyPot.vault()`, `PoolRegistry.vault()` and
+`AmpsHook.vault()` all point at the standby; verify NAV/share moved by less than 50 bp; re-point the keeper and indexer; register a **new**
 standby (14 days) so the next evacuation is possible; publish the incident.
 
 *Drill this.* §9 requires a full rehearsal on 46630, including `AmpsBonds.setVault`, before launch.
@@ -439,7 +468,8 @@ Rehearse all of these on 46630 before §1 item 5 can be ticked, and re-rehearse 
 | 6 | Execute a matured proposal from an address with no roles | it succeeds — the executor is open |
 | 7 | Swap a policy pointer (`FeePolicy`) | new fees apply to new swaps only; nothing re-prices retroactively |
 | 8 | Swap `BondPolicy` | only new bonds re-price; existing vesting positions are untouched |
-| 9 | Register a standby vault (14 d), then run the full denylist → `emergencyMigrate` drill | NAV/share moves < 50 bp; all four `setVault` pointers move; a new standby is registered afterwards |
+| 9 | Register a standby vault (14 d), then run the full denylist → `emergencyMigrate` drill | NAV/share moves < 50 bp; all five vault roles move (AMPS, bonds, pot, registry, hook); the standby can `initializePool` and place; a new standby is registered afterwards |
+| 9a | Point `AmpsHook.setRouter` at the zero address (7 d), then back at `AmpsRouter` | while it is zero, a `rotate` still executes but both hops pay `ampsFeeBps` — the exemption is withdrawn, not the route; the dApp's Rotate surface shows the mismatch before a signature is asked for |
 | 10 | Retire a constituent, then reinstate it | I37 holds throughout; vesting claims keep working |
 | 11 | Lose the deployer key **after** `finalize` | nothing is lost: it has no roles |
 | 12 | Lose 2 of 5 proposer signers | the Safe still reaches 3/5 and governance continues |

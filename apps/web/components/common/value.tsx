@@ -11,6 +11,9 @@ export interface ValueProps {
    * When true the value is unavailable and is rendered as a dash with a reason, never as zero.
    * This is the whole point of the component: `AmpsQuoter` zeroes the fields of a read that
    * failed, and a zero rendered as data is something a user can trade on.
+   *
+   * The design draws it the same way — the degraded NVDA pool is an em dash in every column it
+   * appears in, on the landing page, in the holdings table and in the ladder.
    */
   unavailable?: boolean
   reason?: string
@@ -22,7 +25,7 @@ export function Value({children, unavailable, reason, className, title}: ValuePr
   if (unavailable || children === null || children === undefined || children === '') {
     return (
       <span
-        className={cn('text-muted-foreground', className)}
+        className={cn('text-dim', className)}
         title={reason ?? 'Unavailable'}
         data-unavailable="true"
         aria-label={reason ? `Unavailable: ${reason}` : 'Unavailable'}

@@ -35,9 +35,9 @@ export function usePoolQuote(poolId: Hex | undefined) {
 /**
  * The rotation quote, with the credit the caller's own hop 1 will create already applied.
  *
- * The quoter deliberately does not read `IAmpsHook.rotationCredit()`: it is transient storage and
- * always zero from a fresh `eth_call`, so consulting it would make every quote wrong in exactly
- * the direction that matters.
+ * The quoter deliberately does not read `IAmpsHook.rotationCredit(address)`: it is transient storage
+ * keyed by the swap's `sender`, and always zero from a fresh `eth_call`, so consulting it would make
+ * every quote wrong in exactly the direction that matters.
  */
 export function useRotationQuote(params: {hop1?: Hex; hop2?: Hex; amountIn?: bigint}) {
   const quoter = contract('quoter')

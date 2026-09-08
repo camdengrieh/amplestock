@@ -8,18 +8,19 @@ import {MockWeth9, TestnetPools} from "../../script/10_TestnetPools.s.sol";
 import {GenesisPlacement} from "../../script/11_GenesisPlacement.s.sol";
 import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
 import {AmpsHook} from "../../src/hook/AmpsHook.sol";
+import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {IOracleGate} from "../../src/interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../../src/interfaces/IPoolRegistry.sol";
 import {BountyPot} from "../../src/keeper/BountyPot.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {FeedRegistry} from "../../src/oracle/FeedRegistry.sol";
+import {AmpsRouter} from "../../src/periphery/AmpsRouter.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
 import {FeePolicy} from "../../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../../src/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "../../src/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {ConstituentStatus, GateState, PoolClass, PoolConfig} from "../../src/types/Types.sol";
@@ -30,7 +31,6 @@ import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {MockUsdg} from "../mocks/MockUsdg.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
 import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IExtsload} from "@uniswap/v4-core/src/interfaces/IExtsload.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -117,13 +117,13 @@ contract Phase3Scripts is V4TestBase {
     PoolRegistry internal registry;
     FeedRegistry internal feeds;
     AmpsBonds internal bonds;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     LadderPositionValuer internal valuer;
     LadderPolicy internal ladderPolicy;
     RolloutPolicy internal rolloutPolicy;
     FeePolicy internal feePolicy;
     BondPolicy internal bondPolicy;
+    AmpsRouter internal ampsRouter;
     MockMarketReference internal phase2Reference;
     VestingWallet internal teamVesting;
 
@@ -317,8 +317,21 @@ contract Phase3Scripts is V4TestBase {
     // 09_Phase3Wire, in isolation
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice The bootstrap check refuses while step 2 is unfinished: no pools, no hub ring, no gate.
+    /// @notice The bootstrap check refuses while the hook has no router: revision 6's pass-through exemption is
+    ///         a pointer like any other, and an index that opens with it withdrawn charges a rotation two exits.
+    ///         It is checked **before** the pool count, so the fixture reaches it with nothing else done.
+    function test_wire_bootstrapRefusesUntilTheRouterIsNamed() public {
+        assertEq(hook.router(), address(0), "the fixture leaves the exemption withdrawn");
+        Phase3Wire.Targets memory t = _targets(address(0));
+        vm.expectRevert(abi.encodeWithSelector(Phase3Wire.PointerUnset.selector, bytes32("router")));
+        wireScript.checkBootstrap(t, uint16(POOLS));
+    }
+
+    /// @notice The bootstrap check refuses while step 2 is unfinished: no pools, no hub ring, no gate. With the
+    ///         router named, the next thing missing is the pools.
     function test_wire_bootstrapRefusesBeforeThePoolsExist() public {
+        vm.prank(TIMELOCK);
+        hook.setRouter(address(ampsRouter));
         Phase3Wire.Targets memory t = _targets(address(0));
         vm.expectRevert(abi.encodeWithSelector(Phase3Wire.PoolsMissing.selector, uint16(0), uint16(POOLS)));
         wireScript.checkBootstrap(t, uint16(POOLS));
@@ -331,18 +344,25 @@ contract Phase3Scripts is V4TestBase {
         genesisScript.assertGateGreen(address(vault));
     }
 
-    /// @notice The proposal form of the batch: seven timelock calls, in the §9.1 order, with the right selectors.
-    function test_wire_proposalIsSevenCallsInOrder() public view {
+    /// @notice The proposal form of the batch: eight timelock calls, in the §9.1 order, with the right
+    ///         selectors — the router move beside the fee policy, and the gate pointer last.
+    function test_wire_proposalIsEightCallsInOrder() public view {
         Phase3Wire.Call[] memory calls = wireScript.buildCalls(_targets(address(0x9A7E)), address(0x9A7E));
-        assertEq(calls.length, 7, "seven moves");
+        assertEq(calls.length, 8, "eight moves");
         for (uint256 i; i < 4; ++i) {
             assertEq(calls[i].target, address(vault), "the four pointer moves are vault calls");
             assertEq(bytes4(calls[i].data), IAmpsVault.setPolicyPointer.selector, "setPolicyPointer");
         }
         assertEq(calls[4].target, address(hook), "the fee policy move is a hook call");
         assertEq(bytes4(calls[4].data), AmpsHook.setFeePolicy.selector, "setFeePolicy");
-        assertEq(calls[5].target, address(bonds), "the bond policy move is a bonds call");
-        assertEq(calls[6].target, address(vault), "the gate pointer goes last");
+        assertEq(calls[5].target, address(hook), "the router move is a hook call too");
+        assertEq(bytes4(calls[5].data), AmpsHook.setRouter.selector, "setRouter");
+        assertEq(
+            calls[5].data, abi.encodeCall(AmpsHook.setRouter, (address(ampsRouter))), "...naming the deployed router"
+        );
+        assertEq(calls[5].what, "hook.setRouter(AmpsRouter)", "and the proposal says so in words");
+        assertEq(calls[6].target, address(bonds), "the bond policy move is a bonds call");
+        assertEq(calls[7].target, address(vault), "the gate pointer goes last");
 
         bytes memory schedule = wireScript.scheduleBatchCalldata(calls, bytes32("salt"), 7 days);
         assertEq(
@@ -405,6 +425,7 @@ contract Phase3Scripts is V4TestBase {
         assertGe(hook.observationCoverage(registry.hubPoolId()), vault.twapWindow(), "...and fills with time alone");
 
         // ---- Bootstrap step 4: the pointer moves, then the gate. ----------------------------------------------
+        assertEq(hook.router(), address(0), "the exemption is withdrawn until the batch runs");
         address gate = wireScript.execute(_targets(address(0)), true);
 
         assertEq(vault.marketReference(), address(hook), "marketReference -> AmpsHook");
@@ -412,16 +433,27 @@ contract Phase3Scripts is V4TestBase {
         assertEq(vault.ladderPolicy(), address(ladderPolicy), "ladderPolicy");
         assertEq(vault.rolloutPolicy(), address(rolloutPolicy), "rolloutPolicy");
         assertEq(hook.feePolicy(), address(feePolicy), "hook.setFeePolicy");
+        assertEq(hook.router(), address(ampsRouter), "hook.setRouter named the protocol router");
+        assertEq(
+            IAmpsHook(address(hook)).router(),
+            address(ampsRouter),
+            "...and the interface a rotation is priced through agrees"
+        );
         assertEq(bonds.policy(), address(bondPolicy), "bonds.setPolicy");
         assertEq(vault.oracleGate(), gate, "the vault points at the redeployed gate");
         assertEq(IOracleGate(gate).marketReference(), address(hook), "the gate reads the hook's poolState");
         assertEq(feeds.oracleGate(), gate, "FeedRegistry points at the same gate");
         assertTrue(IOracleGate(gate).state(0) == GateState.GREEN, "gate is GREEN before genesis");
 
-        // A second wiring pass moves nothing.
+        // A second wiring pass moves nothing — and, because every move is guarded on the value already in
+        // place, it makes no call at all. An empty log is the strongest form of that: a re-sent `setRouter` or
+        // `setFeePolicy` would be a governance action against a live vault, not a deployment step.
+        vm.recordLogs();
         address gateAgain = wireScript.execute(_targets(gate), false);
+        assertEq(vm.getRecordedLogs().length, 0, "a second wiring pass emits nothing, i.e. it sent nothing");
         assertEq(gateAgain, gate, "re-run keeps the same gate");
         assertEq(vault.oracleGate(), gate, "re-run leaves the pointer alone");
+        assertEq(hook.router(), address(ampsRouter), "re-run leaves the router pointer alone");
 
         // ---- Bootstrap step 5: genesis and the ladders. -------------------------------------------------------
         _fundSeed();
@@ -607,19 +639,21 @@ contract Phase3Scripts is V4TestBase {
         vm.label(address(registry), "PoolRegistry");
     }
 
-    /// @dev Everything the vault points at, plus the three policies and the team's vesting wallet. `OracleGate`
-    ///      is deliberately absent: `09_Phase3Wire` deploys it.
+    /// @dev Everything the vault points at, plus the three policies, the protocol router and the team's vesting
+    ///      wallet. `OracleGate` is deliberately absent: `09_Phase3Wire` deploys it. The router is deployed here
+    ///      but deliberately **not** named on the hook — `09_Phase3Wire` sends `setRouter`, and the fixture
+    ///      leaving `hook.router()` zero is what makes that a real move.
     function _deployPeriphery() private {
         feeds = new FeedRegistry(TIMELOCK, address(0));
         bondPolicy = new BondPolicy();
         bonds = new AmpsBonds(address(vault), address(registry), address(bondPolicy));
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(assets.usdg, address(vault), TIMELOCK);
         valuer =
             new LadderPositionValuer(IExtsload(address(poolManager)), address(vault), IPoolRegistry(address(registry)));
         ladderPolicy = new LadderPolicy();
         rolloutPolicy = new RolloutPolicy();
         feePolicy = new FeePolicy(Constants.K_VOL_X18, Constants.K_DEV_BPS, Constants.F_WALL_BPS, Constants.LAMBDA_X18);
+        ampsRouter = new AmpsRouter(IPoolManager(address(poolManager)), address(amps), address(registry), assets.weth9);
         phase2Reference = new MockMarketReference();
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
     }
@@ -630,7 +664,6 @@ contract Phase3Scripts is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));
         vault.setPolicyPointer(bytes32("marketReference"), address(phase2Reference));
@@ -670,7 +703,8 @@ contract Phase3Scripts is V4TestBase {
             ladderPolicy: address(ladderPolicy),
             rolloutPolicy: address(rolloutPolicy),
             feePolicy: address(feePolicy),
-            bondPolicy: address(bondPolicy)
+            bondPolicy: address(bondPolicy),
+            router: address(ampsRouter)
         });
     }
 

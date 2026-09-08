@@ -160,7 +160,8 @@ contract DeployScripts is Test {
     ///         What it proves, in order:
     ///           1. direct mode with no timelock configured is refused — there would be nothing to broadcast *as*,
     ///              and a `TimelockController` cannot sign its own bootstrap;
-    ///           2. the address book round-trips through `03_Core`, key for key, the newest key included;
+    ///           2. the address book round-trips through `03_Core`, key for key, `core.router` — the newest
+    ///              key, which the apps read — included;
     ///           3. `12_Verify` reads the same book — it has its own reader, because `Core` embeds every
     ///              contract's creation code and deploying one to call a `view` function would drag all of it
     ///              into `12_Verify`'s artefact;
@@ -233,12 +234,18 @@ contract DeployScripts is Test {
         assertEq(fromCore.registry, set.registry, "registry");
         assertEq(fromCore.oracleGate, set.oracleGate, "oracleGate");
         assertEq(fromCore.quoter, set.quoter, "quoter");
+        assertEq(fromCore.router, set.router, "router");
         assertEq(fromCore.usdg, set.usdg, "usdg");
         assertEq(keccak256(abi.encode(fromVerify)), keccak256(abi.encode(fromCore)), "the two readers agree");
         assertEq(
             vm.parseJsonString(writtenDeployments, ".envOverrides.quoter"),
             "AMPS_QUOTER",
             "the env map survives a write"
+        );
+        assertEq(
+            vm.parseJsonString(writtenDeployments, ".envOverrides.router"),
+            "AMPS_ROUTER",
+            "...the router's entry included"
         );
 
         // ---- 4 ----
@@ -250,17 +257,33 @@ contract DeployScripts is Test {
             "AmpsVault takes amps, poolManager, timelock, guardian"
         );
         assertEq(vm.parseJsonBytes(writtenArgs, ".contracts[6].args").length, 0, "BondPolicy takes nothing");
+        assertEq(vm.parseJsonString(writtenArgs, ".contracts[13].name"), "AmpsRouter", "the router is recorded last");
+        assertEq(
+            vm.parseJsonBytes(writtenArgs, ".contracts[13].args"),
+            abi.encode(set.poolManager, set.amps, set.registry, set.weth9),
+            "AmpsRouter takes poolManager, amps, registry, weth9"
+        );
 
         // ---- 5 ----
         bool sawQuoter;
         bool sawVault;
+        bool sawRouter;
         for (uint256 i; i < targets.length; ++i) {
             if (keccak256(bytes(targets[i].name)) == keccak256("AmpsQuoter")) sawQuoter = true;
             if (keccak256(bytes(targets[i].name)) == keccak256("AmpsVault")) sawVault = true;
+            if (keccak256(bytes(targets[i].name)) == keccak256("AmpsRouter")) {
+                sawRouter = true;
+                assertEq(
+                    targets[i].args,
+                    abi.encode(set.poolManager, set.amps, set.registry, set.weth9),
+                    "the router's verification args are re-encoded from the same book"
+                );
+            }
             assertTrue(targets[i].deployed != address(0), "no target carries a zero address");
         }
         assertFalse(sawQuoter, "the undeployed quoter is skipped");
         assertTrue(sawVault, "the vault is emitted");
+        assertTrue(sawRouter, "and so is the router");
         assertTrue(_contains(script, "#!/usr/bin/env bash"), "verify.sh is a shell script");
         assertTrue(_contains(script, "set -euo pipefail"), "...that stops on the first failure");
         assertTrue(
@@ -404,7 +427,6 @@ contract DeployScripts is Test {
             registry: address(0x5E915),
             hook: address(0x38C0),
             bonds: address(0xB011D5),
-            staking: address(0x57A417),
             bountyPot: address(0xB0117),
             feedRegistry: address(0xFEED),
             oracleGate: address(0x6A7E),
@@ -414,6 +436,7 @@ contract DeployScripts is Test {
             feePolicy: address(0xFEE),
             bondPolicy: address(0xB0D),
             quoter: address(0x9407E5),
+            router: address(0x120A7E2),
             weth9: address(0x9E7),
             usdg: address(0x05D9)
         });

@@ -24,11 +24,16 @@ import {IMarketReference} from "./IMarketReference.sol";
 ///        - the live same-transaction rotation credit, for the quoter;
 ///        - per-pool configuration, so the quoter can reproduce a fee without simulating a swap.
 ///
+/// @dev **The fee model, revision 6.** {ampsFeeBps} is the base fee on **both** directions of every pool: a buy
+///      of AMPS and a sell of AMPS both pay it. {buyFeeBps} is the **pass-through** base — the price of one hop
+///      of a rotation — and is charged only on a hop where `sender == router()` and `hookData` is exactly
+///      `Constants.ROUTER_ROTATE`. The dynamic components and the rail refusal are unchanged and sit on top.
+///
 /// @dev **The rotation credit lives in EIP-1153 transient storage**, so it is zero at the start of every
-///      transaction and cannot be carried across one (I26). It is credited in `afterSwap` by the AMPS a buyer
-///      actually received, and consumed in `beforeSwap` by an exact-input sell, blended and rounded **up**. A 1-wei
-///      buy therefore unlocks a 1-wei credit and nothing more; a buy-then-sell round trip inside one transaction
-///      pays a buy fee plus a sell fee on the uncredited excess and nets the swapper nothing.
+///      transaction and cannot be carried across one (I26). It is credited in `afterSwap` by the AMPS a
+///      pass-through buy actually received, and consumed in `beforeSwap` by a pass-through exact-input sell,
+///      blended and rounded **up**. Only {router} can earn or spend one: every other hop pays {ampsFeeBps} and
+///      leaves the slot alone, so a manufactured credit is not a thing that exists to be gamed.
 interface IAmpsHook is IMarketReference {
     /// @notice Emitted by `afterSwap` when a pool's high-water tick advances.
     /// @param poolId The pool.
@@ -38,7 +43,8 @@ interface IAmpsHook is IMarketReference {
     /// @notice Emitted when the vault resets a pool's high-water mark at `compound()`.
     /// @param poolId The pool.
     /// @param previousHighWaterTick The mark that was consumed.
-    /// @param newHighWaterTick The mark it was reset to (the tick currently in force).
+    /// @param newHighWaterTick The mark it was reset to: `min(lastTruncatedTick, lastRawTick)`, so it is never
+    ///        left above where the pool actually is. See {resetHighWater}.
     event HighWaterReset(PoolId indexed poolId, int24 previousHighWaterTick, int24 newHighWaterTick);
 
     /// @notice Emitted when a surge fee is armed.
@@ -96,7 +102,7 @@ interface IAmpsHook is IMarketReference {
 
     /// @notice Emitted by every governed hook setter, so the indexer and the governance drill can follow a
     ///         parameter without decoding calldata. Mirrors `IAmpsVault.VaultParameterChanged`.
-    /// @param parameter The parameter name as a short string, e.g. `bytes32("sellFeeBps")`.
+    /// @param parameter The parameter name as a short string, e.g. `bytes32("ampsFeeBps")`.
     /// @param poolId The pool the change applies to, or `bytes32(0)` for a protocol-wide parameter.
     /// @param previousValue The value before.
     /// @param newValue The value after.
@@ -108,6 +114,16 @@ interface IAmpsHook is IMarketReference {
     /// @param previousPolicy The policy replaced.
     /// @param newPolicy The policy installed.
     event FeePolicyChanged(address indexed previousPolicy, address indexed newPolicy);
+
+    /// @notice Emitted when the pass-through router pointer moves. **48 h timelock.**
+    /// @param previousRouter The router that loses the pass-through exemption.
+    /// @param newRouter The router that gains it; `address(0)` turns the exemption off entirely.
+    event RouterChanged(address indexed previousRouter, address indexed newRouter);
+
+    /// @notice Emitted when the hook is handed from one vault to another by {setVault}.
+    /// @param previousVault The vault that gave the hook up.
+    /// @param newVault The vault that now holds every vault-only entry point.
+    event VaultChanged(address indexed previousVault, address indexed newVault);
 
     /// @notice `currency0` of the pool being initialised is not AMPS. Hard requirement: it fixes the sign of every
     ///         fee direction and every one-sided placement in the protocol.
@@ -148,12 +164,22 @@ interface IAmpsHook is IMarketReference {
     function amps() external view returns (address ampsAddress);
 
     /// @notice The vault: the only address allowed to initialise a pool, add liquidity or reset a high-water mark.
+    /// @dev Storage rather than an immutable, so `AmpsVault.emergencyMigrate` can hand the hook to the standby
+    ///      vault; see {setVault}.
     /// @return vaultAddress The vault address.
     function vault() external view returns (address vaultAddress);
 
     /// @notice The pool registry.
     /// @return registryAddress The registry address.
     function registry() external view returns (address registryAddress);
+
+    /// @notice The protocol router: the only `sender` whose swaps can ever be pass-through, and then only on a
+    ///         hop carrying `Constants.ROUTER_ROTATE` as its `hookData`.
+    /// @dev Governed storage, replaceable by the timelock, `address(0)` at deployment and a legal setting
+    ///      thereafter (meaning "no router; every hop pays `ampsFeeBps`"). The hook never calls this address —
+    ///      it is a permission, not a pointer — so naming a contract here can move no value and block no swap.
+    /// @return routerAddress The router address.
+    function router() external view returns (address routerAddress);
 
     /// @notice The oracle gate.
     /// @return gateAddress The gate address.
@@ -163,7 +189,7 @@ interface IAmpsHook is IMarketReference {
     /// @return policyAddress The `IFeePolicy` address.
     function feePolicy() external view returns (address policyAddress);
 
-    /// @notice The governance timelock: the only caller of {setSellFeeBps}, {setBuyFeeBps},
+    /// @notice The governance timelock: the only caller of {setAmpsFeeBps}, {setBuyFeeBps},
     ///         {setMaxTickMovePerBlock} and {setFeePolicy}.
     /// @return timelockAddress The timelock address.
     function timelock() external view returns (address timelockAddress);
@@ -188,23 +214,56 @@ interface IAmpsHook is IMarketReference {
     /// @return state The state, excluding the observation ring (read that through {IMarketReference}).
     function poolState(PoolId poolId) external view returns (HookPoolState memory state);
 
-    /// @notice The live same-transaction rotation credit, in AMPS wei.
+    /// @notice The live same-transaction rotation credit one account holds, in AMPS wei.
     /// @dev Reads EIP-1153 transient storage, so it is always zero when read from a fresh transaction — which is
     ///      exactly what makes it useless to an off-chain observer and safe to expose.
+    /// @dev **The credit is per `sender`, not per transaction.** It is credited to, and spendable only by, the
+    ///      account the PoolManager reports as the swap's `sender` — the router or settlement contract that
+    ///      unlocked it. One transaction-global credit would pool the credits of every settlement path in a
+    ///      transaction: two independent routers in one multicall, or two bundle-mates sharing a builder's
+    ///      transaction, would discount each other's sells, and a credit earned in the deep hub would discount a
+    ///      sell into a thin spoke. The `sender` key bounds a credit to the path that earned it.
+    ///
+    /// @dev **Only {router} can ever hold one.** A buy earns a credit only when it is the protocol router's
+    ///      rotation hop — `sender == router()` and `hookData == Constants.ROUTER_ROTATE` — and a sell spends one
+    ///      only under the same condition. Every other swap in the system, from any sender and through any
+    ///      router, pays `ampsFeeBps` in both directions and neither earns nor spends. This view therefore reads
+    ///      zero for every address but the router, and reads zero for the router too outside the one transaction
+    ///      in which its `rotate` is running.
+    /// @param sender The account whose credit to read; in practice, {router}.
     /// @return credit The credit.
-    function rotationCredit() external view returns (uint256 credit);
+    function rotationCredit(address sender) external view returns (uint256 credit);
 
     /// @notice The fee the hook would charge for a swap right now, without simulating one.
     /// @dev The quoter's entry point. Never reverts: a swap that would be refused returns `refuse == true`.
+    ///
+    /// @dev **`passThrough` is the whole fee model in one flag.** `false` prices an ordinary swap by anybody at
+    ///      all — base `ampsFeeBps`, in both directions, on every pool. `true` prices the protocol router's
+    ///      rotation hop: base `buyFeeBps` on a buy; base `buyFeeBps` on an exact-input sell, because the credit
+    ///      a `rotate` carries into hop 2 is by construction exactly the AMPS hop 1 returned; and base
+    ///      `ampsFeeBps` on an exact-output sell, which consumes no credit and which the router never builds.
+    ///      Nothing else can obtain the `true` pricing: see {router}.
+    ///
+    /// @dev Reads no transient storage. A credit belongs to the swap's `sender`, which an `eth_call` is not, so
+    ///      the pass-through case is *modelled* rather than looked up. A partially covered sell — one larger than
+    ///      the rotation that funds it — is priced by `AmpsQuoter.quoteSellWithCredit`.
+    ///
+    /// @dev **There is exactly one fee entry point, and `passThrough` is not optional.** An earlier revision
+    ///      carried a four-argument alias that meant `passThrough == false`; it was removed because an alias for
+    ///      the honest case is an invitation to quote the dishonest one by accident, and because an overloaded
+    ///      `quoteFee` makes `IAmpsHook.quoteFee.selector` ambiguous, which forced every off-chain and on-chain
+    ///      caller to hand-spell the signature. An ordinary swap — which is every swap that is not the protocol
+    ///      router's rotation hop — passes `false`.
     /// @param poolId The pool.
     /// @param zeroForOne True for a sell (AMPS in).
     /// @param exactInput True for an exact-input swap.
     /// @param amountIn The input amount, or 0 when unknown.
+    /// @param passThrough Whether to price the swap as one leg of a protocol-router rotation.
     /// @return feePips The fee in pips, without the override flag.
-    /// @return baseBps The base component after any rotation blend.
+    /// @return baseBps The base component: `ampsFeeBps`, `buyFeeBps`, or the blend between them.
     /// @return dynBps The dynamic component after clamping.
     /// @return refuse Whether the swap would be refused for being deviation-increasing beyond the outer rail.
-    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
+    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn, bool passThrough)
         external
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse);
@@ -231,11 +290,20 @@ interface IAmpsHook is IMarketReference {
     // Governed parameters
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The protocol-wide sell fee charged on every AMPS-in swap in all 32 pools. 500 bp at launch.
+    /// @notice The protocol-wide AMPS fee: the base fee on **both** directions of all 32 pools. 500 bp at launch.
+    /// @dev Revision 6. It is not a sell fee: a buy of AMPS pays it too, because entering the index and leaving it
+    ///      are the same trade seen from two sides, and a fee charged on one side alone is a fee a round trip
+    ///      halves. What the base fee is *not* charged on is a rotation — moving between two constituents through
+    ///      AMPS — which is the pass-through case {buyFeeBps} prices.
     /// @return value The parameter.
-    function sellFeeBps() external view returns (uint16 value);
+    function ampsFeeBps() external view returns (uint16 value);
 
-    /// @notice A pool's base buy fee.
+    /// @notice A pool's **pass-through** base fee: what one hop of a protocol-router rotation costs.
+    /// @dev Revision 6. This is no longer the fee an ordinary buy pays — an ordinary buy pays {ampsFeeBps}, like
+    ///      every other hop. It is charged only on a hop where `sender == router()` and the hop carries
+    ///      `Constants.ROUTER_ROTATE`, i.e. on the two hops of `AmpsRouter.rotate`, and it is the price of moving
+    ///      through the index rather than into or out of it. Bands are unchanged: [5, 100] bp entry, [1, 50] bp
+    ///      spoke.
     /// @param poolId The pool.
     /// @return value The parameter. 30 bp entry, 5 or 10 bp spoke.
     function buyFeeBps(PoolId poolId) external view returns (uint16 value);
@@ -244,13 +312,13 @@ interface IAmpsHook is IMarketReference {
     // Hard bands
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Hard floor of `sellFeeBps`, in bps. 100.
+    /// @notice Hard floor of `ampsFeeBps`, in bps. 100.
     /// @return value The bound.
-    function SELL_FEE_BPS_MIN() external view returns (uint16 value);
+    function AMPS_FEE_BPS_MIN() external view returns (uint16 value);
 
-    /// @notice Hard ceiling of `sellFeeBps`, in bps. 600.
+    /// @notice Hard ceiling of `ampsFeeBps`, in bps. 600.
     /// @return value The bound.
-    function SELL_FEE_BPS_MAX() external view returns (uint16 value);
+    function AMPS_FEE_BPS_MAX() external view returns (uint16 value);
 
     /// @notice The largest total fee the hook can ever return, in bps. 2,600, far below `MAX_LP_FEE` (I16).
     /// @return value The bound.
@@ -269,6 +337,11 @@ interface IAmpsHook is IMarketReference {
     /// @dev Called by `compound()` after the buyback burn has consumed the previous window. Vault-only because the
     ///      mark is what decides which AMPS is bought-back inventory: anyone able to reset it could hide a buyback
     ///      from the burn.
+    /// @dev The mark is re-armed at `min(lastTruncatedTick, lastRawTick)` and not at the truncated tick alone:
+    ///      the truncated tick is rate-limited and can sit thousands of ticks above the pool after a fast fall,
+    ///      and a mark left up there would cover the asks the same `compound` re-lays at the fallen price — which
+    ///      the next `compound` would then burn as inventory that was never sold. Flooring it can only lower the
+    ///      mark, so it never widens what the burn takes.
     /// @param poolId The pool.
     /// @return previousHighWaterTick The mark that was consumed.
     function resetHighWater(PoolId poolId) external returns (int24 previousHighWaterTick);
@@ -281,8 +354,8 @@ interface IAmpsHook is IMarketReference {
     function armSurge(PoolId poolId, uint16 surgeBps, bytes32 reason) external;
 
     /// @notice Sets the protocol-wide sell fee. **Only timelock (48 h).**
-    /// @param value The new fee, inside `[SELL_FEE_BPS_MIN, SELL_FEE_BPS_MAX]`.
-    function setSellFeeBps(uint16 value) external;
+    /// @param value The new fee, inside `[AMPS_FEE_BPS_MIN, AMPS_FEE_BPS_MAX]`.
+    function setAmpsFeeBps(uint16 value) external;
 
     /// @notice Sets a pool's buy fee. **Only timelock (48 h).**
     /// @param poolId The pool.
@@ -298,4 +371,19 @@ interface IAmpsHook is IMarketReference {
     /// @notice Replaces the fee policy pointer. **Only timelock (7 d).**
     /// @param newPolicy The new `IFeePolicy`.
     function setFeePolicy(address newPolicy) external;
+
+    /// @notice Names the protocol router, the only `sender` that can hold the pass-through exemption. **Only
+    ///         timelock (48 h).** Replaceable, and `address(0)` is legal: it withdraws the exemption entirely.
+    /// @dev The address is never called by the hook, so there is no code check and no zero check. Emits
+    ///      {RouterChanged}.
+    /// @param newRouter The new router, or `address(0)` for none.
+    function setRouter(address newRouter) external;
+
+    /// @notice Hands the hook to a new vault. **Only the current vault.**
+    /// @dev The migration leg of {vault}. `AmpsVault.emergencyMigrate` calls this best-effort while moving the
+    ///      protocol to its standby vault; without it the standby could never `initializePool`, add liquidity or
+    ///      {armSurge}, because every one of those checks is against {vault}. Reverts on the zero address, and
+    ///      emits {VaultChanged}.
+    /// @param newVault The vault that takes over every vault-only entry point.
+    function setVault(address newVault) external;
 }

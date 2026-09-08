@@ -53,7 +53,7 @@ contract AlwaysReverts {
 ///      extra exemptions are asserted below to refuse for their own reason in every gate state.
 contract GuardSymmetryTest is AmpsVaultFixture {
     /// @dev Every external state-changing selector on `AmpsVault`. Update the count deliberately, never silently.
-    uint256 internal constant EXPECTED_MUTATING_COUNT = 27;
+    uint256 internal constant EXPECTED_MUTATING_COUNT = 25;
 
     // -------------------------------------------------------------------------------------------------------------
     // The `AmpsBonds` half of step 1
@@ -153,7 +153,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         }
         assertEq(exempt, 3, "redeemProRata, emergencyMigrate and unlockCallback, and nothing else");
         assertEq(bondsGated, 2, "depositBonded and mintVesting, and nothing else");
-        assertEq(entries.length - exempt - bondsGated, 22, "the rest take the management policy");
+        assertEq(entries.length - exempt - bondsGated, 20, "the rest take the management policy");
     }
 
     /// @notice The `AmpsBonds` classification is complete, disjoint and the size the ABI says it should be.
@@ -529,8 +529,6 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             Guard.MANAGEMENT
         );
         _add("setRedeemFeeBps", abi.encodeCall(IAmpsVault.setRedeemFeeBps, (50)), TIMELOCK, Guard.MANAGEMENT);
-        _add("setBurnBps", abi.encodeCall(IAmpsVault.setBurnBps, (50)), TIMELOCK, Guard.MANAGEMENT);
-        _add("setStakerBps", abi.encodeCall(IAmpsVault.setStakerBps, (50)), TIMELOCK, Guard.MANAGEMENT);
         _add("setRefUpRateBps", abi.encodeCall(IAmpsVault.setRefUpRateBps, (500)), TIMELOCK, Guard.MANAGEMENT);
         _add("setRefDivergenceBps", abi.encodeCall(IAmpsVault.setRefDivergenceBps, (500)), TIMELOCK, Guard.MANAGEMENT);
         _add("setTwapWindow", abi.encodeCall(IAmpsVault.setTwapWindow, (900)), TIMELOCK, Guard.MANAGEMENT);

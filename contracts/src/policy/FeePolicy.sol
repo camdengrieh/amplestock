@@ -8,19 +8,26 @@ import {GateState, PoolClass, Session} from "../types/Types.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 
 /// @title FeePolicy
-/// @notice The launch dynamic-fee law (`directional-wall-v1`): a directional base fee blended by the
-///         same-transaction rotation credit, plus a dynamic part built from realised volatility, deviation from
-///         fair, the dividend-capture toll, the session add-on and the placement surge. Pure in substance,
-///         stateless, holding no funds, and pointer-upgradeable behind the 7-day timelock, which is how the four
-///         Phase 0 coefficients get recalibrated without new `AmpsHook` bytecode.
+/// @notice The launch dynamic-fee law (`directional-wall-v1`): the ordinary-swap base fee, plus a dynamic part
+///         built from realised volatility, deviation from fair, the dividend-capture toll, the session add-on and
+///         the placement surge. Pure in substance, stateless, holding no funds, and pointer-upgradeable behind the
+///         7-day timelock, which is how the four Phase 0 coefficients get recalibrated without new `AmpsHook`
+///         bytecode.
 ///
-/// @dev **The law**, exactly `docs/phase3-state-model.md` §1.4 steps 3-7:
+/// @dev **Only `dynBps` is this contract's to decide, and revision 6 is why that matters.** `AmpsHook` reads word
+///      2 of the returned `FeeQuote` and nothing else: it computes the base fee, the rotation credit and the rail
+///      itself. The base fee now depends on whether the swap is one hop of an `AmpsRouter.rotate` — the hook's
+///      `passThrough` flag, which is derived from the PoolManager's `sender` and the hop's `hookData` — and
+///      **neither of those is in `FeeInput`**, so this contract cannot see it and must not pretend to. What it
+///      reports as `baseBps`/`feePips` is therefore the honest quote for an **ordinary swap**: `ampsFeeBps` in
+///      both directions, no pass-through base and no rotation blend. The pass-through base and the credit blend
+///      are applied by the hook, on top of the `dynBps` this returns; `AmpsHook.quoteFee(..., passThrough)` and
+///      `AmpsQuoter` are where a router hop is priced.
+///
+/// @dev **The law**, `docs/phase3-state-model.md` §1.4 steps 3-7 with step 3 as the hook now applies it:
 ///
 ///      ```
-///      base = zeroForOne ? sellFeeBps : buyFeeBps
-///      if (zeroForOne && exactInput && amountIn != 0):                       // the rotation blend
-///          c    = min(amountIn, rotationCredit)
-///          base = buyFeeBps + ceilDiv((sellFeeBps - buyFeeBps) * (amountIn - c), amountIn)
+///      base      = ampsFeeBps                                                 // both directions; see above
 ///      f_vol     = min(K_VOL_X18 * varianceX18 / 1e36, F_VOL_CAP_BPS)
 ///      f_dev     = 0                                                          price-improving swaps
 ///                = K_DEV_BPS * dev^2 / BPS                                    dev <= innerBand
@@ -33,9 +40,10 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 ///      fee       = clamp(base + dyn, F_MIN_BPS, TOTAL_FEE_BPS_MAX)
 ///      ```
 ///
-///      The blend rounds **up**, so a rotation credit never rounds a fee down in the swapper's favour, and
-///      `creditConsumed` comes back so the hook decrements its transient slot by exactly the amount that was
-///      credited (I26). Exact-output sells consume no credit and pay `sellFeeBps` in full.
+///      `creditConsumed` is always zero here: a credit belongs to one `sender` inside one transaction and is
+///      spendable only on a router hop, so a stateless policy that is handed neither the sender nor the hop's
+///      `hookData` has no honest way to say any of it was consumed. The hook owns the transient slot and
+///      decrements it by what it actually blended (I26).
 ///
 /// @dev **A wall, not a clamp, and never a gate.** Only a *deviation-increasing* swap that starts beyond the outer
 ///      rail comes back with `refuse == true`, and even that is returned rather than thrown so `AmpsQuoter` can
@@ -136,8 +144,10 @@ contract FeePolicy is IFeePolicy {
     ///      decomposition is exact rather than nominal: both the `F_MIN_BPS` floor and the `TOTAL_FEE_BPS_MAX`
     ///      ceiling adjust `dynBps` rather than `baseBps` wherever they can.
     function quoteFee(FeeInput calldata input) external view returns (FeeQuote memory quote) {
-        (uint256 base, uint256 credit) = _baseBps(input);
-        quote.creditConsumed = credit;
+        // Step 3, for an ordinary swap: `ampsFeeBps` on both directions. The pass-through base and the rotation
+        // blend are the hook's, because `passThrough` is a fact about the swap's `sender` and `hookData` and
+        // `FeeInput` carries neither. `creditConsumed` stays zero for the same reason.
+        uint256 base = uint256(input.ampsFeeBps);
 
         (uint256 fDev, bool beyondRail) = _deviationBps(input);
         quote.refuse = beyondRail;
@@ -298,29 +308,6 @@ contract FeePolicy is IFeePolicy {
     // -------------------------------------------------------------------------------------------------------------
     // Internals
     // -------------------------------------------------------------------------------------------------------------
-
-    /// @dev The base fee and the rotation credit it consumed. Buys and exact-output sells are one branch each; an
-    ///      exact-input sell blends its credited part at the buy fee and its uncredited part at the sell fee.
-    ///
-    ///      The blend is written as a delta rather than as `ceilDiv(buy*c + sell*(in-c), in)` because the naive
-    ///      form overflows for `amountIn > 2**256 / 600`; both delta forms carry the 512-bit intermediate through
-    ///      `FullMath` and neither can underflow, because the branch is chosen on the sign of `sell - buy`. In
-    ///      production `sellFeeBps >= buyFeeBps` always (bands `[100, 600]` against `[1, 100]`) and only the first
-    ///      branch is reachable; the second exists so a mis-parameterised hook cannot make this function revert.
-    function _baseBps(IFeePolicy.FeeInput calldata input) private pure returns (uint256 base, uint256 creditConsumed) {
-        if (!input.zeroForOne) return (uint256(input.buyFeeBps), 0);
-
-        base = uint256(input.sellFeeBps);
-        if (!input.exactInput || input.amountIn == 0 || input.rotationCredit == 0) return (base, 0);
-
-        uint256 amountIn = input.amountIn;
-        creditConsumed = input.rotationCredit < amountIn ? input.rotationCredit : amountIn;
-
-        uint256 buy = uint256(input.buyFeeBps);
-        base = buy <= base
-            ? buy + FullMath.mulDivRoundingUp(base - buy, amountIn - creditConsumed, amountIn)
-            : base + FullMath.mulDivRoundingUp(buy - base, creditConsumed, amountIn);
-    }
 
     /// @dev `f_dev` and the rail decision. A price-improving swap pays nothing and is never refused, which is the
     ///      whole of I15's "only deviation-increasing swaps beyond the rail revert".

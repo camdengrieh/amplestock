@@ -9,7 +9,6 @@ import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {FeedRegistry} from "../../src/oracle/FeedRegistry.sol";
 import {OracleGate} from "../../src/oracle/OracleGate.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {FeedConfig, InclusionRecord, PlacementRecord, PoolClass} from "../../src/types/Types.sol";
@@ -38,7 +37,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 /// @title PlacementFixture
 /// @notice A real system on `V4TestBase` for the Phase 3 placement suites: real `Amps`, `AmpsVault` (with all
-///         three linked libraries), `PoolRegistry`, `OracleGate`, `FeedRegistry`, `AmpsStaking`, `BountyPot` and
+///         three linked libraries), `PoolRegistry`, `OracleGate`, `FeedRegistry`, `BountyPot` and
 ///         `LadderPositionValuer`, against **live Uniswap v4 pools** — four of them, so a placement really adds
 ///         liquidity, a swap really consumes it, and a redemption really removes it.
 ///
@@ -107,7 +106,6 @@ abstract contract PlacementFixture is V4TestBase {
     Amps internal amps;
     AmpsVault internal vault;
     PoolRegistry internal registry;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     OracleGate internal gate;
     FeedRegistry internal feeds;
@@ -145,6 +143,11 @@ abstract contract PlacementFixture is V4TestBase {
     function deployPlacementWorld() internal {
         vm.warp(GENESIS_TIME);
         vm.roll(GENESIS_BLOCK);
+
+        // `setStandbyVault` refuses a codeless target (audit fix wave 2, finding 6): the standby receives six
+        // `onlyVault` roles in a guardian call with no timelock behind it, so an EOA there is unrecoverable. One
+        // `STOP` is enough to make the constant a contract for every purpose the migration path exercises.
+        vm.etch(STANDBY, hex"00");
 
         deployV4();
         _deployAssets();
@@ -222,7 +225,6 @@ abstract contract PlacementFixture is V4TestBase {
             new PoolRegistry(address(vault), address(hook), TIMELOCK, address(amps), address(weth), address(usdg));
         feeds = new FeedRegistry(TIMELOCK, address(0));
         gate = new OracleGate(TIMELOCK, GUARDIAN, address(feeds), address(registry), address(hook));
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(address(usdg), address(vault), TIMELOCK);
         valuer =
             new LadderPositionValuer(IExtsload(address(poolManager)), address(vault), IPoolRegistry(address(registry)));
@@ -231,7 +233,6 @@ abstract contract PlacementFixture is V4TestBase {
         rolloutPolicy = new PlacementRolloutPolicyStub();
 
         vm.label(address(registry), "PoolRegistry");
-        vm.label(address(staking), "AmpsStaking");
         vm.label(address(pot), "BountyPot");
         vm.label(address(gate), "OracleGate");
         vm.label(address(valuer), "LadderPositionValuer");
@@ -255,7 +256,6 @@ abstract contract PlacementFixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bondsRole));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(hook));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));

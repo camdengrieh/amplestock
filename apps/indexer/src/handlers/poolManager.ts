@@ -11,7 +11,7 @@
  * Three things happen on a `Swap`:
  *
  * 1. **The fee is decomposed** per `src/lib/fee.ts` — direction from the sign of `amount0`, base
- *    from `sellFeeBps`/`buyFeeBps` or from the `RotationCreditConsumed` the hook emitted earlier in
+ *    from `ampsFeeBps`/`buyFeeBps` or from the `RotationCreditConsumed` the hook emitted earlier in
  *    the same transaction, dynamic as the residual against what v4 actually charged.
  * 2. **The pool's ladder is re-decomposed** at the new price. A v4 position converts in place as
  *    the price crosses it (§3.4), so each cell's split into AMPS-still-there and counter-raised
@@ -24,6 +24,7 @@ import {ponder} from 'ponder:registry'
 import schema from 'ponder:schema'
 
 import {classifyAction} from '../lib/actions'
+import {ZERO_ADDRESS} from '../config/addresses'
 import {GRID_MIN_M, POSITION_SALT, cellIndexOf, doublingIndexOf} from '../lib/constants'
 import {ampsToUsd18, realisedLvrAmps} from '../lib/flywheel'
 import {decodeSwapFee} from '../lib/fee'
@@ -32,8 +33,8 @@ import {amountsForLiquidity, clampInt, priceX18FromSqrt, to18} from '../lib/math
 import {STATE, getState, updateFlywheelDay, updateSummary, type Db} from '../lib/store'
 import {jsonRecord} from '../lib/json'
 
-/** `sellFeeBps` at launch (`Constants.SELL_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
-const SELL_FEE_BPS_DEFAULT = 500
+/** `ampsFeeBps` at launch (`Constants.AMPS_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
+const AMPS_FEE_BPS_DEFAULT = 500
 
 /**
  * Scratch the `Placement` handler consumes. Only the liquidity is carried now: the cell count and
@@ -100,7 +101,7 @@ ponder.on('PoolManager:ModifyLiquidity', async ({event, context}) => {
   })
 
   // `modifyLiquidity(…, 0, …)` is how `compound` realises accrued fees (§3.6 step 3). It is not a
-  // ladder move and must not disturb the cell's `principal` or its placement denominator.
+  // ladder move and must not disturb the cell's committed `amount` or its placement denominator.
   if (delta === 0n) return
   if (event.args.salt !== POSITION_SALT) return
 
@@ -112,28 +113,28 @@ ponder.on('PoolManager:ModifyLiquidity', async ({event, context}) => {
   const liquidity = (existing?.liquidity ?? 0n) + delta
   const gridBase = pool.gridBaseTick
   const m = gridBase === null ? 0 : doublingIndexOf(tickLower, gridBase, pool.tickSpacing)
-  const cellIndex = gridBase === null ? -1 : cellIndexOf(tickLower, gridBase, pool.tickSpacing)
+  const bucketIndex = gridBase === null ? -1 : cellIndexOf(tickLower, gridBase, pool.tickSpacing)
 
   const nowAmounts = amountsForLiquidity(sqrtPrice, tickLower, tickUpper, liquidity)
   const ampsAtPlacement = (existing?.ampsAtPlacement ?? 0n) + addedAmounts.amount0
-  const principal =
-    (existing?.principal ?? 0n) + (addedAmounts.amount0 > 0n ? addedAmounts.amount0 : addedAmounts.amount1)
+  const amount =
+    (existing?.amount ?? 0n) + (addedAmounts.amount0 > 0n ? addedAmounts.amount0 : addedAmounts.amount1)
 
   await context.db
     .insert(schema.ladderCell)
     .values({
       id: key,
       poolId: id,
-      cellIndex,
+      bucketIndex,
       m: gridBase === null ? GRID_MIN_M - 1 : m,
       tickLower,
       tickUpper,
       liquidity,
       above: addedAmounts.amount0 > 0n,
-      principal,
+      amount,
       ampsRemaining: nowAmounts.amount0,
-      counterRaised: nowAmounts.amount1,
-      fillBps: fillBpsOf(ampsAtPlacement, nowAmounts.amount0),
+      proceeds: nowAmounts.amount1,
+      filledBps: filledBpsOf(ampsAtPlacement, nowAmounts.amount0),
       ampsAtPlacement,
       placedAt: event.block.timestamp,
       updatedAt: event.block.timestamp,
@@ -142,11 +143,11 @@ ponder.on('PoolManager:ModifyLiquidity', async ({event, context}) => {
     })
     .onConflictDoUpdate(() => ({
       liquidity,
-      principal,
+      amount,
       ampsRemaining: nowAmounts.amount0,
-      counterRaised: nowAmounts.amount1,
+      proceeds: nowAmounts.amount1,
       ampsAtPlacement,
-      fillBps: fillBpsOf(ampsAtPlacement, nowAmounts.amount0),
+      filledBps: filledBpsOf(ampsAtPlacement, nowAmounts.amount0),
       updatedAt: event.block.timestamp,
       removedAt: liquidity === 0n ? event.block.timestamp : null,
       lastAction: action,
@@ -177,7 +178,7 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
   const pool = await context.db.find(schema.pool, {id})
   if (pool === null) return
 
-  const sellFeeBps = clampInt((await getState(context.db, STATE.sellFeeBps)) ?? BigInt(SELL_FEE_BPS_DEFAULT))
+  const ampsFeeBps = clampInt((await getState(context.db, STATE.ampsFeeBps)) ?? BigInt(AMPS_FEE_BPS_DEFAULT))
   const pRefX18 = (await getState(context.db, STATE.pRefX18)) ?? 0n
 
   const ck = creditKey(event.transaction.hash, event.args.id)
@@ -192,7 +193,7 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
     amount0: event.args.amount0,
     amount1: event.args.amount1,
     feePips: Number(event.args.fee),
-    sellFeeBps,
+    ampsFeeBps,
     buyFeeBps: pool.buyFeeBps,
     credit,
   })
@@ -212,8 +213,9 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
   })
   const lvrUsd18 = ampsToUsd18(lvrAmps, pRefX18)
 
+  const swapId = eventId(event.block.number, event.log.logIndex)
   await context.db.insert(schema.swap).values({
-    id: eventId(event.block.number, event.log.logIndex),
+    id: swapId,
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
     txHash: event.transaction.hash,
@@ -242,6 +244,44 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
     notionalUsd18,
     feeUsd18,
   })
+
+  // A swap the protocol's own router unlocked is the only one that *can* be a rotation hop, and
+  // the hook prices a hop at the pass-through fee on a fact that is nowhere in this log: the rotate
+  // flag lives in `hookData`, and `AmpsRouter.buy` / `.sell` share the router's `sender` while
+  // paying `ampsFeeBps` like everybody else. So the fee is decoded here at the default base and the
+  // row is left for `handlers/router.ts`, which sees `Rotated` later in the same transaction and
+  // knows which two hops it named. Only router swaps are stashed, so the table stays tiny.
+  const router = context.contracts.AmpsRouter.address as `0x${string}`
+  if (router !== ZERO_ADDRESS && event.args.sender.toLowerCase() === router.toLowerCase()) {
+    const hk = creditKey(event.transaction.hash, event.args.id)
+    await context.db
+      .insert(schema.pendingHop)
+      .values({
+        id: hk,
+        swapId,
+        sell: fee.sell,
+        amountIn: fee.amountIn,
+        feeAmount: fee.feeAmount,
+        feeBps: fee.feeBps,
+        baseFeeBps: fee.baseFeeBps,
+        feeUsd18,
+        ampsAmount: fee.ampsAmount,
+        logIndex: event.log.logIndex,
+        blockNumber: event.block.number,
+      })
+      .onConflictDoUpdate(() => ({
+        swapId,
+        sell: fee.sell,
+        amountIn: fee.amountIn,
+        feeAmount: fee.feeAmount,
+        feeBps: fee.feeBps,
+        baseFeeBps: fee.baseFeeBps,
+        feeUsd18,
+        ampsAmount: fee.ampsAmount,
+        logIndex: event.log.logIndex,
+        blockNumber: event.block.number,
+      }))
+  }
 
   await context.db.update(schema.pool, {id}).set((row) => ({
     sqrtPriceX96: event.args.sqrtPriceX96,
@@ -290,10 +330,16 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
       closeTick: Number(event.args.tick),
     }))
 
+  // The fee is always taken in the swap's input currency, so a sell pays in AMPS (the side that is
+  // burned at `compound`) and a buy pays in the counter asset (the side that is re-placed as bids).
+  // The split here is therefore by *currency*, which since revision 6 is the distinction that
+  // matters — both directions pay the same `ampsFeeBps` rate.
   await updateFlywheelDay(context.db, event.block.timestamp, (row) => ({
-    sellFeeAmps: row.sellFeeAmps + fee.feeAmps,
-    sellFeeUsd18: row.sellFeeUsd18 + (fee.sell ? feeUsd18 : 0n),
-    buyFeeUsd18: row.buyFeeUsd18 + (fee.sell ? 0n : feeUsd18),
+    sellVolumeAmps: row.sellVolumeAmps + (fee.sell ? fee.ampsAmount : 0n),
+    buyVolumeAmps: row.buyVolumeAmps + (fee.sell ? 0n : fee.ampsAmount),
+    feeAmps: row.feeAmps + fee.feeAmps,
+    feeAmpsUsd18: row.feeAmpsUsd18 + (fee.sell ? feeUsd18 : 0n),
+    feeCounterUsd18: row.feeCounterUsd18 + (fee.sell ? 0n : feeUsd18),
     realisedLvrUsd18: row.realisedLvrUsd18 + lvrUsd18,
     swapCount: row.swapCount + 1,
   }))
@@ -309,7 +355,7 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
 // Ladder decomposition
 // -------------------------------------------------------------------------------------------------
 
-const fillBpsOf = (atPlacement: bigint, remaining: bigint): number => {
+const filledBpsOf = (atPlacement: bigint, remaining: bigint): number => {
   if (atPlacement <= 0n) return 0
   if (remaining >= atPlacement) return 0
   return clampInt(((atPlacement - remaining) * 10_000n) / atPlacement)
@@ -340,9 +386,9 @@ export async function refreshLadder(db: Db, id: `0x${string}`): Promise<void> {
     const above = amounts.amount0 > 0n
     await db.update(schema.ladderCell, {id: key}).set({
       ampsRemaining: amounts.amount0,
-      counterRaised: amounts.amount1,
+      proceeds: amounts.amount1,
       above,
-      fillBps: fillBpsOf(cell.ampsAtPlacement, amounts.amount0),
+      filledBps: filledBpsOf(cell.ampsAtPlacement, amounts.amount0),
     })
     amps += amounts.amount0
     counter += amounts.amount1
@@ -356,7 +402,7 @@ export async function refreshLadder(db: Db, id: `0x${string}`): Promise<void> {
     counterInLadder: counter,
     askCells: asks,
     bidCells: bids,
-    ladderFillBps: fillBpsOf(placed, amps),
+    ladderFillBps: filledBpsOf(placed, amps),
   })
 }
 

@@ -18,8 +18,6 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 contract VaultLayoutTest is AmpsVaultFixture {
     /// @dev Distinct, in-band values so that every field's bit range is separable in the packed word.
     uint16 internal constant P_REDEEM_FEE = 123;
-    uint16 internal constant P_BURN = 456;
-    uint16 internal constant P_STAKER = 789;
     uint16 internal constant P_REF_UP = 1011;
     uint16 internal constant P_REF_DIV = 1213;
     uint32 internal constant P_TWAP = 1415;
@@ -68,8 +66,6 @@ contract VaultLayoutTest is AmpsVaultFixture {
     function test_slot2_governedParameters() public {
         vm.startPrank(TIMELOCK);
         vault.setRedeemFeeBps(P_REDEEM_FEE);
-        vault.setBurnBps(P_BURN);
-        vault.setStakerBps(P_STAKER);
         vault.setRefUpRateBps(P_REF_UP);
         vault.setRefDivergenceBps(P_REF_DIV);
         vault.setTwapWindow(P_TWAP);
@@ -81,8 +77,7 @@ contract VaultLayoutTest is AmpsVaultFixture {
         uint256 word = uint256(vm.load(address(vault), bytes32(uint256(2))));
 
         assertEq(uint16(word), P_REDEEM_FEE, "redeemFeeBps [0..15]");
-        assertEq(uint16(word >> 16), P_BURN, "burnBps [16..31]");
-        assertEq(uint16(word >> 32), P_STAKER, "stakerBps [32..47]");
+        assertEq(uint32(word >> 16), 0, "[16..47] is reserved: `burnBps`/`stakerBps` went with staking in rev 6");
         assertEq(uint16(word >> 48), P_REF_UP, "refUpRateBps [48..63]");
         assertEq(uint16(word >> 64), P_REF_DIV, "refDivergenceBps [64..79]");
         assertEq(uint32(word >> 80), P_TWAP, "twapWindow [80..111]");
@@ -96,11 +91,10 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(word >> 248, 0, "[248..255] is free");
 
         // The packed word is the full reconstruction, not a lucky set of field reads.
-        uint256 expected = uint256(P_REDEEM_FEE) | (uint256(P_BURN) << 16) | (uint256(P_STAKER) << 32)
-            | (uint256(P_REF_UP) << 48) | (uint256(P_REF_DIV) << 64) | (uint256(P_TWAP) << 80)
-            | (uint256(P_TILT) << 112) | (uint256(P_DOUBLINGS) << 176) | (uint256(P_SEED_HALVINGS) << 184)
-            | (uint256(P_BOND_HALVINGS) << 192) | (uint256(P_SPOKE_SEED) << 200) | (uint256(P_ROLLOUT) << 216)
-            | (uint256(P_ENTRY_FLOOR) << 232);
+        uint256 expected = uint256(P_REDEEM_FEE) | (uint256(P_REF_UP) << 48) | (uint256(P_REF_DIV) << 64)
+            | (uint256(P_TWAP) << 80) | (uint256(P_TILT) << 112) | (uint256(P_DOUBLINGS) << 176)
+            | (uint256(P_SEED_HALVINGS) << 184) | (uint256(P_BOND_HALVINGS) << 192) | (uint256(P_SPOKE_SEED) << 200)
+            | (uint256(P_ROLLOUT) << 216) | (uint256(P_ENTRY_FLOOR) << 232);
         assertEq(word, expected, "slot 2 reconstructed");
     }
 
@@ -127,7 +121,7 @@ contract VaultLayoutTest is AmpsVaultFixture {
 
         assertEq(_addressAt(4), address(registry), "slot 4 registry");
         assertEq(_addressAt(5), BONDS, "slot 5 bonds");
-        assertEq(_addressAt(6), address(stakingRole), "slot 6 staking");
+        assertEq(_addressAt(6), address(0), "slot 6 is reserved: staking was removed in rev 6");
         assertEq(_addressAt(7), address(potRole), "slot 7 bountyPot");
         assertEq(_addressAt(8), address(marketRef), "slot 8 marketReference");
         assertEq(_addressAt(9), address(gate), "slot 9 oracleGate");
@@ -140,7 +134,6 @@ contract VaultLayoutTest is AmpsVaultFixture {
         // Every pointer getter reads the slot the layout gives it.
         assertEq(vault.registry(), _addressAt(4), "registry()");
         assertEq(vault.bonds(), _addressAt(5), "bonds()");
-        assertEq(vault.staking(), _addressAt(6), "staking()");
         assertEq(vault.bountyPot(), _addressAt(7), "bountyPot()");
         assertEq(vault.marketReference(), _addressAt(8), "marketReference()");
         assertEq(vault.oracleGate(), _addressAt(9), "oracleGate()");
@@ -149,6 +142,20 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(vault.ladderPolicy(), _addressAt(12), "ladderPolicy()");
         assertEq(vault.rolloutPolicy(), _addressAt(13), "rolloutPolicy()");
         assertEq(vault.standbyVault(), _addressAt(14), "standbyVault()");
+    }
+
+    /// @notice Slot 6 is reserved and stays reserved: `AmpsStaking` lived there until plan revision 6 removed
+    ///         staking, and `VaultNavLib.setPointer` no longer names a slot that writes it. A standby vault is
+    ///         written against these slot numbers, so the slot is left empty rather than reused.
+    function test_slot6_stakingSlotIsReservedAndUnwritable() public {
+        assertEq(_addressAt(6), address(0), "slot 6 starts and stays zero");
+
+        // There is no pointer name that reaches it any more.
+        vm.prank(TIMELOCK);
+        vm.expectRevert(abi.encodeWithSelector(IAmpsVault.UnknownPointerSlot.selector, bytes32("staking")));
+        vault.setPolicyPointer(bytes32("staking"), address(bondsRole));
+
+        assertEq(_addressAt(6), address(0), "and nothing wrote it");
     }
 
     /// @notice Slot 15: `uint128 rolloutMoved24h [0..127] | uint32 rolloutWindowStart [128..159]`. **Phase 3.**
@@ -205,7 +212,7 @@ contract VaultLayoutTest is AmpsVaultFixture {
     /// @dev The revert carries **no return data**: Solidity's generated getter for a dynamic array bounds-checks
     ///      with a bare `revert()`, not with `Panic(0x32)` the way an in-contract `arr[i]` would. A consumer must
     ///      therefore call {IAmpsVault-ladderLength} first rather than probing for a decodable error.
-    function test_slot18_ladderAtIsBoundsChecked() public {
+    function test_slot18_ladderAtIsBoundsChecked() public view {
         (bool ok, bytes memory returndata) =
             address(vault).staticcall(abi.encodeCall(IAmpsVault.ladderAt, (spokePool, 0)));
         assertFalse(ok, "reading past the end reverts");
@@ -233,6 +240,22 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(uint256(vm.load(address(vault), bytes32(uint256(20)))), 4242e18, "and the setter writes slot 20");
     }
 
+    /// @notice Slot 21 [0..7]: `bool navUnconfirmed`. **Audit fix wave 2, finding 4.**
+    /// @dev Appended for the same reason slot 20 was, and it is the *whole* slot: a checkpoint that priced any
+    ///      asset off a `!fresh` or `unconfirmed` answer understates `A`, and `A` is what `navPerShareX18` — the
+    ///      denominator of the bond floor — is built from. `AmpsBonds` reads it back through
+    ///      `IAmpsVault.navUnconfirmed()`, so the slot is part of the layout a standby vault must reproduce.
+    function test_slot21_navUnconfirmedIsAppendedAfterTheDocumentedLayout() public {
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 0, "genesis checkpointed on live answers");
+        assertFalse(vault.navUnconfirmed(), "and the getter agrees");
+
+        feeds.setUnconfirmed(address(weth), true);
+        vault.checkpoint();
+
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 1, "the flag sits alone in slot 21");
+        assertTrue(vault.navUnconfirmed(), "and the getter reads it");
+    }
+
     /// @notice The immutables carry no slot at all: they live in the bytecode, as section 1.1 says.
     function test_immutablesOccupyNoSlot() public view {
         assertEq(vault.amps(), address(amps), "amps");
@@ -240,9 +263,9 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(vault.timelock(), TIMELOCK, "timelock");
         assertEq(vault.guardian(), GUARDIAN, "guardian");
 
-        // Slots 21 and beyond are unused: the layout ends at 20.
-        for (uint256 slot = 21; slot < 26; ++slot) {
-            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 20");
+        // Slots 22 and beyond are unused: the documented layout ends at 20 and slot 21 is the one append since.
+        for (uint256 slot = 22; slot < 26; ++slot) {
+            assertEq(uint256(vm.load(address(vault), bytes32(slot))), 0, "no storage past slot 21");
         }
     }
 

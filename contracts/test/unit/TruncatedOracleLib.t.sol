@@ -36,8 +36,8 @@ contract TruncatedOracleHarness {
         gasUsed = before - gasleft();
     }
 
-    function resetHighWater() external {
-        state.resetHighWater();
+    function resetHighWater(int24 floorTick) external returns (int24 newHighWaterTick) {
+        return state.resetHighWater(floorTick);
     }
 
     function consult(uint32 time, uint32 window) external view returns (int24) {
@@ -202,7 +202,7 @@ contract TruncatedOracleLibTest is Test {
 
     function test_resetHighWaterRevertsWhenNotInitialized() public {
         vm.expectRevert(TruncatedOracleLib.NotInitialized.selector);
-        oracle.resetHighWater();
+        oracle.resetHighWater(0);
     }
 
     function test_readsRevertWhenNotInitialized() public {
@@ -740,14 +740,58 @@ contract TruncatedOracleLibTest is Test {
         oracle.write(T0 + 4, 4, -200, 5000);
         assertEq(oracle.highWaterTick(), int24(900), "still the excursion peak");
 
-        // The vault resets after compounding: the mark drops to wherever the pool actually is.
-        oracle.resetHighWater();
+        // The vault resets after compounding: the mark drops to wherever the pool actually is. Here the cap never
+        // bound, so the raw tick and the truncated tick agree and the floor does not bite.
+        assertEq(oracle.resetHighWater(-200), int24(-200), "the reset returns the mark it armed");
         assertEq(oracle.highWaterTick(), int24(-200), "reset to the live truncated tick");
         assertEq(oracle.lastTruncatedTick(), int24(-200), "reset does not disturb the series");
 
         // ...and starts tracking a fresh excursion from there.
         oracle.write(T0 + 5, 5, -150, 5000);
         assertEq(oracle.highWaterTick(), int24(-150), "new excursion");
+    }
+
+    /// @notice The reset is floored at the caller's raw tick, because the truncated tick it would otherwise land on
+    ///         is rate-limited and lags a fast fall by however many caps the move was worth. A mark left up there
+    ///         covers asks the pool has never traded through, and the vault's buyback burn would take them as
+    ///         inventory it had sold when it had not.
+    function test_resetHighWaterIsFlooredAtTheRawTick() public {
+        oracle.initialize(T0, 10_000);
+
+        // One block, one cap: the pool crashes 9,000 ticks, the recorded series moves 200.
+        int24 truncated = oracle.write(T0 + 1, 1, 1000, 200);
+        assertEq(truncated, int24(9800), "the cap bound the write");
+        assertEq(oracle.highWaterTick(), int24(10_000), "the mark is still the pre-crash peak");
+
+        // Resetting at the truncated tick alone would arm the next window at 9,800 - 8,800 ticks above the pool.
+        int24 armed = oracle.resetHighWater(1000);
+        assertEq(armed, int24(1000), "the mark lands on the raw tick, not the lagging truncated one");
+        assertEq(oracle.highWaterTick(), int24(1000), "and that is what is stored");
+        assertEq(oracle.lastTruncatedTick(), int24(9800), "the truncated series is untouched");
+
+        // The floor can only ever lower the mark: a raw tick above the truncated one leaves the truncated one.
+        oracle.write(T0 + 2, 2, 9800, 200);
+        assertEq(oracle.resetHighWater(TickMath.MAX_TICK), int24(9800), "min, so a high floor never raises it");
+    }
+
+    /// @notice The property behind {test_resetHighWaterIsFlooredAtTheRawTick}: a reset never leaves the mark above
+    ///         the raw tick the caller passed, and never above the live truncated tick either.
+    function testFuzz_resetHighWaterNeverExceedsEitherInput(int24 rawTick, int24 seedTick, int24 pushTo) public {
+        int24 seed = int24(bound(seedTick, TickMath.MIN_TICK, TickMath.MAX_TICK));
+        int24 push = int24(bound(pushTo, TickMath.MIN_TICK, TickMath.MAX_TICK));
+        int24 raw = int24(bound(rawTick, TickMath.MIN_TICK, TickMath.MAX_TICK));
+
+        oracle.initialize(T0, seed);
+        oracle.write(T0 + 1, 1, push, 200);
+
+        int24 live = oracle.lastTruncatedTick();
+        int24 armed = oracle.resetHighWater(raw);
+
+        assertLe(armed, raw, "never above the raw tick");
+        assertLe(armed, live, "never above the truncated tick");
+        assertTrue(armed == raw || armed == live, "and it is one of the two");
+        assertEq(oracle.highWaterTick(), armed, "what was returned is what was stored");
+        assertEq(oracle.lastTruncatedTick(), live, "the series is untouched");
     }
 
     function test_highWaterOnlyEverSeesTruncatedTicks() public {

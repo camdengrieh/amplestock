@@ -210,11 +210,11 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     // Ten ask cells and four seed bid cells (§3.3).
     expect(ladder.cells.length).toBeGreaterThanOrEqual(14)
     for (const cell of ladder.cells) {
-      expect(Number(cell.cellIndex)).toBeGreaterThanOrEqual(0)
-      expect(Number(cell.cellIndex)).toBeLessThan(24)
+      expect(Number(cell.bucketIndex)).toBeGreaterThanOrEqual(0)
+      expect(Number(cell.bucketIndex)).toBeLessThan(24)
     }
     // The buy consumed the bottom of the ask ladder, so at least one cell has raised counter.
-    expect(ladder.cells.some((c) => BigInt(c.counterRaised as string) > 0n)).toBe(true)
+    expect(ladder.cells.some((c) => BigInt(c.proceeds as string) > 0n)).toBe(true)
     expect(BigInt(ladder.totals.ampsInLadder as string)).toBeGreaterThan(0n)
   })
 
@@ -227,14 +227,16 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     const buy = body.swaps.find((s) => s.sell === false)!
     const sell = body.swaps.find((s) => s.sell === true)!
 
-    // The entry pool's buy fee is 30 bp and the base is exactly that; the dynamic part is whatever
-    // the surge and the deviation added on top.
-    expect(buy.baseFeeBps).toBe(30)
+    // Revision 6: `ampsFeeBps` = 500 is the base on **both** directions. The pool's 30 bp is the
+    // pass-through fee and only a hop the router declared as part of a `rotate` ever sees it; this
+    // buy went through the fixture's own swapper, so it pays the full AMPS fee like any other entry.
+    // The fee is taken in the input currency, so the buy's AMPS-side figure is zero.
+    expect(buy.baseFeeBps).toBe(500)
     expect(Number(buy.dynamicFeeBps)).toBeGreaterThanOrEqual(0)
     expect(Number(buy.feeBps)).toBe(Number(buy.baseFeeBps) + Number(buy.dynamicFeeBps))
     expect(BigInt(buy.feeAmps as string)).toBe(0n)
 
-    // The sell pays `sellFeeBps` = 500 as its base, in AMPS.
+    // The sell pays the same 500 bp base, in AMPS.
     expect(sell.baseFeeBps).toBe(500)
     expect(BigInt(sell.feeAmps as string)).toBeGreaterThan(0n)
     expect(BigInt(sell.ampsAmount as string)).toBeGreaterThan(0n)
@@ -259,20 +261,37 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     expect(market.bondCount).toBe(1)
   })
 
-  it('indexes the compound as a four-way split that adds up', async () => {
+  it('indexes the compound as the revision-6 two-currency split', async () => {
     const body = (await indexer.get('/api/flywheel')) as {summary: Json; pools: Json[]; days: Json[]}
     const s = body.summary
     expect(Number(s.compoundCount)).toBeGreaterThan(0)
     const fees = BigInt(s.feesAmpsTotal as string)
     expect(fees).toBeGreaterThan(0n)
-    expect(
-      BigInt(s.creatorPaidTotal as string) +
-        BigInt(s.stakerPaidTotal as string) +
-        BigInt(s.burnedTotal as string) +
-        BigInt(s.relaidTotal as string),
-    ).toBe(fees)
+
+    // The AMPS side has exactly two destinations: the creator, and the fire. `burnedTotal` carries
+    // the buyback burn as well, so the identity is an inequality in that direction and an equality
+    // in the other — nothing is streamed to a staker and nothing is re-laddered.
+    const creatorAmps = BigInt(s.creatorPaidAmpsTotal as string)
+    expect(creatorAmps + BigInt(s.burnedTotal as string)).toBeGreaterThanOrEqual(fees)
+    expect(creatorAmps).toBeLessThan(fees)
     // The creator slice is live at genesis + a few minutes, so it is not zero.
-    expect(BigInt(s.creatorPaidTotal as string)).toBeGreaterThan(0n)
+    expect(creatorAmps).toBeGreaterThan(0n)
+
+    // The counter side is reported in USD, because thirty-two assets cannot be added as amounts.
+    expect(BigInt(s.feesCounterUsd18 as string)).toBeGreaterThanOrEqual(0n)
+    expect(BigInt(s.creatorPaidCounterUsd18 as string)).toBeGreaterThanOrEqual(0n)
+
+    // Staking is gone from the response, not merely empty in it.
+    expect('staking' in body).toBe(false)
+    expect('stakerPaidTotal' in s).toBe(false)
+    expect('relaidTotal' in s).toBe(false)
+
+    const creatorFee = (await indexer.get('/api/creator-fee')) as Json
+    expect(BigInt(creatorFee.paidAmpsTotal as string)).toBe(creatorAmps)
+    expect(BigInt(creatorFee.paidCounterUsd18 as string)).toBe(
+      BigInt(s.creatorPaidCounterUsd18 as string),
+    )
+
     expect(body.days.length).toBeGreaterThan(0)
   })
 

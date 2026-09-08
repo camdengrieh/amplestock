@@ -5,7 +5,6 @@ import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
 import {BountyPot} from "../../src/keeper/BountyPot.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {OracleGate} from "../../src/oracle/OracleGate.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {Checkpoint} from "../../src/types/Types.sol";
@@ -25,7 +24,6 @@ import {StdUtils} from "forge-std/StdUtils.sol";
 /// @param vault The `AmpsVault`.
 /// @param amps The AMPS token.
 /// @param bonds The bonds shell.
-/// @param staking xAMPS.
 /// @param pot The keeper bounty pot.
 /// @param gate The oracle gate.
 /// @param marketRef The observation source (`MockMarketReference` until `AmpsHook` exists).
@@ -47,7 +45,6 @@ struct Phase2Wiring {
     AmpsVault vault;
     Amps amps;
     AmpsBonds bonds;
-    AmpsStaking staking;
     BountyPot pot;
     OracleGate gate;
     MockMarketReference marketRef;
@@ -89,7 +86,6 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     AmpsVault internal immutable VAULT;
     Amps internal immutable AMPS;
     AmpsBonds internal immutable BONDS;
-    AmpsStaking internal immutable STAKING;
     BountyPot internal immutable POT;
     OracleGate internal immutable GATE;
     MockMarketReference internal immutable MARKET_REF;
@@ -122,9 +118,6 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     uint256 public burnedInventory;
     /// @notice AMPS wei claimed out of vesting positions.
     uint256 public claimedVesting;
-    /// @notice AMPS wei this handler has moved into `AmpsStaking` as the vault's staker slice.
-    uint256 public notifiedRewards;
-
     /// @notice Set the moment a non-market-move action lowers NAV/share (I8).
     bool public navEverFell;
     /// @notice Set the moment a bond lowers NAV/share (I27).
@@ -137,8 +130,6 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     bool public claimEverFailed;
     /// @notice Set the moment `P_ref` leaves `[navPerShare, max(navPerShare, rateLimit)]` (I24).
     bool public referenceEverOutOfBand;
-    /// @notice Set the moment `AmpsStaking.totalAssets()` falls on an action that is not a withdrawal (I36).
-    bool public stakingAssetsEverFell;
     /// @notice Set the moment a vault call returns with a registered asset still resting on the vault as an
     ///         ERC-20 balance (I12).
     bool public sweepEverDirty;
@@ -178,14 +169,10 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @dev The vesting positions this handler owns, so {claim} can address one.
     uint256 internal positionCount;
 
-    /// @dev `AmpsStaking.totalAssets()` captured at the start of the action in flight.
-    uint256 internal stakingAssetsBefore;
-
     constructor(Phase2Wiring memory w) {
         VAULT = w.vault;
         AMPS = w.amps;
         BONDS = w.bonds;
-        STAKING = w.staking;
         POT = w.pot;
         GATE = w.gate;
         MARKET_REF = w.marketRef;
@@ -212,10 +199,8 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @dev Captures what the post-action checks compare against. Every action opens with it.
     /// @param name The action, recorded on the first I8 violation so the failure names its own cause.
     /// @param marketMove Whether the action is allowed to lower NAV/share.
-    /// @param withdrawal Whether the action is allowed to lower `AmpsStaking.totalAssets()`.
-    modifier action(bytes32 name, bool marketMove, bool withdrawal) {
+    modifier action(bytes32 name, bool marketMove) {
         uint256 navBefore = _nav();
-        stakingAssetsBefore = _stakingAssets();
         _;
         ++actionCount;
         _checkReference();
@@ -228,8 +213,6 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
             }
             navEverFell = true;
         }
-        uint256 stakingAfter = _stakingAssets();
-        if (!withdrawal && stakingAfter < stakingAssetsBefore) stakingAssetsEverFell = true;
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -240,7 +223,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     ///         gate and floor logic is what decides whether the call lands.
     /// @param seed Picks the market.
     /// @param amount The raw collateral amount, bounded into a plausible range.
-    function bond(uint256 seed, uint256 amount) external action("bond", false, false) {
+    function bond(uint256 seed, uint256 amount) external action("bond", false) {
         uint256 i = _pick(seed, 0, stocks.length - 1);
         uint256 amountIn = bound(amount, 1e12, 20e18);
 
@@ -279,7 +262,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice Claims from one of this handler's vesting positions. I38: whenever anything is claimable the call
     ///         must succeed, whatever the gate, the market or the policy is doing.
     /// @param seed Picks the position.
-    function claim(uint256 seed) external action("claim", false, false) {
+    function claim(uint256 seed) external action("claim", false) {
         if (positionCount == 0) return;
         uint256 id = _pick(seed, 0, positionCount - 1);
 
@@ -307,7 +290,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice Redeems a random fraction of this handler's AMPS and checks I23 exactly: every non-AMPS balance
     ///         pays `floor(floor(b x shares / T) x (BPS - fee) / BPS)` and the released inventory is burned.
     /// @param fraction The fraction of the handler's balance to redeem, in bps.
-    function redeem(uint256 fraction) external action("redeem", false, false) {
+    function redeem(uint256 fraction) external action("redeem", false) {
         uint256 balance = AMPS.balanceOf(address(this));
         if (balance == 0) return;
         uint256 shares = (balance * bound(fraction, 1, Constants.BPS)) / Constants.BPS;
@@ -352,7 +335,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice Advances the clock across sessions and bond epochs, producing one block per second so the layer-A
     ///         watchdog sees a chain that kept running.
     /// @param dt The seconds to advance, bounded to `[1 minute, 3 days]`.
-    function warp(uint256 dt) external action("warp", false, false) {
+    function warp(uint256 dt) external action("warp", false) {
         uint256 step = bound(dt, 1 minutes, 3 days);
         vm.warp(block.timestamp + step);
         vm.roll(block.number + step + 1);
@@ -360,7 +343,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
 
     /// @notice Advances the clock with *no* blocks at all, which is exactly the layer-A watchdog's trigger.
     /// @param dt The seconds to advance.
-    function stall(uint256 dt) external action("stall", false, false) {
+    function stall(uint256 dt) external action("stall", false) {
         vm.warp(block.timestamp + bound(dt, Constants.GRACE_SECONDS_DEFAULT, 2 days));
     }
 
@@ -368,7 +351,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     ///         may legitimately fall, so this action records no NAV comparison.
     /// @param seed Picks the feed.
     /// @param pct The new answer as a percentage of the launch price, in `[25, 400]`.
-    function moveFeed(uint256 seed, uint256 pct) external action("moveFeed", true, false) {
+    function moveFeed(uint256 seed, uint256 pct) external action("moveFeed", true) {
         uint256 i = _pick(seed, 0, stockFeeds.length - 1);
         uint256 answer = (uint256(stockUsd8[i]) * bound(pct, 25, 400)) / 100;
         if (answer == 0) answer = 1;
@@ -378,7 +361,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice Makes one feed stale or outright dead, and undoes it. Also a market move.
     /// @param seed Picks the feed.
     /// @param mode 0 healthy, 1 stale, 2 reverting.
-    function breakFeed(uint256 seed, uint256 mode) external action("breakFeed", true, false) {
+    function breakFeed(uint256 seed, uint256 mode) external action("breakFeed", true) {
         uint256 i = _pick(seed, 0, stockFeeds.length - 1);
         uint256 pick = _pick(mode, 0, 2);
         MockAggregator(stockFeeds[i]).setStale(pick == 1);
@@ -386,7 +369,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     }
 
     /// @notice Republishes every aggregator at its current answer, which is what a live Chainlink node does.
-    function refreshFeeds() external action("refreshFeeds", true, false) {
+    function refreshFeeds() external action("refreshFeeds", true) {
         WETH_FEED.setAnswer(int256(uint256(WETH_USD8)));
         USDG_FEED.setAnswer(int256(uint256(USDG_USD8)));
         for (uint256 i; i < stockFeeds.length; ++i) {
@@ -398,7 +381,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice Moves the hub observation, i.e. the AMPS price the whole reference machinery is anchored to. Both
     ///         entry legs and every spoke move together so the layer-F cross-check has a consistent world to read.
     /// @param priceSeed The new AMPS price, bounded to `[$0.20, $5.00]`.
-    function moveHub(uint256 priceSeed) external action("moveHub", true, false) {
+    function moveHub(uint256 priceSeed) external action("moveHub", true) {
         uint256 price = bound(priceSeed, 0.2e18, 5e18);
         _observe(HUB_POOL, price, USDG_USD8, 6);
         _observe(WETH_POOL, price, WETH_USD8, 18);
@@ -410,7 +393,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice The permissionless checkpoint. The I24 rate-limit ghost lives in {_checkReference}, which every
     ///         action runs, so a checkpoint written from inside another action (a bond refreshes it first) is
     ///         checked too rather than silently moving the ghost's baseline.
-    function checkpoint() external action("checkpoint", false, false) {
+    function checkpoint() external action("checkpoint", false) {
         try VAULT.checkpoint() returns (Checkpoint memory) {
             _checkSwept();
         } catch {}
@@ -418,7 +401,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
 
     /// @notice The permissionless watchdog stamp, and its per-pool sibling that arms the divergence breaker.
     /// @param seed Picks between the two.
-    function poke(uint256 seed) external action("poke", false, false) {
+    function poke(uint256 seed) external action("poke", false) {
         if (_pick(seed, 0, 1) == 0) {
             try GATE.poke() {} catch {}
         } else {
@@ -436,7 +419,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @notice A guardian freeze, protocol-wide or on one constituent, always inside the 7-day auto-expiry bound.
     /// @param seed Picks the scope and the constituent.
     /// @param duration The freeze length.
-    function freeze(uint256 seed, uint256 duration) external action("freeze", false, false) {
+    function freeze(uint256 seed, uint256 duration) external action("freeze", false) {
         uint32 until = uint32(block.timestamp + bound(duration, 1, Constants.GUARDIAN_FREEZE_MAX_SECONDS));
         vm.startPrank(GUARDIAN);
         if (_pick(seed, 0, 1) == 0) {
@@ -449,7 +432,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
 
     /// @notice Clears whatever the guardian froze.
     /// @param seed Picks the scope.
-    function unfreeze(uint256 seed) external action("unfreeze", false, false) {
+    function unfreeze(uint256 seed) external action("unfreeze", false) {
         vm.startPrank(GUARDIAN);
         if (_pick(seed, 0, 1) == 0) {
             try GATE.unfreezeProtocol() {} catch {}
@@ -460,48 +443,12 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // Actions — staking and the bounty pot
+    // Actions — the bounty pot
     // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice The staker slice, exactly as `compound()` will pay it: the vault transfers the AMPS in and calls
-    ///         `notifyReward` in the same transaction.
-    /// @param amount The tranche, bounded by the vault's own inventory.
-    function notifyReward(uint256 amount) external action("notifyReward", false, false) {
-        uint256 inventory = AMPS.balanceOf(address(VAULT));
-        if (inventory < 1e18) return;
-        uint256 cut = bound(amount, 1e12, inventory / 100);
-        if (cut == 0) return;
-
-        vm.startPrank(address(VAULT));
-        try AMPS.transfer(address(STAKING), cut) {
-            try STAKING.notifyReward(cut) {
-                notifiedRewards += cut;
-            } catch {}
-        } catch {}
-        vm.stopPrank();
-    }
-
-    /// @notice Stakes some of this handler's AMPS.
-    /// @param amount The deposit.
-    function stake(uint256 amount) external action("stake", false, false) {
-        uint256 balance = AMPS.balanceOf(address(this));
-        if (balance < 1e15) return;
-        uint256 assets = bound(amount, 1e12, balance / 4);
-        AMPS.approve(address(STAKING), type(uint256).max);
-        try STAKING.deposit(assets, address(this)) {} catch {}
-    }
-
-    /// @notice Unstakes — the one action allowed to lower `AmpsStaking.totalAssets()`.
-    /// @param fraction The fraction of the handler's xAMPS to redeem, in bps.
-    function unstake(uint256 fraction) external action("unstake", false, true) {
-        uint256 shares = (STAKING.balanceOf(address(this)) * bound(fraction, 1, Constants.BPS)) / Constants.BPS;
-        if (shares == 0) return;
-        try STAKING.redeem(shares, address(this), address(this)) {} catch {}
-    }
 
     /// @notice Funds the keeper bounty pot, which must stay outside the NAV numerator (I21).
     /// @param amount The USDG to add.
-    function fundPot(uint256 amount) external action("fundPot", false, false) {
+    function fundPot(uint256 amount) external action("fundPot", false) {
         uint256 raw = bound(amount, 1e6, 1000e6);
         USDG.mint(address(this), raw);
         USDG.approve(address(POT), type(uint256).max);
@@ -512,7 +459,7 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     ///         claims. A donation raises everyone's backing and creates no claim for the donor.
     /// @param seed Picks the token.
     /// @param amount The donation.
-    function donate(uint256 seed, uint256 amount) external action("donate", false, false) {
+    function donate(uint256 seed, uint256 amount) external action("donate", false) {
         uint256 i = _pick(seed, 0, stocks.length - 1);
         MockStockToken(stocks[i]).mint(address(VAULT), bound(amount, 1, 10e18));
         // The donation rests on the vault until a vault call absorbs it, which is exactly what `touch` is for.
@@ -570,15 +517,6 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     /// @dev NAV/share, or zero when the read itself is unavailable (a feed the protocol cannot price at all).
     function _nav() internal view returns (uint256 nav) {
         try VAULT.previewNavPerShareX18() returns (uint256 value) {
-            return value;
-        } catch {
-            return 0;
-        }
-    }
-
-    /// @dev `AmpsStaking.totalAssets()`, or zero when unreadable.
-    function _stakingAssets() internal view returns (uint256 assets) {
-        try STAKING.totalAssets() returns (uint256 value) {
             return value;
         } catch {
             return 0;

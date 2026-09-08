@@ -19,10 +19,18 @@ import {FeedConfig, FeedStatus, Session} from "../types/Types.sol";
 ///        3. **Per-ticker bounds.** `minAnswerUsd8 <= answer <= maxAnswerUsd8`, recorded per feed. This is the
 ///           check that survives an aggregator returning its own circuit-breaker floor.
 ///        4. **Two-confirmation rule on jumps.** A single-round move above `Constants.ANSWER_JUMP_BPS` (10%) is
-///           not accepted until a second round confirms it; until then the previous answer stands and the feed is
-///           reported as unconfirmed rather than stale.
+///           not accepted until a second round confirms it, and while it is held every read reports
+///           `min(previousAnswer, candidate)` with the candidate's `updatedAt`, `unconfirmed == true` **and
+///           `fresh == false`**. The minimum is what makes the hold-back safe for *every* consumer: a crash is
+///           believed at once, a spike is not, so NAV, the bond accretion floor and the gate's fair tick all read
+///           the protocol-favouring side of an unresolved move. Reporting it as not fresh is what makes it safe
+///           for every consumer that never reads `unconfirmed` at all.
 ///        5. **Never multiplied by `uiMultiplier()`.** A Stock Token's display multiplier and its Chainlink answer
 ///           are already in the same units. See `IStockToken`.
+///        6. **`fresh` subsumes `unconfirmed`.** A held-back answer is never reported as fresh, in any session,
+///           so the per-path staleness policy below applies to it unchanged: placements pause, bonds widen the
+///           haircut, swaps continue. A caller that needs to tell an aged answer from a held-back one reads
+///           {feedStatus}; a caller that only asks "may I act on this price?" reads `fresh` and is right.
 ///
 /// @dev **Session-scaled freshness.** The equity feeds are 24/5 with an 86,400 s heartbeat and hold Friday's close
 ///      over the weekend, so a single `maxAge` is either uselessly loose in the Regular session or trips every
@@ -158,15 +166,21 @@ interface IFeedRegistry {
     /// @dev The non-reverting read every gate-aware path uses: it reports `fresh` so the caller can apply its own
     ///      per-path policy, and it applies the positivity, bounds and two-confirmation rules before returning.
     ///      Returns `answerUsd8 == 0` only when no usable answer exists at all.
+    /// @dev **While a jump is held back this is `min(heldLevel, candidate)`, stamped with the candidate's
+    ///      `updatedAt`** — the conservative half of an unresolved move, not the pre-jump level — and `fresh` is
+    ///      false for as long as it is held, whatever the age. A caller that must know *why* an answer is not
+    ///      fresh (aged, or held behind an unresolved jump) reads {feedStatus}; a caller that only has to decide
+    ///      whether it may act on the price reads this flag.
     /// @param token The asset.
     /// @return answerUsd8 The answer, 8 decimals.
     /// @return updatedAt When the answer was published.
-    /// @return fresh Whether the answer is within the session-scaled bound (always true when the session is
-    ///         `CLOSED`, where the check is disabled by design).
+    /// @return fresh Whether the protocol may act on the answer: inside the session-scaled bound (the bound is
+    ///         disabled when the session is `CLOSED`, by design) **and** not held behind an unconfirmed jump.
     function latestAnswer(address token) external view returns (uint256 answerUsd8, uint32 updatedAt, bool fresh);
 
     /// @notice The last accepted answer for `token`, reverting unless it is valid *and* fresh.
-    /// @dev Used by the placement path, which must pause rather than price on a stale feed.
+    /// @dev Used by the placement path, which must pause rather than price on a stale feed — and, since `fresh`
+    ///      subsumes `unconfirmed`, rather than price on a jump the two-confirmation rule is still holding.
     /// @param token The asset.
     /// @return answerUsd8 The answer, 8 decimals.
     function priceUsd8(address token) external view returns (uint256 answerUsd8);
@@ -184,7 +198,7 @@ interface IFeedRegistry {
     /// @param session The equity session to apply.
     /// @return answerUsd8 The answer, 8 decimals; 0 when no usable answer exists.
     /// @return updatedAt When the answer was published.
-    /// @return fresh Whether it is inside the session-scaled bound.
+    /// @return fresh Whether it is inside the session-scaled bound and not held behind an unconfirmed jump.
     function latestAnswerIn(address token, Session session)
         external
         view
@@ -194,13 +208,18 @@ interface IFeedRegistry {
     /// @param token The asset.
     /// @return price18 The answer, 18 decimals; 0 when no usable answer exists.
     /// @return updatedAt When the answer was published.
-    /// @return fresh Whether it is inside the session-scaled bound.
+    /// @return fresh Whether it is inside the session-scaled bound and not held behind an unconfirmed jump.
     function latestAnswerUsd18(address token) external view returns (uint256 price18, uint32 updatedAt, bool fresh);
 
     /// @notice The complete, never-reverting read of one feed: the shape `AmpsQuoter` renders and the shape a
     ///         degraded dApp falls back to.
     /// @dev Returns an all-zero struct with `configured == false` for a token with no feed, and never reverts for
     ///      any input, any aggregator behaviour or any session.
+    /// @dev `status.unconfirmed` marks a held-back jump, and `status.answerUsd8` is then the conservative
+    ///      `min(heldLevel, candidate)` described on {latestAnswer}, stamped with the candidate's `updatedAt`.
+    ///      A held-back answer can be perfectly recent and must still not be treated as the current price, so
+    ///      `unconfirmed` implies `!fresh`: `status.age` and `status.maxAgeSeconds` say whether it is *also*
+    ///      aged, and `unconfirmed` is what distinguishes the two reasons an answer may not be acted on.
     /// @param token The asset.
     /// @return status Everything known about the feed right now.
     function feedStatus(address token) external view returns (FeedStatus memory status);
@@ -282,7 +301,7 @@ interface IFeedRegistry {
     /// @param token The asset to refresh.
     /// @return answerUsd8 The answer in force after the call, 8 decimals.
     /// @return updatedAt Its publication timestamp.
-    /// @return fresh Whether it is inside the session-scaled bound.
+    /// @return fresh Whether it is inside the session-scaled bound and not held behind an unconfirmed jump.
     function refresh(address token) external returns (uint256 answerUsd8, uint32 updatedAt, bool fresh);
 
     /// @notice {refresh} for several tokens in one transaction. **Permissionless and unpaid.**

@@ -20,13 +20,13 @@ export function DegradedNotice({degraded}: {degraded: number}) {
     <Alert variant="warning" data-testid="degraded-notice">
       <AlertTitle>Some values are unavailable</AlertTitle>
       <AlertDescription>
-        <p className="mb-2">{NOTES.degraded}</p>
-        <ul className="list-disc space-y-1 pl-5">
+        <p>{NOTES.degraded}</p>
+        <ul className="space-y-1 border-l border-hair pl-3 font-mono text-[13px]">
           {bits.map((bit) => (
             <li key={bit}>{degradedBitLabels[bit]}</li>
           ))}
         </ul>
-        <p className="mt-2">
+        <p>
           A quote with any flag raised is not permission to trade — the refusal flags fail open for display, not for
           execution.
         </p>

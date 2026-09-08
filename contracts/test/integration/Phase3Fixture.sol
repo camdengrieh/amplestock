@@ -11,12 +11,12 @@ import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {FeedRegistry} from "../../src/oracle/FeedRegistry.sol";
 import {OracleGate} from "../../src/oracle/OracleGate.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
+import {AmpsRouter} from "../../src/periphery/AmpsRouter.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
 import {FeePolicy} from "../../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../../src/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "../../src/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {FeedConfig, InclusionRecord, PlacementRecord, PoolClass} from "../../src/types/Types.sol";
@@ -49,7 +49,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 /// @notice The whole Phase 3 system, real contract by real contract, on live Uniswap v4 pools: `Amps` at a mined
 ///         CREATE2 salt, `AmpsVault` behind its four linked libraries, the **real** `AmpsHook` at a `0x38C0`-shaped
 ///         address, the real `FeePolicy` / `LadderPolicy` / `RolloutPolicy` / `BondPolicy`,
-///         `LadderPositionValuer`, `PoolRegistry`, `AmpsBonds`, `AmpsStaking`, `BountyPot`, `OracleGate` +
+///         `LadderPositionValuer`, `PoolRegistry`, `AmpsBonds`, `BountyPot`, `OracleGate` +
 ///         `FeedRegistry` and `AmpsQuoter`.
 ///
 ///         Nothing here is a stub except the assets themselves: `MockStockToken` for the Robinhood Stock Tokens,
@@ -123,7 +123,6 @@ abstract contract Phase3Fixture is V4TestBase {
     PoolRegistry internal registry;
     AmpsBonds internal bonds;
     BondPolicy internal bondPolicy;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     OracleGate internal gate;
     FeedRegistry internal feeds;
@@ -132,6 +131,12 @@ abstract contract Phase3Fixture is V4TestBase {
     LadderPolicy internal ladderPolicy;
     RolloutPolicy internal rolloutPolicy;
     AmpsQuoter internal quoter;
+
+    /// @dev The protocol router, deployed here and **named to the hook by the timelock**, so this world contains
+    ///      the one contract whose rotation hops are pass-through. Every other swap helper below goes through the
+    ///      ordinary v4 router and therefore pays `ampsFeeBps` in both directions, which is what makes the
+    ///      contrast in `Phase3Flywheel` and `RotationCreditGaming` a real one rather than a stipulated one.
+    AmpsRouter internal ampsRouter;
     VestingWallet internal teamVesting;
 
     MockERC20 internal weth;
@@ -274,7 +279,6 @@ abstract contract Phase3Fixture is V4TestBase {
         gate = new OracleGate(TIMELOCK, GUARDIAN, address(feeds), address(registry), address(hook));
         bondPolicy = new BondPolicy();
         bonds = new AmpsBonds(address(vault), address(registry), address(bondPolicy));
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(address(usdg), address(vault), TIMELOCK);
         valuer =
             new LadderPositionValuer(IExtsload(address(poolManager)), address(vault), IPoolRegistry(address(registry)));
@@ -290,15 +294,18 @@ abstract contract Phase3Fixture is V4TestBase {
             address(gate),
             address(feeds)
         );
+        ampsRouter = new AmpsRouter(poolManager, address(amps), address(registry), address(weth));
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
 
-        vm.prank(TIMELOCK);
+        vm.startPrank(TIMELOCK);
         hook.setFeePolicy(address(feePolicy));
+        hook.setRouter(address(ampsRouter));
+        vm.stopPrank();
 
+        vm.label(address(ampsRouter), "AmpsRouter");
         vm.label(address(gate), "OracleGate");
         vm.label(address(feeds), "FeedRegistry");
         vm.label(address(bonds), "AmpsBonds");
-        vm.label(address(staking), "AmpsStaking");
         vm.label(address(pot), "BountyPot");
         vm.label(address(valuer), "LadderPositionValuer");
         vm.label(address(quoter), "AmpsQuoter");
@@ -323,13 +330,14 @@ abstract contract Phase3Fixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(hook));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));
         vault.setPolicyPointer(bytes32("positionValuer"), address(valuer));
         vault.setPolicyPointer(bytes32("ladderPolicy"), address(ladderPolicy));
         vault.setPolicyPointer(bytes32("rolloutPolicy"), address(rolloutPolicy));
+        // A codeless standby is refused (audit fix wave 2, finding 6); one `STOP` makes the constant a contract.
+        vm.etch(STANDBY, hex"00");
         vault.setStandbyVault(STANDBY);
         vm.stopPrank();
     }
@@ -754,6 +762,28 @@ abstract contract Phase3Fixture is V4TestBase {
         vm.prank(who);
         swapRouter.swapExactTokensForTokens(amountIn, 0, Currency.wrap(counterIn), path, who, type(uint256).max);
         amountOut = IERC20(counterOut).balanceOf(who) - before;
+    }
+
+    /// @notice A rotation through the **protocol router**: `hop1 counter -> AMPS -> hop2 counter`, both hops
+    ///         carrying `Constants.ROUTER_ROTATE`, which is the one shape in the system the hook prices at the
+    ///         pass-through fee. {rotate} above is the same trade through an ordinary v4 router, and pays
+    ///         `ampsFeeBps` on both hops.
+    /// @param hop1 The pool bought in.
+    /// @param hop2 The pool sold into.
+    /// @param who The rotator, funded and approved by this call.
+    /// @param amountIn Hop-1 counter asset in.
+    /// @return amountOut Hop-2 counter asset out.
+    /// @return ampsThrough The AMPS that passed through: hop 1's realised output and hop 2's whole input.
+    function routerRotate(PoolId hop1, PoolId hop2, address who, uint256 amountIn)
+        internal
+        returns (uint256 amountOut, uint256 ampsThrough)
+    {
+        address counter = registry.poolConfig(hop1).counter;
+        fund(counter, who, amountIn);
+        vm.startPrank(who);
+        IERC20(counter).approve(address(ampsRouter), type(uint256).max);
+        (amountOut, ampsThrough) = ampsRouter.rotate(hop1, hop2, amountIn, 0, who, false, type(uint256).max);
+        vm.stopPrank();
     }
 
     /// @notice {buyAmps} as an external self-call, so a scenario can wrap it in `try`/`catch` and treat a

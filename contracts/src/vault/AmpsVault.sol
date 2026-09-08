@@ -2,27 +2,23 @@
 pragma solidity 0.8.30;
 
 import {IAmps} from "../interfaces/IAmps.sol";
-import {IAmpsBonds} from "../interfaces/IAmpsBonds.sol";
-import {IAmpsStaking} from "../interfaces/IAmpsStaking.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
-import {IBountyPot} from "../interfaces/IBountyPot.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {Constants} from "../types/Constants.sol";
 import {
-    AlreadyInitialized,
     GateNotHealthy,
     LengthMismatch,
     NavBleedExceeded,
     NotBonds,
     NotCreator,
     NotGuardian,
+    NotInitialized,
     NotPoolManager,
     NotRegistry,
     NotTimelock,
     OutOfBand,
     Reentrancy,
-    SweepDirty,
     ZeroAddress,
     ZeroAmount
 } from "../types/Errors.sol";
@@ -31,8 +27,6 @@ import {VaultNavLib} from "./VaultNavLib.sol";
 import {VaultPlacementLib} from "./VaultPlacementLib.sol";
 import {VaultRedeemLib} from "./VaultRedeemLib.sol";
 import {VaultRolloutLib} from "./VaultRolloutLib.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -76,14 +70,17 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 ///           which is strictly narrower, and the incident it exists for (an issuer denylisting the vault while
 ///           pausing its oracle) is precisely a state in which `_requireHealthy` would refuse. Gating it would
 ///           brick the evacuation path of an immutable contract.
-///        3. A gate pointer that *reverts* is read as absent rather than as a refusal. The gate is the one pointer
-///           that can refuse every governance call; if a broken one refused, nobody could call `setPolicyPointer`
-///           to replace it and a fund-less contract would have bricked the protocol. Failing open here grants an
-///           attacker nothing they would not already have with a `GREEN` gate.
+///        3. A gate pointer the vault **cannot read** is treated as absent rather than as a refusal — and "cannot
+///           read" is meant in full: a pointer that reverts, that has no code, that answers short, that answers
+///           with an enum ordinal outside `GateState`, or that burns the gas it is given. The gate is the one
+///           pointer that can refuse every governance call; if a broken one refused, nobody could call
+///           `setPolicyPointer` to replace it and a fund-less contract would have bricked the protocol. Failing
+///           open here grants an attacker nothing they would not already have with a `GREEN` gate. This costs a
+///           hand-decoded low-level read rather than a typed `try`: see {_requireGate} for why a `try` covers only
+///           the first of those five.
 contract AmpsVault is IAmpsVault, IUnlockCallback {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
-    using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------------------------------------------
     // Transient slots (EIP-1153), `keccak256("amplestocks.vault.<name>")`, hard-coded (section 1.1)
@@ -102,6 +99,20 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`. NAV/share captured at entry for the R1 post-condition,
     ///      used by the relaxed migration bleed bound. Declared once, in {VaultRedeemLib}.
     uint256 private constant NAV_BEFORE = VaultRedeemLib.NAV_BEFORE;
+
+    /// @dev The gas ceiling on each of the three calls this contract makes to the oracle gate pointer: `state(0)`,
+    ///      `protocolFreezeUntil()` and `poke()`. See {_requireGate} for why they are bounded low-level calls at
+    ///      all rather than typed `try`s.
+    ///
+    ///      **Why it is this large.** The cap is a griefing bound, not a budget: it exists so a mis-pointed or
+    ///      hostile gate cannot consume the caller's whole allowance and turn "fail open" into "fail out of gas".
+    ///      A real `OracleGate.state(0)` is not cheap — it makes several bounded probes of its own (the feed
+    ///      registry, the market reference and the registry, each itself capped at `STOCK_TOKEN_PROBE_GAS`) and
+    ///      reads the freeze, watchdog and divergence state — so anything tight enough to be a budget would make
+    ///      the *healthy* gate read as absent, which is the failure mode with real consequences: the gate would
+    ///      silently stop refusing. 1,500,000 is far above the honest cost and far below a block, and by EIP-150
+    ///      the caller keeps a 1/64th of its remaining gas whatever the callee does with the rest.
+    uint256 private constant GATE_READ_GAS = 1_500_000;
 
     /// @dev The unlock action set lives in {VaultRedeemLib}, which is the one library both the placement path and
     ///      the ungated redemption path may reference, so the discriminators have exactly one home. `ACTION_SETTLE`
@@ -142,10 +153,13 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @dev slot 2 [0..15] — the redemption fee in bps.
     uint16 private _redeemFeeBps;
-    /// @dev slot 2 [16..31] — share of AMPS-side fees burned at `compound()`.
-    uint16 private _burnBps;
-    /// @dev slot 2 [32..47] — share of AMPS-side fees streamed to xAMPS.
-    uint16 private _stakerBps;
+    /// @dev slot 2 [16..47] — reserved, and declared rather than implied. This is where `burnBps` and
+    ///      `stakerBps` lived until plan revision 6 retired the staker leg and made the burn unconditional (the
+    ///      whole AMPS-side remainder after the creator slice is burned, so neither share is a parameter any
+    ///      more). The filler keeps every field above it at the bit offset `docs/phase2-state-model.md` §1.1
+    ///      documents and `VaultPlacementLib` reads by shift, so removing two governed knobs cannot silently move
+    ///      the ladder shape.
+    uint32 private _reservedFeeSplit;
     /// @dev slot 2 [48..63] — maximum upward move of `P_ref` per hour, in bps.
     uint16 private _refUpRateBps;
     /// @dev slot 2 [64..79] — hub-versus-WETH reference divergence threshold, in bps.
@@ -180,8 +194,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     address private _registry;
     /// @dev slot 5 — the bonds shell. Set-once.
     address private _bonds;
-    /// @dev slot 6 — the xAMPS staking vault. Set-once.
-    address private _staking;
+    /// @dev slot 6 — reserved. The xAMPS staking vault lived here until plan revision 6 removed staking
+    ///      altogether; the slot is deliberately left empty rather than reused so that section 1.1's slot numbers
+    ///      — which a standby vault is written against — keep meaning what they have always meant.
+    ///      `VaultNavLib.setPointer` no longer names it, so nothing can write it. `test/unit/VaultLayout.t.sol`
+    ///      asserts it stays zero.
+    address private _reservedSlot6;
     /// @dev slot 7 — the keeper bounty pot. Set-once.
     address private _bountyPot;
 
@@ -234,6 +252,23 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      that matters.
     uint256 private _deployThresholdUsd18;
 
+    /// @dev slot 21 [0..7] — whether the last {_checkpoint} priced any asset off an answer the feed registry is
+    ///      deliberately holding below the market: `!fresh`, or `unconfirmed` while a >10% single-round move waits
+    ///      for its second confirmation (`FeedRegistry` then reports `min(held, candidate)`).
+    ///
+    ///      **Why it is stored and not derived.** A held-back answer understates `A`, so it understates
+    ///      `navPerShareX18` — which is the *denominator* of `AmpsBonds._qFloorX18`. A bond on any **other**
+    ///      collateral would therefore mint below true NAV for as long as the hold lasts, and neither the bond
+    ///      shell nor the gate can see the condition: the gate is scoped to the pool it is asked about, and
+    ///      `VaultNavLib.answer` drops the flag on purpose (it is a valuation read, not a quote). The vault is the
+    ///      one place that knows which assets actually entered `A`, so it is the one place that can say it.
+    ///
+    ///      **Why slot 21 and not slot 15's free upper bits.** `docs/phase2-state-model.md` §1.1 documents slots
+    ///      0-19 field by field and a standby vault is written against them; `_deployThresholdUsd18` was appended
+    ///      at slot 20 rather than packed for exactly that reason, and this is the same decision one slot on.
+    ///      `test/unit/VaultLayout.t.sol` pins the slot and asserts that 22 upward stay empty.
+    bool private _navUnconfirmed;
+
     // -------------------------------------------------------------------------------------------------------------
     // Immutables (bytecode, no slot)
     // -------------------------------------------------------------------------------------------------------------
@@ -265,8 +300,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _GUARDIAN = guardian_;
 
         _redeemFeeBps = Constants.REDEEM_FEE_BPS_DEFAULT;
-        _burnBps = Constants.BURN_BPS_DEFAULT;
-        _stakerBps = Constants.STAKER_BPS_DEFAULT;
         _refUpRateBps = Constants.REF_UP_RATE_BPS_DEFAULT;
         _refDivergenceBps = Constants.REF_DIVERGENCE_BPS_DEFAULT;
         _twapWindow = Constants.TWAP_WINDOW_DEFAULT;
@@ -329,11 +362,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function bonds() external view returns (address bondsAddress) {
         return _bonds;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function staking() external view returns (address stakingAddress) {
-        return _staking;
     }
 
     /// @inheritdoc IAmpsVault
@@ -452,7 +480,22 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     function totalAssetsUsd18() external view returns (uint256 value) {
-        return VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+        (value,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+    }
+
+    /// @inheritdoc IAmpsVault
+    function navUnconfirmed() external view returns (bool held) {
+        return _navUnconfirmed;
+    }
+
+    /// @inheritdoc IAmpsVault
+    function spokeWeightBps(uint16 constituentId) external view returns (uint16 weightBps) {
+        // `A` as last checkpointed: `navPerShareX18 x (T + VIRTUAL_SHARES)`, the inverse of {_navPerShare} up to the
+        // `+ 1` wei. One multiplication instead of the ~150k-gas-per-pool walk `totalAssetsUsd18` would cost, so the
+        // registry's bounded probe of this view succeeds at 32 pools exactly as it does in a two-pool fixture.
+        uint256 total =
+            FullMath.mulDiv(_navPerShareX18, IAmps(_AMPS).totalSupply() + Constants.VIRTUAL_SHARES, Constants.WAD);
+        return VaultNavLib.spokeWeightBps(_sources(), total, address(this), constituentId);
     }
 
     /// @notice `A` measured over an arbitrary holder's balances rather than the vault's own.
@@ -463,7 +506,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @param holder The account to value.
     /// @return value `A` for that account, 18-decimal USD.
     function assetsUsd18Of(address holder) external view returns (uint256 value) {
-        return VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), holder, holder == address(this));
+        (value,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), holder, holder == address(this));
     }
 
     /// @inheritdoc IAmpsVault
@@ -523,16 +566,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function redeemFeeBps() external view returns (uint16 value) {
         return _redeemFeeBps;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function burnBps() external view returns (uint16 value) {
-        return _burnBps;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function stakerBps() external view returns (uint16 value) {
-        return _stakerBps;
     }
 
     /// @inheritdoc IAmpsVault
@@ -629,16 +662,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function REDEEM_FEE_BPS_MAX() external pure returns (uint16 value) {
         return Constants.REDEEM_FEE_BPS_MAX;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function BURN_BPS_MAX() external pure returns (uint16 value) {
-        return Constants.BURN_BPS_MAX;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function STAKER_BPS_MAX() external pure returns (uint16 value) {
-        return Constants.STAKER_BPS_MAX;
     }
 
     /// @inheritdoc IAmpsVault
@@ -801,9 +824,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         tokens = result.tokens;
         amounts = result.amounts;
 
-        _setUnlockAction(VaultRedeemLib.ACTION_PAYOUT);
-        IPoolManager(_POOL_MANAGER).unlock(abi.encode(tokens, result.fromClaims, result.fromIdle, to));
-        _setUnlockAction(0);
+        // The whole payout orchestration lives in the library: the ERC-20 attempt, the claims-only fallback that
+        // no token can block, and the best-effort idle leg outside the unlock. See {VaultRedeemLib-payout}.
+        VaultRedeemLib.payout(_POOL_MANAGER, tokens, result.fromClaims, result.fromIdle, to);
 
         if (result.inventoryBurned != 0) {
             IAmps(_AMPS).burn(address(this), result.inventoryBurned);
@@ -821,7 +844,15 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     /// @dev The gate is poked *before* `_requireHealthy`, so a checkpoint is exactly what clears a layer-A watchdog
     ///      whose cause has passed.
+    ///
+    /// @dev **Refuses before {genesis}, and must.** With no supply, `_navPerShare` is `1e18 / VIRTUAL_SHARES` —
+    ///      $0.001 — and writing that into `_pRefX18` is not recoverable: `PoolRegistry` anchors every pool it
+    ///      opens at `pRefX18()` and falls back to $1.00 only while that word is still *zero*, and pools are
+    ///      registered in exactly this window, with the gate pointer deliberately unset. One unprivileged
+    ///      `checkpoint()` before genesis would therefore open every pool registered afterwards a thousand times
+    ///      below NAV, permanently. `genesis()` mints `S0` before it checkpoints, so the launch path is unaffected.
     function checkpoint() external locked returns (Checkpoint memory snapshot) {
+        if (!_initialized) revert NotInitialized();
         _poke();
         _requireHealthy();
         snapshot = _checkpoint();
@@ -831,7 +862,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     /// @dev Stamps layer A only. It deliberately does not touch `checkpointTimestamp`: refreshing the staleness
     ///      bound without recomputing NAV would let every gated consumer read an old NAV as if it were fresh.
+    /// @dev Refuses before {genesis} for the same reason {checkpoint} does: there is nothing to keep alive yet, and
+    ///      the pre-genesis window belongs to pool registration.
     function touch() external locked {
+        if (!_initialized) revert NotInitialized();
         _poke();
         _requireHealthy();
         _sweepClean();
@@ -1032,16 +1066,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    function setBurnBps(uint16 value) external locked onlyTimelock {
-        _burnBps = uint16(_band(bytes32("burnBps"), value, 0, Constants.BURN_BPS_MAX, _burnBps));
-    }
-
-    /// @inheritdoc IAmpsVault
-    function setStakerBps(uint16 value) external locked onlyTimelock {
-        _stakerBps = uint16(_band(bytes32("stakerBps"), value, 0, Constants.STAKER_BPS_MAX, _stakerBps));
-    }
-
-    /// @inheritdoc IAmpsVault
     function setRefUpRateBps(uint16 value) external locked onlyTimelock {
         _refUpRateBps = uint16(
             _band(
@@ -1146,21 +1170,28 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev The single pointer setter. Five slots are **set-once** and refuse once {genesis} has frozen the wiring
-    ///      (`registry`, `bonds`, `staking`, `bountyPot`); `marketReference` is set-once before genesis and may be
+    /// @dev The single pointer setter. Four slots are **set-once** and refuse once {genesis} has frozen the wiring
+    ///      (`registry`, `bonds`, `bountyPot`); `marketReference` is set-once before genesis and may be
     ///      re-pointed afterwards exactly once more, to `AmpsHook`, under the 7-day timelock. The remaining slots
     ///      are freely pointer-upgradeable and none of them can move a fund.
     function setPolicyPointer(bytes32 slot, address newPointer) external locked onlyTimelock {
         _requireHealthy();
-        if (newPointer == address(0)) revert ZeroAddress();
+        // Every pointer this setter can write names a contract the vault *calls*. A codeless one is a typo, and
+        // for the gate slot specifically it is the typo that used to brick this very function: see {_requireGate}.
+        if (newPointer.code.length == 0) revert ZeroAddress();
         address previous = VaultNavLib.setPointer(slot, newPointer, _wiringFrozen);
         emit PolicyPointerChanged(slot, previous, newPointer);
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev **A codeless standby is refused**, and zero is the codeless case rather than a separate one. The
+    ///      standby is the address {emergencyMigrate} hands five `onlyVault` roles and the whole estate to, in a
+    ///      call the guardian makes under duress and with no timelock behind it; an EOA or a mistyped address
+    ///      there is unrecoverable — the roles are `onlyVault`, so nobody can hand them back. The check is the
+    ///      same one {setPolicyPointer} already makes for every pointer the vault calls.
     function setStandbyVault(address standby) external locked onlyTimelock {
         _requireHealthy();
-        if (standby == address(0)) revert ZeroAddress();
+        if (standby.code.length == 0) revert ZeroAddress();
         _standbyVault = standby;
         emit StandbyVaultRegistered(standby);
     }
@@ -1183,6 +1214,11 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev Not `_requireHealthy`-gated on purpose: the incident this exists for is an issuer denylisting the vault
     ///      while pausing its oracle, which is exactly a state in which the gate refuses. The predicate below is a
     ///      strictly narrower on-chain gate, and the guardian cannot migrate without it.
+    /// @dev **Nothing on this path asserts a clean sweep, and nothing on it may.** The migration exists for a token
+    ///      that refuses to move; requiring the vault's ERC-20 balances to be zero at the end would let the very
+    ///      denylisting that triggers the evacuation veto it, for one wei. `VaultNavLib.evacuate` moves every claim
+    ///      PoolManager-internally, which no token can block, and makes the idle leg best effort; whatever an
+    ///      issuer refuses to release stays on a shell that no longer holds a role, and is dust by I12.
     function emergencyMigrate(address standby) external locked {
         if (msg.sender != _GUARDIAN) revert NotGuardian(msg.sender);
         address registered = _standbyVault;
@@ -1209,11 +1245,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the evacuation.
         VaultNavLib.evacuate(_assets, _POOL_MANAGER, _AMPS, standby);
 
-        // The four `onlyVault` role handovers, in the same transaction. Nobody else can perform any of them.
-        IAmps(_AMPS).setVault(standby);
-        if (_bonds != address(0)) IAmpsBonds(_bonds).setVault(standby);
-        if (_staking != address(0)) IAmpsStaking(_staking).setVault(standby);
-        if (_bountyPot != address(0)) IBountyPot(_bountyPot).setVault(standby);
+        // Every `onlyVault` role, in the same transaction. Nobody else can perform any of them, and the set is
+        // all five: AMPS, `AmpsBonds`, `BountyPot`, `PoolRegistry` and — best effort — the hook.
+        VaultNavLib.handover(_registry, _AMPS, _bonds, _bountyPot, standby);
 
         // The relaxed R1 bound, enforced only when the standby can actually be priced. A dead feed must never stand
         // between the guardian and an evacuation: in Phase 2 there are no positions to bleed, every claim moves one
@@ -1229,7 +1263,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
             tstore(navSlot, 0)
         }
         emit Migrated(standby, navBefore, navAfter);
-        _assertSweepZero();
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1270,16 +1303,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      claims and the zero balance is then asserted.
     function _sweepClean() private {
         VaultRedeemLib.sweepClean(_assets, _POOL_MANAGER);
-    }
-
-    /// @dev The assertion half of {_sweepClean}, without the absorb step: used by {emergencyMigrate}, which has
-    ///      just moved every balance to the standby and must not re-deposit anything into the PoolManager.
-    function _assertSweepZero() private view {
-        uint256 length = _assets.length;
-        for (uint256 i; i < length; ++i) {
-            uint256 balance = IERC20(_assets[i]).balanceOf(address(this));
-            if (balance != 0) revert SweepDirty(_assets[i], balance);
-        }
     }
 
     /// @dev Writes the transient unlock discriminator.
@@ -1341,21 +1364,28 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev `navPerShareX18 = (A + 1) x 1e18 / (T + VIRTUAL_SHARES)`, rounded down. The denominator is
     ///      `Amps.totalSupply()` and nothing else (I6), and `VIRTUAL_SHARES` makes it non-zero in every reachable
     ///      state (I22).
+    /// @dev **Zero shares means no NAV, not $0.001.** With `T == 0` the formula returns `1e18 / VIRTUAL_SHARES`,
+    ///      which is an arithmetic artefact of the virtual-share guard rather than a price of anything: there are
+    ///      no shares for `A` to be per. Reporting zero keeps `PoolRegistry`'s "`pRefX18() == 0` means no
+    ///      checkpoint yet, anchor at $1.00" fallback true by construction. {checkpoint} and {touch} already
+    ///      refuse before {genesis}, so this is the belt to that pair of braces.
     function _navPerShare(uint256 assetsUsd18) private view returns (uint256) {
         uint256 supply = IAmps(_AMPS).totalSupply();
+        if (supply == 0) return 0;
         return FullMath.mulDiv(assetsUsd18 + 1, Constants.WAD, supply + Constants.VIRTUAL_SHARES);
     }
 
     /// @dev NAV/share recomputed from live balances, positions included: what {previewNavPerShareX18} returns and
     ///      what every Phase 3 entry point captures as `navBefore` for R1.
     function _previewNav() private view returns (uint256) {
-        return _navPerShare(VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true));
+        (uint256 assetsUsd18,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
+        return _navPerShare(assetsUsd18);
     }
 
     /// @dev Recomputes `A`, NAV/share, `P_mkt` and `P_ref` and writes the two checkpoint words (section 5).
     function _checkpoint() private returns (Checkpoint memory snapshot) {
         VaultNavLib.Sources memory src = _sources();
-        uint256 assetsUsd18 = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
+        (uint256 assetsUsd18, bool unconfirmed) = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
         uint256 supply = IAmps(_AMPS).totalSupply();
         // The one formula, from the one place: {previewNavPerShareX18} and the checkpoint can never disagree.
         uint256 nav = _navPerShare(assetsUsd18);
@@ -1376,6 +1406,9 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _pMktX18 = _toUint128(pMkt);
         _checkpointTimestamp = uint32(block.timestamp);
         _checkpointBlock = uint32(block.number);
+        // Slot 21: whether the `A` just written was priced off a held-back or stale answer for any asset. A later
+        // checkpoint against a confirmed answer clears it, so the flag always describes the live checkpoint.
+        _navUnconfirmed = unconfirmed;
 
         emit NavCheckpoint(nav, assetsUsd18, supply);
         emit RefCheckpoint(pRef, pMkt, rateLimited, navFloored);
@@ -1418,33 +1451,67 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _requireGate(true);
     }
 
-    /// @dev The two policies over one gate read. A gate that reverts is treated as absent rather than as a refusal:
-    ///      this contract is immutable, and a broken pointer must never be able to lock governance out of replacing
-    ///      it. A guardian protocol freeze refuses both policies, and reports as `SCHEDULED_FREEZE`.
+    /// @dev The two policies over one gate read. A gate that cannot be read is treated as **absent** rather than as
+    ///      a refusal: this contract is immutable, and a broken pointer must never be able to lock governance out
+    ///      of replacing it. A guardian protocol freeze refuses both policies, and reports as `SCHEDULED_FREEZE`.
+    ///
+    /// @dev **Neither read is a typed `try`, and that is load-bearing.** Solidity decodes a *successful* call's
+    ///      returndata in the caller's frame, so `try IOracleGate(gate).state(0) returns (GateState)` fails open
+    ///      only for a gate that *reverts*. It does not survive:
+    ///
+    ///        * a **codeless** pointer — the call succeeds with empty returndata and the decode reverts here;
+    ///        * an **out-of-range enum ordinal** — a `GateState` word above `type(GateState).max` is a `Panic`;
+    ///        * **short returndata** — fewer than 32 bytes is a `Panic` too;
+    ///
+    ///      and for the `void poke()` the compiler's own `extcodesize` check reverts before the `try` is reached.
+    ///      One bad `setPolicyPointer("oracleGate", x)` would therefore brick every gated selector — including
+    ///      `setPolicyPointer` itself, which calls this first, i.e. the one call that could undo it. Each read is
+    ///      instead a bounded low-level call whose word is read by hand and saturated into its declared range,
+    ///      which is exactly the shape `OracleGate._read` uses on its own dependencies. `setPolicyPointer` also
+    ///      refuses a codeless replacement outright, so reaching this state at all takes a self-destructed gate.
+    ///
     /// @param bondsPath Whether to apply the bond policy instead of the management policy.
     function _requireGate(bool bondsPath) private view {
-        address gate = _oracleGate;
-        if (gate == address(0)) return;
+        (bool known, uint256 word) = _gateRead(abi.encodeCall(IOracleGate.state, (0)));
+        if (!known || word > uint256(type(GateState).max)) return;
 
-        try IOracleGate(gate).state(0) returns (GateState gateState) {
-            bool refuses = bondsPath
-                ? (gateState == GateState.DIVERGED || gateState == GateState.SCHEDULED_FREEZE)
-                : (gateState != GateState.GREEN && gateState != GateState.REF_DIVERGED);
-            if (refuses) revert GateNotHealthy(uint8(gateState), bytes32(0));
-        } catch {
-            return;
+        GateState gateState = GateState(uint8(word));
+        bool refuses = bondsPath
+            ? (gateState == GateState.DIVERGED || gateState == GateState.SCHEDULED_FREEZE)
+            : (gateState != GateState.GREEN && gateState != GateState.REF_DIVERGED);
+        if (refuses) revert GateNotHealthy(uint8(gateState), bytes32(0));
+
+        (known, word) = _gateRead(abi.encodeCall(IOracleGate.protocolFreezeUntil, ()));
+        if (known && uint32(word) > block.timestamp) {
+            revert GateNotHealthy(uint8(GateState.SCHEDULED_FREEZE), bytes32(0));
         }
-
-        try IOracleGate(gate).protocolFreezeUntil() returns (uint32 until) {
-            if (until > block.timestamp) revert GateNotHealthy(uint8(GateState.SCHEDULED_FREEZE), bytes32(0));
-        } catch {}
     }
 
-    /// @dev Stamps layer A. Never reverts for a gate reason, and a gate that reverts is ignored.
-    function _poke() private {
+    /// @dev One bounded `staticcall` on the gate pointer, answered only when a whole word came back. Unknown
+    ///      covers every way a pointer can be wrong: zero, codeless, reverting, out of gas or too short.
+    /// @param payload The ABI-encoded call.
+    /// @return known Whether the answer can be believed.
+    /// @return word The first returndata word, read by hand so no shape can `Panic` here.
+    function _gateRead(bytes memory payload) private view returns (bool known, uint256 word) {
         address gate = _oracleGate;
-        if (gate == address(0)) return;
-        try IOracleGate(gate).poke() {} catch {}
+        if (gate == address(0)) return (false, 0);
+        (bool ok, bytes memory returndata) = gate.staticcall{gas: GATE_READ_GAS}(payload);
+        if (!ok || returndata.length < 32) return (false, 0);
+        assembly ("memory-safe") {
+            word := mload(add(returndata, 0x20))
+        }
+        return (true, word);
+    }
+
+    /// @dev Stamps layer A. Never reverts for a gate reason: a low-level call whose failure is ignored, for the
+    ///      same reason {_requireGate} is hand-decoded — a `try` on a `void` external function still reverts on a
+    ///      codeless target, before the `catch` can run.
+    /// @return poked Whether the stamp landed. Every caller discards it; it is a return value so that discarding
+    ///         it is explicit rather than an unused local.
+    function _poke() private returns (bool poked) {
+        address gate = _oracleGate;
+        if (gate == address(0)) return false;
+        (poked,) = gate.call{gas: GATE_READ_GAS}(abi.encodeCall(IOracleGate.poke, ()));
     }
 
     /// @dev Adds `token` to the NAV/redemption enumeration. AMPS is never an asset (I5), and re-registration is a
@@ -1464,11 +1531,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         for (uint256 i; i < length; ++i) {
             _registerAsset(tokens[i]);
         }
-    }
-
-    /// @dev Refuses a write to a set-once pointer once {genesis} has frozen the wiring.
-    function _requireWiringOpen() private view {
-        if (_wiringFrozen) revert AlreadyInitialized();
     }
 
     /// @dev Every governed numeric setter funnels through here: one band check, one {OutOfBand} revert site and

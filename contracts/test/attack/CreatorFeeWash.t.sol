@@ -9,7 +9,7 @@ import {console} from "forge-std/console.sol";
 /// @notice The plan's named attack **creator-fee wash trading**: "every round trip pays the sell fee to earn back
 ///         at most 1 point of it".
 ///
-///         The creator earns `min(creatorBps(t), sellFeeBps) / sellFeeBps` of the AMPS-side fees a `compound`
+///         The creator earns `min(creatorBps(t), ampsFeeBps) / ampsFeeBps` of the AMPS-side fees a `compound`
 ///         collects - one point of five at launch, decaying to zero over thirty days. Washing volume to farm it is
 ///         a 5-for-1 loss before slippage: the wash pays the whole sell fee and the creator gets a fifth of the
 ///         AMPS-side slice of it back, and only after a keeper compounds.
@@ -53,9 +53,9 @@ contract CreatorFeeWashTest is Phase3Fixture {
         assertGt(ampsFees, 0, "the wash generated AMPS-side fees");
         assertLt(paidUsd18, costUsd18, "and the creator got back far less than the washing cost");
         assertLe(
-            paid * uint256(hook.sellFeeBps()),
+            paid * uint256(hook.ampsFeeBps()),
             ampsFees * uint256(vault.creatorBpsAt(block.timestamp)) + ampsFees,
-            "I31: the payout is at most creatorBps / sellFeeBps of the AMPS-side fees"
+            "I31: the payout is at most creatorBps / ampsFeeBps of the AMPS-side fees"
         );
         assertLe(paid * 5, ampsFees + 5, "one point of a five-point sell fee, and no more");
     }
@@ -70,16 +70,20 @@ contract CreatorFeeWashTest is Phase3Fixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         uint256 keeperBefore = amps.balanceOf(KEEPER);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
         uint256 creatorBefore = amps.balanceOf(CREATOR);
+        uint256 supplyBefore = amps.totalSupply();
 
         vm.recordLogs();
         vm.prank(KEEPER);
-        vault.compound(hubPool);
+        (uint256 ampsFees,) = vault.compound(hubPool);
 
         assertEq(amps.balanceOf(KEEPER), keeperBefore, "the keeper is paid in USDG from the pot, never in AMPS");
-        assertGt(amps.balanceOf(CREATOR), creatorBefore, "the creator was paid");
-        assertGt(amps.balanceOf(address(staking)), stakingBefore, "and the stakers, which is a contract, not an EOA");
+        uint256 paid = amps.balanceOf(CREATOR) - creatorBefore;
+        assertGt(paid, 0, "the creator was paid");
+
+        // Since revision 6 there is no second recipient at all: what the creator does not take is burned, so the
+        // AMPS side of the fee leaves the supply rather than reaching any address.
+        assertEq(supplyBefore - amps.totalSupply(), ampsFees - paid, "every other wei of the fee was burned");
     }
 
     /// @notice And the faucet closes: after thirty days the creator earns nothing at all, so the wash has no

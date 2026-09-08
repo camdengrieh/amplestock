@@ -23,7 +23,7 @@ import {PoolClass} from "../types/Types.sol";
 ///
 ///      | bit | source                | what is zeroed when it is set                             |
 ///      |-----|-----------------------|-----------------------------------------------------------|
-///      | 0   | `AmpsHook`            | ticks, bands, fees, `refuseBuy`/`refuseSell`               |
+///      | 0   | `AmpsHook`            | ticks, bands, all fee legs, `refuseBuy`/`refuseSell`               |
 ///      | 1   | `OracleGate`          | `gateState`, `session`, `feedStale`, `corporateFreeze`     |
 ///      | 2   | `FeedRegistry`        | the counter-asset price feeding `pMktX18`                  |
 ///      | 3   | vault checkpoint      | `navPerShareX18`, `pRefX18`, `premiumX18`, `checkpointAge` |
@@ -35,9 +35,11 @@ import {PoolClass} from "../types/Types.sol";
 ///      And `refuseBuy`/`refuseSell` are `false` whenever bit0 is set: the quoter fails **open** for display, and
 ///      an execution path must never treat a quote with `degraded != 0` as permission to trade.
 ///
-/// @dev **Amount-level pricing is not this contract's job.** {PoolQuote} is a fee-and-state view, not a curve
-///      simulator: it says what a swap would *cost in fees* and whether it would be refused, not how much comes
-///      out. `V4Quoter` does the curve, off-chain, and the two are reconciled in the dApp.
+/// @dev **{PoolQuote} is a fee-and-state view, not a curve simulator.** It says what a swap would *cost in
+///      fees* and whether it would be refused, not how much comes out. The amount-level answers are separate
+///      entry points — {quoteExactIn}, {quoteSellWithCredit} and {quoteRotation} — which walk the PoolManager's
+///      own published ticks under the same never-revert rule and report `amountOut == 0` where a curve simulator
+///      would throw. `V4Quoter` remains the off-chain cross-check, and the two are reconciled in the dApp.
 interface IAmpsQuoter {
     /// @notice Everything the quoter knows about one pool, in one struct.
     ///
@@ -55,11 +57,19 @@ interface IAmpsQuoter {
     /// @param fairTick The tick the deviation is measured against.
     /// @param innerBandTicks The inner band half-width in force, by session and class.
     /// @param outerRailTicks The outer rail half-width in force.
-    /// @param buyFeeBps The pool's base buy fee.
-    /// @param sellFeeBps The protocol-wide base sell fee.
-    /// @param buyFeePips The **total** fee a buy would pay right now, in pips, base plus the clamped dynamic part.
-    /// @param sellFeePips The total fee an uncredited sell would pay right now, in pips. A sell inside a rotation
-    ///        pays less; use {quoteRotation} for that.
+    /// @param buyFeeBps The pool's **pass-through** base fee, in bps: what one hop of a protocol-router rotation
+    ///        costs. Revision 6 — it is not what an ordinary buy pays.
+    /// @param ampsFeeBps The protocol-wide AMPS fee, in bps: the base fee on **both** directions of this pool, and
+    ///        what every swap that is not a router rotation hop pays.
+    /// @param buyFeePips The **total** fee an ordinary buy would pay right now, in pips: `ampsFeeBps` plus the
+    ///        clamped dynamic part. This is the number a front end quotes a user who is buying AMPS.
+    /// @param sellFeePips The total fee an ordinary sell would pay right now, in pips. Same base, the sell
+    ///        direction's dynamic part.
+    /// @param passThroughBuyFeePips The total fee hop 1 of a protocol-router rotation would pay through this pool,
+    ///        in pips: `buyFeeBps` plus the buy direction's clamped dynamic part. **Appended field, revision 6.**
+    ///        Unreachable except through `AmpsRouter.rotate`; see {quoteRotation}.
+    /// @param passThroughSellFeePips The same for hop 2 — an exact-input sell fully covered by the credit hop 1
+    ///        created: `buyFeeBps` plus the sell direction's clamped dynamic part. **Appended field, revision 6.**
     /// @param dynBps The dynamic component in force, in bps.
     /// @param dynCapBps The cap on it for the pool's current gate state.
     /// @param refuseSell True when a sell would be refused for beginning beyond the outer rail on the
@@ -97,9 +107,11 @@ interface IAmpsQuoter {
         int24 innerBandTicks;
         int24 outerRailTicks;
         uint16 buyFeeBps;
-        uint16 sellFeeBps;
+        uint16 ampsFeeBps;
         uint24 buyFeePips;
         uint24 sellFeePips;
+        uint24 passThroughBuyFeePips;
+        uint24 passThroughSellFeePips;
         uint16 dynBps;
         uint16 dynCapBps;
         bool refuseSell;
@@ -130,23 +142,48 @@ interface IAmpsQuoter {
     /// @return quotes The quotes.
     function quoteAll() external view returns (PoolQuote[] memory quotes);
 
+    /// @notice Prices one exact-input swap: the fee the hook would charge, whether it would be refused, and the
+    ///         output a full tick walk over the PoolManager's published state produces.
+    /// @dev Never reverts. `amountOut` is zero whenever the swap would be refused, the pool is not initialised, or
+    ///      the walk could not finish — all three of which also raise a bit in `degraded`, except the refusal,
+    ///      which is reported through `refuse`.
+    /// @dev The fee is the **ordinary** one: base `ampsFeeBps` in both directions, which is what any caller who
+    ///      is not `AmpsRouter.rotate` pays. The pass-through price of a hop is {quoteRotation}'s to report.
+    /// @param poolId The pool.
+    /// @param zeroForOne True for a sell (AMPS in), false for a buy.
+    /// @param amountIn The input, in the input currency's raw units.
+    /// @return amountOut The output, in the output currency's raw units.
+    /// @return feePips The total fee in pips, base plus the clamped dynamic part.
+    /// @return refuse Whether the hook would refuse the swap for beginning beyond the outer rail.
+    /// @return degraded The bitfield, restricted to the reads this call made.
+    function quoteExactIn(PoolId poolId, bool zeroForOne, uint256 amountIn)
+        external
+        view
+        returns (uint256 amountOut, uint24 feePips, bool refuse, uint8 degraded);
+
     /// @notice Prices a rotation — stock -> AMPS -> stock, or any two-hop path through an Amplestocks pool — with
     ///         the same-transaction rotation credit applied exactly as the hook would apply it.
     ///
-    /// @dev **The credit is simulated, never read.** `IAmpsHook.rotationCredit()` lives in EIP-1153 transient
+    /// @dev **This prices the `AmpsRouter.rotate` path and nothing else.** Both hops are quoted as pass-through —
+    ///      base `buyFeeBps[hop1]` and `buyFeeBps[hop2]` — because that is the fee the hook charges when, and only
+    ///      when, `sender == IAmpsHook.router()` and both hops carry `Constants.ROUTER_ROTATE`. The same two swaps
+    ///      built by hand through any other router each pay `ampsFeeBps`; use {quoteExactIn} twice for that.
+    ///
+    /// @dev **The credit is simulated, never read.** `IAmpsHook.rotationCredit(sender)` lives in EIP-1153 transient
     ///      storage and is therefore always zero when read from a fresh `eth_call`; consulting it would make every
     ///      quote wrong in exactly the direction that matters. What this function does instead is model the credit
-    ///      the caller's *own* hop 1 will create:
+    ///      the router's own hop 1 will create:
     ///
     ///      ```
-    ///      hop 1: a buy in `hop1`, paying buyFeeBps[hop1]; the AMPS it yields is the credit
-    ///      hop 2: an exact-input sell in `hop2`, base fee
-    ///             = buyFeeBps[hop2] + ceilDiv((sellFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
+    ///      hop 1: a pass-through buy in `hop1`, paying buyFeeBps[hop1]; the AMPS it yields is the credit
+    ///      hop 2: a pass-through exact-input sell of exactly that AMPS in `hop2`, base fee
+    ///             = buyFeeBps[hop2] + ceilDiv((ampsFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
+    ///             = buyFeeBps[hop2], because `rotate` sells precisely what hop 1 bought
     ///      ```
     ///
     ///      That is the hook's own delta form, rounded up the same way, so the quote is exact rather than
-    ///      approximate. Exact-**output** sells consume no credit and pay `sellFeeBps` in full, which is why the
-    ///      dApp always builds hop 2 as `SWAP_EXACT_IN`.
+    ///      approximate. Exact-**output** sells consume no credit and pay `ampsFeeBps` in full, which is why the
+    ///      router only ever builds hop 2 as an exact-input swap.
     /// @param hop1 The pool bought through.
     /// @param hop2 The pool sold through.
     /// @param amountIn The input to hop 1, in `hop1`'s counter-asset raw units.
@@ -158,6 +195,64 @@ interface IAmpsQuoter {
         external
         view
         returns (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed);
+
+    /// @notice Prices an exact-input **sell** that carries a same-transaction rotation credit: hop 2 of a
+    ///         rotation, in the general case where the sell is larger than the buy that funds it.
+    ///
+    /// @dev **A credit exists only on the protocol router's rotation path.** Since revision 6 the hook credits a
+    ///      buy, and lets a sell spend a credit, only when `sender == IAmpsHook.router()` and the hop carries
+    ///      `Constants.ROUTER_ROTATE`. So any `credit != 0` passed here describes a hop inside an
+    ///      `AmpsRouter.rotate`, and for every other caller in the world the honest argument is `credit == 0` —
+    ///      which prices the sell at `ampsFeeBps`, exactly as {quoteExactIn} does.
+    /// @dev The general case of hop 2 of {quoteRotation}: `credit >= ampsIn` reproduces a pure rotation and prices
+    ///      the whole sell at `buyFeeBps`, `credit == 0` prices it at `ampsFeeBps`, and everything between is the
+    ///      hook's `ceilDiv` blend on the uncredited excess. The credit is an argument rather than a read, because
+    ///      the hook holds it in transient storage where an `eth_call` always sees zero.
+    /// @param poolId The pool sold through.
+    /// @param ampsIn AMPS wei sold.
+    /// @param credit AMPS wei of same-transaction rotation credit the router will hold when the sell lands; zero
+    ///        for every path that is not `AmpsRouter.rotate`.
+    /// @return amountOut The counter asset received, in its raw units.
+    /// @return feePips The total fee in pips, with the credit applied.
+    /// @return refuse Whether the hook would refuse the sell.
+    /// @return degraded The bitfield, restricted to the reads this call made.
+    function quoteSellWithCredit(PoolId poolId, uint256 ampsIn, uint256 credit)
+        external
+        view
+        returns (uint256 amountOut, uint24 feePips, bool refuse, uint8 degraded);
+
+    /// @notice Whether a swap would revert right now, and why.
+    /// @dev The rail is the hook's answer, not this contract's: `IAmpsHook.quoteFee` reports the refusal that
+    ///      `beforeSwap` would throw as `Errors.BeyondRail`. The quoter fails **open** — a hook it cannot read
+    ///      reports `refuse == false` with bit 0 set — because a display path must not invent a refusal and an
+    ///      execution path must never treat `degraded != 0` as permission to trade.
+    /// @param poolId The pool.
+    /// @param zeroForOne True for a sell (AMPS in).
+    /// @param exactInput True for an exact-input swap.
+    /// @param amount The input amount, or 0 when unknown.
+    /// @return refuse Whether the swap would revert.
+    /// @return reason `bytes32(0)`, `bytes32("rail")` or `bytes32("uninitialized")`.
+    /// @return degraded The bitfield, restricted to the reads this call made.
+    function wouldRevert(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amount)
+        external
+        view
+        returns (bool refuse, bytes32 reason, uint8 degraded);
+
+    /// @notice The redemption floor expressed in the pool's own ticks: the tick at which AMPS trades at NAV/share,
+    ///         the rail `NAV_RAIL_TICKS` below it, and whether the pool is currently under that rail.
+    /// @dev Disclosure, not enforcement. Nothing on-chain refuses a swap for being below NAV; what the plan says is
+    ///      that nobody rational sells below the redemption floor, and this is the number that makes that visible.
+    ///      A pool below the rail is a pool where `redeemProRata` is the better exit.
+    /// @param poolId The pool.
+    /// @return navTick The spacing-aligned tick at which the pool prices AMPS at NAV/share.
+    /// @return railTick `navTick - NAV_RAIL_TICKS`, the implementation's `Constants.OUTER_RAIL_MIN_TICKS`.
+    /// @return belowRail Whether the live tick is below `railTick`.
+    /// @return navPerShareX18 The NAV/share the ticks were derived from.
+    /// @return degraded The bitfield, restricted to the reads this call made.
+    function navRail(PoolId poolId)
+        external
+        view
+        returns (int24 navTick, int24 railTick, bool belowRail, uint256 navPerShareX18, uint8 degraded);
 
     /// @notice The bond terms of one market, mirroring `AmpsBonds`' own `min(qMarket, qFloor)` with the same
     ///         rounding directions.

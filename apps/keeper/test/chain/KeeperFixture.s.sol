@@ -16,7 +16,6 @@ import {FeePolicy} from "amps/policy/FeePolicy.sol";
 import {LadderPolicy} from "amps/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "amps/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "amps/registry/PoolRegistry.sol";
-import {AmpsStaking} from "amps/staking/AmpsStaking.sol";
 import {Amps} from "amps/token/Amps.sol";
 import {Constants} from "amps/types/Constants.sol";
 import {FeedConfig, GateState, InclusionRecord, PoolClass} from "amps/types/Types.sol";
@@ -227,10 +226,13 @@ contract KeeperFixture is Script {
 
         // The periphery. `OracleGate` is deliberately absent: stage 3 deploys it, which is §9.1's ordering — a
         // gate that is unset is exactly as permissive as a gate that is GREEN, and pool registration needs that.
+        // `AmpsStaking` is absent because it no longer exists, and `AmpsRouter` because the keeper never trades:
+        // its five jobs are `compound`, `rollout`, `deployBonded`, `checkpoint` and `touch`, and none of them
+        // routes a swap. The hook's `router` therefore stays unset here, which is the setting under which every
+        // hop in every pool pays `ampsFeeBps` — exactly the prices these jobs are measured against.
         FeedRegistry feedRegistry = new FeedRegistry(operator, address(0));
         BondPolicy bondPolicy = new BondPolicy();
         AmpsBonds bonds = new AmpsBonds(address(vault), address(registry), address(bondPolicy));
-        AmpsStaking staking = new AmpsStaking(IERC20(address(amps)), address(vault), operator);
         BountyPot pot = new BountyPot(address(usdg), address(vault), operator);
         LadderPositionValuer valuer =
             new LadderPositionValuer(IExtsload(poolManager), address(vault), IPoolRegistry(address(registry)));
@@ -244,7 +246,6 @@ contract KeeperFixture is Script {
 
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feedRegistry));
         vault.setPolicyPointer(bytes32("marketReference"), address(phase2Reference));
@@ -259,7 +260,6 @@ contract KeeperFixture is Script {
         _emit("feedRegistry", address(feedRegistry));
         _emit("bonds", address(bonds));
         _emit("bondPolicy", address(bondPolicy));
-        _emit("staking", address(staking));
         _emit("bountyPot", address(pot));
         _emit("valuer", address(valuer));
         _emit("ladderPolicy", address(ladderPolicy));

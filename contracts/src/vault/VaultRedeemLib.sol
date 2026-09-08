@@ -4,7 +4,6 @@ pragma solidity 0.8.30;
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
 import {PoolStateLib} from "../lib/PoolStateLib.sol";
 import {Constants} from "../types/Constants.sol";
-import {SweepDirty} from "../types/Errors.sol";
 import {PlacementRecord} from "../types/Types.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -101,6 +100,12 @@ library VaultRedeemLib {
 
     /// @dev Remove named cells from one pool and hold the proceeds (rollout source, `withdrawRetiredBids`).
     uint256 internal constant ACTION_HARVEST = 8;
+
+    /// @dev The redemption floor's unblockable payout: hand every claim part to the redeemer as an ERC-6909
+    ///      `transfer` and touch no token contract at all. {payout} falls back to it when the ERC-20 attempt
+    ///      fails for any reason whatever, so that a hostile constituent can degrade a redemption into claims but
+    ///      can never stop it (Phase 2 §7, ruling AD).
+    uint256 internal constant ACTION_PAYOUT_CLAIMS = 9;
 
     // -------------------------------------------------------------------------------------------------------------
     // The live-cell budget (§12 ruling E)
@@ -208,17 +213,15 @@ library VaultRedeemLib {
             (address token, address from, uint256 amount) = abi.decode(data, (address, address, uint256));
             return abi.encode(settleFrom(poolManager, token, from, amount));
         }
-        if (action == ACTION_PAYOUT) {
-            (address[] memory tokens, uint256[] memory fromClaims, uint256[] memory fromIdle, address to) =
-                abi.decode(data, (address[], uint256[], uint256[], address));
-            _payOut(poolManager, tokens, fromClaims, fromIdle, to);
+        if (action == ACTION_PAYOUT || action == ACTION_PAYOUT_CLAIMS) {
+            (address[] memory tokens, uint256[] memory fromClaims, address to) =
+                abi.decode(data, (address[], uint256[], address));
+            _payOut(poolManager, tokens, fromClaims, to, action == ACTION_PAYOUT);
             return "";
         }
         if (action == ACTION_ABSORB) {
-            (address[] memory tokens, uint256[] memory amounts) = abi.decode(data, (address[], uint256[]));
-            for (uint256 i; i < tokens.length; ++i) {
-                settleFrom(poolManager, tokens[i], address(this), amounts[i]);
-            }
+            address token = abi.decode(data, (address));
+            _settleAbsorbed(poolManager, token);
             return "";
         }
         if (action == ACTION_UNWIND) {
@@ -256,70 +259,281 @@ library VaultRedeemLib {
     }
 
     /// @notice I12. Any ERC-20 balance the vault is left holding — a donation, a rounding remainder — is absorbed
-    ///         into ERC-6909 claims (where it becomes backing for every holder) and the zero balance is then
-    ///         asserted. The absorb step is what stops a 1-wei donation from bricking an assert-only
-    ///         implementation.
+    ///         into ERC-6909 claims, where it becomes backing for every holder.
+    ///
+    /// @dev **Nothing in here can revert on a hostile token, and that is the whole point.** `sweepClean` runs at
+    ///      the exit of *every* entry point, `redeemProRata` included, and §7 says the redemption floor cannot be
+    ///      gated. An implementation that read `balanceOf` unguarded, absorbed with `safeTransfer` and then
+    ///      reverted `SweepDirty` on the residue handed anybody a one-transaction kill switch for the whole
+    ///      contract: donate one wei of a Stock Token, have the issuer pause it or denylist the vault, and every
+    ///      selector reverts forever. Four changes close that:
+    ///
+    ///        1. **Balances are probed, not read.** A bounded `staticcall` whose answer is hand-decoded; a token
+    ///           whose `balanceOf` reverts, runs away with the gas or answers short is simply skipped.
+    ///        2. **The absorb is per token and best effort** ({_absorb}): a token that refuses the transfer into
+    ///           the PoolManager costs that token its absorb, not the transaction.
+    ///        3. **Every call into the token is gas-bounded and each token gets its own `unlock`.** A `transfer`
+    ///           that burns whatever it is handed used to leave the skip branch a sixty-fourth of the frame, and
+    ///           a `transfer` that re-entered the PoolManager from inside the vault's *own* unlock could open a
+    ///           delta nobody closes and take the whole `unlock` down with `CurrencyNotSettled`. Both are gone:
+    ///           see {_absorb} for the ordering that removes the second and the caps that remove the first.
+    ///        4. **Residue is disclosed, not enforced.** Whatever is still on the vault at the end is reported
+    ///           with `IAmpsVault.SweepResidue`. It stays part of the vault's holdings — it is counted in `A` and
+    ///           paid out by redemption — so a donation is still backing rather than a leak, exactly as before;
+    ///           only the revert is gone.
+    ///
     /// @param assets The vault's registered non-AMPS assets.
     /// @param poolManager The Uniswap v4 PoolManager.
     function sweepClean(address[] storage assets, address poolManager) public {
         uint256 length = assets.length;
-        address[] memory dirty = new address[](length);
-        uint256[] memory amounts = new uint256[](length);
-        uint256 count;
         for (uint256 i; i < length; ++i) {
             address token = assets[i];
-            uint256 balance = IERC20(token).balanceOf(address(this));
-            if (balance != 0) {
-                dirty[count] = token;
-                amounts[count] = balance;
-                unchecked {
-                    ++count;
-                }
-            }
-        }
-        if (count == 0) return;
+            (bool readable, uint256 balance) = _probeBalance(token);
+            if (!readable || balance == 0) continue;
 
-        assembly ("memory-safe") {
-            mstore(dirty, count)
-            mstore(amounts, count)
+            _absorb(poolManager, token, balance);
+
+            (readable, balance) = _probeBalance(token);
+            if (readable && balance != 0) emit IAmpsVault.SweepResidue(token, balance);
         }
+    }
+
+    /// @dev One token's best-effort absorb: `sync -> transfer` **outside** an unlock, then `settle -> mint` inside
+    ///      one the token cannot poison, abandoned at the first step that fails.
+    ///
+    /// @dev **Why the transfer happens before the `unlock` and not inside it.** v4's `sync` is not
+    ///      `onlyWhenUnlocked`, and neither is an ERC-20 `transfer`. A Stock Token is a beacon proxy whose
+    ///      `transfer` must be assumed hostile, and the one thing a hostile `transfer` can do from inside the
+    ///      vault's own `unlock` is call the PoolManager — `mint`, `take`, a swap — and leave a delta of *its
+    ///      own* open. v4 counts non-zero deltas globally, so the vault's `unlock` then reverts with
+    ///      `CurrencyNotSettled` however clean the vault's own books are, and before this that revert took the
+    ///      entry point with it. Moved out here the same call-back hits `ManagerLocked` and it is the *token's*
+    ///      transfer that fails, which costs that token its absorb and nothing else.
+    ///
+    /// @dev **Every leg is gas-bounded.** `sync` reads the token's `balanceOf` inside the PoolManager and the
+    ///      `transfer` is the token's own code, so an unbounded call to either leaves the skip branch a
+    ///      sixty-fourth of the caller's frame — a griefing kill switch by exhaustion rather than by reverting.
+    ///      Four probe budgets is orders of magnitude more than an honest ERC-20 needs for either.
+    ///
+    /// @dev **The `unlock` itself is `try`/`catch`ed**, so even a residual failure inside it — a `settle` the
+    ///      token starves, a `mint` the PoolManager refuses — skips this token's absorb instead of reverting the
+    ///      entry point. One token, one `unlock`: a token that fails cannot take another token's absorb with it.
+    ///
+    /// @dev **The one thing this cannot undo.** A token that answers `balanceOf` for the probe and for `sync`,
+    ///      accepts the transfer, and *then* refuses `balanceOf` inside `settle` leaves that transfer sitting in
+    ///      the PoolManager uncredited: the transfer is outside the `unlock`, so the `catch` cannot roll it back.
+    ///      The amount is that token's own idle dust (I12), no other asset is touched, and the alternative —
+    ///      transferring inside the `unlock` — is what let a hostile token revert the whole sweep in the first
+    ///      place. It is a disclosure, not a hole: the balance leaves the vault either way.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param token The asset to absorb.
+    /// @param amount The idle balance {sweepClean} measured.
+    function _absorb(address poolManager, address token, uint256 amount) private {
+        if (amount == 0) return;
+
+        (bool synced,) = poolManager.call{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(
+            abi.encodeCall(IPoolManager.sync, (Currency.wrap(token)))
+        );
+        if (!synced) return;
+        if (!_tryTransfer(token, poolManager, amount)) return;
 
         uint256 slot = UNLOCK_ACTION;
         uint256 absorb = ACTION_ABSORB;
         assembly ("memory-safe") {
             tstore(slot, absorb)
         }
-        IPoolManager(poolManager).unlock(abi.encode(dirty, amounts));
+        try IPoolManager(poolManager).unlock(abi.encode(token)) {} catch {}
         assembly ("memory-safe") {
             tstore(slot, 0)
         }
-
-        for (uint256 i; i < count; ++i) {
-            uint256 balance = IERC20(dirty[i]).balanceOf(address(this));
-            if (balance != 0) revert SweepDirty(dirty[i], balance);
-        }
     }
 
-    /// @dev Burns the claim slice and `take`s it out as ERC-20, then pays the remainder from any idle balance.
-    ///      Claims first, idle second.
-    function _payOut(
+    /// @dev The inside-the-unlock half of {_absorb}: credit whatever the transfer moved and mint the claim.
+    ///      `settle` is a bounded low-level call because the PoolManager reads the token's own `balanceOf` inside
+    ///      it, so a token that starves it costs its own absorb rather than the caller's frame; `mint` runs only
+    ///      on a non-zero credit, so no delta is ever opened that this unlock could not close.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param token The asset whose transfer is waiting to be settled.
+    function _settleAbsorbed(address poolManager, address token) private {
+        (bool ok, bytes memory returndata) =
+            poolManager.call{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(abi.encodeCall(IPoolManager.settle, ()));
+        if (!ok || returndata.length < 32) return;
+        uint256 settled;
+        assembly ("memory-safe") {
+            settled := mload(add(returndata, 0x20))
+        }
+        if (settled != 0) IPoolManager(poolManager).mint(address(this), Currency.wrap(token).toId(), settled);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The payout (§7, ruling AD)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice Pays one redemption out: ERC-20 where the token allows it, an ERC-6909 claim where it does not,
+    ///         and value for every asset either way.
+    ///
+    /// @dev **Three nested fallbacks, because the floor may not be stoppable by anybody.** Per asset, `take`
+    ///      moves a real ERC-20 to the redeemer and a token that is paused, that denylists the vault or the
+    ///      redeemer, or that simply burns the gas it is handed makes it fail; the claim is then transferred
+    ///      instead, which is a balance move inside the PoolManager that no token contract can observe or refuse.
+    ///      That is the per-asset fallback, and it lives inside the unlock ({_payOut}).
+    ///
+    ///      The second fallback is this function's own. A hostile `transfer` reached through `take` runs while the
+    ///      PoolManager is unlocked and can open a delta of *its own* — `mint`, `take`, a swap — which makes the
+    ///      vault's `unlock` revert with `CurrencyNotSettled` at the end, after every per-asset `catch` has
+    ///      already been passed. One constituent could therefore revert the whole payout. The ERC-20 attempt is
+    ///      therefore itself a `try`, and its failure runs a second `unlock` that transfers every claim part and
+    ///      touches no token at all. `Constants.REDEEM_PAYOUT_RESERVE_GAS` is held back from the first attempt so
+    ///      that the second is always affordable, however much gas the first one burns.
+    ///
+    ///      The third is the idle leg, which is paid **after** the unlock: an idle ERC-20 balance is dust by I12
+    ///      (every deposit path settles straight into the PoolManager), it cannot be handed over as a claim
+    ///      because it is not one, and moving it inside the unlock would put a hostile `transfer` back on the one
+    ///      call path this function exists to protect. Each leg is a bounded best-effort call; an idle wei a
+    ///      token refuses to move is **not paid** and stays on the vault as backing for every holder.
+    ///
+    /// @dev The result: the redeemer receives value for every asset, as tokens or as claims, and no third party
+    ///      can turn "degraded" into "reverted".
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param tokens The assets being paid, in registration order.
+    /// @param fromClaims The part of each payout that comes out of the vault's ERC-6909 claims.
+    /// @param fromIdle The part that comes out of an idle ERC-20 balance.
+    /// @param to The redeemer.
+    function payout(
         address poolManager,
         address[] memory tokens,
         uint256[] memory fromClaims,
         uint256[] memory fromIdle,
         address to
+    ) public {
+        uint256 slot = UNLOCK_ACTION;
+        bytes memory data = abi.encode(tokens, fromClaims, to);
+        uint256 reserve = Constants.REDEEM_PAYOUT_RESERVE_GAS;
+        bool paid;
+
+        if (gasleft() > reserve) {
+            uint256 action = ACTION_PAYOUT;
+            assembly ("memory-safe") {
+                tstore(slot, action)
+            }
+            try IPoolManager(poolManager).unlock{gas: gasleft() - reserve}(data) {
+                paid = true;
+            } catch {}
+        }
+
+        if (!paid) {
+            uint256 action = ACTION_PAYOUT_CLAIMS;
+            assembly ("memory-safe") {
+                tstore(slot, action)
+            }
+            // Deliberately not `try`ed: this unlock moves ERC-6909 balances the vault is known to hold and calls
+            // no token, so a failure here is a bug in this library rather than something a third party can cause.
+            IPoolManager(poolManager).unlock(data);
+        }
+
+        assembly ("memory-safe") {
+            tstore(slot, 0)
+        }
+
+        uint256 length = tokens.length;
+        for (uint256 i; i < length; ++i) {
+            uint256 idlePart = fromIdle[i];
+            if (idlePart == 0) continue;
+            // The claims are already paid; what is left is dust, and running out of gas over it would revert a
+            // redemption that has otherwise succeeded. An unpaid idle part stays on the vault as backing.
+            if (gasleft() < Constants.STOCK_TOKEN_PROBE_GAS * 8) return;
+            _tryTransfer(tokens[i], to, idlePart);
+        }
+    }
+
+    /// @dev Burns the claim slice and `take`s it out as ERC-20, or hands the claim itself over when it cannot.
+    ///
+    /// @dev **One paused constituent must not stop every redemption.** `take` moves a real ERC-20 to the redeemer,
+    ///      so a Stock Token that is paused, or that denylists either the vault or the redeemer, reverts it — and
+    ///      because the payout walks every registered asset in one unlock, that revert used to take the other
+    ///      thirty-one assets and every other holder's redemption with it. The `take` is therefore attempted and,
+    ///      when it fails, the claim itself is handed over instead: `pm.transfer` is an ERC-6909 balance move
+    ///      inside the PoolManager that touches no token contract, so nothing about the token can block it. The
+    ///      redeemer holds a claim on exactly the same amount and can `take` it whenever the issuer relents.
+    ///
+    /// @dev **The `take` is gas-bounded**, because it calls the token's `transfer`: a token that burns everything
+    ///      it is handed would otherwise leave the `catch` branch a sixty-fourth of the frame and starve the
+    ///      assets after it, which is a way of stopping the floor by exhaustion rather than by reverting.
+    ///
+    /// @dev **The burn lives in the success branch, and must.** `take` opens a negative delta for the vault that
+    ///      burning the claim settles; both orders are legal inside one unlock, but the claim may only be burned
+    ///      when the `take` that consumed it actually happened. In the fallback the claim is transferred, not
+    ///      burned, so the vault's ledger balances either way.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param tokens The assets being paid.
+    /// @param fromClaims The claim part of each payout.
+    /// @param to The redeemer.
+    /// @param withErc20 Whether to attempt the ERC-20 `take` at all. False on {ACTION_PAYOUT_CLAIMS}, the
+    ///        unblockable second attempt, which must not call a token under any circumstances.
+    function _payOut(
+        address poolManager,
+        address[] memory tokens,
+        uint256[] memory fromClaims,
+        address to,
+        bool withErc20
     ) private {
         IPoolManager pm = IPoolManager(poolManager);
         for (uint256 i; i < tokens.length; ++i) {
             uint256 claimPart = fromClaims[i];
-            if (claimPart != 0) {
-                Currency currency = Currency.wrap(tokens[i]);
-                pm.burn(address(this), currency.toId(), claimPart);
-                pm.take(currency, to, claimPart);
+            if (claimPart == 0) continue;
+
+            Currency currency = Currency.wrap(tokens[i]);
+            uint256 id = currency.toId();
+            bool moved;
+            if (withErc20) {
+                try pm.take{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(currency, to, claimPart) {
+                    pm.burn(address(this), id, claimPart);
+                    moved = true;
+                } catch {}
             }
-            uint256 idlePart = fromIdle[i];
-            if (idlePart != 0) IERC20(tokens[i]).safeTransfer(to, idlePart);
+            if (!moved) pm.transfer(to, id, claimPart);
         }
+    }
+
+    /// @dev The vault's own balance of `token`, or `(false, 0)` when the token cannot be asked. A bounded
+    ///      `staticcall` with a hand-decoded answer: a `balanceOf` that reverts, that consumes everything it is
+    ///      given, or that returns fewer than 32 bytes is "unreadable", never a revert of the caller.
+    /// @param token The asset.
+    /// @return readable Whether the answer can be believed.
+    /// @return balance The answer, or zero.
+    function _probeBalance(address token) private view returns (bool readable, uint256 balance) {
+        (bool ok, bytes memory returndata) =
+            token.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        if (!ok || returndata.length < 32) return (false, 0);
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(returndata, 0x20))
+        }
+        return (true, word);
+    }
+
+    /// @dev One ERC-20 `transfer` that reports failure instead of causing it. SafeERC20's acceptance rule, by
+    ///      hand: the call must succeed against a contract, and it must return either nothing at all or a single
+    ///      non-zero word. A short or non-canonical answer is a failure rather than a `Panic` in the vault's frame.
+    /// @dev **Bounded.** Every caller here is a best-effort leg whose failure is a skip, and an unbounded call to
+    ///      a token that burns whatever it is handed leaves that skip branch a sixty-fourth of the frame — which
+    ///      is a way of stopping the redemption floor by exhaustion rather than by reverting. Four probe budgets
+    ///      is orders of magnitude more than an honest ERC-20 `transfer` costs.
+    /// @param token The asset.
+    /// @param to The recipient.
+    /// @param amount The amount.
+    /// @return moved Whether the tokens moved.
+    function _tryTransfer(address token, address to, uint256 amount) private returns (bool moved) {
+        (bool ok, bytes memory returndata) =
+            token.call{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(abi.encodeCall(IERC20.transfer, (to, amount)));
+        if (!ok) return false;
+        if (returndata.length == 0) return token.code.length != 0;
+        if (returndata.length < 32) return false;
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(returndata, 0x20))
+        }
+        return word != 0;
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -402,6 +616,10 @@ library VaultRedeemLib {
     /// @param keepBps `BPS - redeemFeeBps`.
     /// @param released The position principal this asset freed.
     /// @param added The principal plus the realised fees; zero when the unwind has not run.
+    /// @dev The idle leg is a {_probeBalance} rather than a plain `balanceOf`, for the same reason
+    ///      {sweepClean} probes: a constituent whose `balanceOf` reverts would otherwise revert `previewRedeem`
+    ///      and `redeemProRata` for every asset and every holder. An unreadable balance is read as zero, so the
+    ///      claim side — which lives in the PoolManager and cannot be interfered with — is still paid in full.
     /// @return net The payout, after the fee.
     /// @return fromClaim The part taken out of ERC-6909 claims.
     /// @return fromIdle The part taken out of an idle ERC-20 balance.
@@ -415,7 +633,8 @@ library VaultRedeemLib {
         uint256 added
     ) private view returns (uint256 net, uint256 fromClaim, uint256 fromIdle) {
         uint256 claimBalance = IPoolManager(poolManager).balanceOf(address(this), Currency.wrap(token).toId());
-        uint256 balance = claimBalance + IERC20(token).balanceOf(address(this));
+        (, uint256 idleBalance) = _probeBalance(token);
+        uint256 balance = claimBalance + idleBalance;
         if (added != 0) balance = balance > added ? balance - added : 0;
 
         net = FullMath.mulDiv(FullMath.mulDiv(balance, shares, supply) + released, keepBps, Constants.BPS);

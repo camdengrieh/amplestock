@@ -317,12 +317,12 @@ contract Preflight is Script {
             "registry",
             "hook",
             "bonds",
-            "staking",
             "bountyPot",
             "feedRegistry",
             "oracleGate",
             "positionValuer",
-            "quoter"
+            "quoter",
+            "router"
         ];
         uint256 deployed;
         for (uint256 i; i < names.length; ++i) {

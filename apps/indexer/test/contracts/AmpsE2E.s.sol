@@ -17,8 +17,8 @@ import {BondPolicy} from "amps/policy/BondPolicy.sol";
 import {FeePolicy} from "amps/policy/FeePolicy.sol";
 import {LadderPolicy} from "amps/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "amps/policy/RolloutPolicy.sol";
+import {AmpsRouter} from "amps/periphery/AmpsRouter.sol";
 import {PoolRegistry} from "amps/registry/PoolRegistry.sol";
-import {AmpsStaking} from "amps/staking/AmpsStaking.sol";
 import {Amps} from "amps/token/Amps.sol";
 import {Constants} from "amps/types/Constants.sol";
 import {FeedConfig} from "amps/types/Types.sol";
@@ -197,7 +197,7 @@ contract AmpsE2E is Script {
         address registry;
         address feedRegistry;
         address bonds;
-        address staking;
+        address router;
         address bountyPot;
         address valuer;
         address ladderPolicy;
@@ -599,7 +599,10 @@ contract AmpsE2E is Script {
         FeedRegistry feeds = new FeedRegistry(deployer, address(0));
         BondPolicy bondPolicy = new BondPolicy();
         AmpsBonds bonds = new AmpsBonds(d.vault, d.registry, address(bondPolicy));
-        AmpsStaking staking = new AmpsStaking(IERC20(d.amps), d.vault, deployer);
+        // The protocol's own router. Immutable, ownerless, holds nothing between transactions, and
+        // points at nothing the vault points at: the hook's `setRouter` is its whole relationship
+        // with the protocol, and that is a permission rather than a pointer.
+        AmpsRouter router = new AmpsRouter(IPoolManager(d.poolManager), d.amps, d.registry, assets.weth9);
         BountyPot pot = new BountyPot(assets.usdg, d.vault, deployer);
         LadderPositionValuer valuer =
             new LadderPositionValuer(IExtsload(d.poolManager), d.vault, IPoolRegistry(d.registry));
@@ -614,7 +617,7 @@ contract AmpsE2E is Script {
         d.feedRegistry = address(feeds);
         d.bondPolicy = address(bondPolicy);
         d.bonds = address(bonds);
-        d.staking = address(staking);
+        d.router = address(router);
         d.bountyPot = address(pot);
         d.valuer = address(valuer);
         d.ladderPolicy = address(ladderPolicy);
@@ -627,16 +630,21 @@ contract AmpsE2E is Script {
     /// @dev Step 1 of §9.1: every pointer except `oracleGate`, which `09_Phase3Wire` installs last.
     ///      `marketReference` starts on the hook here rather than on a Phase 2 mock — there is no earlier
     ///      pointer to move, and the wiring script leaves an already-correct pointer alone.
+    ///
+    ///      There is no `staking` pointer: revision 6 removed the contract, and with it the vault slot.
+    ///      `AmpsHook.setRouter` is not a vault pointer at all — it is the hook granting one address the
+    ///      pass-through exemption — so it is sent here as its own timelock call, and emits `RouterChanged`
+    ///      for the indexer to record as `hook.pointer:router`.
     function _wirePointers() private {
         vm.startBroadcast(deployer);
         IAmpsVault vault = IAmpsVault(d.vault);
         vault.setPolicyPointer(bytes32("registry"), d.registry);
         vault.setPolicyPointer(bytes32("bonds"), d.bonds);
-        vault.setPolicyPointer(bytes32("staking"), d.staking);
         vault.setPolicyPointer(bytes32("bountyPot"), d.bountyPot);
         vault.setPolicyPointer(bytes32("feedRegistry"), d.feedRegistry);
         vault.setPolicyPointer(bytes32("marketReference"), d.hook);
         vault.setPolicyPointer(bytes32("positionValuer"), d.valuer);
+        AmpsHook(d.hook).setRouter(d.router);
         vm.stopBroadcast();
     }
 
@@ -700,7 +708,7 @@ contract AmpsE2E is Script {
                 _kv("registry", d.registry),
                 _kv("feedRegistry", d.feedRegistry),
                 _kv("bonds", d.bonds),
-                _kv("staking", d.staking),
+                _kv("router", d.router),
                 _kv("bountyPot", d.bountyPot),
                 _kv("valuer", d.valuer),
                 _kv("ladderPolicy", d.ladderPolicy),
@@ -741,7 +749,7 @@ contract AmpsE2E is Script {
         d.registry = vm.envAddress("AMPS_REGISTRY");
         d.feedRegistry = vm.envAddress("AMPS_FEED_REGISTRY");
         d.bonds = vm.envAddress("AMPS_BONDS");
-        d.staking = vm.envAddress("AMPS_STAKING");
+        d.router = vm.envAddress("AMPS_ROUTER");
         d.bountyPot = vm.envAddress("AMPS_BOUNTY_POT");
         d.valuer = vm.envAddress("AMPS_POSITION_VALUER");
         d.ladderPolicy = vm.envAddress("AMPS_LADDER_POLICY");
