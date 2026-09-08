@@ -8,9 +8,10 @@
  *
  * The only address the keeper needs given to it is **AMPS**. Everything else is resolved from the chain:
  * `Amps.vault()` names the live vault (so an `emergencyMigrate` is followed without a redeploy), and the vault
- * names the registry, the bonds, the bounty pot, the oracle gate and the hook. That is what "tolerates
- * reverting pointers gracefully" means in practice: the topology is a read, not a config file. There is no
- * staking pointer to resolve: revision 6 removed the contract, and the keeper runs no staking job.
+ * names the registry, the bonds, the bounty pot, the oracle gate, the hook and — until the launch settles — the
+ * genesis adapter. That is what "tolerates reverting pointers gracefully" means in practice: the topology is a
+ * read, not a config file. There is no staking pointer to resolve: revision 6 removed the contract, and the
+ * keeper runs no staking job.
  */
 
 import {chains, chainById, type AmpsChainId} from '@amplestocks/config'
@@ -41,6 +42,12 @@ export interface KeeperConfig {
   readonly vaultOverride: `0x${string}` | null
   /** Optional: `AmpsQuoter`, which answers the whole per-pool scan in one call when present. */
   readonly quoterAddress: `0x${string}` | null
+  /**
+   * Optional: `AmpsGenesis`. Unset, the keeper reads `AmpsVault.genesis()` — the vault's own
+   * set-once pointer, which is the authority — so this exists only for a fixture chain where the
+   * pointer has not been wired yet.
+   */
+  readonly genesisAddress: `0x${string}` | null
   /** The address the keeper's transactions come from, for simulation. */
   readonly senderAddress: `0x${string}`
   readonly submitter: SubmitterKind
@@ -178,6 +185,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KeeperConfig {
     gasLimitCeiling: big(env, 'AMPS_GAS_LIMIT_CEILING', DEFAULT_POLICY.gasLimitCeiling),
     scanIntervalSeconds: num(env, 'AMPS_SCAN_INTERVAL_SECONDS', DEFAULT_POLICY.scanIntervalSeconds),
     inFlightTimeoutSeconds: num(env, 'AMPS_IN_FLIGHT_TIMEOUT_SECONDS', DEFAULT_POLICY.inFlightTimeoutSeconds),
+    settleEnabled: bool(env, 'AMPS_SETTLE_ENABLED', DEFAULT_POLICY.settleEnabled),
   }
 
   return {
@@ -187,6 +195,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KeeperConfig {
     ampsAddress: address(env, 'AMPS_TOKEN_ADDRESS'),
     vaultOverride: optionalAddress(env, 'AMPS_VAULT_ADDRESS'),
     quoterAddress: optionalAddress(env, 'AMPS_QUOTER_ADDRESS'),
+    genesisAddress: optionalAddress(env, 'AMPS_GENESIS_ADDRESS'),
     senderAddress: address(env, 'AMPS_SENDER_ADDRESS'),
     submitter,
     relayer,

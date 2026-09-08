@@ -6,15 +6,17 @@ import {useReadContract} from 'wagmi'
 import type {Address} from 'viem'
 
 import {useAuction} from './use-auction'
+import {useGenesis} from './use-genesis'
 import {useBondParameters, useDailyIssuance} from './use-bonds'
 import {useAmpsFee, useHookRouter, usePoolFeeBands} from './use-hook-params'
 import {useRegistrySummary} from './use-registry'
 import {useCreatorBps, useVaultSnapshot} from './use-vault'
 import {activeChainId} from '@/lib/chains'
-import {contract} from '@/lib/contracts'
-import {deployment, genesisAuctions} from '@/lib/deployment'
+import {contract, erc20Abi} from '@/lib/contracts'
+import {deployment, genesisAuctions, referenceBook} from '@/lib/deployment'
 import {PHASE_LABEL, q96PriceToWholeX18} from '@/lib/auction'
-import {resolveDocFigures, type DocsAuctionRead, type DocsChainReads} from '@/lib/docs/resolve'
+import {GENESIS_PHASE_LABEL, floorQ96ToWholeX18, launchNavPerShareX18} from '@/lib/genesis'
+import {resolveDocFigures, type DocsAuctionRead, type DocsChainReads, type DocsGenesisRead} from '@/lib/docs/resolve'
 import type {FigureId, FigureValue} from '@/lib/docs/figures'
 
 /**
@@ -41,6 +43,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
   const registry = useRegistrySummary()
   const auctionUsdg = useAuction('usdg')
   const auctionEth = useAuction('eth')
+  const genesisState = useGenesis()
 
   const ampsToken = contract('amps')
   const supply = useReadContract({
@@ -48,6 +51,16 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
     functionName: 'totalSupply',
     query: {enabled: ampsToken !== undefined},
   })
+
+  // USDG's own decimals: `raisedUsdg()` is raw units and a stablecoin's decimals are a read.
+  const usdgAddress = referenceBook(activeChainId)?.usdg
+  const usdgMeta = useReadContract({
+    ...(usdgAddress ? {address: usdgAddress} : {}),
+    abi: erc20Abi,
+    functionName: 'decimals',
+    query: {enabled: usdgAddress !== undefined},
+  })
+  const usdgDecimals = usdgMeta.data === undefined ? undefined : Number(usdgMeta.data)
 
   const auctions = React.useMemo<Partial<Record<'usdg' | 'eth', DocsAuctionRead>>>(() => {
     const one = (a: typeof auctionUsdg): DocsAuctionRead => ({
@@ -72,6 +85,38 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
       ...(auctionEth.address ? {eth: one(auctionEth)} : {}),
     }
   }, [auctionUsdg, auctionEth])
+
+  const genesis = React.useMemo<DocsGenesisRead>(() => {
+    // NAV/share at launch: the adapter's raise over `S0`, which is the fully diluted denominator
+    // the vault's own `Genesis` log divided by. Not the live checkpoint and not `totalSupply()` —
+    // both move, and this is a fact about one block.
+    const nav = launchNavPerShareX18({
+      ...(genesisState.raisedUsd18 !== undefined ? {raisedUsd18: genesisState.raisedUsd18} : {}),
+      ...(vault.s0 !== undefined ? {totalSupply: vault.s0} : {}),
+    })
+    const floorUsdg = floorQ96ToWholeX18({
+      ...(genesisState.floorUsdgQ96 !== undefined ? {floorQ96: genesisState.floorUsdgQ96} : {}),
+      ...(usdgDecimals !== undefined ? {currencyDecimals: usdgDecimals} : {}),
+    })
+    const floorEth = floorQ96ToWholeX18({
+      ...(genesisState.floorEthQ96 !== undefined ? {floorQ96: genesisState.floorEthQ96} : {}),
+      currencyDecimals: 18,
+    })
+    return {
+      ...(genesisState.phase ? {phase: GENESIS_PHASE_LABEL[genesisState.phase]} : {}),
+      ...(genesisState.settled !== undefined ? {settled: genesisState.settled} : {}),
+      ...(genesisState.p0X18 !== undefined ? {p0X18: genesisState.p0X18} : {}),
+      ...(genesisState.raisedUsd18 !== undefined ? {raisedUsd18: genesisState.raisedUsd18} : {}),
+      ...(genesisState.raisedUsdg !== undefined ? {raisedUsdg: genesisState.raisedUsdg} : {}),
+      ...(usdgDecimals !== undefined ? {usdgDecimals} : {}),
+      ...(genesisState.raisedWeth !== undefined ? {raisedWeth: genesisState.raisedWeth} : {}),
+      ...(genesisState.unsoldAmps !== undefined ? {unsoldAmps: genesisState.unsoldAmps} : {}),
+      ...(genesisState.ethUsdX18 !== undefined ? {ethUsdX18: genesisState.ethUsdX18} : {}),
+      ...(floorUsdg !== undefined ? {floorUsdgX18: floorUsdg} : {}),
+      ...(floorEth !== undefined ? {floorEthX18: floorEth} : {}),
+      ...(nav !== undefined ? {navPerShareX18: nav} : {}),
+    }
+  }, [genesisState, usdgDecimals, vault.s0])
 
   const reads = React.useMemo<DocsChainReads>(
     () => ({
@@ -129,6 +174,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
       ...(registry.indexCapBps !== undefined ? {indexCapBps: registry.indexCapBps} : {}),
       ...(registry.indexFloorBps !== undefined ? {indexFloorBps: registry.indexFloorBps} : {}),
       auctions,
+      genesis,
     }),
     [
       fee.ampsFeeBps,
@@ -173,6 +219,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
       registry.indexCapBps,
       registry.indexFloorBps,
       auctions,
+      genesis,
     ],
   )
 

@@ -3,8 +3,10 @@
 /**
  * `@amplestocks/keeper` — the permissionless bountied upkeep service.
  *
- * It runs five calls and no others: `compound(poolId)`, `rollout(constituentId)`,
- * `deployBonded(constituentId)`, `checkpoint()` and `touch()`. It **never re-centres and never re-widens** a
+ * It runs five calls on the vault and no others: `compound(poolId)`, `rollout(constituentId)`,
+ * `deployBonded(constituentId)`, `checkpoint()` and `touch()` — plus `AmpsGenesis.settle()`, which runs **once in
+ * the protocol's life**, is unpaid, and retires itself the moment the launch is placed. It **never re-centres and
+ * never re-widens** a
  * ladder — there is no such entry point in the vault and there never will be; `AmpsHook`'s `RebalanceNeeded`
  * event is a notification that the fee schedule reacted, and the keeper's answer to it is a `compound`.
  *

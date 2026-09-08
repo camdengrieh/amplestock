@@ -38,6 +38,13 @@ export const ENV_OVERRIDES = {
   hook: 'AMPS_HOOK',
   bonds: 'AMPS_BONDS',
   router: 'AMPS_ROUTER',
+  /**
+   * `AmpsGenesis`. It is deployment state like everything else here, but unlike everything else it
+   * is *finished*: after `settle()` the adapter emits nothing more. An unresolved zero address is
+   * therefore the ordinary state on a chain whose launch predates this indexer, and the genesis
+   * tables simply stay empty rather than the source disappearing from the build.
+   */
+  genesis: 'AMPS_GENESIS',
   bountyPot: 'AMPS_BOUNTY_POT',
   feedRegistry: 'AMPS_FEED_REGISTRY',
   oracleGate: 'AMPS_ORACLE_GATE',

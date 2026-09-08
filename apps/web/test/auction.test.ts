@@ -11,7 +11,6 @@ import {
   bidStatus,
   formatQ96Price,
   genesisPremiumBps,
-  launchNavPerShareX18,
   q96PriceToWholeX18,
   secondsToBlock,
   snapToTick,
@@ -144,16 +143,12 @@ describe('a bid’s status against the clearing price', () => {
 })
 
 describe('settlement arithmetic', () => {
-  it('divides the raise by the whole supply to get NAV per share', () => {
-    expect(launchNavPerShareX18({raisedUsd18: 5_000n * WAD, tokensSold: 5_000n * WAD})).toBe(WAD)
-    expect(launchNavPerShareX18({raisedUsd18: 5_000n * WAD, tokensSold: 0n})).toBeUndefined()
-  })
-
   it('prices the genesis premium as supply over sold, less one', () => {
-    // 5,000 AMPS in total, 3,325 sold through the auction: the entry-pool tranche.
-    expect(genesisPremiumBps({totalSupply: 5_000n * WAD, tokensSold: 3_325n * WAD})).toBe(5037)
-    expect(genesisPremiumBps({totalSupply: 5_000n * WAD, tokensSold: 5_000n * WAD})).toBe(0)
-    expect(genesisPremiumBps({totalSupply: 5_000n * WAD, tokensSold: 0n})).toBeUndefined()
+    // Revision 7: S0 = 20,000 with 10,000 sold through the two auctions, so a full clear leaves the
+    // reference price at exactly twice NAV per share. That is the disclosed premium.
+    expect(genesisPremiumBps({totalSupply: 20_000n * WAD, tokensSold: 10_000n * WAD})).toBe(10_000)
+    expect(genesisPremiumBps({totalSupply: 20_000n * WAD, tokensSold: 20_000n * WAD})).toBe(0)
+    expect(genesisPremiumBps({totalSupply: 20_000n * WAD, tokensSold: 0n})).toBeUndefined()
   })
 
   it('converts to USD through a feed answer, and refuses to without one', () => {

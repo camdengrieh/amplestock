@@ -25,7 +25,8 @@ Do not start §2 until all of these are true. They are the plan's Phase 6 exit c
 | 8 | Written contact with Chainlink Labs and Robinhood chain/BD, including bond-collateral custody | written |
 | 9 | Proposer Safe 3/5 and guardian Safe 2/4 deployed on 4663, signers confirmed, hardware keys in hand | Safe addresses |
 | 10 | Deployer key is a fresh hardware key used for nothing else | key ceremony note |
-| 11 | The founders' $5,000 ($2,500 ETH, $2,500 USDG) is in the proposer Safe | on-chain |
+| 11 | The founders' **fallback** seed ($10,000 USDG + 4 WETH) is in the proposer Safe — used **only** if neither auction graduates | on-chain |
+| 11b | `script/config/genesis.json` reviewed and signed off: the CCA factory address, the 24 h start delay, the 72 h window, both `requiredCurrencyRaised` bars, both tick spacings and the validation hook | written, with the file's commit hash |
 | 12 | `pnpm --filter @amplestocks/contracts broadcast-test` green twice in a row on the launch commit | CI run |
 
 **Stop conditions from Phase 0 still apply.** If modelled fee revenue is below modelled gap LVR + bounty + gas on
@@ -33,53 +34,91 @@ the top-weighted pools, or fewer than 5 names clear the β rule at σ_u = 3%, do
 
 ---
 
-## 2. Launch day
+## 2. Launch day — and the four days it now spans
 
-One session, one operator at the keyboard, two Safe quorums on call. Every step is a `forge script` from
-`docs/deploy-runbook.md` §1 unless it says otherwise.
+Revision 7 sells half the supply at auction, so a launch is no longer one session. It is **three sessions with a
+72-hour bidding window between the first two**: deploy and open the auctions, wait, settle and place. The order is
+not a preference — `PoolRegistry` opens each pool at `AmpsVault.pRefX18()` in the same call that registers it, so
+the pools cannot be registered until settlement has written `P0` (`docs/genesis-cca.md` §5).
+
+Two Safe quorums on call throughout. Every step is a `forge script` from `docs/deploy-runbook.md` §1 unless it says
+otherwise.
+
+**Session 1 — deploy, wire, open the auctions.**
 
 | # | Step | Who | Notes |
 |---|---|---|---|
-| 1 | `00_Preflight` on 4663, strict | operator | must be zero `FAIL`; archive the report |
+| 1 | `00_Preflight` on 4663, strict | operator | must be zero `FAIL`; it also asserts the CCA factory holds code; archive the report |
 | 2 | `02_Libraries`, both passes | operator (deployer key) | record `librariesFlag` |
 | 3 | Predict the vault address, mine the AMPS salt off chain, verify with `01_MineAmps` | operator | three leading zero bytes; the salt is bound to that exact vault address |
-| 4 | `03_Core` | operator (deployer key) | deploys the `TimelockController` at `minDelay = 0` with the Safe **and** the deployer as proposers; guardian gets `CANCELLER_ROLE` |
+| 4 | `03_Core` | operator (deployer key) | deploys the `TimelockController` at `minDelay = 0` with the Safe **and** the deployer as proposers, guardian gets `CANCELLER_ROLE`, and deploys **`AmpsGenesis`** |
 | 5 | `12_Verify` + `verify.sh` for what exists so far | operator | verify early; a failed verification is cheaper to debug now |
-| 6 | `05_Registry` | operator | 32 pools, 30 markets, the launch weight vector; ~194 transactions in relay mode |
-| 7 | Wait for the hub ring to cover `twapWindow` (~30 min) | — | `observationCoverage(hubPoolId) >= 1800` |
-| 8 | Proposer Safe transfers $2,500 WETH and $2,500 USDG to the `TimelockController` | Safe 3/5 | `genesis()` pulls from `msg.sender`, and that is the timelock |
-| 9 | `09_Phase3Wire` (`WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false`) | operator | ends by asserting `gate.state(0) == GREEN` |
-| 10 | `11_GenesisPlacement`, phase 1, then phase 2 sixty seconds later | operator | §3; ends with 328 live cells and NAV/share $1.00 |
-| 11 | Apply the guarded-launch parameters (§4, §5) as one timelock batch at zero delay | operator, from the Safe's approved calldata | halved bond capacity, halved rollout |
-| 12 | `03_Core CORE_STAGE=finalize` | operator | `minDelay` 0 → 48 h; the deployer stops being a proposer and a canceller. **After this the deployer key is powerless.** |
-| 13 | `12_Verify` + `verify.sh`, all contracts | operator | every address on Blockscout |
-| 14 | Start the keeper and the indexer against 4663 | operator | `docs/keeper-runbook.md` §5 |
-| 15 | Publish the dApp with the geo-block and terms gate live | operator | |
-| 16 | Announce the deployment addresses and `docs/` | — | no price or return language |
+| 6 | `09_Phase3Wire` **pass 1**, `WIRE_DEFER_GATE=true` | operator | the 8 pointer moves including `vault.genesis`; **the gate pointer is deliberately left unset** |
+| 7 | `05_Registry` with `REGISTRY_FEEDS_ONLY=true` | operator | all 32 feeds installed, **no pool registered**: a checkpoint prices WETH9 and USDG, and `genesisPlace` ends in one |
+| 8 | `06a_GenesisAuction` | operator, from the Safe's approved calldata | `genesisMint` (S0 = 20,000, three tranches) **plus** `AmpsGenesis.createAuctions`; ends with both auctions funded and their `startBlock`/`endBlock` published |
 
-**Abort points.** Steps 1–7 are reversible in the sense that nothing is at risk: no user funds exist and the
-worst case is a redeployment. From step 8 the founders' seed is in the timelock; from step 10 `S0` is minted and
-the genesis latch is closed — after that the only way back is a migration (§8.11). If anything is wrong at step
-9 or 10, stop, do not run `finalize`, and redeploy from step 2 with fresh salts.
+**Session 2 — the bidding window (~72 h, about 2.59M blocks at 100 ms).**
+
+| # | Step | Who | Notes |
+|---|---|---|---|
+| 9 | Nothing is operated | — | bidders bid. `checkpoint()` on either leg is permissionless and unpaid; the dApp's Auction surface shows both legs live |
+| 10 | **Do not set the gate pointer** | operator | `settle()` is permissionless *and* gated: a gate pointed now makes any third party's `settle()` revert `GateNotHealthy` and stalls the launch |
+
+**Session 3 — settle, register, place.**
+
+| # | Step | Who | Notes |
+|---|---|---|---|
+| 11 | `06b_GenesisSettle`, once every leg's `endBlock` has passed | operator (or anybody, or the keeper's `settle` job) | `AmpsGenesis.settle()` → `genesisPlace`: `P0`, the proceeds as backing, the unsold AMPS as inventory, `initialized` closed |
+| 12 | `05_Registry` in full | operator | 32 pools **opened at `P0`**, 30 markets, the launch weight vector; ~194 transactions in relay mode |
+| 13 | Wait for the hub ring to cover `twapWindow` (~30 min) | — | `observationCoverage(hubPoolId) >= 1800` |
+| 14 | `09_Phase3Wire` **pass 2** | operator | the gate pointer; ends by asserting `gate.state(0) == GREEN` |
+| 15 | `11_GenesisPlacement`, phase 1, then phase 2 sixty seconds later | operator | §3; ends with 328 live cells. Leave `AMPS_BID_USDG`/`AMPS_BID_WETH` unset and it bids exactly the proceeds the vault holds |
+| 16 | Apply the guarded-launch parameters (§4, §5) as one timelock batch at zero delay | operator, from the Safe's approved calldata | halved bond capacity, halved rollout |
+| 17 | `03_Core CORE_STAGE=finalize` | operator | `minDelay` 0 → 48 h; the deployer stops being a proposer and a canceller. **After this the deployer key is powerless.** |
+| 18 | `12_Verify` + `verify.sh`, all contracts | operator | every address on Blockscout, `AmpsGenesis` included |
+| 19 | Start the keeper and the indexer against 4663 | operator | `docs/keeper-runbook.md` §5 |
+| 20 | Publish the dApp with the geo-block and terms gate live | operator | the Auction surface's Settlement panel is the launch record |
+| 21 | Announce the deployment addresses and `docs/` | — | no price or return language |
+
+**Abort points.** Steps 1–7 are reversible in the sense that nothing is at risk: no user funds exist and the worst
+case is a redeployment. **Step 8 is the point of no return for the supply**: `S0` is minted and the auction tranche
+is inside auctions nobody can cancel — the adapter has no rescue function and `createAuctions` is one-shot. From
+step 11 the genesis latch is closed and the only way back is a migration (§8.11). If anything is wrong before step
+8, stop and redeploy from step 2 with fresh salts; if anything is wrong after it, the auctions still run to their
+`endBlock` and the worst outcome is a launch that does not graduate, which is a refund for every bidder and the
+fallback below.
+
+**If neither leg graduates.** `settle()` still runs, returns the whole tranche to the vault and calls nothing;
+`AmpsGenesis.phase()` reads `Aborted` and bidders refund in full **through the auctions themselves**. Then, and
+only then, the founders' fallback seed is used: the proposer Safe moves $10,000 USDG and 4 WETH into the
+`TimelockController` (`genesisPlace` pulls from `msg.sender`, and that is the timelock) and `06b_GenesisSettle`
+assembles the two governed calls that open the vault at `p0X18 = 1e18` — the pre-revision-7 launch exactly, pools
+at $1.00. It is a 7-day-class proposal with a visible calldata, and the announcement has to say the launch was the
+fallback rather than the auction.
 
 ---
 
 ## 3. Genesis, per the confirmed table
 
-`11_GenesisPlacement` mints `S0` and lays the ladders in one pass. These are the confirmed launch parameters, not
-options.
+Genesis is two calls with the auction between them: `06a_GenesisAuction` runs `genesisMint` and opens the auctions,
+`06b_GenesisSettle` runs `AmpsGenesis.settle()`, which calls `genesisPlace`, and `11_GenesisPlacement` lays the
+ladders afterwards. These are the confirmed launch parameters, not options — the three tranche sizes and the floor
+are `Constants.sol` values and `genesisMint` refuses any other allocation. The mechanism as built is
+`docs/genesis-cca.md`.
 
 | Item | Value |
 |---|---|
-| `S0` | 5,000 AMPS (18 dec), minted exactly once |
-| Team tranche | 250 AMPS (5%) to an OZ `VestingWallet`, 2-month linear, **no cliff** |
-| POL tranche | 4,750 AMPS (95%), held by the vault as ask inventory |
-| → 30 spokes | 47.5 AMPS each (1% of the POL tranche) = 1,425 AMPS |
-| → entry pools | 1,662.5 AMPS each in `AMPS/USDG` and `AMPS/WETH` = 3,325 AMPS |
-| Founders' seed | $2,500 ETH against the `AMPS/WETH` asks, $2,500 USDG against the `AMPS/USDG` asks — 50/50 |
-| Launch price | $1.00 = NAV/share at genesis |
-| Ask ladder | 10 doublings, tilt 1.25, cells `m = 0..9` ($1 → $1,024) |
-| Seed bids | 4 halvings, cells `m = -1..-4`, entry pools only |
+| `S0` | 20,000 AMPS (18 dec), minted exactly once by `genesisMint` |
+| Team tranche | 1,000 AMPS (5%) to an OZ `VestingWallet`, 2-month linear, **no cliff** |
+| Auction tranche | 10,000 AMPS (50%), sold through two Uniswap Continuous Clearing Auctions: **5,000 denominated in USDG and 5,000 in native ETH**, floor **$1.00 per AMPS** in each currency |
+| POL tranche | 9,000 AMPS (45%), held by the vault as ask inventory |
+| → 30 spokes | 90 AMPS each (1% of the POL tranche) = 2,700 AMPS |
+| → entry pools | 3,150 AMPS each in `AMPS/USDG` and `AMPS/WETH` = 6,300 AMPS |
+| Launch price | **`P0`, the auctions' uniform clearing price** — ≈$1.00 at a clear at the floor. Every pool is opened at it |
+| NAV/share at launch | `raised / S0`, fully diluted (decision 14) = **$0.50 at a full clear at the floor**, and the premium (`P0 / NAV − 1` = 100%) is **disclosed, not smoothed** |
+| Seed bids | the auction proceeds themselves — 5,000 USDG and 2 WETH at a full floor clear — as 4 halvings, cells `m = -1..-4`, entry pools only |
+| Founders' fallback seed | $10,000 USDG + 4 WETH, spent **only** if neither leg graduates, opening the vault at $1.00 |
+| Ask ladder | 10 doublings, tilt 1.25, cells `m = 0..9` (`P0` → 1,024·`P0`) |
 | Live cells after both phases | 328 = 32 × 10 asks + 2 × 4 bids |
 | Creator fee | 100 bp of **trade volume** — buys and sells alike — decaying linearly to zero over 30 days, paid **in kind** out of each currency's fees at `compound()`. Immutable schedule; only the current `creator` may reassign the address |
 
@@ -99,14 +138,49 @@ changed: the AMPS fee is the base on *both* directions of every pool.
 There is **no `stakerBps` row, no `burnBps` row and no `rewardStreamSeconds` row**: revision 6 removed staking and
 made the burn a whole share rather than a governed fraction of one, so none of the three exists to set.
 
-Assert after step 10:
+**The auction parameters the operator does set** are the schedule and the graduation bars, not the price or the
+size. They live in `script/config/genesis.json` (precondition 11b) and every one of them is overridable by an
+environment variable at run time:
+
+| Key | Launch value | What it decides |
+|---|---|---|
+| `factory` | `0x000000001F26a0044BaA66024e7b6599c61963F8` | The `ContinuousClearingAuctionFactory`. Fixed in `AmpsGenesis`'s bytecode at construction. `AMPS_CCA_FACTORY` |
+| `startDelayHours` | 24 | Blocks between `createAuctions` and the first issuance block. `AMPS_AUCTION_START_DELAY_HOURS` |
+| `durationHours` | 72 | The bidding window. `AMPS_AUCTION_DURATION_HOURS` |
+| `claimDelayHours` | 0 | Between `endBlock` and claiming. `AMPS_AUCTION_CLAIM_DELAY_HOURS` |
+| `usdg.requiredCurrencyRaised`, `eth.requiredCurrencyRaised` | 1,000 USDG / 0.4 WETH — $1,000 a leg at $2,500 ETH | The graduation bar per leg, in that currency's raw units. A leg that misses it sells nothing and refunds everybody. Review it against the raise the launch actually needs. `AMPS_AUCTION_USDG_REQUIRED`, `AMPS_AUCTION_ETH_REQUIRED` |
+| `usdg.tickSpacing`, `eth.tickSpacing` | 1% of that leg's floor | Q96 price granularity. Upstream's minimum is 2; 1% keeps the tick book small enough that the auction cannot be griefed into an out-of-gas |
+| `usdg.validationHook`, `eth.validationHook` | zero | An `IValidationHook` for geo-blocking or an allowlist |
+| `usdg.steps`, `eth.steps` | flat | `[{mps, blocks}]`; must sum to `1e7` over exactly the window. A single `{0,0}` asks `06a` for a flat schedule |
+| `ethUsdX18` | 0 (read the feed) | The ETH/USD price `06a` carries, cross-checked against `FeedRegistry` within the vault's `refDivergenceBps` |
+| `fallback.seedUsdg`, `fallback.seedWeth` | 10,000 USDG, 4 WETH | The fallback seed only. **Not** `11_GenesisPlacement`'s bid sizes, which are `AMPS_BID_*` |
+
+**The tranche sizes and the floor are not in that file and cannot be set.** `AmpsGenesis.createAuctions` computes
+each floor from the currency's own decimals and refuses any allocation other than the constants, because a
+mis-scaled floor is a total loss for bidders.
+
+Assert after step 8 (the mint half — no price exists yet, and that is correct):
 
 ```bash
-cast call $AMPS  "totalSupply()(uint256)"        # 5000000000000000000000
-cast call $AMPS  "balanceOf(address)(uint256)" $TEAM_VESTING   # 250000000000000000000
-cast call $VAULT "navPerShareX18()(uint256)"     # 1e18 +/- rounding
-cast call $VAULT "liveCells()(uint32)"           # 328
-cast call $GATE  "state(uint16)(uint8)" 0        # 0 == GREEN
+cast call $AMPS    "totalSupply()(uint256)"                     # 20000000000000000000000
+cast call $AMPS    "balanceOf(address)(uint256)" $TEAM_VESTING  # 1000000000000000000000
+cast call $AMPS    "balanceOf(address)(uint256)" $GENESIS       # 10000000000000000000000 (both legs' tranche)
+cast call $VAULT   "genesisMinted()(bool)"                      # true
+cast call $VAULT   "initialized()(bool)"                        # false  -- the auction runs in this window
+cast call $VAULT   "navPerShareX18()(uint256)"                  # 0      -- A is zero; a NAV here would be invented
+cast call $GENESIS "phase()(uint8)"                             # 0 Created, then 1 Bidding
+```
+
+Assert after step 15 (the launch):
+
+```bash
+cast call $GENESIS "settled()(bool)"                            # true
+cast call $GENESIS "phase()(uint8)"                             # 3 == Settled (4 == Aborted: see §2's fallback)
+cast call $GENESIS "p0X18()(uint256)"                           # P0, the clearing price
+cast call $VAULT   "pRefX18()(uint256)"                         # == p0X18, unless the NAV floor bound it
+cast call $VAULT   "navPerShareX18()(uint256)"                  # raisedUsd18 / 20,000e18
+cast call $VAULT   "liveCells()(uint32)"                        # 328
+cast call $GATE    "state(uint16)(uint8)" 0                     # 0 == GREEN
 ```
 
 ---
@@ -137,9 +211,14 @@ zero delay during the launch session; after `finalize` the same change is a 48-h
 
 Two distributions are on a schedule by construction, and one is throttled deliberately.
 
-**The POL tranche moves by rollout, not at once.** Genesis puts 3,325 AMPS in the entry pools and only 47.5 into
+**The POL tranche moves by rollout, not at once.** Genesis puts 6,300 AMPS in the entry pools and only 90 into
 each spoke. `AmpsVault.rollout(constituentId)` moves the rest out over time, and the keeper calls it — nobody
 hands out a tranche.
+
+**The auction tranche is distributed by the auctions themselves.** Whatever does not clear comes back to the vault
+as inventory at `genesisPlace` — pulled with a plain `transferFrom`, neither minted nor counted in `A` — and is
+never re-offered except through the ordinary rollout. There is no discretionary allocation of it and nobody to ask
+for one.
 
 | Parameter | v1 value | **Guarded launch** | Cap | Setter |
 |---|---|---|---|---|
@@ -150,13 +229,14 @@ Rollout never places a spoke ask below `P_ref` and never takes the entry pools b
 even a mis-set `rolloutBpsPerDay` cannot drain the hub. At 100 bp/day the spokes reach their target weights over
 roughly a quarter, which is the intended pace: liquidity follows demonstrated volume rather than leading it.
 
-**The team tranche vests itself.** 250 AMPS, OZ `VestingWallet`, 60 days linear, no cliff, no governance path to
+**The team tranche vests itself.** 1,000 AMPS, OZ `VestingWallet`, 60 days linear, no cliff, no governance path to
 accelerate or claw back. Nothing to operate.
 
 **The creator fee expires by itself.** 100 bp of trade volume — buys and sells alike — decaying linearly to zero
 over 30 days from genesis, and paid in kind out of each currency's fees at `compound()`: AMPS by transfer,
 counter assets best-effort with an ERC-6909-claim fallback so a gated token can never block a compound. There is
-no setter, no band and no extension.
+no setter, no band and no extension. The clock starts at **`genesisPlace`**, not at the mint: the 72-hour bidding
+window does not eat into the creator's schedule.
 
 **And nothing else is distributed at all.** After the creator's slice the whole AMPS side of every fee is burned,
 and the counter side stays as bids in the pool that earned it. There is no staking tranche to schedule, no reward
@@ -374,7 +454,9 @@ bonds and redemption never touch the keeper. Fee AMPS and bonded stock queue.
 
 *Act.* Bring up the second operator instance from a clean checkout (`docs/keeper-runbook.md` §9 proves it decides
 identically). If both are down, anyone can run the five calls by hand — `compound(poolId)`, `rollout(id)`,
-`deployBonded(id)`, `touch()`, `checkpoint()` — and collect the same bounty.
+`deployBonded(id)`, `touch()`, `checkpoint()` — and collect the same bounty. Before the launch is placed the same
+is true of `AmpsGenesis.settle()`, which is unpaid: if no keeper is watching when both auctions end, anybody may
+send it, and §2 step 11's `06b_GenesisSettle` is that transaction.
 
 *On resumption.* Confirm no duplicate send, no R1 violation, and that `touch()` cleared any tripped watchdog.
 

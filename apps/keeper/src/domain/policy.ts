@@ -50,6 +50,15 @@ export interface KeeperPolicy {
   readonly scanIntervalSeconds: number
   /** Give up on an in-flight transaction after this long and let the next scan re-decide. */
   readonly inFlightTimeoutSeconds: number
+  /**
+   * Watch for the genesis settlement and send `AmpsGenesis.settle()` when it becomes callable.
+   *
+   * On by default, and harmless afterwards: the reader stops reading the adapter the moment
+   * `settled()` comes back true, so a keeper started after the launch pays four RPC calls once and
+   * then never asks again. Turn it off with `AMPS_SETTLE_ENABLED=false` to leave settlement to a
+   * different operator — it is permissionless, so somebody else's keeper does the same work.
+   */
+  readonly settleEnabled: boolean
 }
 
 /** The launch policy: `Constants.sol` values, and the plan's keeper row. */
@@ -69,6 +78,7 @@ export const DEFAULT_POLICY: KeeperPolicy = {
   gasLimitCeiling: 30_000_000n,
   scanIntervalSeconds: 15,
   inFlightTimeoutSeconds: 300,
+  settleEnabled: true,
 }
 
 /** $1, the launch `chost`. Exported so tests and the CRE mirror do not re-derive it. */

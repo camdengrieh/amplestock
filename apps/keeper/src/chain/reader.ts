@@ -19,6 +19,7 @@
 import {erc20Abi, type Address, type PublicClient} from 'viem'
 import {
   ampsAbi,
+  ampsGenesisAbi,
   ampsHookAbi,
   ampsVaultAbi,
   bountyPotAbi,
@@ -29,10 +30,12 @@ import {
 } from '@amplestocks/abis'
 import {
   GateState,
+  GenesisPhase,
   PoolClass,
   Session,
   type ChainSnapshot,
   type ConstituentSnapshot,
+  type GenesisSnapshot,
   type PoolSnapshot,
   type PotSnapshot,
   type VaultSnapshot,
@@ -52,6 +55,14 @@ export interface Topology {
   readonly hook: Address
   readonly poolManager: Address
   readonly feedRegistry: Address
+  /**
+   * `AmpsVault.genesis()` — the adapter, or the zero address once the pointer was never set.
+   *
+   * It is a set-once pointer written before `genesisMint`, so it names the adapter for the life of
+   * the vault, settled or not. The keeper reads it like every other pointer rather than being told
+   * it, for the same reason: the topology is a read.
+   */
+  readonly genesis: Address
 }
 
 const ZERO: Address = '0x0000000000000000000000000000000000000000'
@@ -82,10 +93,10 @@ export class ChainReader {
       vaultOverride ??
       ((await this.client.readContract({address: amps, abi: ampsAbi, functionName: 'vault'})) as Address)
 
-    const read = async (name: 'registry' | 'bonds' | 'bountyPot' | 'oracleGate' | 'marketReference' | 'poolManager' | 'feedRegistry') =>
+    const read = async (name: 'registry' | 'bonds' | 'bountyPot' | 'oracleGate' | 'marketReference' | 'poolManager' | 'feedRegistry' | 'genesis') =>
       (await this.client.readContract({address: vault, abi: ampsVaultAbi, functionName: name})) as Address
 
-    const [registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry] = await Promise.all([
+    const [registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry, genesis] = await Promise.all([
       read('registry'),
       read('bonds'),
       read('bountyPot'),
@@ -93,9 +104,45 @@ export class ChainReader {
       read('marketReference'),
       read('poolManager'),
       read('feedRegistry'),
+      // A vault deployed before revision 7 has no `genesis()` at all, and one deployed with it and
+      // never wired answers the zero address. Both are "no settle job", not an outage.
+      read('genesis').catch(() => ZERO),
     ])
 
-    return {amps, vault, registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry}
+    return {amps, vault, registry, bonds, bountyPot, oracleGate, hook, poolManager, feedRegistry, genesis}
+  }
+
+  /**
+   * `AmpsGenesis`, or `undefined` once there is nothing left to watch.
+   *
+   * Latched: the first time `settled()` comes back true this reader stops asking for ever. A launch
+   * settles exactly once and never un-settles, so any further read is four RPC calls a scan for an
+   * answer that cannot change. A keeper started years after the launch pays that cost once.
+   */
+  private genesisSettledLatch = false
+
+  async genesisSnapshot(topology: Topology, enabled: boolean): Promise<GenesisSnapshot | undefined> {
+    if (!enabled || this.genesisSettledLatch || topology.genesis === ZERO) return undefined
+    const genesis = {address: topology.genesis, abi: ampsGenesisAbi} as const
+    try {
+      const [phase, settled, usdgAuction, ethAuction] = await Promise.all([
+        this.client.readContract({...genesis, functionName: 'phase'}) as Promise<number>,
+        this.client.readContract({...genesis, functionName: 'settled'}) as Promise<boolean>,
+        this.client.readContract({...genesis, functionName: 'usdgAuction'}) as Promise<Address>,
+        this.client.readContract({...genesis, functionName: 'ethAuction'}) as Promise<Address>,
+      ])
+      if (settled) {
+        this.genesisSettledLatch = true
+        this.logger.info('genesis is settled; the settle job retires itself', {adapter: topology.genesis})
+        return undefined
+      }
+      return {address: topology.genesis, phase: Number(phase) as GenesisPhase, settled, usdgAuction, ethAuction}
+    } catch (error) {
+      // A pointer that holds no code, or an adapter that will not answer. Neither is worth failing
+      // a scan over — the other five jobs are unaffected — but it must not be silent either.
+      this.logger.warn('genesis read failed; no settle job this scan', {adapter: topology.genesis, error})
+      return undefined
+    }
   }
 
   private async vaultSnapshot(topology: Topology, now: number): Promise<VaultSnapshot> {
@@ -344,7 +391,7 @@ export class ChainReader {
   }
 
   /** One whole scan. */
-  async snapshot(topology: Topology, ethUsd18: bigint): Promise<ChainSnapshot> {
+  async snapshot(topology: Topology, ethUsd18: bigint, settleEnabled = false): Promise<ChainSnapshot> {
     const block = await this.client.getBlock({blockTag: 'latest'})
     const now = Number(block.timestamp)
 
@@ -365,6 +412,8 @@ export class ChainReader {
         .readContract({address: topology.hook, abi: ampsHookAbi, functionName: 'ampsFeeBps'})
         .catch(() => AMPS_FEE_BPS_DEFAULT) as Promise<number>,
     ])
+
+    const genesis = await this.genesisSnapshot(topology, settleEnabled)
 
     const ids = await this.poolIds(topology)
     const pools = (
@@ -406,6 +455,7 @@ export class ChainReader {
       pot,
       pools,
       constituents,
+      ...(genesis === undefined ? {} : {genesis}),
       baseFeeWei: block.baseFeePerGas ?? 0n,
       ethUsd18,
     }

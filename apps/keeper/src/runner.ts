@@ -40,6 +40,7 @@ import {ChainReader, type Topology} from './chain/reader.js'
 import {
   cooldownFrom,
   encodeJob,
+  jobTarget,
   placedPools,
   readBountyReport,
   revertLabel,
@@ -144,7 +145,7 @@ export class Runner {
     const topology = await this.topology()
 
     this.placedThisScan.clear()
-    const read = await reader.snapshot(topology, this.options.ethUsd18)
+    const read = await reader.snapshot(topology, this.options.ethUsd18, policy.settleEnabled)
     const snapshot: ChainSnapshot = {
       ...read,
       pools: read.pools.map((pool) => this.withOverlay(pool)),
@@ -278,7 +279,9 @@ export class Runner {
 
     try {
       const submission = await submitter.submit({
-        to: topology.vault,
+        // Five of the six jobs go to the vault; `settle` goes to the genesis adapter, whose address
+        // it carries as its own target.
+        to: jobTarget(job, topology.vault, topology.genesis),
         data: encodeJob(job),
         gasLimit,
         jobKey: job.key,
@@ -313,6 +316,11 @@ export class Runner {
           Number(vaultGasAllowanceUsd18(receipt.gasUsed, snapshot.baseFeeWei, snapshot.ethUsd18)) / 1e18,
         )
         if (job.kind === 'touch') this.lastTouchAt = snapshot.now
+        // The launch happened. The reader latches on `settled()` at the next scan and the job stops
+        // being produced at all, but saying so here is what an operator watching the log wants.
+        if (job.kind === 'settle') {
+          logger.info('genesis settled', {adapter: job.target, hash: receipt.hash})
+        }
 
         // Exactly the pools the vault stamped, from the `Placement` logs the job emitted. A `rollout` is
         // addressed by constituent but places into the destination spoke and whichever entry pools it

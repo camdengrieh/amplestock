@@ -35,6 +35,7 @@ export type AmpsContractKey =
   | 'hook'
   | 'oracleGate'
   | 'timelock'
+  | 'genesis'
 
 export type Deployment = Readonly<Partial<Record<AmpsContractKey, Address>>>
 
@@ -57,11 +58,17 @@ export const deployment: Deployment = readDeployment()
 /**
  * The genesis auctions.
  *
- * Two Continuous Clearing Auctions sell the entry-pool AMPS tranche: one against USDG and one
+ * Two Continuous Clearing Auctions sell the 10,000-AMPS auction tranche: one against USDG and one
  * against native ETH (`currency == address(0)`). They are kept out of {Deployment} because they are
- * not part of the running protocol — they exist once, and every surface other than `/auction`
- * should be unable to reach for them by accident. A key with no valid address is simply absent, and
- * the surface renders the same "not deployed on this chain" state every other address gets.
+ * not part of the running protocol *and have no ABI in `@amplestocks/abis`* — they are Uniswap's
+ * contracts, deployed by a factory, and every surface other than `/auction` should be unable to
+ * reach for them by accident. A key with no valid address is simply absent, and the surface renders
+ * the same "not deployed on this chain" state every other address gets.
+ *
+ * `AmpsGenesis` is **not** here: it is ours, it is the vault's own `genesis` pointer, and it is
+ * reached through {contract}(`'genesis'`) like every other Amplestocks contract. The adapter is
+ * what turns these two auctions into a launch — it sweeps both legs, derives `P0` and calls
+ * `AmpsVault.genesisPlace` — so the Settlement panel reads it rather than adding up the auctions.
  */
 export type GenesisAuctionKey = 'usdg' | 'eth'
 export type GenesisAuctions = Readonly<Partial<Record<GenesisAuctionKey, Address>>>

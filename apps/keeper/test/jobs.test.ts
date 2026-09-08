@@ -7,17 +7,21 @@ import {
   toFunctionSelector,
   type AbiEvent,
 } from 'viem'
-import {ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
+import {ampsGenesisAbi, ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
 import {
   cooldownFrom,
   decodeRevert,
   encodeJob,
+  jobTarget,
   readBountyReport,
+  JOB_ORDER,
   KEEPER_ERROR_ABI,
   retryAfter,
 } from '../src/jobs/index.js'
 import {jobKey} from '../src/domain/decide.js'
-import {SPOKE_POOL} from './helpers.js'
+import {GENESIS, SPOKE_POOL} from './helpers.js'
+
+const VAULT = '0x00000000000000000000000000000000000000a0' as const
 
 describe('calldata', () => {
   it('encodes each job at the selector the vault ABI declares', () => {
@@ -47,6 +51,28 @@ describe('calldata', () => {
     for (const name of ['compound', 'rollout', 'deployBonded', 'checkpoint', 'touch']) {
       expect(names).toContain(name)
     }
+  })
+
+  it('encodes settle at the adapter’s selector, not the vault’s', () => {
+    expect(encodeJob({kind: 'settle', target: GENESIS, key: 'x'})).toBe(toFunctionSelector('settle()'))
+    expect(ampsGenesisAbi.filter((item) => item.type === 'function').map((item) => item.name)).toContain('settle')
+    // And the vault has no such selector, which is why the target matters.
+    expect(ampsVaultAbi.filter((item) => item.type === 'function').map((item) => item.name)).not.toContain('settle')
+  })
+
+  it('sends settle to the adapter and everything else to the vault', () => {
+    expect(jobTarget({kind: 'settle', target: GENESIS, key: 'x'}, VAULT, undefined)).toBe(GENESIS)
+    // A settle candidate with no target of its own falls back to the topology's pointer, never to an
+    // empty string — which `simulateContract` would reject as an address anyway.
+    expect(jobTarget({kind: 'settle', target: '', key: 'x'}, VAULT, GENESIS)).toBe(GENESIS)
+    expect(jobTarget({kind: 'settle', target: '', key: 'x'}, VAULT, undefined)).toBe(VAULT)
+    expect(jobTarget({kind: 'compound', target: SPOKE_POOL, key: 'x'}, VAULT, GENESIS)).toBe(VAULT)
+    expect(jobTarget({kind: 'touch', target: '', key: 'x'}, VAULT, GENESIS)).toBe(VAULT)
+  })
+
+  it('considers settle first: it is the one job with a deadline the protocol cares about', () => {
+    expect(JOB_ORDER[0]).toBe('settle')
+    expect(new Set(JOB_ORDER).size).toBe(JOB_ORDER.length)
   })
 })
 

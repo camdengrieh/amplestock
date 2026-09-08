@@ -20,6 +20,8 @@ reasoning that is too fine-grained for here.
 | `AmpsVault` | logs | its address | NAV and reference checkpoints, redemption, burns, placements, compounds, gate mirrors, the exit sweep's residue disclosures, every governed parameter |
 | `AmpsBonds` | logs | its address | markets, purchases, positions, claims, per-epoch and per-day issuance and accretion, forwarded collateral, the vault pointer |
 | `AmpsRouter` | logs | its address | `Bought`, `Sold` and `Rotated` — which trades came through the protocol's own router, and which of them were rotations |
+| `AmpsGenesis` | logs | its address | `AuctionsCreated`, `Settled`, `ClearingPricesDiverged` — the launch, and the only source that *stops* emitting: after `settle()` the adapter is finished |
+| `GenesisAuctionUsdg`, `GenesisAuctionEth` | logs | **factory** over `AmpsGenesis.AuctionsCreated` | the two Continuous Clearing Auctions: `BidSubmitted`, `BidExited`, `TokensClaimed`, `CheckpointUpdated`. Two sources over one event, because Ponder's `factory` reads a single parameter and the adapter announces both legs in one log — which is what puts `usdg` or `eth` on a bid row without a read |
 | `Amps` | logs | its address | the token's vault pointer |
 | `PoolRegistry` | logs | its address | **the allowlist**: which pools and constituents are ours; bond-market detachments and the vault pointer |
 | `OracleGate` | logs | its address | gate state per pool, watchdog, divergence, freezes |
@@ -37,7 +39,7 @@ reasoning that is too fine-grained for here.
 The Stock Tokens themselves are deliberately *not* a log source: they emit only ERC-20 events, which
 the index has no use for. What is watched is their **transactions**, for the reason below.
 
-Three of these deserve their reasoning stated:
+Four of these deserve their reasoning stated:
 
 **The `PoolManager` is shared.** It carries every v4 pool on the chain, so a pool is ours if and only
 if `PoolRegistry.PoolRegistered` announced it. That row is the filter, in the handler, always. When
@@ -52,6 +54,14 @@ fire in the same block the call lands in. A second, slower detector probes `isBl
 constituent poll, so a denylist applied through a multicall, a Safe or an upgrade is still caught,
 one poll interval late.
 
+**The genesis auctions are Uniswap's, and their addresses do not exist until the launch runs.** They are deployed
+by Uniswap's factory inside `AmpsGenesis.createAuctions`, so they can only be a factory source, and their ABI is
+hand-written in `src/abi/external.ts` (events only) for the same reason the Stock Token's is: we do not author them,
+so codegen over `contracts/out` will never produce them. `apps/web/lib/abi/cca.ts` carries the same five fragments
+plus the read and write surface the bidding UI needs; the two transcriptions must agree and no artefact can check
+them. An unresolved `AMPS_GENESIS` is the ordinary state on a chain whose launch predates this indexer: the genesis
+tables simply stay empty rather than the source disappearing from the build.
+
 **`AnswerUpdated` comes from the aggregator, not the proxy.** `FeedRegistry` stores the Chainlink
 *proxy*; on 4663 the underlying `AccessControlledOffchainAggregator` is what emits `AnswerUpdated`,
 so the factory-derived source stays empty on mainnet until Phase 0 records the aggregator behind
@@ -63,7 +73,7 @@ are written from.
 
 ## 2. Schema
 
-47 tables. Conventions: event rows are keyed `"<blockNumber>-<logIndex>"` zero-padded so text order
+50 tables. Conventions: event rows are keyed `"<blockNumber>-<logIndex>"` zero-padded so text order
 is chain order; entity rows are keyed by on-chain identity, lower-cased; AMPS is 18-decimal wei, USD
 is 18-decimal (`Usd18`), Chainlink answers stay in their own 8 decimals (`Usd8`), prices are `X18`;
 enums are stored as the on-chain ordinal *and* a decoded label.
@@ -74,18 +84,42 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 |---|---|---|
 | `nav_checkpoint` | event | `navPerShareX18`, `A`, `T`, and the change in bps since the previous checkpoint |
 | `ref_checkpoint` | event | `pRefX18`, `pMktX18`, `rateLimited`, `navFloored`, the NAV in force, the premium |
-| `share_point` | block | shares by class: `totalSupply`, `inventory`, `vesting`, `staked`, `bondUnvested`, `circulating` |
+| `share_point` | block | shares by class: `totalSupply`, `inventory`, `vesting`, `bondUnvested`, `circulating` — four classes and a total, because revision 6 removed the staked class and `circulating` is `totalSupply - inventory - vesting - bondUnvested` |
 | `vault_summary` | singleton | the Vault page in one row: live NAV/`P_ref`/`P_mkt`/premium, shares by class (three, not four — there is no staked class), cumulative fees **in each currency**, the creator's cumulative take in each currency, cumulative burned, bond issuance, redemptions, net supply change |
 | `redemption` | event | `owner`, `to`, `shares`, `inventoryBurned`, `feeBps`, the NAV it paid at, gross and fee in USD |
 | `burn_event` | event | `amount`, the raw `bytes32` reason and its decoded label |
 | `vesting_mint` | event | the team `VestingWallet` draws |
+
+### Genesis: the launch and its two auctions
+
+Revision 7's launch, as built: `docs/genesis-cca.md`. What the indexer keeps of it is three tables.
+
+| Table | Key | What it holds |
+|---|---|---|
+| `genesis` | singleton | the whole launch in one row: the adapter and the vault; the mint half from `AmpsVault.GenesisMinted` (`mintedBlock`, `creator`, `teamVestingWallet`, `teamShares`, `auctionShares`, `polShares`); the auction half from `AmpsGenesis.AuctionsCreated` (`usdgAuction`, `ethAuction`, `floorUsdgQ96`, `floorEthQ96`, `startBlock`, `endBlock`); the settlement from `Settled` (`settledBlock`, `settledPhase`, `p0X18`, `raisedUsdg`, `raisedWeth`, `unsoldAmps`, `usdgGraduated`, `ethGraduated`, `graduated`); the launch from the vault's own `Genesis` (`launchBlock`, `totalMinted`, `navPerShareX18`, `raisedUsd18`, `premiumBps`); and the divergence disclosure (`diverged`, `divergedUsdgP0X18`, `divergedEthP0X18`, `divergenceToleranceBps`) |
+| `auction_bid` | `"<auction>-<bidId>"` | every bid in either leg: `leg` (`usdg` / `eth`), `owner`, `maxPriceQ96`, `amountQ96`, when it was submitted, and — once the bidder exits and claims — `tokensFilled`, `currencyRefunded`, `claimedAmount`. Additive: the dApp reads a wallet's *own* bids straight off the auction's logs and keeps doing so; what this adds is the whole book |
+| `auction_checkpoint` | event | the clearing-price series per leg: `clearingPriceQ96` and `cumulativeMps` at each `CheckpointUpdated`. `checkpoint()` is a **write**, not a view, so the price only moves when somebody pays to advance it — which makes this the only record of what the auction actually charged over the window |
+
+Four facts about these rows, all of them consequences of the contracts rather than choices:
+
+* **The row is legible at every point in genesis.** Revision 7 splits genesis into `genesisMint` and `genesisPlace`
+  with a 72-hour auction between them, so four logs on two contracts fill this row over three days and none of them
+  waits for the others. A row with tranches and no auctions, or auctions and no settlement, is correct.
+* **`phase` is not a column.** `AmpsGenesis.phase()` is derived from the block number, and `Created → Bidding` is a
+  block-number fact with no event behind it. The row carries `settledPhase` — `settled`, `aborted`, or `""` before
+  settlement — which is the terminal answer a log does decide; a live phase is a chain read.
+* **Zero is never a price.** `p0X18` is zero before settlement *and* zero for ever after a settlement in which
+  nothing graduated, so `settledBlock` and `graduated` are what a consumer reads.
+* **`GenesisMinted` carries `teamVestingWallet` and `Genesis` no longer does.** Revision 7 moved it: it is a fact
+  about the mint, and the launch log needed the room for `p0X18` and `raisedUsd18`. The vault handler writes the
+  summary's `teamVestingWallet` from the mint half accordingly.
 
 ### Placements, the ladder, compounds, rollouts
 
 | Table | Key | What it holds |
 |---|---|---|
 | `placement` | event | `poolId`, `above`, `buckets`, `amount`, `anchorTick`, the vault's own `reason` (raw and decoded) and the `action` it maps to, the caller, the `lowerTick`/`upperTick` range written, the cell count, and the liquidity the same transaction added |
-| `ladder_cell` | `"<poolId>-<tickLower>"` | the durable ladder record: `cellIndex` (`m - GRID_MIN_M`), `m`, the tick bounds, live `liquidity`, `above`, cumulative `principal`, and — recomputed at the pool's live price — `ampsRemaining`, `counterRaised` and `fillBps` |
+| `ladder_cell` | `"<poolId>-<tickLower>"` | the durable ladder record: `cellIndex` (`m - GRID_MIN_M`), `m`, the tick bounds, live `liquidity`, `above`, cumulative `principal`, and — recomputed at the pool's live price — `ampsRemaining`, `proceeds` and **`filledBps`** (renamed from `fillBps` in revision 6, with `ampsAtPlacement` beside it as its denominator) |
 | `liquidity_change` | event | every `ModifyLiquidity` on our pools: the audit trail behind `ladder_cell` |
 | `compound_event` | event | the revision-6 `Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`: what was collected in each currency, the creator's slice of each taken in kind, and the AMPS burned — the fee remainder plus the buyback. Plus the creator bps in force, NAV either side and the change in bps, and the bounty paid. There is no `stakerPaid` and no `relaid` column: the AMPS side is burned in full and the counter side is re-placed in the same pool, so neither number exists |
 | `rollout_event` | event | `AmpsVault.Rollout`: `constituentId`, the destination `toPoolId`, `movedAmps` taken out of the entry pools' unfilled asks and `placedAmps` the destination ladder committed, the caller |
@@ -95,10 +129,12 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | Table | Key | What it holds |
 |---|---|---|
 | `pool` | `PoolId` | counter and its decimals, class, constituent, tick spacing, `doublingTicks`, `gridBaseTick`, `buyFeeBps`, feed, the price it opened at, live `sqrtPriceX96`/`tick`/`liquidity`, gate state, cumulative volume and fees by direction, rotation credit, ladder totals, the valuer cross-check (`valuerAmps`, `valuerCounter`, `valuerDeltaBps`, `valuerCheckedBlock`, §4), realised LVR and fee revenue in USD |
-| `swap` | event | direction, both deltas, `amountIn`/`amountOut`, the AMPS and counter legs, the post-swap price and tick, `feePips`/`feeBps`, **`baseFeeBps`**, **`dynamicFeeBps`**, **`creditedAmount`**, the fee amount in the input currency and in AMPS, notional and fee in USD |
+| `swap` | event | direction, both deltas, `amountIn`/`amountOut`, the AMPS and counter legs, the post-swap price and tick, `feePips`/`feeBps`, **`baseFeeBps`**, **`dynamicFeeBps`**, **`creditedAmount`**, the fee amount in the input currency and in AMPS, notional and fee in USD. `baseFeeBps` is `ampsFeeBps` for **both** directions under revision 6 — the pass-through `buyFeeBps` is reachable only through `AmpsRouter.rotate` — and hop 1 of a rotation is written optimistically as an ordinary buy and then **corrected retroactively** by the `Rotated` handler out of `pending_hop`, because a hop cannot know a second hop follows it |
 | `pool_day` | `"<poolId>-<day>"` | per-pool per-UTC-day volume, fees, credited AMPS, swap count, realised LVR, the day's tick range |
 | `rebalance_signal` | event | `RebalanceNeeded`: tick, fair tick, deviation |
 | `hook_event` | event | `SurgeArmed`, `MultiplierStepDetected`, `HighWaterAdvanced/Reset`, `GateCacheRefreshed`, `Initialize` |
+| `router_trade` | event | revision 6's `AmpsRouter` log: `kind` (`buy` / `sell` / `rotate`), the pool — and `hop2PoolId` for a rotation — the payer and recipient, amounts in and out, `ampsAmount`, `passThrough` (true for a rotation and nothing else), what the hops actually paid from the `swap` rows, and `hop1BaseFeeBps` / `hop2BaseFeeBps` |
+| `pending_hop` | `"<tx>-<poolId>"` | internal: hop 1 of a possible rotation, parked so the `Rotated` handler that arrives later in the same transaction can correct its fee decomposition in place |
 
 ### Registry, gate, feeds, constituents
 
@@ -142,7 +178,7 @@ share price to track, no reward stream to sample and no APR to realise.
 | `denylist_alarm` | event/job | every observation of the denylist: `detection` (`call` or `probe`), target, caller, selector, the decoded accounts, whether it touches a protocol address, severity |
 | `reconciliation` | block | indexed versus chain for NAV, `P_ref`, supply, inventory and `A`, with the deltas, the bounds in force, `ok` and the breached fields |
 | `alert` | event/job | every alert raised, its severity and detail, and what the sink did with it |
-| `flywheel_day` | day | the dashboard's headline series: sell-fee revenue, bond issuance and accretion, burns, staker and creator payments, re-laddered AMPS, redemptions, net supply change, realised LVR, NAV open/close, closing premium, swap count |
+| `flywheel_day` | day | the dashboard's headline series, split by currency because revision 6 collects two: `sellVolumeAmps` / `buyVolumeAmps`, `feeAmps` + `feeAmpsUsd18` and `feeCounterUsd18`, bond issuance and accretion, `burnedAmps`, `creatorPaidAmps` + `creatorPaidCounterUsd18`, redemptions, net supply change, realised LVR, NAV open/close, closing premium, swap count. **There is no staker payment column and no re-laddered-AMPS column**: revision 6 burns the AMPS side of every fee in full after the creator's slice, so neither number exists |
 | `pending_credit` | `"<tx>-<poolId>"` | internal: a rotation credit parked for the `Swap` that follows it |
 | `indexer_state` | key | internal: the small scratch the handlers keep between events |
 
@@ -320,6 +356,8 @@ indexer.
 | `gate` | `critical` | the watchdog tripped, a protocol freeze was set, or the vault migrated |
 | `gate` | `warning` | any pool gate left `GREEN` |
 | `corporate-action` | `warning` | a `uiMultiplier` step past `DIVIDEND_STEP_BPS_MAX`, or a constituent frozen for a corporate action |
+| `genesis` | `critical` | `AmpsGenesis.Settled` with neither leg graduated: nothing was sold, the whole auction tranche went back to the vault and **the launch did not happen**. The vault stays shut, every bidder has money to reclaim from the auctions themselves, and the fallback needs a governance proposal with a 7-day delay |
+| `genesis` | `warning` | `ClearingPricesDiverged`: both legs graduated and their implied prices sit further apart than the vault's own `refDivergenceBps`. Disclosure rather than a failure — the USDG price is used regardless, because it is the only one denominated in the unit `P_ref` is quoted in — but the ETH/USD price the proposal carried and the market's own ETH bid do not tell the same story about what AMPS is worth |
 | `sweep-residue` | `warning` | `AmpsVault.SweepResidue`: the exit sweep could not fold a token's idle balance into the vault's ERC-6909 claims, so the token is paused, denylisting the vault or unreadable. Disclosure, not a breach — the residue stays part of the vault's holdings, is valued in `A` and is paid out by redemption — so it pages one step below the denylist alarm that would raise the same fact if it could see the issuer's call |
 
 The denylist alarm also has its own table, `denylist_alarm`, served at `/api/alerts/denylist`, which
@@ -348,7 +386,10 @@ The end-to-end suite does exactly this and is the shortest path to a working loc
 AMPS_E2E=1 pnpm --filter @amplestocks/indexer test:e2e
 ```
 
-It starts `anvil`, deploys the whole system through the Phase 3 scripts, drives genesis, a swap, a
+It starts `anvil`, deploys the whole system through the Phase 3 scripts, drives both halves of genesis
+— `genesisMint` and then `genesisPlace` in the **founders'-seed form**, because the fixture is about
+the indexer and not about an auction, and a {MockGenesisHolder} stands in for the adapter so the
+auction tranche is in `totalSupply` without being the vault's inventory — then a swap, a
 bond, a compound, a redemption and a real `blockAccounts` call, then runs the indexer against the
 resulting chain and asserts, in order: the reconciliation at every block, the denylist alarm, the
 journey itself (genesis, the ladders, the fee decomposition, the bond's accretion, the compound's
@@ -373,9 +414,11 @@ The handler tests import the *real* indexing functions (through `src/index.ts`, 
 registers them) and call them with synthetic events against an in-memory `context.db`. The three
 Ponder virtual modules are aliased to test doubles in `vitest.config.ts`.
 
-**Counts.** 121 offline tests across five files — 78 over the pure libraries (`lib` 33, `math` 18,
-`fee` 15, `reconcile` 12) and 43 handler tests on synthetic logs — plus 14 end-to-end tests behind
-`AMPS_E2E=1`.
+**Counts.** 147 offline tests across six files — 80 over the pure libraries (`lib` 34, `math` 18,
+`fee` 16, `reconcile` 12) and 67 handler tests on synthetic logs (`handlers` 55, `genesis` 12) — plus
+14 end-to-end tests behind `AMPS_E2E=1`. `genesis.test.ts` drives the four launch logs in every order
+they can arrive in, including a settlement that graduated, one that did not, and an indexer started
+mid-auction that never saw the mint.
 The offline suite runs in about four seconds and touches no network; the end-to-end suite takes
 about 75 seconds including the Foundry build.
 
@@ -389,6 +432,7 @@ query away. The typed layer is for the shapes the dApp asks for repeatedly:
 | Route | Serves |
 |---|---|
 | `GET /api/vault` | the summary row, the latest share sample, the latest reconciliation |
+| `GET /api/genesis?leg=&bids=&checkpoints=` | the launch: the singleton `genesis` row, the bid book (newest first) and the clearing-price series (oldest first). `leg=usdg\|eth` narrows both lists. **404 = "not indexed yet"**, which for a launch that has not happened is the correct answer rather than an error, and `p0X18` of zero is not a price — read `settledBlock` and `graduated` |
 | `GET /api/nav-history?since=&limit=` | NAV/share, `A`, `T` over time |
 | `GET /api/premium-history` | `P_ref`, `P_mkt`, premium over time |
 | `GET /api/share-history` | shares by class over time |
@@ -411,6 +455,17 @@ query away. The typed layer is for the shapes the dApp asks for repeatedly:
 | `GET /api/reconciliation?failing=1` | reconciliation runs and totals |
 | `GET /api/keeper` | the keeper-job ledger and bounty payments |
 | `GET /api/parameters` | every governed parameter's latest value |
+
+**There is no `/api/staking`.** Revision 6 removed `AmpsStaking` from the protocol, so an endpoint for it would be
+a claim that the thing it describes still exists — and `staking` is gone from the `/api/flywheel` envelope for the
+same reason, along with the staker slice of a compound and the re-laddered-AMPS series.
+
+Three field names changed with revision 6 and are worth stating, because a consumer written against the old ones
+compiles and renders nothing: `creatorPaidTotal` → **`creatorPaidAmpsTotal`** (with `creatorPaidCounterUsd18`
+beside it, since the creator is now paid in kind out of every currency); `paidTotal` → **`paidAmpsTotal`** plus
+**`paidCounterUsd18`** on the creator-fee endpoint; and `fillBps` → **`filledBps`** on every ladder cell.
+`apps/web/lib/indexer/types.ts` is a transcription of these envelopes, so the web types and this table are checked
+against each other by `apps/web/test/indexer.test.ts` rather than by convention.
 
 `bigint` does not survive `JSON.stringify`, so every response renders them as decimal strings.
 `BigInt(value)` on the way back in is exact; nothing is narrowed to a float.
@@ -525,6 +580,19 @@ inferred, and that is the number the reconciliation compares against `Amps.total
   `passThroughSellFeePips`. Appended, so every earlier field decodes unchanged; a consumer that
   decodes the struct positionally must still regenerate its ABI, because the two new fields sit
   before `dynBps`.
+- **The address set changed with the contracts.** Revision 6 removed `AmpsStaking`, so the
+  `AMPS_STAKING` variable is gone and **`AMPS_ROUTER`** took its place as the log source for the
+  protocol's own router; revision 7 adds **`AMPS_GENESIS`**, the only address here that may legitimately
+  be left empty on a launched chain, because the adapter is finished once it has settled. Both are the
+  names `deployments.json` lists under `envOverrides`, and `src/config/addresses.ts` is the single
+  place they are resolved.
+- **Revision 7 split the vault's genesis log in two.** `GenesisMinted(teamVestingWallet, creator,
+  genesis, teamShares, auctionShares, polShares)` is the mint and
+  `Genesis(creator, totalMinted, navPerShareX18, p0X18, raisedUsd18)` is the launch — so the vault
+  handler no longer reads `teamVestingWallet` off the launch log (which was the revision-6 shape) and
+  the two halves have an unambiguous ordering across the 72-hour auction between them. `Genesis` also
+  gained `p0X18` and `raisedUsd18`, which is where `vault_summary.pRefX18` and `totalAssetsUsd18`
+  come from at launch. Both events changed `topic0`, so `packages/abis` had to be regenerated.
 
 ## 9. Licence
 

@@ -12,7 +12,7 @@ each gate state.
 
 ## 1. What it runs
 
-Five calls on `AmpsVault`, and no others.
+Five calls on `AmpsVault`, one on `AmpsGenesis` that runs once in the protocol's life, and no others.
 
 | Job | Call | Paid? | Fires when |
 |---|---|---|---|
@@ -21,6 +21,20 @@ Five calls on `AmpsVault`, and no others.
 | Deploy bonded | `deployBonded(uint16 constituentId)` | bounty | idle bonded collateral clears `deployThresholdUsd18` |
 | Checkpoint | `checkpoint()` | **no** | the vault checkpoint is older than `AMPS_CHECKPOINT_REFRESH_SECONDS` (1,200 s) |
 | Touch | `touch()` | **no** | every `AMPS_TOUCH_INTERVAL_SECONDS` (900 s), and immediately whenever the watchdog has tripped |
+| Settle genesis | `AmpsGenesis.settle()` | **no** | once, in the first block after both auctions' `endBlock`, while `AmpsGenesis.settled()` is false |
+
+**Settle genesis is unpaid and one-shot**: it sweeps both legs, wraps the ETH and calls `AmpsVault.genesisPlace` in
+the same transaction. It takes `_requireHealthy`, so it fails while the vault's gate pointer is set and the hub pool
+does not exist yet — the gate pointer must stay unset until settlement (`docs/genesis-cca.md` §5). After it
+succeeds the job retires itself; the keeper's five ordinary jobs only start once the launch is placed.
+
+It is the only job whose transaction does not go to the vault, and the only one screened on a single field: the
+adapter's own `phase()`, which reads `Ended` exactly when the call is possible. It is deliberately **not** screened
+on gate state — a launch stuck behind an early gate pointer must surface as a `GateNotHealthy` simulation revert
+naming the real problem, not as "gate not green" every scan for ever. The reader latches the adapter reads off the
+moment `settled()` comes back true, so a keeper started years after the launch pays four RPC calls once and then
+never asks again, and the job stops appearing in the metrics at all: a job that can never run again is not a job
+with a skip reason.
 
 **It never re-centres and never re-widens anything.** There is no vault entry point that could, and there never
 will be — ladders are placed once and consumed (`docs/phase3-state-model.md` §3, invariant I35). `AmpsHook`'s
@@ -44,9 +58,14 @@ Two stages. Screening is free (`view` reads only); qualification costs one `eth_
 | 5 | `now >= lastPlacementAt + 60` | `cooldown` (carries `readyAt`) | §3.8 step 6 |
 | 6 | `liveCells + headroom <= 512` | `cell-budget` | §12 ruling E |
 | 7 | job-specific: idle collateral, rollout weight, checkpoint age | `below-deploy-threshold`, `no-work`, `not-due`, `checkpoint-fresh` | §3.7 |
+| 8 | `settle` only: `AmpsGenesis.phase() == Ended` | `not-due` while the auctions run, `already-settled` once they have | §1 |
 
 Steps 1 and 7 of the gauntlet — the transient lock and the R1 post-condition — are invisible to a `view`. They
 land in the simulation, below.
+
+**Checks 1-6 do not apply to `settle`.** It is not a placement and not a call on the vault, and screening it on
+gate state would hide the one failure that matters (§1). Its whole screen is check 8; everything else about it is
+decided by the simulation.
 
 `touch()` is screened differently on purpose: **the watchdog is what it exists to clear.** `AmpsVault.touch`
 pokes `OracleGate` *before* it checks the gate, and `OracleGate.poke()` stamps the watchdog, so one `touch`
@@ -172,9 +191,12 @@ from `@amplestocks/config`'s chain records (4663 and 46630), which Phase 0 re-ve
 
 The keeper is told **one** address — AMPS — and resolves the rest every scan: `Amps.vault()` names the live
 vault, so an `emergencyMigrate` is followed without a redeploy, and the vault names the registry, the bonds, the
-bounty pot, the oracle gate and the hook. There is no staking contract to resolve: revision 6 removed staking, so
-the keeper reads nothing about a reward stream and has no `notifyReward` to watch. A governance pointer move is a
-value that changes between two scans, not an outage.
+bounty pot, the oracle gate, the hook and — until the launch settles — the genesis adapter (`AmpsVault.genesis()`,
+a set-once pointer, so it names the adapter for the life of the vault whether or not it has settled). **There is no
+staking pointer to resolve**: revision 6 removed `AmpsStaking` from the protocol, so the keeper reads nothing about a
+reward stream, has no `notifyReward` to watch and runs no staking job — a vault deployed before revision 6 would
+answer `staking()`, and this keeper never asks. A governance pointer move is a value that changes between two scans,
+not an outage.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -199,6 +221,8 @@ value that changes between two scans, not an outage.
 | `AMPS_BOUNTY_MARGIN_BPS` | `0` | require the bounty to exceed gas by this margin |
 | `AMPS_RUN_UNPAID` | `false` | keep working when the pot cannot pay |
 | `AMPS_ALLOW_REF_DIVERGED` | `false` | the vault permits `REF_DIVERGED`; the keeper does not by default |
+| `AMPS_GENESIS_ADDRESS` | from `AmpsVault.genesis()` | optional; pins the adapter for a fixture chain whose pointer is not wired yet |
+| `AMPS_SETTLE_ENABLED` | `true` | watch for the settlement and send `AmpsGenesis.settle()`. Ignored once `settled()` is true, so it costs nothing after the launch; set it to `false` to leave settlement to another operator — it is permissionless, so somebody else's keeper does the same work |
 | `AMPS_GAS_LIMIT_BUFFER_BPS` / `AMPS_GAS_LIMIT_CEILING` | `2500` / `30000000` | applied to `eth_estimateGas` |
 | `AMPS_METRICS_HOST` / `AMPS_METRICS_PORT` | `0.0.0.0` / `9464` | |
 | `AMPS_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
@@ -316,6 +340,21 @@ failure: the window is charged on what left the entry pools, the remainder is re
 (`Placed` with `reason = "rollback"`), and the bounty is paid on what was placed, which the `chost` guard may round
 to zero when the destination's live-cell budget is full.
 
+### Genesis will not settle
+
+`amps_keeper_simulation_reverts_total{job="settle"}` is the one to watch during a launch, and the error label says
+what to do:
+
+| Revert | Cause | Fix |
+|---|---|---|
+| `AuctionNotEnded(auction, endBlock)` | the job ran a block early, or one leg's window is longer than the other's | nothing; `phase()` reads `Ended` only when every created leg has closed, and the next scan sends it |
+| `GateNotHealthy(state, poolId)` | the vault's gate pointer was set before settlement, and the hub pool does not exist yet | this is an operator error, not a race (`docs/genesis-cca.md` §5). The gate must be unpointed by governance before the launch can proceed — page the Safe |
+| `AlreadySettled()` | somebody else's `settle()` won | expected and harmless: the launch happened. The reader latches the reads off at the next scan and the job disappears |
+| `NotSweptClean(token, balance)` | a leg paid out something the adapter did not expect | do not retry blindly; read `AmpsGenesis`'s balances and escalate — the adapter asserts it is empty on purpose |
+
+`settle` never appears at all once `settled()` is true, so an *absent* settle metric after the launch is the
+correct state, not a broken exporter.
+
 ### The pot is empty
 
 Jobs degrade to unpaid, they do not stop (`BountyPot.pay` returns what it could transfer and emits `BountyPaid`
@@ -383,7 +422,9 @@ refused while its neighbours run; a stale checkpoint refreshed; a tripped watchd
 `deployBonded` firing above the deploy threshold and not below it; a 48-hour outage resumed with no duplicate
 send; a second instance deciding identically; the bounty-versus-gas refusal at a pinned 1 gwei basefee; the
 measured-versus-reported work and gas series agreeing; the pot swept empty and the degrade-to-unpaid switch;
-and the assertion that only the five permissionless jobs are ever encoded and that no ladder cell moves.
+and the assertion that only the permissionless jobs are ever encoded and that no ladder cell moves. The `settle`
+job is covered by the offline suite rather than by the chain suite: the chain fixture stands the system up with
+the launch already placed, so a settlement is not reachable in it.
 
 ### A Phase 3 script bug the fixture found (being fixed by the deploy agent)
 

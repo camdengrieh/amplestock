@@ -88,6 +88,7 @@ describe('IndexerClient', () => {
     expect(ENDPOINTS.flywheel).toBe('/api/flywheel')
     expect(ENDPOINTS.gateStatus).toBe('/api/gate')
     expect(ENDPOINTS.burnHistory).toBe('/api/burns')
+    expect(ENDPOINTS.genesis).toBe('/api/genesis')
   })
 
   it('has no staking endpoint — revision 6 removed staking', () => {
@@ -149,5 +150,43 @@ describe('the envelopes the /api layer actually answers', () => {
     const result = await clientReturning({burns: [], total: '0', count: 0}).burnHistory()
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.data.count).toBe(0)
+  })
+
+  it('keeps the launch envelope whole: one row, the bid book and the price series', async () => {
+    const body = {
+      genesis: {
+        adapter: '0x00000000000000000000000000000000000000ac',
+        settledPhase: 'settled',
+        p0X18: '1000000000000000000',
+        raisedUsdg: '5000000000',
+        raisedWeth: '2000000000000000000',
+        raisedUsd18: '10000000000000000000000',
+        totalMinted: '20000000000000000000000',
+        navPerShareX18: '500000000000000000',
+        premiumBps: 10_000,
+        graduated: true,
+      },
+      bids: [{auction: '0x00000000000000000000000000000000000000ad', leg: 'usdg', bidId: '7'}],
+      checkpoints: [{leg: 'usdg', clearingPriceQ96: '1'}],
+    }
+    const result = await clientReturning(body).genesis({leg: 'usdg'})
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      // The field names are `apps/indexer/ponder.schema.ts`'s own, so a rename there is a type error
+      // here rather than a panel that renders undefined.
+      expect(result.data.genesis.settledPhase).toBe('settled')
+      expect(result.data.genesis.premiumBps).toBe(10_000)
+      expect(result.data.genesis.graduated).toBe(true)
+      expect(result.data.bids[0]?.leg).toBe('usdg')
+      expect(result.data.checkpoints[0]?.clearingPriceQ96).toBe('1')
+    }
+  })
+
+  it('has no `phase` field on the launch row, because no log carries one', async () => {
+    // `AmpsGenesis.phase()` is derived from the block number, so a live phase is a chain read. The
+    // row carries `settledPhase`, the terminal answer a log does decide.
+    const result = await clientReturning({genesis: {settledPhase: ''}, bids: [], checkpoints: []}).genesis()
+    expect(result.ok).toBe(true)
+    if (result.ok) expect('phase' in result.data.genesis).toBe(false)
   })
 })

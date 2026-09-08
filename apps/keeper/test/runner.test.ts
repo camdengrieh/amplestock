@@ -24,6 +24,8 @@ const TOPOLOGY: Topology = {
   hook: '0x00000000000000000000000000000000000000b5',
   poolManager: '0x00000000000000000000000000000000000000b6',
   feedRegistry: '0x00000000000000000000000000000000000000b7',
+  // `AmpsVault.genesis()`. Zero is the ordinary post-launch state and means "no settle job".
+  genesis: '0x0000000000000000000000000000000000000000',
 }
 
 /**

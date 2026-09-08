@@ -27,6 +27,7 @@ import {
   ampsAbi,
   ampsBondsAbi,
   ampsBondsLensAbi,
+  ampsGenesisAbi,
   ampsHookAbi,
   ampsQuoterAbi,
   ampsRouterAbi,
@@ -52,6 +53,14 @@ export const abis = {
   registryLens: poolRegistryLensAbi,
   hook: ampsHookAbi,
   oracleGate: oracleGateAbi,
+  /**
+   * The genesis adapter. One-shot and ownerless: `createAuctions` is the timelock's, `settle()` is
+   * anybody's, and after it there is nothing left to call. It is listed here rather than beside the
+   * two auctions because it is an Amplestocks contract with a generated ABI, and because its
+   * fifteen custom errors belong in {allAbis} so a failed `settle()` is named rather than printed
+   * as a selector.
+   */
+  genesis: ampsGenesisAbi,
   /**
    * `LadderPositionValuer` has no deployment slot of its own: it is a pointer the vault holds, so
    * the app reads `AmpsVault.positionValuer()` rather than carrying another environment variable.

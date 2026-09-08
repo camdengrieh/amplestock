@@ -40,6 +40,7 @@ import {
   updateSummary,
 } from '../lib/store'
 import {settleAccretion} from './bonds'
+import {launchPremiumBps, updateGenesis} from './genesis'
 import {reconcileAgain, runReconciliation, sampleShares} from './reconcile'
 
 const PREV_NAV = 'vault.navPerSharePrevX18'
@@ -49,6 +50,55 @@ const PLACEMENT_LIQ = (tx: string, pool: string) => `placement.liquidity.${tx}.$
 // Genesis
 // -------------------------------------------------------------------------------------------------
 
+/**
+ * `genesisMint` — step one of two, and the only one that mints.
+ *
+ * `S0` exists from this block and `A` is still zero, so the summary records the supply and the
+ * addresses and touches **no** price: NAV/share is undefined until `genesisPlace` writes the first
+ * checkpoint, and writing a zero here would make the reconciliation job compare a real
+ * `Amps.totalSupply()` against a NAV that does not exist yet.
+ *
+ * `teamVestingWallet` moved here in revision 7. It is a fact about the *mint* — who received the
+ * team tranche — and the launch log has no room for it beside the price it was renamed to carry.
+ */
+ponder.on('AmpsVault:GenesisMinted', async ({event, context}) => {
+  const s0 = event.args.teamShares + event.args.auctionShares + event.args.polShares
+
+  await updateSummary(context.db, event.block.number, event.block.timestamp, () => ({
+    vault: context.contracts.AmpsVault.address as `0x${string}`,
+    amps: context.contracts.AmpsToken.address as `0x${string}`,
+    registry: context.contracts.PoolRegistry.address as `0x${string}`,
+    creator: event.args.creator,
+    teamVestingWallet: event.args.teamVestingWallet,
+    genesisMinted: s0,
+    totalSupply: s0,
+  }))
+
+  // The mint half of the launch row. It is the whole of it for the next 72 hours.
+  await updateGenesis(context.db, event.block.number, () => ({
+    vault: context.contracts.AmpsVault.address as `0x${string}`,
+    adapter: event.args.genesis,
+    mintedBlock: event.block.number,
+    mintedAt: event.block.timestamp,
+    creator: event.args.creator,
+    teamVestingWallet: event.args.teamVestingWallet,
+    teamShares: event.args.teamShares,
+    auctionShares: event.args.auctionShares,
+    polShares: event.args.polShares,
+  }))
+
+  await setState(context.db, STATE.totalSupply, s0, event.block.number)
+  await setState(context.db, STATE.supplyEvented, s0, event.block.number)
+})
+
+/**
+ * `genesisPlace` — step two, and the block the protocol opens in.
+ *
+ * Revision 7 changed the shape: `teamVestingWallet` left for `GenesisMinted` and `p0X18` and
+ * `raisedUsd18` arrived, so the launch log now says what the auction decided rather than only that
+ * a launch happened. `genesisAt` is stamped here rather than at the mint because the creator's own
+ * decay clock starts here — the bidding window does not eat into it.
+ */
 ponder.on('AmpsVault:Genesis', async ({event, context}) => {
   await updateSummary(context.db, event.block.number, event.block.timestamp, () => ({
     vault: context.contracts.AmpsVault.address as `0x${string}`,
@@ -57,14 +107,33 @@ ponder.on('AmpsVault:Genesis', async ({event, context}) => {
     genesisAt: event.block.timestamp,
     genesisBlock: event.block.number,
     creator: event.args.creator,
-    teamVestingWallet: event.args.teamVestingWallet,
     genesisMinted: event.args.totalMinted,
     genesisNavPerShareX18: event.args.navPerShareX18,
     navPerShareX18: event.args.navPerShareX18,
+    totalAssetsUsd18: event.args.raisedUsd18,
     totalSupply: event.args.totalMinted,
+    pRefX18: event.args.p0X18,
+    premiumBps: launchPremiumBps(event.args.p0X18, event.args.navPerShareX18),
   }))
+
+  // The other half of the launch row: what the vault measured, beside what the adapter swept. On
+  // the fallback path this is the only settlement record there is — `settle()` emitted an aborted
+  // `Settled` and the timelock opened the vault itself, hours or days later.
+  await updateGenesis(context.db, event.block.number, () => ({
+    vault: context.contracts.AmpsVault.address as `0x${string}`,
+    creator: event.args.creator,
+    launchBlock: event.block.number,
+    launchAt: event.block.timestamp,
+    totalMinted: event.args.totalMinted,
+    navPerShareX18: event.args.navPerShareX18,
+    raisedUsd18: event.args.raisedUsd18,
+    premiumBps: launchPremiumBps(event.args.p0X18, event.args.navPerShareX18),
+  }))
+
   await setState(context.db, STATE.genesisAt, event.block.timestamp, event.block.number)
   await setState(context.db, STATE.navPerShareX18, event.args.navPerShareX18, event.block.number)
+  await setState(context.db, STATE.totalAssetsUsd18, event.args.raisedUsd18, event.block.number)
+  await setState(context.db, STATE.pRefX18, event.args.p0X18, event.block.number)
   await setState(context.db, STATE.totalSupply, event.args.totalMinted, event.block.number)
   await setState(context.db, STATE.supplyEvented, event.args.totalMinted, event.block.number)
 })

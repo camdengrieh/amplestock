@@ -25,6 +25,8 @@ export const E2E = {
   /** The two genesis Continuous Clearing Auctions. */
   auctionUsdg: '0x00000000000000000000000000000000000a000c',
   auctionEth: '0x00000000000000000000000000000000000a000d',
+  /** `AmpsGenesis`, the adapter that settles them into the vault. */
+  genesis: '0x00000000000000000000000000000000000a000e',
 } as const
 
 export const RPC_URL = 'http://127.0.0.1:8545'

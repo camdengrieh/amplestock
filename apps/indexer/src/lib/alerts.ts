@@ -20,7 +20,9 @@
  * `nav-bleed` (a `compound` past the R1 bound), `gate` (a watchdog trip, a protocol freeze, a
  * migration), `corporate-action` (an unannounced `uiMultiplier` step) and `sweep-residue` (the
  * vault's exit sweep could not absorb a registered token's idle balance — the token is paused,
- * denylisting the vault or unreadable, and says so in a log rather than a revert).
+ * denylisting the vault or unreadable, and says so in a log rather than a revert) and `genesis`
+ * (the launch: no auction leg graduated, so nothing was sold and the vault is still shut; or both
+ * legs graduated at prices further apart than the vault's own divergence tolerance).
  *
  * **The sink is a no-op by default.** Every alert is always written to the `alert` table, which is
  * the durable record and what the HTTP layer serves. Delivery on top of that is a single webhook:
@@ -32,7 +34,15 @@
 export type AlertSeverity = 'info' | 'warning' | 'critical'
 
 export interface AlertPayload {
-  kind: 'denylist' | 'reconciliation' | 'gate' | 'nav-bleed' | 'corporate-action' | 'sweep-residue'
+  kind:
+    | 'denylist'
+    | 'reconciliation'
+    | 'gate'
+    | 'nav-bleed'
+    | 'corporate-action'
+    | 'sweep-residue'
+    /** The launch: no leg graduated, or the two legs' clearing prices disagreed. */
+    | 'genesis'
   severity: AlertSeverity
   /** What the alert is about: a pool id, a token, a block. */
   subject: string

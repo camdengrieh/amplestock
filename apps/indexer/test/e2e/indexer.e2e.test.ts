@@ -165,7 +165,7 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
   it('indexes genesis and the launch vector', async () => {
     const body = (await indexer.get('/api/vault')) as {summary: Json}
     const s = body.summary
-    expect(BigInt(s.genesisMinted as string)).toBe(5_000n * 10n ** 18n)
+    expect(BigInt(s.genesisMinted as string)).toBe(20_000n * 10n ** 18n)
 
     // NAV/share *at genesis* is the $1.00 launch price, up to the few basis points §12.2 ruling L
     // documents: each ask ladder is valued at the reference price as it is placed, so laying all of
@@ -184,6 +184,21 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     expect(nav).toBeGreaterThan(genesisNav)
     expect(BigInt(s.pRefX18 as string)).toBeGreaterThanOrEqual(nav)
     expect(s.creator).not.toBe('0x0000000000000000000000000000000000000000')
+
+    // The launch row, and the shape a *fallback* launch leaves it in: the mint half is there, the
+    // vault's own `Genesis` is there, and the settlement half is empty because no auction ran — this
+    // fixture opens the vault through the timelock's `genesisPlace`, which is the no-graduation path.
+    const launch = (await indexer.get('/api/genesis')) as {genesis: Json}
+    const g = launch.genesis
+    expect(BigInt(g.teamShares as string)).toBe(1_000n * 10n ** 18n)
+    expect(BigInt(g.auctionShares as string)).toBe(10_000n * 10n ** 18n)
+    expect(BigInt(g.polShares as string)).toBe(9_000n * 10n ** 18n)
+    expect(BigInt(g.launchBlock as string)).toBeGreaterThan(0n)
+    expect(BigInt(g.totalMinted as string)).toBe(20_000n * 10n ** 18n)
+    // No adapter log, so no settlement: zero here is "it did not happen", never a price of zero.
+    expect(BigInt(g.settledBlock as string)).toBe(0n)
+    expect(g.graduated).toBe(false)
+    expect(g.settledPhase).toBe('')
 
     const supply = (await indexer.get('/api/supply')) as Json
     expect(BigInt(supply.bondIssued as string)).toBeGreaterThan(0n)

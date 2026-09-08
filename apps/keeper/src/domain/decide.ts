@@ -12,14 +12,17 @@
  *  * {@link qualify} — after an `eth_call` and an `eth_estimateGas`: is this job *worth* sending? Work value
  *    against `chost`, bounty against gas. Needs a simulation, so it is a second stage.
  *
- * Nothing here re-centres or re-widens anything. The five jobs are the five permissionless entry points and
- * there is no sixth: `RebalanceNeeded` from the hook is a *notification that the fee schedule reacted*, and the
- * keeper's answer to it is `compound`, never a range move (`IAmpsHook`'s own note on the event says so).
+ * Nothing here re-centres or re-widens anything. The five ordinary jobs are the five permissionless entry points
+ * on the vault and there is no sixth: `RebalanceNeeded` from the hook is a *notification that the fee schedule
+ * reacted*, and the keeper's answer to it is `compound`, never a range move (`IAmpsHook`'s own note on the event
+ * says so). `settle` is not a sixth vault entry point either — it is a one-shot call on `AmpsGenesis` that
+ * exists only until the launch happens, and it retires itself the moment it does.
  */
 
 import {
   BOUNTIED_JOBS,
   GateState,
+  GenesisPhase,
   type ChainSnapshot,
   type ConstituentSnapshot,
   type JobCandidate,
@@ -283,6 +286,41 @@ export function screenTouch(snapshot: ChainSnapshot, policy: KeeperPolicy, lastT
   return {candidate: job, eligible: true}
 }
 
+/**
+ * `AmpsGenesis.settle()` — unpaid, permissionless, one-shot, and the only job that is not a call on
+ * the vault.
+ *
+ * The screen is one field: the adapter's own `phase()`. It derives `Ended` from the block number
+ * and its own state, and `Ended` means precisely "every created leg's end block has passed and
+ * `settle()` has not run" — which is precisely when the call is possible. Reconstructing that from
+ * the two auctions' end blocks would be more reads and a comparison the adapter already makes.
+ *
+ * **It is not screened against the gate**, and that is deliberate rather than an omission. `settle()`
+ * takes the vault's `_requireHealthy` through `genesisPlace`, and at settlement time the hub pool
+ * does not exist yet, so a gate pointed too early reports `WATCHDOG` and the call reverts
+ * (`docs/genesis-cca.md` §5: the gate pointer must not be set between the auctions' creation and
+ * their settlement). Refusing the job here on gate state would hide that: the operator would see
+ * "gate not green" every scan and never learn that the launch is stuck. The simulation reverts with
+ * `GateNotHealthy` instead, which names the actual problem, and `docs/keeper-runbook.md` §1 says
+ * what to do about it.
+ */
+export function screenSettle(snapshot: ChainSnapshot): Screening {
+  const genesis = snapshot.genesis
+  // No adapter, settlement already observed, or the job switched off: not a candidate at all.
+  if (genesis === undefined) {
+    return {candidate: candidate('settle', ''), eligible: false, reason: 'already-settled', detail: 'no adapter'}
+  }
+  const job = candidate('settle', genesis.address)
+
+  if (genesis.settled || genesis.phase === GenesisPhase.Settled || genesis.phase === GenesisPhase.Aborted) {
+    return {candidate: job, eligible: false, reason: 'already-settled', detail: GenesisPhase[genesis.phase]}
+  }
+  if (genesis.phase !== GenesisPhase.Ended) {
+    return {candidate: job, eligible: false, reason: 'not-due', detail: GenesisPhase[genesis.phase]}
+  }
+  return {candidate: job, eligible: true, detail: 'both legs ended, unsettled'}
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The whole scan
 // ---------------------------------------------------------------------------------------------------------------
@@ -297,6 +335,11 @@ export function screenTouch(snapshot: ChainSnapshot, policy: KeeperPolicy, lastT
  */
 export function screen(snapshot: ChainSnapshot, policy: KeeperPolicy, lastTouchAt: number): Screening[] {
   const out: Screening[] = [screenTouch(snapshot, policy, lastTouchAt), screenCheckpoint(snapshot, policy)]
+
+  // Only while there is a launch to settle. Once the reader latches `settled()` there is no genesis
+  // in the snapshot and the job stops appearing at all — including in the metrics, which is right:
+  // a job that can never run again is not a job with a skip reason.
+  if (snapshot.genesis !== undefined) out.push(screenSettle(snapshot))
 
   for (const pool of snapshot.pools) out.push(screenCompound(pool, snapshot, policy))
 

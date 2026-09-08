@@ -2,7 +2,7 @@
 'use client'
 
 import * as React from 'react'
-import {useAccount, useBlockNumber, useReadContract, useSimulateContract} from 'wagmi'
+import {useAccount, useBlockNumber, useReadContract, useReadContracts, useSimulateContract} from 'wagmi'
 import type {Address} from 'viem'
 
 import {
@@ -13,6 +13,7 @@ import {
   MyBidsTable,
   PhaseTag,
   SettlementPanel,
+  type SettleAction,
   type UsdRate,
 } from './auction-panels'
 import {FieldRow} from '@/components/common/stat'
@@ -24,11 +25,17 @@ import {Callout, Kicker, RowGroup, SectionHead} from '@/components/ledger/primit
 import {Label} from '@/components/ui/label'
 import {Tabs, TabsList, TabsTrigger} from '@/components/ui/tabs'
 import {useAuction, useMyBids, useRequiredDemand, useUsdgUsd, type AuctionState} from '@/hooks/use-auction'
+import {useGenesis, type GenesisState} from '@/hooks/use-genesis'
+import {useRegistrySummary} from '@/hooks/use-registry'
 import {useTx} from '@/hooks/use-tx'
+import {useVaultSnapshot} from '@/hooks/use-vault'
+import {ampsGenesisAbi} from '@amplestocks/abis/generated'
 import {ccaAbi} from '@/lib/abi/cca'
 import {PHASE_LABEL, formatQ96Price, snapToTick, wholeX18ToQ96Price} from '@/lib/auction'
 import {activeChainId, blockTimeSeconds} from '@/lib/chains'
-import {contract} from '@/lib/contracts'
+import {referenceBook} from '@/lib/deployment'
+import {contract, erc20Abi} from '@/lib/contracts'
+import {settleBlockedReason} from '@/lib/genesis'
 import {explorerTxUrl, genesisAuctions, hasAnyGenesisAuction, type GenesisAuctionKey} from '@/lib/deployment'
 import {formatAmount, parseAmount, shortAddress} from '@/lib/format'
 
@@ -59,6 +66,11 @@ export function AuctionSurface() {
   const usdgRate = useUsdgUsd()
   const {data: blockNumber} = useBlockNumber({query: {refetchInterval: 12_000}})
 
+  const genesis = useGenesis()
+  const vault = useVaultSnapshot()
+  const registry = useRegistrySummary()
+  const settle = useSettleGenesis(genesis)
+
   const ampsToken = contract('amps')
   const supply = useReadContract({
     ...(ampsToken ?? {address: undefined as unknown as Address, abi: [] as never}),
@@ -66,9 +78,20 @@ export function AuctionSurface() {
     query: {enabled: ampsToken !== undefined},
   })
 
+  // USDG's own decimals, asked of USDG. The adapter reports `raisedUsdg` in raw units and a
+  // stablecoin's decimals are a read, not a convention worth assuming in a settlement figure.
+  const usdgAddress = referenceBook(activeChainId)?.usdg
+  const usdgMeta = useReadContract({
+    ...(usdgAddress ? {address: usdgAddress} : {}),
+    abi: erc20Abi,
+    functionName: 'decimals',
+    query: {enabled: usdgAddress !== undefined},
+  })
+  const usdgDecimals = usdgMeta.data === undefined ? undefined : Number(usdgMeta.data)
+
   const configured = AUCTION_KEYS.filter((key) => genesisAuctions[key] !== undefined)
 
-  if (!hasAnyGenesisAuction()) {
+  if (!hasAnyGenesisAuction() && genesis.address === undefined) {
     return (
       <div className="space-y-10" data-testid="auction-surface">
         <SurfaceHeading
@@ -125,17 +148,65 @@ export function AuctionSurface() {
       ))}
 
       <SettlementPanel
+        genesis={genesis}
         auctions={auctions.filter((a) => a.address !== undefined)}
-        usdgRate={{
-          ...(usdgRate.answer !== undefined ? {answer: usdgRate.answer} : {}),
-          ...(usdgRate.answerDecimals !== undefined ? {answerDecimals: usdgRate.answerDecimals} : {}),
-        }}
-        {...(supply.data !== undefined ? {ampsTotalSupply: supply.data as bigint} : {})}
+        {...(usdgDecimals !== undefined ? {usdgDecimals} : {})}
+        {...(vault.s0 !== undefined ? {genesisSupply: vault.s0} : {})}
+        {...(vault.checkpoint ? {pRefX18: vault.checkpoint.pRefX18} : {})}
+        {...(vault.liveCells !== undefined ? {liveCells: vault.liveCells} : {})}
+        {...(registry.poolCount !== undefined ? {poolCount: registry.poolCount} : {})}
+        {...(vault.initialized !== undefined ? {vaultInitialized: vault.initialized} : {})}
+        settle={settle}
       />
 
       <AuctionExplainer />
     </div>
   )
+}
+
+/**
+ * `AmpsGenesis.settle()`, simulated and sent.
+ *
+ * Permissionless, unpaid and one-shot. There is nothing to price and nothing to approve — the
+ * adapter already holds the tranche and is already the auctions' `fundsRecipient` — so the whole of
+ * the decision is "may it be called now", which is `phase() == Ended && !settled()`. The
+ * simulation is still run, because the call takes the vault's health check and a gate pointed too
+ * early is exactly the failure a reader needs named rather than discovered by sending.
+ */
+function useSettleGenesis(genesis: GenesisState): SettleAction {
+  const {isConnected} = useAccount()
+  const handle = contract('genesis')
+
+  const blockedReason = settleBlockedReason({
+    ...(genesis.address ? {address: genesis.address} : {}),
+    ...(genesis.phase ? {phase: genesis.phase} : {}),
+    ...(genesis.settled !== undefined ? {settled: genesis.settled} : {}),
+    connected: isConnected,
+  })
+
+  const simulation = useSimulateContract({
+    ...(handle ? {address: handle.address} : {}),
+    abi: ampsGenesisAbi,
+    functionName: 'settle',
+    args: [] as const,
+    query: {enabled: handle !== undefined && isConnected && blockedReason === undefined},
+  })
+
+  const tx = useTx({
+    simulation: simulation.data,
+    simulationError: simulation.error,
+    isSimulating: simulation.isLoading,
+    ...(blockedReason ? {blockedReason} : {}),
+  })
+
+  return {
+    phase: tx.phase,
+    ...(tx.blockedReason ? {blockedReason: tx.blockedReason} : {}),
+    error: tx.error,
+    ...(tx.hash ? {hash: tx.hash} : {}),
+    explorerUrl: tx.hash ? explorerTxUrl(activeChainId, tx.hash) : null,
+    onClick: () => void tx.send(),
+  }
 }
 
 type PendingAction =

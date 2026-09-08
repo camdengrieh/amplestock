@@ -2,7 +2,7 @@
 
 The permissionless bountied upkeep service for Amplestocks. TypeScript, viem 2, Node 22.
 
-It runs five calls on `AmpsVault` and no others:
+It runs five calls on `AmpsVault`, one on `AmpsGenesis` that happens once in the protocol's life, and no others:
 
 | Job | Paid from `BountyPot`? |
 |---|---|
@@ -11,6 +11,13 @@ It runs five calls on `AmpsVault` and no others:
 | `deployBonded(constituentId)` | yes |
 | `checkpoint()` | no, by design |
 | `touch()` | no, by design |
+| `AmpsGenesis.settle()` | no, by design — and one-shot |
+
+**The settle job is the launch, and it retires itself.** After both genesis auctions' `endBlock` it sends
+`AmpsGenesis.settle()`, which sweeps both legs, wraps the ETH and calls `AmpsVault.genesisPlace` in the same
+transaction. It is screened on the adapter's own `phase()` and nothing else; once `settled()` comes back true the
+reader stops reading the adapter for the life of the process and the job stops being produced at all. `docs/keeper-runbook.md` §1 and `docs/genesis-cca.md` §5 carry the operational half — in particular that the vault's
+gate pointer must stay unset until settlement, or every attempt reverts `GateNotHealthy`.
 
 **It never re-centres and never re-widens a ladder.** No vault entry point could, and none ever will —
 placements are made once and consumed (`docs/phase3-state-model.md` §3, invariant I35). `AmpsHook`'s

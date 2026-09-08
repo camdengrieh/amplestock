@@ -157,3 +157,69 @@ export const erc20Abi = [
     outputs: [{name: '', type: 'string'}],
   },
 ] as const
+
+/**
+ * Uniswap's `ContinuousClearingAuction`, events only.
+ *
+ * The two genesis auctions are deployed by Uniswap's factory, not by us, so their ABI is not in
+ * `@amplestocks/abis` and never will be. Only the five events are declared here: the indexer
+ * subscribes to the auctions as a **factory** over `AmpsGenesis.AuctionsCreated`, so it needs the
+ * topics and nothing else — every read the dApp makes of an auction it makes directly.
+ *
+ * `apps/web/lib/abi/cca.ts` carries the same five fragments plus the read and write surface the
+ * bidding UI needs. The two are transcriptions of the same upstream contract (CCA v2.1.0, MIT) and
+ * must agree; `test/abi.test.ts` has no artefact to check them against, because there is no
+ * Solidity source for them in this repository.
+ *
+ * `CheckpointUpdated` is the one that matters most: `checkpoint()` is a write rather than a view,
+ * so the clearing price only moves when somebody pays to advance it, and this log is the only
+ * record of what the auction actually charged over the bidding window.
+ */
+export const continuousClearingAuctionAbi = [
+  {
+    type: 'event',
+    name: 'BidSubmitted',
+    inputs: [
+      {name: 'id', type: 'uint256', indexed: true},
+      {name: 'owner', type: 'address', indexed: true},
+      {name: 'priceQ96', type: 'uint256', indexed: false},
+      {name: 'amount', type: 'uint128', indexed: false},
+    ],
+  },
+  {
+    type: 'event',
+    name: 'CheckpointUpdated',
+    inputs: [
+      {name: 'blockNumber', type: 'uint256', indexed: false},
+      {name: 'clearingPriceQ96', type: 'uint256', indexed: false},
+      {name: 'cumulativeMps', type: 'uint24', indexed: false},
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ClearingPriceUpdated',
+    inputs: [
+      {name: 'blockNumber', type: 'uint256', indexed: false},
+      {name: 'clearingPriceQ96', type: 'uint256', indexed: false},
+    ],
+  },
+  {
+    type: 'event',
+    name: 'BidExited',
+    inputs: [
+      {name: 'bidId', type: 'uint256', indexed: true},
+      {name: 'owner', type: 'address', indexed: true},
+      {name: 'tokensFilled', type: 'uint256', indexed: false},
+      {name: 'currencyRefunded', type: 'uint256', indexed: false},
+    ],
+  },
+  {
+    type: 'event',
+    name: 'TokensClaimed',
+    inputs: [
+      {name: 'bidId', type: 'uint256', indexed: true},
+      {name: 'owner', type: 'address', indexed: true},
+      {name: 'tokensFilled', type: 'uint256', indexed: false},
+    ],
+  },
+] as const

@@ -25,7 +25,7 @@ export const SURFACES: readonly Surface[] = [
     label: 'Auction',
     kicker: 'Genesis',
     blurb:
-      'The Continuous Clearing Auction that sells the entry-pool tranche. One uniform clearing price, and a full refund if it does not graduate.',
+      'The two Continuous Clearing Auctions that sold half the supply and set the launch reference price. One uniform clearing price per leg, and a full refund from a leg that does not graduate.',
   },
   {
     href: '/buy',

@@ -33,10 +33,18 @@ export enum PoolClass {
   SPOKE_HIGH_VOL = 3,
 }
 
-/** The five permissionless jobs. Nothing else is ever sent — no re-centring, no re-widening (I35). */
-export type JobKind = 'compound' | 'rollout' | 'deployBonded' | 'checkpoint' | 'touch'
+/**
+ * The permissionless jobs. Nothing else is ever sent — no re-centring, no re-widening (I35).
+ *
+ * `settle` is the odd one out and the only one that is not a call on the vault: it is
+ * `AmpsGenesis.settle()`, it runs **once in the protocol's life**, and it retires itself the moment
+ * it succeeds. It is here rather than in a separate process because it is the same shape as every
+ * other job — read the chain, screen it, simulate it, send it — and because the failure a keeper
+ * must not have at launch is "nobody was watching for the end block".
+ */
+export type JobKind = 'compound' | 'rollout' | 'deployBonded' | 'checkpoint' | 'touch' | 'settle'
 
-/** Every job is bountied except the two upkeep calls, which are unpaid by design. */
+/** Every job is bountied except the upkeep calls and `settle`, which are unpaid by design. */
 export const BOUNTIED_JOBS: readonly JobKind[] = ['compound', 'rollout', 'deployBonded']
 
 /**
@@ -61,11 +69,17 @@ export type SkipReason =
   | 'not-due'
   | 'simulation-reverted'
   | 'in-flight'
+  /** `settle`: the launch is already settled, or the adapter reports no auction at all. */
+  | 'already-settled'
 
 /** A job the keeper may run, before simulation. */
 export interface JobCandidate {
   readonly kind: JobKind
-  /** `poolId` for `compound`, the decimal constituent id for `rollout`/`deployBonded`, `''` for upkeep. */
+  /**
+   * `poolId` for `compound`, the decimal constituent id for `rollout`/`deployBonded`, `''` for the
+   * two upkeep calls, and the adapter's address for `settle` — which is also the address the
+   * transaction goes **to**, and the only job for which that is not the vault.
+   */
   readonly target: string
   /** Stable identity for de-duplication and metrics: `<kind>:<target>`. */
   readonly key: string
@@ -130,6 +144,32 @@ export interface ConstituentSnapshot {
   readonly rolloutWeightBps: number
 }
 
+/**
+ * `AmpsGenesis`, as the keeper sees it.
+ *
+ * `phase` is the whole decision. The adapter derives it from the block number and its own state, so
+ * `Ended` means precisely "every created leg's end block has passed and `settle()` has not run" —
+ * which is precisely when `settle()` is callable. Reading the two auctions' end blocks separately
+ * would reconstruct the same answer out of more reads and a comparison the contract already makes.
+ */
+export interface GenesisSnapshot {
+  readonly address: `0x${string}`
+  readonly phase: GenesisPhase
+  readonly settled: boolean
+  /** Disclosure only: which legs exist. `settle()` needs neither. */
+  readonly usdgAuction: `0x${string}`
+  readonly ethAuction: `0x${string}`
+}
+
+/** `IAmpsGenesis.Phase`, ordinals preserved. */
+export enum GenesisPhase {
+  Created = 0,
+  Bidding = 1,
+  Ended = 2,
+  Settled = 3,
+  Aborted = 4,
+}
+
 /** The bounty pot, as the keeper sees it. */
 export interface PotSnapshot {
   readonly address: `0x${string}`
@@ -182,6 +222,15 @@ export interface ChainSnapshot {
   readonly pot: PotSnapshot
   readonly pools: readonly PoolSnapshot[]
   readonly constituents: readonly ConstituentSnapshot[]
+  /**
+   * The genesis adapter, while there is one to watch.
+   *
+   * Absent means "no settle job": either no adapter is configured, or `settled()` came back true
+   * once and the reader latched the reads off for the life of the process. A launch is settled
+   * exactly once and never un-settles, so continuing to read it would be four RPC calls a scan
+   * for an answer that cannot change.
+   */
+  readonly genesis?: GenesisSnapshot
   /** `block.baseFeePerGas`, wei. Used for the profitability check. */
   readonly baseFeeWei: bigint
   /** ETH price in 18-decimal USD, from configuration or a feed. Zero disables the profitability check. */
