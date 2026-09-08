@@ -49,7 +49,7 @@ import {console2} from "forge-std/console2.sol";
 ///      freshly initialised pool has no observations, so with the gate already wired **no pool can be registered
 ///      and `genesis()` can never run**. The order is therefore:
 ///
-///        1. deploy everything; wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`)
+///        1. deploy everything; wire the vault's set-once pointers (`registry`, `bonds`, `bountyPot`)
 ///           and `feedRegistry` / `positionValuer` / `marketReference`, and **leave `oracleGate` unset** — a gate
 ///           that is absent is exactly as permissive as a gate that is `GREEN`;
 ///        2. register the 32 pools (`05_Registry`), each `vault.initializePool` passing with no gate;
@@ -295,7 +295,6 @@ contract Phase3Wire is Script {
         IAmpsVault vault = IAmpsVault(t.vault);
         if (vault.registry() == address(0)) revert PointerUnset(bytes32("registry"));
         if (vault.bonds() == address(0)) revert PointerUnset(bytes32("bonds"));
-        if (vault.staking() == address(0)) revert PointerUnset(bytes32("staking"));
         if (vault.bountyPot() == address(0)) revert PointerUnset(bytes32("bountyPot"));
         if (vault.feedRegistry() == address(0)) revert PointerUnset(bytes32("feedRegistry"));
         if (vault.positionValuer() == address(0)) revert PointerUnset(SLOT_POSITION_VALUER);

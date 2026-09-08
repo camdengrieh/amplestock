@@ -143,7 +143,6 @@ contract VaultMigrationTest is AmpsVaultFixture {
 
         assertEq(amps.vault(), STANDBY, "AMPS minting");
         assertEq(bondsRole.vault(), STANDBY, "AmpsBonds");
-        assertEq(stakingRole.vault(), STANDBY, "AmpsStaking");
         assertEq(potRole.vault(), STANDBY, "BountyPot");
         assertEq(registry.vault(), STANDBY, "PoolRegistry");
         assertEq(hookRole.vault(), STANDBY, "AmpsHook");

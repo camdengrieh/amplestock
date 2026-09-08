@@ -804,15 +804,15 @@ contract VaultPlacementTest is PlacementFixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(TIMELOCK);
         vault.place(hubPool, true, 10e18);
 
-        assertGt(amps.balanceOf(CREATOR) - creatorBefore, 0, "the creator slice was paid");
-        assertGt(amps.balanceOf(address(staking)) - stakingBefore, 0, "the staker slice was streamed");
-        assertLt(amps.totalSupply(), supplyBefore, "and the burn slice was burned");
+        assertGt(amps.balanceOf(CREATOR) - creatorBefore, 0, "the creator's AMPS slice was paid");
+        assertGt(usdg.balanceOf(CREATOR) - creatorUsdgBefore, 0, "and the counter slice with it");
+        assertLt(amps.totalSupply(), supplyBefore, "and every wei of the AMPS-side remainder was burned");
         assertSweepClean("place into a cell with accrued fees");
     }
 

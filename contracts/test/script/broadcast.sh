@@ -254,7 +254,6 @@ read_addresses() {
   HOOK=$(json "$CONFIG_DIR/deployments.json" "['core']['hook']")
   REGISTRY=$(json "$CONFIG_DIR/deployments.json" "['core']['registry']")
   BONDS=$(json "$CONFIG_DIR/deployments.json" "['core']['bonds']")
-  STAKING=$(json "$CONFIG_DIR/deployments.json" "['core']['staking']")
   POT=$(json "$CONFIG_DIR/deployments.json" "['core']['bountyPot']")
   FEEDS=$(json "$CONFIG_DIR/deployments.json" "['core']['feedRegistry']")
   GATE=$(json "$CONFIG_DIR/deployments.json" "['core']['oracleGate']")
@@ -299,7 +298,6 @@ expect "bonds.marketCount" "$(call "$BONDS" 'marketCount()(uint16)')" "30"
 expect "vault.oracleGate (unset)" "$(call "$VAULT" 'oracleGate()(address)')" "0x0000000000000000000000000000000000000000"
 expect "vault.registry" "$(call "$VAULT" 'registry()(address)')" "$(cast to-check-sum-address "$REGISTRY")"
 expect "vault.bonds" "$(call "$VAULT" 'bonds()(address)')" "$(cast to-check-sum-address "$BONDS")"
-expect "vault.staking" "$(call "$VAULT" 'staking()(address)')" "$(cast to-check-sum-address "$STAKING")"
 expect "vault.bountyPot" "$(call "$VAULT" 'bountyPot()(address)')" "$(cast to-check-sum-address "$POT")"
 expect "vault.feedRegistry" "$(call "$VAULT" 'feedRegistry()(address)')" "$(cast to-check-sum-address "$FEEDS")"
 expect "vault.marketReference" "$(call "$VAULT" 'marketReference()(address)')" "$(cast to-check-sum-address "$HOOK")"

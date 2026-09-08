@@ -64,9 +64,6 @@ library Constants {
     ///         to matter against a 5,000e18 supply. There is no genesis burn because there is no NAV mint.
     uint256 internal constant VIRTUAL_SHARES = 1e3;
 
-    /// @notice ERC-4626 decimals offset used by `AmpsStaking` (xAMPS), matching `VIRTUAL_SHARES = 10**3`.
-    uint8 internal constant STAKING_DECIMALS_OFFSET = 3;
-
     /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 47.5 AMPS per spoke.
     uint16 internal constant SPOKE_SEED_BPS_DEFAULT = 100;
 
@@ -111,23 +108,11 @@ library Constants {
     /// @notice Hard ceiling of a spoke's buy fee.
     uint16 internal constant BUY_FEE_BPS_SPOKE_MAX = 50;
 
-    /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 1%, paid to the remaining holders.
+    /// @notice Launch `redeemFeeBps`: the pro-rata floor exit costs 2.5%, paid to the remaining holders.
     uint16 internal constant REDEEM_FEE_BPS_DEFAULT = 250;
 
     /// @notice Hard ceiling of `redeemFeeBps`. 5%. There is no floor: governance may set it to zero.
     uint16 internal constant REDEEM_FEE_BPS_MAX = 500;
-
-    /// @notice Launch `burnBps`: 10% of the AMPS-side fees left after the creator and staker slices is burned.
-    uint16 internal constant BURN_BPS_DEFAULT = 1000;
-
-    /// @notice Hard ceiling of `burnBps`. 25%.
-    uint16 internal constant BURN_BPS_MAX = 2500;
-
-    /// @notice Launch `stakerBps`: 30% of the AMPS-side fees are streamed to xAMPS.
-    uint16 internal constant STAKER_BPS_DEFAULT = 3000;
-
-    /// @notice Hard ceiling of `stakerBps`. 50%.
-    uint16 internal constant STAKER_BPS_MAX = 5000;
 
     /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `ampsFeeBps`, never added on top.
     /// @dev The whole schedule is immutable. There is no setter, no band and no governance path that can extend,
@@ -136,20 +121,6 @@ library Constants {
 
     /// @notice The creator fee decays linearly to zero over 30 days from genesis, then is structurally zero.
     uint32 internal constant CREATOR_DECAY_SECONDS = 30 * ONE_DAY;
-
-    // -------------------------------------------------------------------------------------------------------------
-    // Staking (48 h timelock)
-    // -------------------------------------------------------------------------------------------------------------
-
-    /// @notice Launch `rewardStreamSeconds`: notified rewards vest into xAMPS linearly over 24 h, which is what
-    ///         makes a stake/unstake sandwich around `compound()` worthless.
-    uint32 internal constant REWARD_STREAM_SECONDS_DEFAULT = 24 * ONE_HOUR;
-
-    /// @notice Hard floor of `rewardStreamSeconds`. 1 h.
-    uint32 internal constant REWARD_STREAM_SECONDS_MIN = ONE_HOUR;
-
-    /// @notice Hard ceiling of `rewardStreamSeconds`. 7 d.
-    uint32 internal constant REWARD_STREAM_SECONDS_MAX = 7 * ONE_DAY;
 
     // -------------------------------------------------------------------------------------------------------------
     // Bonds (48 h timelock for parameters, 7 d for the collateral set and the policy pointer)
@@ -564,6 +535,21 @@ library Constants {
     ///      `beforeSwap` by an exact-input sell, blended and rounded up.
     bytes32 internal constant ROTATION_CREDIT_SLOT = keccak256("amplestocks.hook.ROTATION_CREDIT");
 
+    /// @notice The `hookData` flag the protocol router puts on both hops of a rotation, and the only thing that
+    ///         makes a swap hop *pass-through*: `keccak256("amplestocks.router.ROTATE")`.
+    /// @dev A hop is pass-through iff `sender == AmpsHook.router()` **and** `hookData` is exactly these 32 bytes.
+    ///      Both halves are load-bearing. The `sender` check is what stops anyone else from claiming the
+    ///      exemption, and the flag is what stops the router's *own* plain `buy` and `sell` — which pass empty
+    ///      `hookData` — from claiming it: a rotation is the only shape the exemption is priced for, and the
+    ///      router only ever sets this on the two hops of one `rotate` call.
+    /// @dev **Why a flag at all, when the sender check already narrows it to one contract.** A hop's fee is fixed
+    ///      in `beforeSwap`, before the swap runs, and the first hop of any route cannot know that a second
+    ///      follows. Making every router swap pass-through would hand the discount to a plain exit routed through
+    ///      the protocol's own front end; making none of them would mean the rotation the credit exists for could
+    ///      not be built at all. The flag lets the router say, at the moment it opens the unlock, which of the two
+    ///      it is building — and it is checkable by the hook without trusting anything the caller supplied.
+    bytes32 internal constant ROUTER_ROTATE = keccak256("amplestocks.router.ROTATE");
+
     // -------------------------------------------------------------------------------------------------------------
     // Ladder and rollout (48 h timelock; future placements only, never a reshape of existing positions)
     // -------------------------------------------------------------------------------------------------------------
@@ -715,7 +701,7 @@ library Constants {
     // Governance and keeper
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Fast timelock: fees, bands, bond parameters, ladder shape, rollout, staking, keeper. 48 h.
+    /// @notice Fast timelock: fees, bands, bond parameters, ladder shape, rollout, keeper. 48 h.
     uint32 internal constant TIMELOCK_FAST_SECONDS = 48 * ONE_HOUR;
 
     /// @notice Slow timelock: constituent lifecycle, collateral set, index weights, policy pointers. 7 d.

@@ -153,10 +153,13 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @dev slot 2 [0..15] — the redemption fee in bps.
     uint16 private _redeemFeeBps;
-    /// @dev slot 2 [16..31] — share of AMPS-side fees burned at `compound()`.
-    uint16 private _burnBps;
-    /// @dev slot 2 [32..47] — share of AMPS-side fees streamed to xAMPS.
-    uint16 private _stakerBps;
+    /// @dev slot 2 [16..47] — reserved, and declared rather than implied. This is where `burnBps` and
+    ///      `stakerBps` lived until plan revision 6 retired the staker leg and made the burn unconditional (the
+    ///      whole AMPS-side remainder after the creator slice is burned, so neither share is a parameter any
+    ///      more). The filler keeps every field above it at the bit offset `docs/phase2-state-model.md` §1.1
+    ///      documents and `VaultPlacementLib` reads by shift, so removing two governed knobs cannot silently move
+    ///      the ladder shape.
+    uint32 private _reservedFeeSplit;
     /// @dev slot 2 [48..63] — maximum upward move of `P_ref` per hour, in bps.
     uint16 private _refUpRateBps;
     /// @dev slot 2 [64..79] — hub-versus-WETH reference divergence threshold, in bps.
@@ -191,8 +194,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     address private _registry;
     /// @dev slot 5 — the bonds shell. Set-once.
     address private _bonds;
-    /// @dev slot 6 — the xAMPS staking vault. Set-once.
-    address private _staking;
+    /// @dev slot 6 — reserved. The xAMPS staking vault lived here until plan revision 6 removed staking
+    ///      altogether; the slot is deliberately left empty rather than reused so that section 1.1's slot numbers
+    ///      — which a standby vault is written against — keep meaning what they have always meant.
+    ///      `VaultNavLib.setPointer` no longer names it, so nothing can write it. `test/unit/VaultLayout.t.sol`
+    ///      asserts it stays zero.
+    address private _reservedSlot6;
     /// @dev slot 7 — the keeper bounty pot. Set-once.
     address private _bountyPot;
 
@@ -293,8 +300,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         _GUARDIAN = guardian_;
 
         _redeemFeeBps = Constants.REDEEM_FEE_BPS_DEFAULT;
-        _burnBps = Constants.BURN_BPS_DEFAULT;
-        _stakerBps = Constants.STAKER_BPS_DEFAULT;
         _refUpRateBps = Constants.REF_UP_RATE_BPS_DEFAULT;
         _refDivergenceBps = Constants.REF_DIVERGENCE_BPS_DEFAULT;
         _twapWindow = Constants.TWAP_WINDOW_DEFAULT;
@@ -357,11 +362,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function bonds() external view returns (address bondsAddress) {
         return _bonds;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function staking() external view returns (address stakingAddress) {
-        return _staking;
     }
 
     /// @inheritdoc IAmpsVault
@@ -569,16 +569,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    function burnBps() external view returns (uint16 value) {
-        return _burnBps;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function stakerBps() external view returns (uint16 value) {
-        return _stakerBps;
-    }
-
-    /// @inheritdoc IAmpsVault
     function refUpRateBps() external view returns (uint16 value) {
         return _refUpRateBps;
     }
@@ -672,16 +662,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     function REDEEM_FEE_BPS_MAX() external pure returns (uint16 value) {
         return Constants.REDEEM_FEE_BPS_MAX;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function BURN_BPS_MAX() external pure returns (uint16 value) {
-        return Constants.BURN_BPS_MAX;
-    }
-
-    /// @inheritdoc IAmpsVault
-    function STAKER_BPS_MAX() external pure returns (uint16 value) {
-        return Constants.STAKER_BPS_MAX;
     }
 
     /// @inheritdoc IAmpsVault
@@ -1086,16 +1066,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    function setBurnBps(uint16 value) external locked onlyTimelock {
-        _burnBps = uint16(_band(bytes32("burnBps"), value, 0, Constants.BURN_BPS_MAX, _burnBps));
-    }
-
-    /// @inheritdoc IAmpsVault
-    function setStakerBps(uint16 value) external locked onlyTimelock {
-        _stakerBps = uint16(_band(bytes32("stakerBps"), value, 0, Constants.STAKER_BPS_MAX, _stakerBps));
-    }
-
-    /// @inheritdoc IAmpsVault
     function setRefUpRateBps(uint16 value) external locked onlyTimelock {
         _refUpRateBps = uint16(
             _band(
@@ -1200,8 +1170,8 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
-    /// @dev The single pointer setter. Five slots are **set-once** and refuse once {genesis} has frozen the wiring
-    ///      (`registry`, `bonds`, `staking`, `bountyPot`); `marketReference` is set-once before genesis and may be
+    /// @dev The single pointer setter. Four slots are **set-once** and refuse once {genesis} has frozen the wiring
+    ///      (`registry`, `bonds`, `bountyPot`); `marketReference` is set-once before genesis and may be
     ///      re-pointed afterwards exactly once more, to `AmpsHook`, under the 7-day timelock. The remaining slots
     ///      are freely pointer-upgradeable and none of them can move a fund.
     function setPolicyPointer(bytes32 slot, address newPointer) external locked onlyTimelock {
@@ -1215,7 +1185,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     /// @dev **A codeless standby is refused**, and zero is the codeless case rather than a separate one. The
-    ///      standby is the address {emergencyMigrate} hands six `onlyVault` roles and the whole estate to, in a
+    ///      standby is the address {emergencyMigrate} hands five `onlyVault` roles and the whole estate to, in a
     ///      call the guardian makes under duress and with no timelock behind it; an EOA or a mistyped address
     ///      there is unrecoverable — the roles are `onlyVault`, so nobody can hand them back. The check is the
     ///      same one {setPolicyPointer} already makes for every pointer the vault calls.
@@ -1276,8 +1246,8 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         VaultNavLib.evacuate(_assets, _POOL_MANAGER, _AMPS, standby);
 
         // Every `onlyVault` role, in the same transaction. Nobody else can perform any of them, and the set is
-        // all six: AMPS, `AmpsBonds`, `AmpsStaking`, `BountyPot`, `PoolRegistry` and — best effort — the hook.
-        VaultNavLib.handover(_registry, _AMPS, _bonds, _staking, _bountyPot, standby);
+        // all five: AMPS, `AmpsBonds`, `BountyPot`, `PoolRegistry` and — best effort — the hook.
+        VaultNavLib.handover(_registry, _AMPS, _bonds, _bountyPot, standby);
 
         // The relaxed R1 bound, enforced only when the standby can actually be priced. A dead feed must never stand
         // between the guardian and an evacuation: in Phase 2 there are no positions to bleed, every claim moves one

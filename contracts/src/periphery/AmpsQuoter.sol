@@ -38,7 +38,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///
 ///      | bit | source | what is zeroed when it is set |
 ///      |-----|--------|-------------------------------|
-///      | 0   | `AmpsHook` | `fairTick`, bands, `buyFeeBps`/`ampsFeeBps`, both fee legs, `refuseBuy`/`refuseSell` |
+///      | 0   | `AmpsHook` | `fairTick`, bands, `buyFeeBps`/`ampsFeeBps`, all four fee legs, `refuseBuy`/`refuseSell` |
 ///      | 1   | `OracleGate` | `gateState`, `session`, `feedStale`, `corporateFreeze` |
 ///      | 2   | `FeedRegistry` | the counter-asset answer behind `pMktX18` |
 ///      | 3   | vault checkpoint | `navPerShareX18`, `pRefX18`, `premiumX18`, `checkpointAge` |
@@ -57,10 +57,17 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///      real swap to the wei, up to two documented limits: it is bounded at {MAX_SWAP_STEPS} tick words, and it is
 ///      a *view* of state that any transaction landing before the caller's can move.
 ///
+/// @dev **Two prices per direction (revision 6).** Every ordinary swap — any sender, any router — pays base
+///      `ampsFeeBps` in both directions, and that is what `buyFeePips` and `sellFeePips` report. The pool's
+///      `buyFeeBps` is now the **pass-through** fee, charged only on a hop of `AmpsRouter.rotate`, and that is
+///      what `passThroughBuyFeePips`, `passThroughSellFeePips` and {quoteRotation} report. A consumer that shows
+///      a user the cost of buying AMPS wants the first pair; a router comparing a rotation against two separate
+///      trades wants both.
+///
 /// @dev **The rotation credit is simulated, never read.** `IAmpsHook.rotationCredit(address)` is EIP-1153
 ///      transient storage keyed by the swap's `sender`, and is therefore zero in every fresh `eth_call` and zero
 ///      for this contract at any time; consulting it would understate hop 2's credit by exactly the amount that
-///      matters. {quoteRotation} models the credit the caller's own hop 1 will create, and
+///      matters. {quoteRotation} models the credit the router's own hop 1 will create, and
 ///      takes the sell base from `IAmpsHook.ampsFeeBps()` rather than from `quoteFee`'s `baseBps`, so a quoter
 ///      called from inside a transaction that already holds a credit cannot double-count it.
 contract AmpsQuoter is IAmpsQuoter {
@@ -117,6 +124,15 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @dev `Constants.OUTER_RAIL_MIN_TICKS` (800), the plan's "NAV x (1 - 800 ticks)" rail, read from the shared
     ///      constant rather than restated so the two can never drift.
     int24 public constant NAV_RAIL_TICKS = Constants.OUTER_RAIL_MIN_TICKS;
+
+    /// @notice `bytes4(keccak256("quoteFee(bytes32,bool,bool,uint256,bool)"))` — the five-argument
+    ///         `IAmpsHook.quoteFee`, the only fee entry point this contract calls.
+    /// @dev Spelled out because `quoteFee` is overloaded on `IAmpsHook` (the four-argument form is the
+    ///      `passThrough == false` alias kept for Phase 3 integrations), and `IAmpsHook.quoteFee.selector` does not
+    ///      resolve across an overload set. `PoolId` is a user-defined value type over `bytes32`, which is what the
+    ///      ABI signature above says. The unit suite asserts this constant against the interface's own encoding,
+    ///      so a signature change fails a test rather than silently degrading every quote.
+    bytes4 public constant QUOTE_FEE_SELECTOR = bytes4(keccak256("quoteFee(bytes32,bool,bool,uint256,bool)"));
 
     // -------------------------------------------------------------------------------------------------------------
     // Wiring (immutable: a quoter that can be re-pointed is a quoter that can be made to lie)
@@ -305,6 +321,8 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @dev Never reverts. `amountOut` is zero whenever the swap would be refused, the pool is not initialised, or
     ///      the walk could not finish — all three of which also raise a bit in `degraded`, except the refusal,
     ///      which is reported through `refuse`.
+    /// @dev The fee is the **ordinary** one: base `ampsFeeBps` in both directions, which is what any caller who
+    ///      is not `AmpsRouter.rotate` pays. The pass-through price of a hop is {quoteRotation}'s to report.
     /// @param poolId The pool.
     /// @param zeroForOne True for a sell (AMPS in), false for a buy.
     /// @param amountIn The input, in the input currency's raw units.
@@ -318,7 +336,7 @@ contract AmpsQuoter is IAmpsQuoter {
         returns (uint256 amountOut, uint24 feePips, bool refuse, uint8 degraded)
     {
         bool okFee;
-        (okFee, feePips,, refuse) = _quoteFee(poolId, zeroForOne, true, amountIn);
+        (okFee, feePips,, refuse) = _quoteFee(poolId, zeroForOne, true, amountIn, false);
         if (!okFee) return (0, 0, false, DEGRADED_HOOK);
         if (refuse) return (0, feePips, true, 0);
 
@@ -328,10 +346,11 @@ contract AmpsQuoter is IAmpsQuoter {
     }
 
     /// @inheritdoc IAmpsQuoter
-    /// @dev Hop 1 is a buy in `hop1` at `buyFeeBps[hop1]` plus its dynamic part; the AMPS it yields is both hop 2's
-    ///      input and hop 2's credit, so the blend below always resolves to `buyFeeBps[hop2]` for a pure rotation
-    ///      and degrades continuously toward `ampsFeeBps` as the caller sells more than it just bought. The general
-    ///      case — selling more than the hop before it bought — is {quoteSellWithCredit}.
+    /// @dev Hop 1 is a pass-through buy in `hop1` at `buyFeeBps[hop1]` plus its dynamic part; the AMPS it yields is
+    ///      both hop 2's input and hop 2's credit, so the blend below always resolves to `buyFeeBps[hop2]` for a
+    ///      pure rotation and degrades continuously toward `ampsFeeBps` as the caller sells more than it just
+    ///      bought. The general case — selling more than the hop before it bought — is {quoteSellWithCredit}, and
+    ///      the router itself cannot build it: `rotate` sells exactly the realised output of hop 1.
     /// @dev `amountOut` is **zero** whenever the route would not execute: either hop refused for beginning beyond
     ///      its outer rail, a pool unreadable, or a tick walk that did not finish. The fees are still reported in
     ///      that case, so a front end can say what the route *would* have cost; a router must treat `amountOut ==
@@ -344,7 +363,8 @@ contract AmpsQuoter is IAmpsQuoter {
         bool refuse1;
         {
             bool okFee1;
-            (okFee1, hop1FeePips,, refuse1) = _quoteFee(hop1, false, true, amountIn);
+            // Hop 1 is priced pass-through, because `AmpsRouter.rotate` flags it as such.
+            (okFee1, hop1FeePips,, refuse1) = _quoteFee(hop1, false, true, amountIn, true);
             if (!okFee1) return (0, 0, 0, 0);
         }
 
@@ -362,15 +382,22 @@ contract AmpsQuoter is IAmpsQuoter {
         if (refuse1 || refuse2 || hop2Degraded != 0) return (0, hop1FeePips, hop2FeePips, creditUsed);
     }
 
-    /// @notice Prices an exact-input **sell** that carries a same-transaction rotation credit, which is the shape
-    ///         the dApp builds whenever a user sells more AMPS than the hop before it bought.
+    /// @notice Prices an exact-input **sell** that carries a same-transaction rotation credit: hop 2 of a
+    ///         rotation, in the general case where the sell is larger than the buy that funds it.
+    ///
+    /// @dev **A credit exists only on the protocol router's rotation path.** Since revision 6 the hook credits a
+    ///      buy, and lets a sell spend a credit, only when `sender == IAmpsHook.router()` and the hop carries
+    ///      `Constants.ROUTER_ROTATE`. So any `credit != 0` passed here describes a hop inside an
+    ///      `AmpsRouter.rotate`, and for every other caller in the world the honest argument is `credit == 0` —
+    ///      which prices the sell at `ampsFeeBps`, exactly as {quoteExactIn} does.
     /// @dev The general case of hop 2 of {quoteRotation}: `credit >= ampsIn` reproduces a pure rotation and prices
     ///      the whole sell at `buyFeeBps`, `credit == 0` prices it at `ampsFeeBps`, and everything between is the
     ///      hook's `ceilDiv` blend on the uncredited excess. The credit is an argument rather than a read, because
     ///      the hook holds it in transient storage where an `eth_call` always sees zero.
     /// @param poolId The pool sold through.
     /// @param ampsIn AMPS wei sold.
-    /// @param credit AMPS wei of same-transaction rotation credit the caller will hold when the sell lands.
+    /// @param credit AMPS wei of same-transaction rotation credit the router will hold when the sell lands; zero
+    ///        for every path that is not `AmpsRouter.rotate`.
     /// @return amountOut The counter asset received, in its raw units.
     /// @return feePips The total fee in pips, with the credit applied.
     /// @return refuse Whether the hook would refuse the sell.
@@ -380,7 +407,9 @@ contract AmpsQuoter is IAmpsQuoter {
         view
         returns (uint256 amountOut, uint24 feePips, bool refuse, uint8 degraded)
     {
-        (bool okFee,, uint16 dynBps, bool refused) = _quoteFee(poolId, true, true, ampsIn);
+        // The dynamic part is the same on both prices of a direction — the pass-through flag moves the base and
+        // nothing else — so it is read once, from the ordinary quote, and the base is blended below.
+        (bool okFee,, uint16 dynBps, bool refused) = _quoteFee(poolId, true, true, ampsIn, false);
         if (!okFee) return (0, 0, false, DEGRADED_HOOK);
 
         feePips = _blendedSellFeePips(poolId, ampsIn, credit, dynBps);
@@ -411,7 +440,7 @@ contract AmpsQuoter is IAmpsQuoter {
         if (!okSlot0) degraded |= DEGRADED_POOL;
         else if (sqrtPriceX96 == 0) return (true, "uninitialized", degraded);
 
-        (bool okFee,,, bool refused) = _quoteFee(poolId, zeroForOne, exactInput, amount);
+        (bool okFee,,, bool refused) = _quoteFee(poolId, zeroForOne, exactInput, amount, false);
         if (!okFee) return (false, bytes32(0), degraded | DEGRADED_HOOK);
         return (refused, refused ? bytes32("rail") : bytes32(0), degraded);
     }
@@ -559,27 +588,66 @@ contract AmpsQuoter is IAmpsQuoter {
     // Internals: filling the quote
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev Both fee legs and the sell base, all from the hook. `dynBps` is reported as the larger of the two
-    ///      directions' clamped dynamic components: the wall is directional (`f_dev` and the dividend capture apply
-    ///      to one side only), so the single field the struct carries is the worst side, and each direction's own
-    ///      dynamic part is recoverable as `feePips / PIPS_PER_BPS - baseBps`.
+    /// @dev All four fee legs and both bases, all from the hook.
+    ///
+    /// @dev **Four legs, because revision 6 has two prices per direction.** `buyFeePips` and `sellFeePips` are what
+    ///      an ordinary trade pays — base `ampsFeeBps` on *both* sides — and are the numbers a front end shows a
+    ///      user buying or selling AMPS. `passThroughBuyFeePips` and `passThroughSellFeePips` are the two hops of
+    ///      an `AmpsRouter.rotate`, based on the pool's `buyFeeBps`, and are unreachable through any other path.
+    ///      `quote.buyFeeBps` is read off the pass-through buy leg, which is where that parameter now lives.
+    ///
+    /// @dev `dynBps` is reported as the larger of the two directions' clamped dynamic components: the wall is
+    ///      directional (`f_dev` and the dividend capture apply to one side only), so the single field the struct
+    ///      carries is the worst side, and each direction's own dynamic part is recoverable as
+    ///      `feePips / PIPS_PER_BPS - baseBps`. It is the same for both prices of a direction, because the base
+    ///      fee is the only thing the pass-through flag moves.
+    /// @dev Written as four scoped legs rather than four parallel tuples because the legacy pipeline runs out of
+    ///      stack slots otherwise; a leg that cannot be read zeroes everything the earlier legs wrote, so the
+    ///      interface's contract — "bit 0 set means every fee field is zero" — still holds exactly.
     function _fillFees(PoolQuote memory quote, PoolId poolId) private view {
         if (quote.degraded & DEGRADED_HOOK != 0) return;
 
-        (bool okBuy, uint24 buyPips, uint16 buyBase, uint16 buyDyn, bool refuseBuy_) = _quoteFeeFull(poolId, false);
-        (bool okSell, uint24 sellPips, uint16 sellBase, uint16 sellDyn, bool refuseSell_) = _quoteFeeFull(poolId, true);
-        if (!okBuy || !okSell) {
-            quote.degraded |= DEGRADED_HOOK;
-            return;
+        {
+            (bool ok, uint24 pips,, uint16 dyn, bool refuse) = _quoteFeeFull(poolId, false, false);
+            if (!ok) return _zeroFees(quote);
+            quote.buyFeePips = pips;
+            quote.dynBps = dyn;
+            quote.refuseBuy = refuse;
         }
+        {
+            (bool ok, uint24 pips, uint16 base, uint16 dyn, bool refuse) = _quoteFeeFull(poolId, true, false);
+            if (!ok) return _zeroFees(quote);
+            quote.sellFeePips = pips;
+            quote.ampsFeeBps = base;
+            if (dyn > quote.dynBps) quote.dynBps = dyn;
+            quote.refuseSell = refuse;
+        }
+        {
+            (bool ok, uint24 pips, uint16 base,,) = _quoteFeeFull(poolId, false, true);
+            if (!ok) return _zeroFees(quote);
+            quote.passThroughBuyFeePips = pips;
+            quote.buyFeeBps = base;
+        }
+        {
+            (bool ok, uint24 pips,,,) = _quoteFeeFull(poolId, true, true);
+            if (!ok) return _zeroFees(quote);
+            quote.passThroughSellFeePips = pips;
+        }
+    }
 
-        quote.buyFeePips = buyPips;
-        quote.sellFeePips = sellPips;
-        quote.buyFeeBps = buyBase;
-        quote.ampsFeeBps = sellBase;
-        quote.dynBps = buyDyn > sellDyn ? buyDyn : sellDyn;
-        quote.refuseBuy = refuseBuy_;
-        quote.refuseSell = refuseSell_;
+    /// @dev Raises bit 0 and clears every field the hook is the source of truth for, so a half-answered hook
+    ///      cannot leave a caller with three good fee legs and one silent zero.
+    function _zeroFees(PoolQuote memory quote) private pure {
+        quote.degraded |= DEGRADED_HOOK;
+        quote.buyFeePips = 0;
+        quote.sellFeePips = 0;
+        quote.passThroughBuyFeePips = 0;
+        quote.passThroughSellFeePips = 0;
+        quote.buyFeeBps = 0;
+        quote.ampsFeeBps = 0;
+        quote.dynBps = 0;
+        quote.refuseBuy = false;
+        quote.refuseSell = false;
     }
 
     /// @dev The gate is the authority on the session and on every freeze; the hook's cached copies are only the
@@ -685,8 +753,12 @@ contract AmpsQuoter is IAmpsQuoter {
     // Internals: the fee arithmetic
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev `IAmpsHook.quoteFee`, hand-decoded.
-    function _quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
+    /// @dev The five-argument `IAmpsHook.quoteFee`, hand-encoded and hand-decoded. The selector is spelled out
+    ///      rather than taken from the interface because `quoteFee` is overloaded there (the four-argument form is
+    ///      the `passThrough == false` alias), and `.selector` is ambiguous across an overload set;
+    ///      `test_theHookSelectorIsTheOneTheInterfaceDeclares` in `test/unit/AmpsQuoter.t.sol` pins it.
+    /// @param passThrough Whether to price the hop as one leg of a protocol-router rotation.
+    function _quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn, bool passThrough)
         private
         view
         returns (bool ok, uint24 feePips, uint16 dynBps, bool refuse)
@@ -694,7 +766,7 @@ contract AmpsQuoter is IAmpsQuoter {
         bytes memory data;
         (ok, data) = _read(
             _hook,
-            abi.encodeWithSelector(IAmpsHook.quoteFee.selector, poolId, zeroForOne, exactInput, amountIn),
+            abi.encodeWithSelector(QUOTE_FEE_SELECTOR, poolId, zeroForOne, exactInput, amountIn, passThrough),
             PROBE_GAS,
             4
         );
@@ -704,8 +776,8 @@ contract AmpsQuoter is IAmpsQuoter {
         refuse = _word(data, 3) != 0;
     }
 
-    /// @dev {_quoteFee} with the base component as well, for the two legs of {quotePool}.
-    function _quoteFeeFull(PoolId poolId, bool zeroForOne)
+    /// @dev {_quoteFee} with the base component as well, for the four fee legs of {quotePool}.
+    function _quoteFeeFull(PoolId poolId, bool zeroForOne, bool passThrough)
         private
         view
         returns (bool ok, uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
@@ -713,7 +785,7 @@ contract AmpsQuoter is IAmpsQuoter {
         bytes memory data;
         (ok, data) = _read(
             _hook,
-            abi.encodeWithSelector(IAmpsHook.quoteFee.selector, poolId, zeroForOne, true, uint256(0)),
+            abi.encodeWithSelector(QUOTE_FEE_SELECTOR, poolId, zeroForOne, true, uint256(0), passThrough),
             PROBE_GAS,
             4
         );

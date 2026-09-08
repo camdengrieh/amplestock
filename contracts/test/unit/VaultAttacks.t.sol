@@ -319,7 +319,7 @@ contract VaultAttackTest is AmpsVaultFixture {
             hooks: IHooks(address(0))
         });
 
-        payloads = new bytes[](26);
+        payloads = new bytes[](24);
         payloads[0] = abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE));
         payloads[1] = abi.encodeCall(IAmpsVault.checkpoint, ());
         payloads[2] = abi.encodeCall(IAmpsVault.touch, ());
@@ -333,18 +333,16 @@ contract VaultAttackTest is AmpsVaultFixture {
         payloads[10] = abi.encodeCall(IAmpsVault.deployBonded, (1));
         payloads[11] = abi.encodeWithSignature("withdrawRetiredBids(uint16)", 1);
         payloads[12] = abi.encodeCall(IAmpsVault.setRedeemFeeBps, (50));
-        payloads[13] = abi.encodeCall(IAmpsVault.setBurnBps, (50));
-        payloads[14] = abi.encodeCall(IAmpsVault.setStakerBps, (50));
-        payloads[15] = abi.encodeCall(IAmpsVault.setRefUpRateBps, (500));
-        payloads[16] = abi.encodeCall(IAmpsVault.setRefDivergenceBps, (500));
-        payloads[17] = abi.encodeCall(IAmpsVault.setTwapWindow, (900));
-        payloads[18] = abi.encodeCall(IAmpsVault.setLadderShape, (1.25e18, 10, 4, 4));
-        payloads[19] = abi.encodeCall(IAmpsVault.setRolloutParams, (200, 3000));
-        payloads[20] = abi.encodeCall(IAmpsVault.setSpokeSeedBps, (100));
-        payloads[21] = abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("positionValuer"), address(valuer)));
-        payloads[22] = abi.encodeCall(IAmpsVault.setStandbyVault, (STANDBY));
-        payloads[23] = abi.encodeCall(IAmpsVault.setCreator, (BOB));
-        payloads[24] = abi.encodeCall(IAmpsVault.emergencyMigrate, (STANDBY));
-        payloads[25] = abi.encodeCall(IAmpsVault.setDeployThresholdUsd18, (100e18));
+        payloads[13] = abi.encodeCall(IAmpsVault.setRefUpRateBps, (500));
+        payloads[14] = abi.encodeCall(IAmpsVault.setRefDivergenceBps, (500));
+        payloads[15] = abi.encodeCall(IAmpsVault.setTwapWindow, (900));
+        payloads[16] = abi.encodeCall(IAmpsVault.setLadderShape, (1.25e18, 10, 4, 4));
+        payloads[17] = abi.encodeCall(IAmpsVault.setRolloutParams, (200, 3000));
+        payloads[18] = abi.encodeCall(IAmpsVault.setSpokeSeedBps, (100));
+        payloads[19] = abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("positionValuer"), address(valuer)));
+        payloads[20] = abi.encodeCall(IAmpsVault.setStandbyVault, (STANDBY));
+        payloads[21] = abi.encodeCall(IAmpsVault.setCreator, (BOB));
+        payloads[22] = abi.encodeCall(IAmpsVault.emergencyMigrate, (STANDBY));
+        payloads[23] = abi.encodeCall(IAmpsVault.setDeployThresholdUsd18, (100e18));
     }
 }

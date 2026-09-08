@@ -3,7 +3,6 @@ pragma solidity 0.8.30;
 
 import {IAmps} from "../interfaces/IAmps.sol";
 import {IAmpsBonds} from "../interfaces/IAmpsBonds.sol";
-import {IAmpsStaking} from "../interfaces/IAmpsStaking.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
 import {IBountyPot} from "../interfaces/IBountyPot.sol";
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
@@ -433,8 +432,6 @@ library VaultNavLib {
             (slot, setOnce) = (4, true);
         } else if (name == bytes32("bonds")) {
             (slot, setOnce) = (5, true);
-        } else if (name == bytes32("staking")) {
-            (slot, setOnce) = (6, true);
         } else if (name == bytes32("bountyPot")) {
             (slot, setOnce) = (7, true);
         } else if (name == bytes32("marketReference")) {
@@ -488,19 +485,20 @@ library VaultNavLib {
         _tryMoveIdle(ampsToken, standby);
     }
 
-    /// @notice The six `onlyVault` role handovers `AmpsVault.emergencyMigrate` performs, in one place.
+    /// @notice The five `onlyVault` role handovers `AmpsVault.emergencyMigrate` performs, in one place.
     ///
-    /// @dev **Why the whole set and not four of them.** Before this existed the migration moved AMPS, `AmpsBonds`,
-    ///      `AmpsStaking` and `BountyPot` and left `PoolRegistry._vault` and `AmpsHook.vault` pointing at the
-    ///      evacuated shell, so the standby could not open a pool and the hook still trusted a vault that no
-    ///      longer held the estate. The registry and the hook are the other two contracts that name a vault.
+    /// @dev **Why the whole set and not three of them.** Before this existed the migration moved AMPS, `AmpsBonds`
+    ///      and `BountyPot` and left `PoolRegistry._vault` and `AmpsHook.vault` pointing at the evacuated shell,
+    ///      so the standby could not open a pool and the hook still trusted a vault that no longer held the
+    ///      estate. The registry and the hook are the other two contracts that name a vault. (A sixth leg handed
+    ///      `AmpsStaking` on until plan revision 6 removed staking from the protocol.)
     ///
-    /// @dev **Why it lives here.** `AmpsVault` is at the EIP-170 ceiling and six external calls do not fit; the
+    /// @dev **Why it lives here.** `AmpsVault` is at the EIP-170 ceiling and five external calls do not fit; the
     ///      migration is a cold path where one extra `DELEGATECALL` costs nothing. Nothing here is reachable from
     ///      `redeemProRata`.
     ///
-    /// @dev **Why the hook leg is best effort and the other five are not.** The five named contracts are deployed
-    ///      by this protocol and all five implement `setVault`; a failure there is a wiring bug the guardian must
+    /// @dev **Why the hook leg is best effort and the other four are not.** The four named contracts are deployed
+    ///      by this protocol and all four implement `setVault`; a failure there is a wiring bug the guardian must
     ///      see. The hook address comes back from the registry and is flag-mined and immutable, so a deployment
     ///      whose hook predates `setVault(address)` is representable — and a hook that cannot hand its pointer on
     ///      must not be able to trap the estate in a denylisted vault. Its call is therefore gas-bounded and its
@@ -510,20 +508,11 @@ library VaultNavLib {
     /// @param registry The pool registry, which both holds a vault pointer and names the hook.
     /// @param amps The AMPS token.
     /// @param bonds `AmpsBonds`, or zero when unwired.
-    /// @param staking `AmpsStaking`, or zero when unwired.
     /// @param bountyPot `BountyPot`, or zero when unwired.
     /// @param standby The pre-registered standby vault, the new holder of every role.
-    function handover(
-        address registry,
-        address amps,
-        address bonds,
-        address staking,
-        address bountyPot,
-        address standby
-    ) public {
+    function handover(address registry, address amps, address bonds, address bountyPot, address standby) public {
         IAmps(amps).setVault(standby);
         if (bonds != address(0)) IAmpsBonds(bonds).setVault(standby);
-        if (staking != address(0)) IAmpsStaking(staking).setVault(standby);
         if (bountyPot != address(0)) IBountyPot(bountyPot).setVault(standby);
         if (registry == address(0)) return;
 

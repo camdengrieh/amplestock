@@ -19,7 +19,7 @@ fs_permissions = [
   # the script's job; every other consumer of this directory only reads.
   { access = "read-write", path = "./script/config" },
 ]
-gas_reports = ["AmpsHook", "AmpsVault", "AmpsBonds", "AmpsStaking", "Amps"]
+gas_reports = ["AmpsHook", "AmpsVault", "AmpsBonds", "Amps"]
 fuzz = { runs = 512, max_test_rejects = 200_000 }
 invariant = { runs = 64, depth = 64, fail_on_revert = false }
 

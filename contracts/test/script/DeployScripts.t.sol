@@ -404,7 +404,6 @@ contract DeployScripts is Test {
             registry: address(0x5E915),
             hook: address(0x38C0),
             bonds: address(0xB011D5),
-            staking: address(0x57A417),
             bountyPot: address(0xB0117),
             feedRegistry: address(0xFEED),
             oracleGate: address(0x6A7E),

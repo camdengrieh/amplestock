@@ -20,7 +20,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 /// @notice Minimal stand-in for the three contracts that hold a vault pointer and hand it on during an emergency
-///         migration: `AmpsBonds`, `AmpsStaking` and `BountyPot`. Only `setVault` is ever reached from the vault.
+///         migration: `AmpsBonds` and `BountyPot`. Only `setVault` is ever reached from the vault.
 /// @dev    A contract rather than an EOA because Solidity's high-level calls check `extcodesize`, so an EOA
 ///         pointer would make `emergencyMigrate` revert for the wrong reason.
 contract MockVaultRole {
@@ -98,8 +98,6 @@ abstract contract AmpsVaultFixture is V4TestBase {
 
     /// @dev The bonds shell: the only address that may deposit collateral or mint vesting AMPS.
     MockVaultRole internal bondsRole;
-    /// @dev The xAMPS staking vault.
-    MockVaultRole internal stakingRole;
     /// @dev The keeper bounty pot.
     MockVaultRole internal potRole;
     /// @dev `address(bondsRole)`, for the many `vm.prank`s that speak as the bonds shell.
@@ -156,14 +154,12 @@ abstract contract AmpsVaultFixture is V4TestBase {
         feeds.setAnswer(address(stock2), STOCK_USD8);
 
         bondsRole = new MockVaultRole(address(vault));
-        stakingRole = new MockVaultRole(address(vault));
         potRole = new MockVaultRole(address(vault));
         BONDS = address(bondsRole);
 
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bondsRole));
-        vault.setPolicyPointer(bytes32("staking"), address(stakingRole));
         vault.setPolicyPointer(bytes32("bountyPot"), address(potRole));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));
         vault.setPolicyPointer(bytes32("oracleGate"), address(gate));

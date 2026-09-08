@@ -150,13 +150,15 @@ contract Phase3FlywheelTest is Phase3Fixture {
     ///         * `totalSupply` falls, because the AMPS the vault buys back below the high-water mark is burned
     ///           (I33) and nothing mints outside `AmpsBonds` (I10);
     ///         * the vault's USDG holding equals the seed plus exactly the counter asset the round trip left
-    ///           behind — every USDG the buyers paid in, less every USDG the sellers took out. That residue is the
-    ///           fee take plus the ladder's own convexity, and there is no third term.
+    ///           behind — every USDG the buyers paid in, less every USDG the sellers took out and less the
+    ///           creator's slice of the counter-side fees (I31, the one leg that leaves the protocol). That
+    ///           residue is the fee take plus the ladder's own convexity, and there is no fourth term.
     function test_pumpThenDumpBurnsSupplyAndLeavesSeedPlusFees() public {
         uint256 supplyBefore = amps.totalSupply();
         uint256 navBefore = vault.previewNavPerShareX18();
         uint256 usdgSupplyBefore = usdg.totalSupply();
         uint256 managerUsdgBefore = usdg.balanceOf(address(poolManager));
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
         assertEq(usdg.balanceOf(BOB), 0, "the pumper starts with nothing");
 
         // Pump: the whole move is bought out of the ask ladder, one rail-limited step at a time.
@@ -179,10 +181,12 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // behind: `inbound - outbound`, which is the fee take plus the ladder's own convexity and nothing else.
         uint256 minted = usdg.totalSupply() - usdgSupplyBefore;
         uint256 returned = usdg.balanceOf(BOB);
+        uint256 creatorTook = usdg.balanceOf(CREATOR) - creatorUsdgBefore;
+        assertGt(creatorTook, 0, "the compound paid the creator their slice of the counter-side fees");
         assertEq(
             usdg.balanceOf(address(poolManager)),
-            managerUsdgBefore + minted - returned,
-            "the vault's USDG is exactly the seed plus the round trip's residue"
+            managerUsdgBefore + minted - returned - creatorTook,
+            "the vault's USDG is exactly the seed plus the round trip's residue, less the creator's slice"
         );
         assertGt(minted, returned, "and the residue is positive: the round trip paid, it did not earn");
         assertSweepClean("pump then dump");
@@ -192,14 +196,13 @@ contract Phase3FlywheelTest is Phase3Fixture {
     // compound
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice §3.6 step 5, in order and to the wei, on fees earned by real swaps through the real hook:
-    ///         `creatorCut = ampsFees * min(creatorBps(t), ampsFeeBps) / ampsFeeBps`, then `stakerBps` of the
-    ///         remainder, then exactly `burnBps` of what is left, then the rest re-laddered.
-    function test_compoundPaysCreatorThenStakerThenBurnsBurnBps() public {
+    /// @notice §3.6 step 5 as revision 6 states it, to the wei, on fees earned by real swaps through the real
+    ///         hook: `creatorAmps = ampsFees * min(creatorBps(t), ampsFeeBps) / ampsFeeBps`, and every wei that is
+    ///         left is burned. No staker leg, no `burnBps`, no re-ladder.
+    function test_compoundPaysCreatorThenBurnsTheWholeRemainder() public {
         _tradeForAmpsFees();
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(KEEPER);
@@ -209,15 +212,10 @@ contract Phase3FlywheelTest is Phase3Fixture {
         uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
         uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
-        uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
-        uint256 burnCut = (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
-        uint256 relaid = ampsFees - creatorCut - stakerCut - burnCut;
 
         assertEq(amps.balanceOf(CREATOR) - creatorBefore, creatorCut, "the creator's slice, to the wei");
-        assertEq(amps.balanceOf(address(staking)) - stakingBefore, stakerCut, "the stakers' slice, to the wei");
-        assertGe(supplyBefore - amps.totalSupply(), burnCut, "at least burnBps of the remainder was burned");
-        assertEq(creatorCut + stakerCut + burnCut + relaid, ampsFees, "the split is exhaustive");
-        assertGt(relaid, 0, "and something went back into the ladder");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "`burned` is exactly what left the supply");
+        assertGe(burned, ampsFees - creatorCut, "and the whole AMPS-side remainder is in it");
         assertGt(burned, 0, "the compound burned AMPS");
     }
 
@@ -525,19 +523,13 @@ contract Phase3FlywheelTest is Phase3Fixture {
         assertEq(claimed, bonded, "the whole position vested");
         assertEq(amps.balanceOf(CAROL), bonded, "and landed on the buyer");
 
-        // 5. Stake, then receive the streamed staker slice of a compound.
-        vm.startPrank(CAROL);
-        amps.approve(address(staking), type(uint256).max);
-        uint256 shares = staking.deposit(bonded, CAROL);
-        vm.stopPrank();
-        assertGt(shares, 0, "xAMPS minted");
-
-        uint256 stakedAssetsBefore = staking.totalAssets();
+        // 5. Compound: the AMPS-side fee leaves the supply for good.
         _tradeForAmpsFees();
+        uint256 supplyBeforeCompound = amps.totalSupply();
         vm.prank(KEEPER);
-        vault.compound(hubPool);
-        warpBy(Constants.REWARD_STREAM_SECONDS_DEFAULT + 1);
-        assertGt(staking.totalAssets(), stakedAssetsBefore, "the staker slice streamed in");
+        (, uint256 burnedByCompound) = vault.compound(hubPool);
+        assertGt(burnedByCompound, 0, "the compound burned the AMPS-side fee");
+        assertEq(supplyBeforeCompound - amps.totalSupply(), burnedByCompound, "and `totalSupply` fell by exactly it");
 
         // 6. Sell AMPS and pay the sell fee.
         uint256 sellIn = amps.balanceOf(ALICE) / 4;

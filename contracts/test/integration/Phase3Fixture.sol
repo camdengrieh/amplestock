@@ -16,7 +16,6 @@ import {FeePolicy} from "../../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../../src/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "../../src/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {FeedConfig, InclusionRecord, PlacementRecord, PoolClass} from "../../src/types/Types.sol";
@@ -49,7 +48,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 /// @notice The whole Phase 3 system, real contract by real contract, on live Uniswap v4 pools: `Amps` at a mined
 ///         CREATE2 salt, `AmpsVault` behind its four linked libraries, the **real** `AmpsHook` at a `0x38C0`-shaped
 ///         address, the real `FeePolicy` / `LadderPolicy` / `RolloutPolicy` / `BondPolicy`,
-///         `LadderPositionValuer`, `PoolRegistry`, `AmpsBonds`, `AmpsStaking`, `BountyPot`, `OracleGate` +
+///         `LadderPositionValuer`, `PoolRegistry`, `AmpsBonds`, `BountyPot`, `OracleGate` +
 ///         `FeedRegistry` and `AmpsQuoter`.
 ///
 ///         Nothing here is a stub except the assets themselves: `MockStockToken` for the Robinhood Stock Tokens,
@@ -123,7 +122,6 @@ abstract contract Phase3Fixture is V4TestBase {
     PoolRegistry internal registry;
     AmpsBonds internal bonds;
     BondPolicy internal bondPolicy;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     OracleGate internal gate;
     FeedRegistry internal feeds;
@@ -274,7 +272,6 @@ abstract contract Phase3Fixture is V4TestBase {
         gate = new OracleGate(TIMELOCK, GUARDIAN, address(feeds), address(registry), address(hook));
         bondPolicy = new BondPolicy();
         bonds = new AmpsBonds(address(vault), address(registry), address(bondPolicy));
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(address(usdg), address(vault), TIMELOCK);
         valuer =
             new LadderPositionValuer(IExtsload(address(poolManager)), address(vault), IPoolRegistry(address(registry)));
@@ -298,7 +295,6 @@ abstract contract Phase3Fixture is V4TestBase {
         vm.label(address(gate), "OracleGate");
         vm.label(address(feeds), "FeedRegistry");
         vm.label(address(bonds), "AmpsBonds");
-        vm.label(address(staking), "AmpsStaking");
         vm.label(address(pot), "BountyPot");
         vm.label(address(valuer), "LadderPositionValuer");
         vm.label(address(quoter), "AmpsQuoter");
@@ -323,7 +319,6 @@ abstract contract Phase3Fixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(hook));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));

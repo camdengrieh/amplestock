@@ -261,3 +261,41 @@ error UnconfirmedNav();
 ///      keep the best-effort behaviour, because a bid is never a burn candidate under the first half of the rule.
 /// @param poolId The pool, as `PoolId.unwrap`.
 error HighWaterResetFailed(bytes32 poolId);
+
+// -----------------------------------------------------------------------------------------------------------------
+// `AmpsRouter` (`src/periphery/AmpsRouter.sol`)
+// -----------------------------------------------------------------------------------------------------------------
+
+/// @notice The call arrived after the deadline the caller signed for. Every `AmpsRouter` entry point takes one:
+///         a swap that sits in the mempool across a session change is a different trade from the one quoted.
+/// @param deadline The deadline supplied.
+/// @param timestamp The block timestamp that passed it.
+error DeadlineExpired(uint256 deadline, uint256 timestamp);
+
+/// @notice `AmpsRouter.rotate` was asked to use one pool for both hops. Buying AMPS and selling it straight back
+///         into the same pool is not a rotation: it is a round trip that moves the tick out and back, and pricing
+///         it at two pass-through fees would make the pool pay for the caller's own noise.
+/// @param poolId The pool named twice, as `PoolId.unwrap`.
+error SameHop(bytes32 poolId);
+
+/// @notice A rotation's two hops did not net to zero AMPS inside the unlock. Asserted before anything is settled,
+///         so a router that ever held AMPS across a `rotate` reverts rather than banking it.
+/// @param delta The router's residual AMPS delta on the PoolManager.
+error AmpsResidual(int256 delta);
+
+/// @notice Native value was sent to an entry point that cannot use it: the pool's counter asset is not WETH, or
+///         `msg.value` did not match the input amount the caller asked to swap.
+/// @param value The `msg.value` received.
+error UnexpectedValue(uint256 value);
+
+/// @notice An ETH transfer out of the router failed. Only reachable on the `unwrap` leg, and only when the
+///         recipient rejects the payment; the caller's answer is to take WETH instead.
+/// @param to The intended recipient.
+/// @param amount The amount, in wei.
+error NativeTransferFailed(address to, uint256 amount);
+
+/// @notice `unwrap` was asked for, or native value was sent, on a pool whose counter asset is not the wrapped
+///         native token the router was deployed against. Wrapping and unwrapping are WETH-leg conveniences and
+///         mean nothing on a USDG or stock leg.
+/// @param counter The pool's counter asset.
+error NotWrappedNative(address counter);

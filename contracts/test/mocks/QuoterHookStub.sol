@@ -57,7 +57,14 @@ contract QuoterHookStub is IAmpsHook {
     uint32 internal _twapWindow = Constants.TWAP_WINDOW_DEFAULT;
 
     mapping(PoolId poolId => HookPoolState state) internal _state;
-    mapping(PoolId poolId => mapping(bool zeroForOne => FeeAnswer answer)) internal _fees;
+    /// @dev Keyed by direction **and** by the pass-through flag, because revision 6 gives every direction two
+    ///      prices: `[false]` is what an ordinary swap pays (base `ampsFeeBps`) and `[true]` is what one hop of an
+    ///      `AmpsRouter.rotate` pays (base `buyFeeBps`).
+    mapping(PoolId poolId => mapping(bool zeroForOne => mapping(bool passThrough => FeeAnswer answer))) internal _fees;
+
+    /// @notice The protocol router, as `IAmpsHook.router()`. Settable, and nothing here reads it: the stub is told
+    ///         what `quoteFee` answers rather than deriving it.
+    address public router;
     mapping(PoolId poolId => Observation observation) internal _obs;
 
     /// @notice Seeds a pool with the shape a spoke has at rest: initialised, a class, a counter's decimals, a
@@ -126,33 +133,54 @@ contract QuoterHookStub is IAmpsHook {
         _state[poolId].session = session;
     }
 
-    /// @notice Sets what {quoteFee} answers for one direction.
+    /// @notice Sets what {quoteFee} answers for one direction and one pricing.
     /// @param poolId The pool.
     /// @param zeroForOne True for the sell leg.
+    /// @param passThrough True for the rotation-hop price, false for the ordinary one.
     /// @param answer The answer.
-    function setFee(PoolId poolId, bool zeroForOne, FeeAnswer calldata answer) external {
-        _fees[poolId][zeroForOne] = answer;
+    function setFee(PoolId poolId, bool zeroForOne, bool passThrough, FeeAnswer calldata answer) external {
+        _fees[poolId][zeroForOne][passThrough] = answer;
     }
 
-    /// @notice Sets both directions from bps, with no dynamic part and no refusal — the resting state.
+    /// @notice Sets all four fee legs from three bps figures, with no dynamic part and no refusal.
+    /// @dev Three and not two, because the hook this stub stands in for is asked four questions per pool — buy
+    ///      and sell, ordinary and pass-through — and the fixture's pool hook does not have to answer them the
+    ///      way the production hook would. `passThroughFee` is what both directions cost on a router rotation hop
+    ///      and is also what `buyFeeBps(poolId)` reports; `ordinarySellFee` doubles as `ampsFeeBps()`, which is
+    ///      what the quoter's own blend arithmetic is measured against.
     /// @param poolId The pool.
-    /// @param buyFee The buy fee in bps.
-    /// @param sellFee The sell fee in bps.
-    function setFlatFees(PoolId poolId, uint16 buyFee, uint16 sellFee) external {
-        _fees[poolId][false] =
-            FeeAnswer({feePips: uint24(buyFee) * Constants.PIPS_PER_BPS, baseBps: buyFee, dynBps: 0, refuse: false});
-        _fees[poolId][true] =
-            FeeAnswer({feePips: uint24(sellFee) * Constants.PIPS_PER_BPS, baseBps: sellFee, dynBps: 0, refuse: false});
-        _state[poolId].buyFeeBps = buyFee;
-        ampsFeeBps = sellFee;
+    /// @param ordinaryBuyFee What an ordinary buy costs, in bps.
+    /// @param ordinarySellFee What an ordinary sell costs, in bps; also the protocol-wide `ampsFeeBps`.
+    /// @param passThroughFee What one hop of a router rotation costs, in bps; also the pool's `buyFeeBps`.
+    function setFlatFees(PoolId poolId, uint16 ordinaryBuyFee, uint16 ordinarySellFee, uint16 passThroughFee) external {
+        _fees[poolId][false][false] = _flat(ordinaryBuyFee);
+        _fees[poolId][true][false] = _flat(ordinarySellFee);
+        _fees[poolId][false][true] = _flat(passThroughFee);
+        _fees[poolId][true][true] = _flat(passThroughFee);
+        _state[poolId].buyFeeBps = passThroughFee;
+        ampsFeeBps = ordinarySellFee;
     }
 
-    /// @notice Sets the refusal flag of one direction.
+    /// @dev One fee leg with no dynamic part and no refusal.
+    function _flat(uint16 bps) private pure returns (FeeAnswer memory answer) {
+        answer = FeeAnswer({feePips: uint24(bps) * Constants.PIPS_PER_BPS, baseBps: bps, dynBps: 0, refuse: false});
+    }
+
+    /// @notice Sets the refusal flag of one direction, on both of its prices: the rail is a property of the pool
+    ///         and the tick, and does not know what the swap is paying.
     /// @param poolId The pool.
     /// @param zeroForOne True for the sell leg.
     /// @param refuse Whether that leg is beyond the rail.
     function setRefuse(PoolId poolId, bool zeroForOne, bool refuse) external {
-        _fees[poolId][zeroForOne].refuse = refuse;
+        _fees[poolId][zeroForOne][false].refuse = refuse;
+        _fees[poolId][zeroForOne][true].refuse = refuse;
+    }
+
+    /// @notice Sets the router pointer the quoter and the gate may read back.
+    /// @param router_ The router.
+    function setRouter(address router_) external {
+        emit RouterChanged(router, router_);
+        router = router_;
     }
 
     /// @notice Sets the observation ring's answers.
@@ -247,13 +275,22 @@ contract QuoterHookStub is IAmpsHook {
     }
 
     /// @inheritdoc IAmpsHook
-    function quoteFee(PoolId poolId, bool zeroForOne, bool, uint256)
+    function quoteFee(PoolId poolId, bool zeroForOne, bool, uint256, bool passThrough)
+        public
+        view
+        returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
+    {
+        FeeAnswer memory answer = _fees[poolId][zeroForOne][passThrough];
+        return (answer.feePips, answer.baseBps, answer.dynBps, answer.refuse);
+    }
+
+    /// @inheritdoc IAmpsHook
+    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
         external
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
     {
-        FeeAnswer memory answer = _fees[poolId][zeroForOne];
-        return (answer.feePips, answer.baseBps, answer.dynBps, answer.refuse);
+        return quoteFee(poolId, zeroForOne, exactInput, amountIn, false);
     }
 
     /// @inheritdoc IAmpsHook

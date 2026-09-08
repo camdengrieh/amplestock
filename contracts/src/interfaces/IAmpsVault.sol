@@ -163,14 +163,23 @@ interface IAmpsVault {
     event Rollout(uint16 indexed constituentId, PoolId indexed poolId, uint256 movedAmps, uint256 placedAmps);
 
     /// @notice Emitted on every `compound()`. **Phase 3.**
+    /// @dev The whole of plan revision 6's split, in one log line: the creator takes `creatorBps / ampsFeeBps` of
+    ///      the fees collected in **each** currency, every wei of the AMPS side that is left is burned, and the
+    ///      counter side that is left is re-placed as bids. There is no ask placement and no staker leg, so
+    ///      `ampsFees == creatorAmps + burnedFromFees` exactly, and `burned` is that plus the buyback burn.
     /// @param poolId The pool.
     /// @param ampsFees AMPS-side fees collected.
-    /// @param creatorPaid AMPS paid to the creator.
-    /// @param stakerPaid AMPS streamed to xAMPS.
+    /// @param counterFees Counter-side fees collected, in the counter's own decimals.
+    /// @param creatorAmps AMPS paid to the creator.
+    /// @param creatorCounter Counter paid to the creator, in kind or as an ERC-6909 claim.
     /// @param burned AMPS burned, buyback burn included.
-    /// @param relaid AMPS re-placed as asks above the market.
     event Compound(
-        PoolId indexed poolId, uint256 ampsFees, uint256 creatorPaid, uint256 stakerPaid, uint256 burned, uint256 relaid
+        PoolId indexed poolId,
+        uint256 ampsFees,
+        uint256 counterFees,
+        uint256 creatorAmps,
+        uint256 creatorCounter,
+        uint256 burned
     );
 
     /// @notice Emitted whenever the vault's view of a pool's gate state changes.
@@ -279,10 +288,6 @@ interface IAmpsVault {
     /// @notice The bonds shell: the only address that may call {depositBonded} and {mintVesting}.
     /// @return bondsAddress The bonds address.
     function bonds() external view returns (address bondsAddress);
-
-    /// @notice The xAMPS staking vault.
-    /// @return stakingAddress The staking address.
-    function staking() external view returns (address stakingAddress);
 
     /// @notice The keeper bounty pot. Its balance is excluded from `A` (I21).
     /// @return bountyPotAddress The pot address.
@@ -508,17 +513,9 @@ interface IAmpsVault {
     // Reads — governed parameters
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The redemption fee, in bps. 100 at launch.
+    /// @notice The redemption fee, in bps. 250 at launch.
     /// @return value The parameter.
     function redeemFeeBps() external view returns (uint16 value);
-
-    /// @notice Share of AMPS-side fees burned at `compound()`, after the creator and staker slices. 1,000 at launch.
-    /// @return value The parameter.
-    function burnBps() external view returns (uint16 value);
-
-    /// @notice Share of AMPS-side fees streamed to xAMPS. 3,000 at launch.
-    /// @return value The parameter.
-    function stakerBps() external view returns (uint16 value);
 
     /// @notice Maximum upward move of `P_ref` per hour, in bps. 1,000 at launch.
     /// @return value The parameter.
@@ -586,14 +583,6 @@ interface IAmpsVault {
     /// @notice Hard ceiling of `redeemFeeBps`. 500.
     /// @return value The bound.
     function REDEEM_FEE_BPS_MAX() external view returns (uint16 value);
-
-    /// @notice Hard ceiling of `burnBps`. 2,500.
-    /// @return value The bound.
-    function BURN_BPS_MAX() external view returns (uint16 value);
-
-    /// @notice Hard ceiling of `stakerBps`. 5,000.
-    /// @return value The bound.
-    function STAKER_BPS_MAX() external view returns (uint16 value);
 
     /// @notice Hard floor of `refUpRateBps`. 100.
     /// @return value The bound.
@@ -833,14 +822,6 @@ interface IAmpsVault {
     /// @param value The new fee, at most `REDEEM_FEE_BPS_MAX`.
     function setRedeemFeeBps(uint16 value) external;
 
-    /// @notice Sets the burn share. **Only timelock (48 h).**
-    /// @param value The new share, at most `BURN_BPS_MAX`.
-    function setBurnBps(uint16 value) external;
-
-    /// @notice Sets the staker share. **Only timelock (48 h).**
-    /// @param value The new share, at most `STAKER_BPS_MAX`.
-    function setStakerBps(uint16 value) external;
-
     /// @notice Sets the reference rate limit. **Only timelock (48 h).**
     /// @param value The new rate, inside `[REF_UP_RATE_BPS_MIN, REF_UP_RATE_BPS_MAX]`.
     function setRefUpRateBps(uint16 value) external;
@@ -884,7 +865,7 @@ interface IAmpsVault {
     /// @dev This is the vault's single pointer setter, and it serves two populations of slot:
     ///
     ///        - **Set-once wiring**, written before {genesis} and refused for ever afterwards: `bytes32("registry")`,
-    ///          `bytes32("bonds")`, `bytes32("staking")` and `bytes32("bountyPot")`. Each of those contracts takes
+    ///          `bytes32("bonds")` and `bytes32("bountyPot")`. Each of those contracts takes
     ///          the vault in *its* constructor, so the vault cannot hold them as immutables; {genesis} sets the
     ///          `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
     ///        - **Pointer-upgradeable policies**, replaceable at any time under the same 7-day delay:
@@ -923,7 +904,7 @@ interface IAmpsVault {
     ///      PoolManager-internally to the standby vault -> the standby vault re-adds at the same ticks. The R1
     ///      bleed cap is relaxed to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call.
     ///
-    /// @dev **The six roles.** `Amps`, `AmpsBonds`, `AmpsStaking`, `BountyPot` and `PoolRegistry` are handed over
+    /// @dev **The five roles.** `Amps`, `AmpsBonds`, `BountyPot` and `PoolRegistry` are handed over
     ///      outright; `AmpsHook` is a best-effort bounded call, so a hook that cannot hand its pointer on cannot
     ///      trap the estate in a denylisted vault. The registry matters as much as the token roles: it is the
     ///      contract that asks a vault to open a pool, so a standby it does not recognise inherits the estate and

@@ -189,7 +189,7 @@ contract Verify is Script {
         }
     }
 
-    /// @dev The oracle layer, bonds, staking, the pot, the valuer and the quoter.
+    /// @dev The oracle layer, bonds, the pot, the valuer and the quoter.
     function _addPeriphery(Target[] memory buffer, uint256 n, Core.Set memory set) private pure returns (uint256) {
         n = _add(
             buffer,
@@ -216,15 +216,6 @@ contract Verify is Script {
             "src/bonds/AmpsBonds.sol:AmpsBonds",
             set.bonds,
             abi.encode(set.vault, set.registry, set.bondPolicy),
-            ""
-        );
-        n = _add(
-            buffer,
-            n,
-            "AmpsStaking",
-            "src/staking/AmpsStaking.sol:AmpsStaking",
-            set.staking,
-            abi.encode(set.amps, set.vault, set.timelock),
             ""
         );
         n = _add(
@@ -293,7 +284,6 @@ contract Verify is Script {
         set.registry = _address(json, ".core.registry", "AMPS_REGISTRY");
         set.hook = _address(json, ".core.hook", "AMPS_HOOK");
         set.bonds = _address(json, ".core.bonds", "AMPS_BONDS");
-        set.staking = _address(json, ".core.staking", "AMPS_STAKING");
         set.bountyPot = _address(json, ".core.bountyPot", "AMPS_BOUNTY_POT");
         set.feedRegistry = _address(json, ".core.feedRegistry", "AMPS_FEED_REGISTRY");
         set.oracleGate = _address(json, ".core.oracleGate", "AMPS_ORACLE_GATE");

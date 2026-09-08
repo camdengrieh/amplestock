@@ -19,7 +19,6 @@ import {FeePolicy} from "../../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../../src/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "../../src/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {ConstituentStatus, GateState, PoolClass, PoolConfig} from "../../src/types/Types.sol";
@@ -30,7 +29,6 @@ import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {MockUsdg} from "../mocks/MockUsdg.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
 import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IExtsload} from "@uniswap/v4-core/src/interfaces/IExtsload.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -117,7 +115,6 @@ contract Phase3Scripts is V4TestBase {
     PoolRegistry internal registry;
     FeedRegistry internal feeds;
     AmpsBonds internal bonds;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     LadderPositionValuer internal valuer;
     LadderPolicy internal ladderPolicy;
@@ -613,7 +610,6 @@ contract Phase3Scripts is V4TestBase {
         feeds = new FeedRegistry(TIMELOCK, address(0));
         bondPolicy = new BondPolicy();
         bonds = new AmpsBonds(address(vault), address(registry), address(bondPolicy));
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(assets.usdg, address(vault), TIMELOCK);
         valuer =
             new LadderPositionValuer(IExtsload(address(poolManager)), address(vault), IPoolRegistry(address(registry)));
@@ -630,7 +626,6 @@ contract Phase3Scripts is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));
         vault.setPolicyPointer(bytes32("marketReference"), address(phase2Reference));

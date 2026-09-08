@@ -141,8 +141,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.expectRevert(AlreadyInitialized.selector);
         vault.setPolicyPointer(bytes32("bonds"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
-        vault.setPolicyPointer(bytes32("staking"), replacement);
-        vm.expectRevert(AlreadyInitialized.selector);
         vault.setPolicyPointer(bytes32("bountyPot"), replacement);
 
         // Pointer-upgradeable slots stay open; `marketReference` is re-pointed once, to the hook, in Phase 3.
@@ -653,10 +651,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRedeemFeeBps(10);
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
-        vault.setBurnBps(10);
-        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
-        vault.setStakerBps(10);
-        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRefUpRateBps(200);
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vault.setRefDivergenceBps(200);
@@ -680,8 +674,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
     /// @notice The launch values are what the constructor writes.
     function test_launchParameters() public view {
         assertEq(vault.redeemFeeBps(), Constants.REDEEM_FEE_BPS_DEFAULT, "redeemFeeBps");
-        assertEq(vault.burnBps(), Constants.BURN_BPS_DEFAULT, "burnBps");
-        assertEq(vault.stakerBps(), Constants.STAKER_BPS_DEFAULT, "stakerBps");
         assertEq(vault.refUpRateBps(), Constants.REF_UP_RATE_BPS_DEFAULT, "refUpRateBps");
         assertEq(vault.refDivergenceBps(), Constants.REF_DIVERGENCE_BPS_DEFAULT, "refDivergenceBps");
         assertEq(vault.twapWindow(), Constants.TWAP_WINDOW_DEFAULT, "twapWindow");
@@ -712,24 +704,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
             )
         );
         vault.setRedeemFeeBps(Constants.REDEEM_FEE_BPS_MAX + 1);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OutOfBand.selector, bytes32("burnBps"), uint256(Constants.BURN_BPS_MAX) + 1, 0, Constants.BURN_BPS_MAX
-            )
-        );
-        vault.setBurnBps(Constants.BURN_BPS_MAX + 1);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OutOfBand.selector,
-                bytes32("stakerBps"),
-                uint256(Constants.STAKER_BPS_MAX) + 1,
-                0,
-                Constants.STAKER_BPS_MAX
-            )
-        );
-        vault.setStakerBps(Constants.STAKER_BPS_MAX + 1);
 
         vault.setRefUpRateBps(Constants.REF_UP_RATE_BPS_MIN);
         vault.setRefUpRateBps(Constants.REF_UP_RATE_BPS_MAX);
@@ -902,8 +876,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.S0(), Constants.S0, "S0");
         assertEq(vault.VIRTUAL_SHARES(), Constants.VIRTUAL_SHARES, "VIRTUAL_SHARES");
         assertEq(vault.REDEEM_FEE_BPS_MAX(), Constants.REDEEM_FEE_BPS_MAX, "REDEEM_FEE_BPS_MAX");
-        assertEq(vault.BURN_BPS_MAX(), Constants.BURN_BPS_MAX, "BURN_BPS_MAX");
-        assertEq(vault.STAKER_BPS_MAX(), Constants.STAKER_BPS_MAX, "STAKER_BPS_MAX");
         assertEq(vault.REF_UP_RATE_BPS_MIN(), Constants.REF_UP_RATE_BPS_MIN, "REF_UP_RATE_BPS_MIN");
         assertEq(vault.REF_UP_RATE_BPS_MAX(), Constants.REF_UP_RATE_BPS_MAX, "REF_UP_RATE_BPS_MAX");
         assertEq(vault.REF_DIVERGENCE_BPS_MIN(), Constants.REF_DIVERGENCE_BPS_MIN, "REF_DIVERGENCE_BPS_MIN");
@@ -1160,7 +1132,6 @@ contract AmpsVaultTest is AmpsVaultFixture {
 
         assertEq(amps.vault(), STANDBY, "Amps role handed on");
         assertEq(bondsRole.vault(), STANDBY, "AmpsBonds role handed on");
-        assertEq(stakingRole.vault(), STANDBY, "AmpsStaking role handed on");
         assertEq(potRole.vault(), STANDBY, "BountyPot role handed on");
     }
 

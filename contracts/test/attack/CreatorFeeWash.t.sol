@@ -70,16 +70,20 @@ contract CreatorFeeWashTest is Phase3Fixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         uint256 keeperBefore = amps.balanceOf(KEEPER);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
         uint256 creatorBefore = amps.balanceOf(CREATOR);
+        uint256 supplyBefore = amps.totalSupply();
 
         vm.recordLogs();
         vm.prank(KEEPER);
-        vault.compound(hubPool);
+        (uint256 ampsFees,) = vault.compound(hubPool);
 
         assertEq(amps.balanceOf(KEEPER), keeperBefore, "the keeper is paid in USDG from the pot, never in AMPS");
-        assertGt(amps.balanceOf(CREATOR), creatorBefore, "the creator was paid");
-        assertGt(amps.balanceOf(address(staking)), stakingBefore, "and the stakers, which is a contract, not an EOA");
+        uint256 paid = amps.balanceOf(CREATOR) - creatorBefore;
+        assertGt(paid, 0, "the creator was paid");
+
+        // Since revision 6 there is no second recipient at all: what the creator does not take is burned, so the
+        // AMPS side of the fee leaves the supply rather than reaching any address.
+        assertEq(supplyBefore - amps.totalSupply(), ampsFees - paid, "every other wei of the fee was burned");
     }
 
     /// @notice And the faucet closes: after thirty days the creator earns nothing at all, so the wash has no

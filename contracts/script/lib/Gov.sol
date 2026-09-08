@@ -45,7 +45,7 @@ interface ITimelock {
 ///         deployment actually has.
 ///
 ///         Every mutator on `AmpsVault`, `PoolRegistry`, `FeedRegistry`, `OracleGate`, `AmpsBonds`, `AmpsHook`,
-///         `AmpsStaking` and `BountyPot` is `onlyTimelock`, and that address is an **immutable** on the vault, the
+///         `AmpsBonds` and `BountyPot` is `onlyTimelock`, and that address is an **immutable** on the vault, the
 ///         registry and the hook — it is fixed in the constructor and can never be handed on. So the bootstrap
 ///         cannot be run by an EOA that is later replaced by governance: whatever address the constructors are
 ///         given has to make all ~100 registration calls itself.

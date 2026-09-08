@@ -84,12 +84,11 @@ contract DenylistMigrationTest is Phase3Fixture {
         }
         assertGt(movedAssets, 0, "the standby holds the estate as ERC-6909 claims");
 
-        // Every `onlyVault` role moved in the same transaction — all six of them, not the four the handover used
-        // to cover. `PoolRegistry` matters as much as the token roles: it is the contract that asks a vault to
+        // Every `onlyVault` role moved in the same transaction — all five of them, not the three the handover
+        // used to cover. `PoolRegistry` matters as much as the token roles: it is the contract that asks a vault to
         // open a pool, so a standby the registry does not recognise inherits the estate and can never grow it.
         assertEq(amps.vault(), STANDBY, "AMPS minting");
         assertEq(bonds.vault(), STANDBY, "AmpsBonds");
-        assertEq(staking.vault(), STANDBY, "AmpsStaking");
         assertEq(pot.vault(), STANDBY, "BountyPot");
         assertEq(registry.vault(), STANDBY, "PoolRegistry");
 

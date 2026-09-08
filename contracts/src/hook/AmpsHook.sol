@@ -29,9 +29,16 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 /// @title AmpsHook
-/// @notice The one immutable hook behind all 32 Amplestocks pools: a directional fee with a same-transaction
-///         rotation credit, a truncated observation ring, and the per-pool state the vault, the bonds shell and
-///         the quoter read.
+/// @notice The one immutable hook behind all 32 Amplestocks pools: one protocol-wide AMPS fee on both directions
+///         of every pool, a pass-through exemption for the protocol router's rotation hops, a truncated
+///         observation ring, and the per-pool state the vault, the bonds shell and the quoter read.
+///
+/// @dev **The fee model in three lines (revision 6).** Every hop of every pool pays `ampsFeeBps` (500 bp at
+///      launch) as its base, buys and sells alike, plus the unchanged dynamic components and the unchanged rail
+///      refusal. The single exception is a hop the protocol router flags as one leg of a rotation
+///      ({_isPassThrough}): its base is the pool's own `buyFeeBps` — 30 bp entry, 5 or 10 bp spoke — which is the
+///      price of *moving through* the index rather than entering or leaving it. `buyFeeBps` is therefore the
+///      pass-through fee, and nothing else in the system pays it.
 ///
 /// @dev **Shape (I13, I18).** Permissions are exactly `0x38C0` — `BEFORE_INITIALIZE | AFTER_INITIALIZE |
 ///      BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP`. No `*_RETURNS_DELTA` bit, no `BEFORE_REMOVE_LIQUIDITY`
@@ -76,18 +83,13 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      sharing a block builder's transaction, would pool their credits, and a credit earned in the deep hub
     ///      would discount a sell into a thin spoke. Keying by `sender` bounds the credit to one settlement path.
     ///
-    /// @dev **What `sender` is, and what that means.** The `sender` the PoolManager hands both callbacks is the
-    ///      account that took the lock — the router or settlement contract, not the end user behind it. The credit
-    ///      is therefore shared by *everything one unlocker settles in one transaction*. The rotation it exists
-    ///      for (hop 1 buy, hop 2 sell, one router call) sees one credit, as intended; so does a batching
-    ///      settlement contract that pairs one party's entry with another party's exit inside a single call, and
-    ///      on the matched size that seller is charged the buy fee rather than the 500 bp sell fee. **This is an
-    ///      accepted design property, not an oversight.** Such a batch is economically the rotation the credit is
-    ///      priced for: the AMPS leaving on the sell is AMPS that entered on the buy in the same transaction, the
-    ///      protocol collects two buy fees on the matched size, and no AMPS is sold out of the pool that was not
-    ///      bought into it in the same transaction — which is the invariant the sell fee defends. What remains
-    ///      excluded is the cross-path case: a credit earned under one unlocker can never discount a sell settled
-    ///      under a different one, so the exposure is bounded by what a single settlement contract itself pairs.
+    /// @dev **And, since revision 6, only one `sender` can hold a credit at all.** A buy earns a credit only when
+    ///      it is the protocol router's rotation hop ({_isPassThrough}), and a sell spends one only on the same
+    ///      condition; every other hop in the system pays `ampsFeeBps` and neither earns nor spends. The batching
+    ///      case the earlier design accepted — a settlement contract pairing one party's entry with another
+    ///      party's exit and blending them — is therefore gone: that contract is not {router}, so both of its legs
+    ///      pay the AMPS fee. What is left is exactly the flow the credit was priced for, built by one audited
+    ///      contract in one `unlock`, with the second hop selling precisely what the first hop bought.
     uint256 private constant ROTATION_CREDIT_SLOT = 0x28ef4cf38086db5318537797461c68e4f15873dbd0e73f3e45f6b1f32032b976;
 
     /// @dev Gas ceiling on the gate snapshot. Generous — but finite, so a gate that loops cannot take the swap
@@ -170,6 +172,18 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      packed word above is untouched. Moved only by {setVault}, and only by the vault itself.
     address public vault;
 
+    /// @inheritdoc IAmpsHook
+    /// @dev **The whole of the pass-through exemption is this one word.** A swap hop is pass-through — priced at
+    ///      the pool's `buyFeeBps` rather than at the protocol-wide `ampsFeeBps`, and allowed to earn or spend a
+    ///      rotation credit — iff the PoolManager reports this address as the swap's `sender` **and** the hop
+    ///      carries `Constants.ROUTER_ROTATE` as its `hookData`. Everything else in the world pays `ampsFeeBps`
+    ///      in both directions.
+    ///
+    /// @dev Storage rather than immutable, and replaceable by the timelock alone: the router is ordinary
+    ///      periphery with no privileges beyond this one, so a bug in it must be fixable without redeploying the
+    ///      hook, and the zero address is a valid setting meaning "no router, nothing is pass-through".
+    address public router;
+
     /// @dev Per pool: the CONFIG word (§1.2), written at `afterInitialize` and thereafter only by governance.
     mapping(PoolId poolId => uint256 word) private _cfg;
 
@@ -204,6 +218,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
     struct SwapCtx {
         bool sell;
         bool exactInput;
+        bool passThrough;
         uint256 amountIn;
         uint256 credit;
     }
@@ -351,12 +366,14 @@ contract AmpsHook is BaseHook, IAmpsHook {
     // beforeSwap
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev §1.4, in order: three cold `SLOAD`s, the base fee and the rotation blend, the start-of-swap rail
-    ///      check, the dynamic components through the policy pointer, the clamp, the override flag.
+    /// @dev §1.4, in order: three cold `SLOAD`s, the base fee and — on the protocol router's rotation hop alone —
+    ///      the rotation blend, the start-of-swap rail check, the dynamic components through the policy pointer,
+    ///      the clamp, the override flag.
     ///
-    /// @dev `sender` is the account that unlocked the PoolManager, and it is what the rotation credit is keyed by:
-    ///      a swapper may only spend a credit its own earlier hop in this transaction created.
-    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    /// @dev `sender` is the account that unlocked the PoolManager. It decides two things and no others: whether
+    ///      this hop is the protocol router's rotation hop (see {_isPassThrough}), and, if it is, which account's
+    ///      rotation credit it may spend — its own and no one else's.
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -368,11 +385,13 @@ contract AmpsHook is BaseHook, IAmpsHook {
         SwapCtx memory ctx;
         ctx.sell = params.zeroForOne;
         ctx.exactInput = params.amountSpecified < 0;
+        ctx.passThrough = _isPassThrough(sender, hookData);
         if (ctx.exactInput) ctx.amountIn = uint256(-params.amountSpecified);
 
-        // Hashed once, on the only path that can spend a credit, and reused by the write below.
+        // Hashed once, on the only path that can spend a credit, and reused by the write below. A hop that is not
+        // the router's rotation hop neither reads nor writes the slot: it pays `ampsFeeBps` whatever is in it.
         uint256 slot;
-        if (ctx.sell && ctx.exactInput && ctx.amountIn != 0) {
+        if (ctx.passThrough && ctx.sell && ctx.exactInput && ctx.amountIn != 0) {
             slot = _creditSlot(sender);
             ctx.credit = _tload(slot);
         }
@@ -411,14 +430,15 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      reverting gate, a policy that runs out of gas, a token that returns garbage — can reach the swapper.
     ///      The post-swap rail check at the end is the single deliberate exception (§10 ruling 2).
     ///
-    /// @dev `sender` is carried rather than discarded for the same reason `beforeSwap` carries it: the rotation
-    ///      credit belongs to the account that earned it (see {ROTATION_CREDIT_SLOT}).
+    /// @dev `sender` and `hookData` are carried rather than discarded for the same reason `beforeSwap` carries
+    ///      them: only the protocol router's rotation hop earns a credit, and it earns it for itself (see
+    ///      {ROTATION_CREDIT_SLOT} and {_isPassThrough}).
     function _afterSwap(
         address sender,
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
-        bytes calldata
+        bytes calldata hookData
     ) internal override returns (bytes4, int128) {
         PoolId id = key.toId();
         // A pool the hook never initialised cannot be one of ours; there is nothing to record and nothing to
@@ -438,9 +458,10 @@ contract AmpsHook is BaseHook, IAmpsHook {
         // 3. EWMA realised variance on the raw tick delta, and the pre-computed `f_vol`.
         _updateVariance(d, a, tick);
 
-        // 4. The rotation credit, from the realised delta and never the requested amount (I26), and to the buyer
-        //    and no one else.
-        if (!params.zeroForOne) _credit(sender, delta);
+        // 4. The rotation credit, from the realised delta and never the requested amount (I26), to the buyer and
+        //    no one else — and only when the buy was the protocol router's rotation hop (I26, revision 6). An
+        //    ordinary buy pays `ampsFeeBps` and earns nothing, so there is nothing for it to leave behind.
+        if (!params.zeroForOne && _isPassThrough(sender, hookData)) _credit(sender, delta);
 
         // 5. Surge and capture are decayed at quote time; this only clears them once they are worth nothing.
         _clearDecayed(a);
@@ -489,7 +510,8 @@ contract AmpsHook is BaseHook, IAmpsHook {
     }
 
     /// @dev Step 4 of §1.5: credit the AMPS a buyer actually received, never the amount they asked for (I26), to
-    ///      the account that received it and to no one else.
+    ///      the account that received it and to no one else — and only when that account is {router} and the hop
+    ///      carried `Constants.ROUTER_ROTATE`, which the caller has already checked.
     /// @param sender The account the PoolManager attributes the swap to; the credit's owner.
     /// @param delta The realised balance delta.
     function _credit(address sender, BalanceDelta delta) private {
@@ -514,21 +536,42 @@ contract AmpsHook is BaseHook, IAmpsHook {
         HookStateLib.Armed memory a,
         SwapCtx memory ctx
     ) private view returns (Quote memory q) {
-        uint16 sellFee = _ampsFee;
+        uint16 ampsFee = _ampsFee;
 
-        // Step 3: the base fee, and the rotation blend on an exact-input sell.
-        q.baseBps = ctx.sell ? sellFee : c.buyFeeBps;
-        if (ctx.sell && ctx.exactInput && ctx.amountIn != 0 && ctx.credit != 0) {
-            uint256 consumed = ctx.credit < ctx.amountIn ? ctx.credit : ctx.amountIn;
-            q.creditConsumed = consumed;
-            // Rounded up, so a credit never rounds a fee down in the swapper's favour. `mulDivRoundingUp` carries
-            // the 512-bit intermediate the naive `(buy*c + sell*(in-c) + in-1)/in` form overflows on. The bands
-            // ([100, 600] against [1, 100]) make `sellFee >= buyFee` structural; the guard is there so that a
-            // future band change can never underflow the subtraction, and it consumes the credit either way.
-            q.baseBps = sellFee > c.buyFeeBps
-                ? c.buyFeeBps
-                    + uint16(FullMath.mulDivRoundingUp(sellFee - c.buyFeeBps, ctx.amountIn - consumed, ctx.amountIn))
-                : sellFee;
+        // Step 3: the base fee.
+        //
+        // **Revision 6.** `ampsFeeBps` is the base fee on BOTH directions of every pool, and `buyFeeBps` is the
+        // *pass-through* base: the price of moving through a pool rather than entering or leaving the index
+        // through it. So the default below is `ampsFeeBps`, and only the protocol router's rotation hop
+        // ({_isPassThrough}) ever sees anything else.
+        q.baseBps = ampsFee;
+
+        if (ctx.passThrough) {
+            if (!ctx.sell) {
+                // Hop 1 of a rotation: the pass-through base outright. `afterSwap` credits what it realises.
+                q.baseBps = c.buyFeeBps;
+            } else if (ctx.exactInput) {
+                // Hop 2: `buyFeeBps` on the AMPS this transaction's hop 1 actually bought, `ampsFeeBps` on any
+                // excess. A `rotate` sells exactly what hop 1 returned, so the excess is zero and the whole sell
+                // is pass-through; anything larger is an exit wearing a rotation's clothes and is priced as one.
+                uint256 consumed = ctx.credit < ctx.amountIn ? ctx.credit : ctx.amountIn;
+                uint256 uncredited = ctx.amountIn - consumed;
+                q.creditConsumed = consumed;
+                if (uncredited == 0) {
+                    // Fully covered — and the degenerate `amountIn == 0` the view surface asks about, which is
+                    // "what would a pass-through sell cost", not "what does a zero-sized one cost".
+                    q.baseBps = c.buyFeeBps;
+                } else if (ampsFee > c.buyFeeBps) {
+                    // Rounded up, so a credit never rounds a fee down in the swapper's favour. `mulDivRoundingUp`
+                    // carries the 512-bit intermediate the naive `(buy*c + amps*(in-c) + in-1)/in` form overflows
+                    // on. The bands ([100, 600] against [1, 100]) make `ampsFee >= buyFee` structural; the guard
+                    // is there so a future band change can never underflow the subtraction.
+                    q.baseBps = c.buyFeeBps
+                        + uint16(FullMath.mulDivRoundingUp(ampsFee - c.buyFeeBps, uncredited, ctx.amountIn));
+                }
+            }
+            // An exact-**output** sell falls through to `ampsFeeBps`: it consumes no credit, and the router only
+            // ever builds a rotation out of two exact-input hops.
         }
 
         // Step 4: the deviation, measured on the start-of-swap tick, and the rail.
@@ -1034,6 +1077,36 @@ contract AmpsHook is BaseHook, IAmpsHook {
         out = value > type(uint64).max ? type(uint64).max : uint64(value);
     }
 
+    /// @dev Whether this hop is the protocol router's rotation hop — the one and only pass-through case.
+    ///
+    /// @dev **Both halves are necessary.** The `sender` check is what confines the exemption to a contract
+    ///      governance has vetted and can replace; the `hookData` flag is what confines it to the *shape* the
+    ///      exemption is priced for. `AmpsRouter.buy` and `AmpsRouter.sell` pass empty `hookData` and are
+    ///      therefore ordinary swaps paying `ampsFeeBps`, exactly like a swap through any other router: routing an
+    ///      exit through the protocol's own front end must not make the exit cheaper. Only `AmpsRouter.rotate`
+    ///      sets the flag, and it sets it on both hops of one `unlock`.
+    ///
+    /// @dev **Why not simply exempt every swap the router settles.** A hop's fee is fixed in `beforeSwap`, before
+    ///      the swap runs, and the first hop of a route cannot know whether a second follows. Charging the
+    ///      pass-through fee on hop 1 and reconciling afterwards would need the hook to hold and refund value,
+    ///      which it never does (I13) — so the router declares its intent up front instead, and the hook checks
+    ///      the declaration against an address only the timelock can move.
+    ///
+    /// @dev The length test comes before the storage read on purpose: an ordinary swap passes empty `hookData`
+    ///      and therefore pays nothing at all for this check — not even the cold `SLOAD` of {router}.
+    /// @param sender The account the PoolManager reports as the swap's initiator.
+    /// @param hookData The bytes that account attached to this hop.
+    /// @return passThrough Whether the hop is priced as one leg of a protocol rotation.
+    function _isPassThrough(address sender, bytes calldata hookData) private view returns (bool passThrough) {
+        if (hookData.length != 32) return false;
+        bytes32 flag;
+        assembly ("memory-safe") {
+            flag := calldataload(hookData.offset)
+        }
+        if (flag != Constants.ROUTER_ROTATE) return false;
+        passThrough = sender == router && sender != address(0);
+    }
+
     /// @dev The transient slot holding one account's rotation credit: `keccak256(ROTATION_CREDIT_SLOT, sender)`.
     ///      One keccak of two words, computed at most once per callback.
     /// @param sender The credit's owner, as the PoolManager reports it.
@@ -1188,23 +1261,28 @@ contract AmpsHook is BaseHook, IAmpsHook {
 
     /// @inheritdoc IAmpsHook
     /// @dev Never reverts. An unknown pool reports `refuse == true`, which is what a swap through it would do.
-    /// @dev **The credit it applies is the caller's own.** The rotation credit is keyed by the `sender` the
-    ///      PoolManager reports, so the only credit this view can honestly price a sell against is `msg.sender`'s
-    ///      — which is zero in every fresh `eth_call`, and is the router's own credit when a router asks
-    ///      mid-transaction what its next hop will cost. A quoter contract standing between the two therefore
-    ///      cannot double-count a credit it does not hold; `AmpsQuoter.quoteSellWithCredit` takes the credit as an
-    ///      argument for exactly that reason.
-    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
-        external
+    ///
+    /// @dev **It is a pure function of its arguments and the pool's state; it reads no transient storage.** The
+    ///      rotation credit is keyed by the swap's `sender`, so a credit read here would be `msg.sender`'s — zero
+    ///      in every fresh `eth_call`, and never the credit of the account whose swap is being priced. What
+    ///      `passThrough` does instead is *model* the router hop: the credit a `rotate` carries into hop 2 is by
+    ///      construction exactly the AMPS hop 1 returned, so the modelled blend is the fee the hook will charge,
+    ///      to the basis point, rather than an approximation of it. `AmpsQuoter.quoteSellWithCredit` is where a
+    ///      partially covered sell is priced, and it takes the credit as an argument for the same reason.
+    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn, bool passThrough)
+        public
         view
         returns (uint24, uint16, uint16, bool)
     {
         if (!HookStateLib.isInitialized(_cfg[poolId])) return (0, 0, 0, true);
+        uint256 modelled = exactInput ? amountIn : 0;
         SwapCtx memory ctx = SwapCtx({
             sell: zeroForOne,
             exactInput: exactInput,
-            amountIn: exactInput ? amountIn : 0,
-            credit: (zeroForOne && exactInput && amountIn != 0) ? _rotationCredit(msg.sender) : 0
+            passThrough: passThrough,
+            amountIn: modelled,
+            // The router sells exactly what its own hop 1 bought, so a pass-through sell is fully covered.
+            credit: passThrough ? modelled : 0
         });
         Quote memory q = _quote(
             HookStateLib.unpackConfig(_cfg[poolId]),
@@ -1213,6 +1291,15 @@ contract AmpsHook is BaseHook, IAmpsHook {
             ctx
         );
         return (uint24(q.feeBps) * Constants.PIPS_PER_BPS, q.baseBps, q.dynBps, q.refuse);
+    }
+
+    /// @inheritdoc IAmpsHook
+    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
+        external
+        view
+        returns (uint24, uint16, uint16, bool)
+    {
+        return quoteFee(poolId, zeroForOne, exactInput, amountIn, false);
     }
 
     /// @inheritdoc IAmpsHook
@@ -1385,6 +1472,20 @@ contract AmpsHook is BaseHook, IAmpsHook {
         address previous = _policy;
         _policy = newPolicy;
         emit FeePolicyChanged(previous, newPolicy);
+    }
+
+    /// @inheritdoc IAmpsHook
+    /// @dev **The zero address is a legal setting**, and it is the safe one: it turns the pass-through exemption
+    ///      off entirely, so every hop in every pool pays `ampsFeeBps` until a router is named again. There is no
+    ///      code check on the address either, because a router that has not been deployed yet cannot be given one
+    ///      — the address is a *permission*, not a pointer the hook ever calls. Nothing here can move value,
+    ///      block a swap or change a rail; the worst a wrong address can do is fail to be anybody, in which case
+    ///      no hop is ever pass-through.
+    function setRouter(address newRouter) external {
+        _onlyTimelock();
+        address previous = router;
+        router = newRouter;
+        emit RouterChanged(previous, newRouter);
     }
 
     /// @notice Sets how often `afterSwap` may refresh a pool's cached gate view. **Only timelock (48 h).**

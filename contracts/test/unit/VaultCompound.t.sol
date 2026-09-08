@@ -6,19 +6,34 @@ import {IBountyPot} from "../../src/interfaces/IBountyPot.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 /// @title VaultCompoundTest
-/// @notice `docs/phase3-state-model.md` §8.1's row for this file: the creator -> staker -> burn -> re-ladder split
-///         to the wei, `creatorBps(t) == 0` after day 30 (I31), the high-water buyback burn in all three tick
-///         positions (I33), the reset ordering, and the keeper bounty.
+/// @notice `docs/phase3-state-model.md` §8.1's row for this file: plan revision 6's split — the creator's slice
+///         of **each** currency, then the whole AMPS-side remainder burned and the whole counter-side remainder
+///         re-placed as bids — to the wei, `creatorBps(t) == 0` after day 30 (I31), the high-water buyback burn in
+///         all three tick positions (I33), the reset ordering, and the keeper bounty.
 ///
 /// @dev The fees are real: they come out of real swaps against the real ladder through the v4 router, at the
 ///      hook's real directional fee (500 bp on an AMPS-in swap, 30 bp on an AMPS-out one in an entry pool).
 contract VaultCompoundTest is PlacementFixture {
+    /// @dev The `Compound` event's data half, decoded.
+    struct Compounded {
+        uint256 ampsFees;
+        uint256 counterFees;
+        uint256 creatorAmps;
+        uint256 creatorCounter;
+        uint256 burned;
+    }
+
+    /// @dev `vm.getRecordedLogs()` empties the buffer, so a test that reads two things out of one call reads it
+    ///      once and keeps it here.
+    Vm.Log[] private _logs;
+
     function setUp() public {
         deployPlacementWorld();
         placeGenesisLadders();
@@ -30,43 +45,48 @@ contract VaultCompoundTest is PlacementFixture {
     // §3.6 step 5 — the split
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The whole of §3.6 step 5, in order and to the wei:
+    /// @notice The whole of §3.6 step 5 as revision 6 states it, to the wei:
     ///         ```
-    ///         creatorCut = ampsFees x min(creatorBps(t), ampsFeeBps) / ampsFeeBps
-    ///         stakerCut  = (ampsFees - creatorCut) x stakerBps / BPS
-    ///         burnCut    = (ampsFees - creatorCut - stakerCut) x burnBps / BPS
-    ///         relaid     = ampsFees - creatorCut - stakerCut - burnCut
+    ///         creatorAmps    = ampsFees    x min(creatorBps(t), ampsFeeBps) / ampsFeeBps
+    ///         creatorCounter = counterFees x min(creatorBps(t), ampsFeeBps) / ampsFeeBps
+    ///         burned         = ampsFees - creatorAmps                       (plus the buyback)
+    ///         bids           = counterFees - creatorCounter                 (re-placed below the market)
     ///         ```
-    function test_split_creatorThenStakerThenBurnThenRelaidToTheWei() public {
+    function test_split_creatorInEachCurrencyThenTheWholeAmpsRemainderIsBurned() public {
         _tradeForAmpsFees();
         // The mark sits at the live tick, so nothing is crossed and the only burn is the fee split's. The
         // buyback burn has its own three tests below.
         hook.setHighWaterTick(hubPool, tickOf(hubPool));
 
-        uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
+        uint256 creatorAmpsBefore = amps.balanceOf(CREATOR);
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
         uint256 supplyBefore = amps.totalSupply();
 
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        vm.recordLogs();
         vm.prank(KEEPER);
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
         assertGt(ampsFees, 0, "the sell really paid a fee in AMPS");
 
         uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
-        uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
-        uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
-        uint256 burnCut = (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
-        uint256 relaid = ampsFees - creatorCut - stakerCut - burnCut;
+        Compounded memory log = _lastCompound();
+        assertGt(log.counterFees, 0, "and the buy really paid one in USDG");
 
-        assertEq(amps.balanceOf(CREATOR) - creatorBefore, creatorCut, "the creator's slice, to the wei");
-        assertEq(amps.balanceOf(address(staking)) - stakingBefore, stakerCut, "the stakers' slice, to the wei");
-        assertEq(burned, burnCut, "and the burn is exactly burnBps of what is left");
-        assertEq(supplyBefore - amps.totalSupply(), burnCut, "totalSupply fell by exactly the burn");
+        uint256 creatorAmps = ampsFees * creatorBps / ampsFeeBps;
+        uint256 creatorCounter = log.counterFees * creatorBps / ampsFeeBps;
 
-        // The remainder went back into the ladder rather than anywhere else: the four slices are the whole fee.
-        assertEq(creatorCut + stakerCut + burnCut + relaid, ampsFees, "the split is exhaustive");
-        assertGt(relaid, 0, "and something was re-laddered");
+        // The same fraction of each currency, and the log says the same thing the balances do.
+        assertEq(amps.balanceOf(CREATOR) - creatorAmpsBefore, creatorAmps, "the creator's AMPS slice, to the wei");
+        assertEq(usdg.balanceOf(CREATOR) - creatorUsdgBefore, creatorCounter, "and the USDG slice, to the wei");
+        assertEq(log.creatorAmps, creatorAmps, "the event agrees on AMPS");
+        assertEq(log.creatorCounter, creatorCounter, "and on the counter");
+
+        // Every wei of the AMPS side that is left is burned. Nothing is streamed and nothing is re-laddered.
+        assertEq(burned, ampsFees - creatorAmps, "the burn is the whole AMPS-side remainder");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "totalSupply fell by exactly the burn");
+        assertEq(log.burned, burned, "and the event agrees");
+        assertEq(creatorAmps + burned, ampsFees, "the AMPS split is exhaustive: creator, then burn, and nothing else");
         assertSweepClean("compound");
     }
 
@@ -113,32 +133,121 @@ contract VaultCompoundTest is PlacementFixture {
         syncMarket();
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
+        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
+        hook.setHighWaterTick(hubPool, tickOf(hubPool));
 
+        vm.recordLogs();
         vm.prank(KEEPER);
-        (uint256 ampsFees,) = vault.compound(hubPool);
+        (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
 
         assertGt(ampsFees, 0, "there were fees to split");
-        assertEq(amps.balanceOf(CREATOR), creatorBefore, "the creator got nothing");
-        assertEq(
-            amps.balanceOf(address(staking)) - stakingBefore,
-            ampsFees * vault.stakerBps() / Constants.BPS,
-            "and the stakers' slice is now measured against the whole fee"
-        );
+        assertEq(amps.balanceOf(CREATOR), creatorBefore, "the creator got no AMPS");
+        assertEq(usdg.balanceOf(CREATOR), creatorUsdgBefore, "and no counter asset either");
+
+        Compounded memory log = _lastCompound();
+        assertEq(log.creatorAmps, 0, "the event says zero");
+        assertEq(log.creatorCounter, 0, "in both currencies");
+        assertEq(burned, ampsFees, "and the whole AMPS-side fee is burned instead");
     }
 
-    /// @notice Counter-side fees are left where the ladder raised them: they go back into the pool as bids below
-    ///         the market rather than out to anybody.
-    function test_counterSideFeesStayInThePoolAsBids() public {
+    /// @notice The creator's fraction is the same one in every currency at every point of the schedule: day 0,
+    ///         mid-decay and after it ends. `creatorBps / ampsFeeBps` of the collected fees is `creatorBps` of the
+    ///         volume that produced them, because the hook charges `ampsFeeBps` on both sides of every trade.
+    /// @dev The warps are whole weeks so that every sample lands on the same weekday and the same time of day as
+    ///      genesis: `OracleGate` reports `DEGRADED` outside regular trading hours, and a `compound` refuses in
+    ///      `DEGRADED`, so a mid-decay sample taken on a Saturday would be testing the calendar rather than the
+    ///      split. Day 14 is mid-decay (53 bp of 100) and day 35 is past the end of the schedule.
+    function test_split_theCreatorTakesTheSameFractionOfEachCurrencyAcrossTheSchedule() public {
+        _assertCreatorFraction("day 0");
+
+        warpBy(14 days);
+        syncMarket();
+        assertGt(vault.creatorBpsAt(block.timestamp), 0, "mid-decay, and not yet zero");
+        _assertCreatorFraction("day 14");
+
+        warpBy(21 days);
+        syncMarket();
+        assertEq(vault.creatorBpsAt(block.timestamp), 0, "the schedule has run out");
+        _assertCreatorFraction("day 35");
+    }
+
+    /// @notice A counter asset that refuses the creator cannot revert `compound`: the in-kind `take` is bounded,
+    ///         its failure falls back to an ERC-6909 claim, and the burn, the bids and the bounty all still happen.
+    ///
+    /// @dev This is the same shape `VaultRedeemLib._payOut` uses for the redemption floor, and it exists for the
+    ///      same reason: the token that refuses is exactly the token whose issuer would otherwise hold a veto over
+    ///      the protocol's fee engine.
+    function test_split_aGatedCounterTokenPaysTheCreatorInClaimsAndDoesNotRevert() public {
+        PoolId spoke = spokePools[0];
+        MockStockToken stock = stocks[0];
+
+        // A buy in the spoke pays its fee in the Stock Token, which is the counter side there. The trade is
+        // deliberately tiny and the buy fee deliberately large: the spoke's ladder is 47.5 AMPS and `syncMarket`
+        // re-seeds every ring at the *hub's* AMPS price, so a buy that walks the spoke far from the hub would fail
+        // the placement divergence check rather than the thing this test is about. A 5% buy fee makes the
+        // creator's counter slice comfortably non-zero while what actually reaches the pool moves it ~280 ticks,
+        // well inside `PLACEMENT_DIVERGENCE_TICKS`.
+        hook.setBuyFeeBps(spoke, 500);
+        buyAmps(spoke, address(stock), 0.0004e18);
+        syncMarket();
+        hook.setHighWaterTick(spoke, tickOf(spoke));
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        // The issuer denylists the creator. An ERC-20 `transfer` to them now reverts.
+        address[] memory blocked = new address[](1);
+        blocked[0] = CREATOR;
+        stock.blockAccounts(blocked);
+
+        uint256 claimBefore = poolManager.balanceOf(CREATOR, uint256(uint160(address(stock))));
+        uint256 supplyBefore = amps.totalSupply();
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        (uint256 ampsFees,) = vault.compound(spoke);
+
+        Compounded memory log = _lastCompound();
+        assertGt(log.counterFees, 0, "the buy paid a counter-side fee");
+        assertGt(log.creatorCounter, 0, "and the creator was owed a slice of it");
+        assertEq(stock.balanceOf(CREATOR), 0, "the token refused the in-kind transfer");
+        assertEq(
+            poolManager.balanceOf(CREATOR, uint256(uint160(address(stock)))) - claimBefore,
+            log.creatorCounter,
+            "so the creator holds the slice as an ERC-6909 claim instead"
+        );
+
+        // And the rest of the call happened exactly as it would have.
+        assertEq(supplyBefore - amps.totalSupply(), log.burned, "the burn still ran");
+        assertEq(log.creatorAmps, ampsFees * vault.creatorBpsAt(block.timestamp) / hook.ampsFeeBps(), "AMPS unaffected");
+        assertSweepClean("gated creator");
+    }
+
+    /// @notice Counter-side fees leave the protocol only through the creator's slice: everything else goes back
+    ///         into the pool as bids below the market, at the prices the ladder raised it at.
+    function test_counterSideFeesStayInThePoolAsBidsExceptTheCreatorSlice() public {
         // A buy pays its fee in USDG, which is the counter side of the hub.
         buyAmps(hubPool, address(usdg), 200e6);
         syncMarket();
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
-        uint256 usdgOut = usdg.balanceOf(CREATOR) + usdg.balanceOf(address(staking));
+        uint256 creatorBefore = usdg.balanceOf(CREATOR);
+        uint256 poolBefore = usdg.balanceOf(address(poolManager));
+
+        vm.recordLogs();
         vm.prank(KEEPER);
         vault.compound(hubPool);
-        assertEq(usdg.balanceOf(CREATOR) + usdg.balanceOf(address(staking)), usdgOut, "no counter asset left");
+
+        Compounded memory log = _lastCompound();
+        assertGt(log.counterFees, 0, "the buy paid a counter-side fee");
+        assertEq(
+            usdg.balanceOf(CREATOR) - creatorBefore,
+            log.counterFees * vault.creatorBpsAt(block.timestamp) / hook.ampsFeeBps(),
+            "the creator's slice, to the wei"
+        );
+        assertEq(
+            poolBefore - usdg.balanceOf(address(poolManager)),
+            log.creatorCounter,
+            "and the creator's slice is the only USDG that left the PoolManager"
+        );
         assertSweepClean("counter-side fees");
     }
 
@@ -246,6 +355,7 @@ contract VaultCompoundTest is PlacementFixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         uint256 poolUsdg = usdg.balanceOf(address(poolManager));
+        uint256 creatorUsdg = usdg.balanceOf(CREATOR);
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(KEEPER);
@@ -254,7 +364,11 @@ contract VaultCompoundTest is PlacementFixture {
         assertEq(burned, _expectedBurnCut(ampsFees), "nothing was burned but the fee split");
         assertEq(supplyBefore - amps.totalSupply(), burned, "and the supply agrees");
         assertGe(_liquidityAt(hubPool, straddledLower), straddledLiquidity, "the straddled cell is untouched");
-        assertEq(usdg.balanceOf(address(poolManager)), poolUsdg, "and no USDG left the PoolManager");
+        assertEq(
+            poolUsdg - usdg.balanceOf(address(poolManager)),
+            usdg.balanceOf(CREATOR) - creatorUsdg,
+            "the creator's counter slice is the only USDG that left the PoolManager"
+        );
         assertSweepClean("straddled cell");
     }
 
@@ -292,9 +406,8 @@ contract VaultCompoundTest is PlacementFixture {
 
         assertGt(burned, _expectedBurnCut(ampsFees), "more was burned than the fee split alone");
         assertEq(supplyBefore - amps.totalSupply(), burned, "and every wei of it left the supply");
-        // The cell was emptied by the burn; what stands in it now is only the fee remainder step 6 re-laddered,
-        // which is a fraction of the inventory that was there.
-        assertLt(_liquidityAt(hubPool, base), cell0, "the bought-back inventory is gone from the cell");
+        // The cell was emptied by the burn and nothing re-fills it: revision 6 places no ask at `compound`.
+        assertEq(_liquidityAt(hubPool, base), 0, "the bought-back inventory is gone from the cell");
 
         // Cell 1 was only ever *partly* crossed by the mark, so it is not inventory the market gave back and is
         // left alone — the two halves of the predicate, in one assertion.
@@ -366,9 +479,9 @@ contract VaultCompoundTest is PlacementFixture {
         assertEq(amps.totalSupply(), supplyBefore, "the supply is untouched");
     }
 
-    /// @notice The ordering rule of §3.5: the burn runs *before* the re-ladder and the mark is reset *after*, so
-    ///         freshly re-laddered AMPS can never be mistaken for bought-back inventory on the next call.
-    function test_i33_theMarkIsResetAfterTheBurnSoFreshAsksAreNotBurnedNext() public {
+    /// @notice The ordering rule of §3.5: the burn runs *before* anything this call places, and the mark is reset
+    ///         *after*, so nothing `compound` leaves behind can be mistaken for bought-back inventory next time.
+    function test_i33_theMarkIsResetAfterTheBurnSoFreshCellsAreNotBurnedNext() public {
         _tradeForAmpsFees();
         // The mark crossed the whole ask ladder: every ask cell holding AMPS is bought-back inventory.
         hook.setHighWaterTick(hubPool, _highestAskUpper());
@@ -378,11 +491,11 @@ contract VaultCompoundTest is PlacementFixture {
         vm.prank(KEEPER);
         (uint256 fees1, uint256 burned1) = vault.compound(hubPool);
         assertGt(burned1, _expectedBurnCut(fees1), "the first compound bought back and burned");
-        // Twice, not once: the re-ladder of step 6 resets the mark for the asks it has just placed, and step 8
-        // resets it again for the call as a whole. Both are after the burn, which is the ordering that matters.
-        assertEq(hook.highWaterResetCount(hubPool) - resetsBefore, 2, "and reset the mark, after the burn");
+        // Once: step 8's reset for the call as a whole. There is no ask placement to reset it a second time
+        // since revision 6, and what matters is unchanged — the reset is *after* the burn.
+        assertEq(hook.highWaterResetCount(hubPool) - resetsBefore, 1, "and reset the mark, after the burn");
 
-        // The mark now sits at the live tick, so the AMPS just re-laddered above it is not "crossed".
+        // The mark now sits at the live tick, so nothing above it is "crossed".
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
         vm.prank(KEEPER);
         (uint256 fees2, uint256 burned2) = vault.compound(hubPool);
@@ -473,19 +586,19 @@ contract VaultCompoundTest is PlacementFixture {
         assertSweepClean("compound at the budget");
     }
 
-    /// @notice And with the budget full **and** every cell of the pool already live, the re-ladder merges into
-    ///         all of them, so nothing is left idle at all.
-    function test_e_compoundStillReLaddersIntoExistingCellsWhenTheBudgetIsFull() public {
+    /// @notice And with the budget full **and** the pool's bid cells already live, the counter re-placement
+    ///         merges into them, so nothing is left idle at all.
+    function test_e_compoundStillPlacesCounterBidsIntoExistingCellsWhenTheBudgetIsFull() public {
         _tradeForAmpsFees();
         hook.setHighWaterTick(hubPool, tickOf(hubPool));
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
-        uint256 before = _askAmountTotal();
+        uint256 before = _bidAmountTotal();
         forceLiveCells(Constants.MAX_LIVE_CELLS);
 
         vm.prank(KEEPER);
         vault.compound(hubPool);
-        assertGt(_askAmountTotal(), before, "the ask cells took the re-laddered fees");
+        assertGt(_bidAmountTotal(), before, "the bid cells took the counter-side fees");
     }
 
     /// @notice The buyback burn takes cells *out* of the count, which is what keeps a long-lived vault from
@@ -719,19 +832,19 @@ contract VaultCompoundTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // I32 — the re-laid ask ladder is anchored at `P_ref`, like every other ask
+    // I10/I32 — `compound` places no ask at all
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice **The finding this closes.** `place`, `rollout` and `deployBonded` all anchor an ask ladder at
-    ///         `tickOf(P_ref / P_counter)` — I32's "a rolled-out ask is never placed below `P_ref`" — but
-    ///         `compound` anchored its re-ladder at the *live tick*. A pool trading below the reference therefore
-    ///         re-laid its own fees as asks under the protocol's own backing and undersold it, once a minute, on a
-    ///         permissionless call. `_cells` takes `max(fromAnchor, fromTick)`, so anchoring at the reference
-    ///         still keeps every ask strictly above the live tick when the pool is *above* the reference instead.
-    function test_i32_compoundAnchorsTheRelaidAskLadderAtTheReferenceNotTheTick() public {
+    /// @notice Revision 6's structural half of I10 and I32 at once: `compound` never places an ask. The AMPS-side
+    ///         fees are burned rather than re-laddered, so the ask inventory is genesis POL less what the market
+    ///         bought and what `rollout` moved, and there is no path on which a permissionless call can re-sell
+    ///         AMPS the protocol has just bought back — nor, on a pool trading below the reference, undersell its
+    ///         own backing, which is what anchoring the old re-ladder at the live tick did.
+    function test_compoundNeverPlacesAnAsk() public {
         _tradeForAmpsFees();
 
-        // A drawdown, so the reference and the live tick are not the same number and the assertion has content.
+        // A drawdown, so the pool trades below the reference: the exact configuration in which the old re-ladder
+        // put asks under the protocol's own backing.
         giveShares(BOB, 80e18);
         sellAmps(hubPool, amps.balanceOf(BOB));
         syncMarket();
@@ -740,36 +853,38 @@ contract VaultCompoundTest is PlacementFixture {
         int24 refTick = PriceLib.fairTick(vault.pRefX18(), USDG_USD8, 6, TICK_SPACING);
         assertLt(tickOf(hubPool), refTick, "the pool is trading below P_ref");
 
+        uint256 askBefore = _askAmountTotal();
         vm.recordLogs();
         vm.prank(KEEPER);
-        vault.compound(hubPool);
+        (uint256 ampsFees,) = vault.compound(hubPool);
+        assertGt(ampsFees, 0, "the call really had AMPS-side fees it could have re-laddered");
 
-        (int24 anchorTick, int24 lowestTick,) = _lastAskPlacement(hubPool);
-        assertEq(anchorTick, refTick, "the re-ladder is anchored at tickOf(P_ref / P_counter)");
-        assertGe(lowestTick, refTick, "so its first cell sits at or above the reference cell");
+        assertEq(_askPlacementCount(hubPool), 0, "no ask Placement was emitted");
+        assertLe(_askAmountTotal(), askBefore, "and no ask cell grew");
+        assertGt(_bidPlacementCount(hubPool), 0, "while the counter side was placed as bids, as it always is");
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // §3.6 step 5 — the creator slice cannot be enlarged by cutting the sell fee
+    // §3.6 step 5 — the creator slice under a governed fee change
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice **The finding this closes.** `creatorCut = ampsFees x creatorBps / ampsFeeBps` reads the collected
-    ///         fee as "`ampsFeeBps` of what crossed the pool". `AMPS_FEE_BPS_MIN` and `CREATOR_FEE_BPS` are both
-    ///         100, so an entirely in-band `setAmpsFeeBps(100)` made that ratio **one** and routed every wei of
-    ///         the AMPS-side fees to the creator — no staker stream, no burn, no re-ladder. Flooring the divisor
-    ///         at `AMPS_FEE_BPS_DEFAULT` caps the slice at one fifth of the AMPS-side fees however low the live
-    ///         fee goes.
-    function test_theCreatorSliceIsCappedWhenTheSellFeeIsCutToItsFloor() public {
+    /// @notice The old divisor floor (`max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT)`) is gone, and what bounds the slice
+    ///         now is the clamp `creatorBps <= ampsFeeBps`. Cutting the base fee to its floor cannot pay the
+    ///         creator more than the whole of one currency's fees, the split stays exhaustive, and what the
+    ///         creator does not take is burned — which is the reason the floor is no longer needed: there is no
+    ///         permanent constituency left for a fee cut to starve.
+    function test_theCreatorSliceIsClampedToTheWholeFeeWhenTheSellFeeIsCutToItsFloor() public {
         _tradeForAmpsFees();
         hook.setHighWaterTick(hubPool, tickOf(hubPool));
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
-        // The whole attack: cut the base fee to its floor immediately before the permissionless call.
+        // Cut the base fee to its floor immediately before the permissionless call. `AMPS_FEE_BPS_MIN` and
+        // `CREATOR_FEE_BPS` are both 100, so the ratio is as large as it can ever be.
         hook.setAmpsFeeBps(Constants.AMPS_FEE_BPS_MIN);
-        assertEq(uint256(hook.ampsFeeBps()), uint256(Constants.CREATOR_FEE_BPS), "the ratio the bug turned into 1");
+        assertEq(uint256(hook.ampsFeeBps()), uint256(Constants.CREATOR_FEE_BPS), "the ratio is at its ceiling");
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 stakingBefore = amps.balanceOf(address(staking));
+        uint256 supplyBefore = amps.totalSupply();
 
         vm.recordLogs();
         vm.prank(KEEPER);
@@ -777,10 +892,38 @@ contract VaultCompoundTest is PlacementFixture {
         assertGt(ampsFees, 0, "there were fees to split");
 
         uint256 creatorPaid = amps.balanceOf(CREATOR) - creatorBefore;
-        assertLe(creatorPaid, ampsFees / 5, "never more than CREATOR_FEE_BPS / AMPS_FEE_BPS_DEFAULT of the fees");
-        assertGt(amps.balanceOf(address(staking)) - stakingBefore, 0, "the stakers were still paid");
-        assertGt(burned, 0, "the burn still happened");
-        assertGt(_lastCompoundRelaid(), 0, "and something was still re-laddered");
+        assertLe(creatorPaid, ampsFees, "never more than the whole of the AMPS-side fees");
+        assertEq(
+            creatorPaid,
+            ampsFees * vault.creatorBpsAt(block.timestamp) / Constants.AMPS_FEE_BPS_MIN,
+            "exactly creatorBps / ampsFeeBps of them"
+        );
+        assertEq(burned, ampsFees - creatorPaid, "and every wei that is left is still burned");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "the supply agrees");
+        assertEq(_askPlacementCount(hubPool), 0, "and nothing was re-laddered");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Revision 6 — the retired surface is gone
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice `staking()`, `burnBps()`, `stakerBps()`, their bands and their setters do not exist on the vault
+    ///         any more: staking was removed and the burn is unconditional, so there is no parameter to read and
+    ///         no selector for a stale integration — or a stale timelock proposal — to reach.
+    function test_theRetiredStakingAndBurnSelectorsAreGone() public {
+        string[5] memory reads = ["staking()", "burnBps()", "stakerBps()", "BURN_BPS_MAX()", "STAKER_BPS_MAX()"];
+        for (uint256 i; i < reads.length; ++i) {
+            (bool ok,) = address(vault).staticcall(abi.encodeWithSignature(reads[i]));
+            assertFalse(ok, string.concat("selector still reachable: ", reads[i]));
+        }
+
+        string[2] memory setters = ["setBurnBps(uint16)", "setStakerBps(uint16)"];
+        vm.startPrank(TIMELOCK);
+        for (uint256 i; i < setters.length; ++i) {
+            (bool ok,) = address(vault).call(abi.encodeWithSignature(setters[i], uint16(1)));
+            assertFalse(ok, string.concat("selector still reachable: ", setters[i]));
+        }
+        vm.stopPrank();
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -806,32 +949,82 @@ contract VaultCompoundTest is PlacementFixture {
         }
     }
 
-    /// @dev The last ask-side `Placement` for `poolId` in the recorded logs. `vm.recordLogs()` must have been
-    ///      armed before the call.
-    function _lastAskPlacement(PoolId poolId) private returns (int24 anchorTick, int24 lowestTick, int24 highestTick) {
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        for (uint256 i = logs.length; i != 0; --i) {
-            Vm.Log memory entry = logs[i - 1];
+    /// @dev How many `Placement` logs for `poolId` on the given side the recorded logs hold. `vm.recordLogs()`
+    ///      must have been armed before the call; the logs are *consumed* by the read, so a test asks once.
+    function _placementCount(Vm.Log[] memory logs, PoolId poolId, bool wantAbove) private view returns (uint256 n) {
+        for (uint256 i; i < logs.length; ++i) {
+            Vm.Log memory entry = logs[i];
             if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Placement.selector) continue;
             if (entry.topics[1] != PoolId.unwrap(poolId)) continue;
-            (bool above,,, int24 anchor,, int24 lower, int24 upper) =
-                abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
-            if (!above) continue;
-            return (anchor, lower, upper);
+            (bool above,,,,,,) = abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
+            if (above == wantAbove) ++n;
         }
-        revert("no ask Placement");
     }
 
-    /// @dev The `relaid` field of the last `Compound` in the recorded logs.
-    function _lastCompoundRelaid() private returns (uint256 relaid) {
-        Vm.Log[] memory logs = vm.getRecordedLogs();
+    /// @dev Ask-side `Placement` logs for `poolId`, out of the buffer this call drains.
+    function _askPlacementCount(PoolId poolId) private returns (uint256 n) {
+        return _placementCount(_drainLogs(), poolId, true);
+    }
+
+    /// @dev Bid-side `Placement` logs for `poolId`, out of the buffer this call drains.
+    function _bidPlacementCount(PoolId poolId) private returns (uint256 n) {
+        return _placementCount(_drainLogs(), poolId, false);
+    }
+
+    /// @dev The recorded logs, cached so several readers in one test see the same buffer: `vm.getRecordedLogs()`
+    ///      empties it.
+    function _drainLogs() private returns (Vm.Log[] memory logs) {
+        if (_logs.length == 0) {
+            Vm.Log[] memory fresh = vm.getRecordedLogs();
+            for (uint256 i; i < fresh.length; ++i) {
+                _logs.push(fresh[i]);
+            }
+        }
+        return _logs;
+    }
+
+    /// @dev The last `Compound` in the recorded logs, field by field.
+    function _lastCompound() private returns (Compounded memory log) {
+        Vm.Log[] memory logs = _drainLogs();
         for (uint256 i = logs.length; i != 0; --i) {
             Vm.Log memory entry = logs[i - 1];
             if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Compound.selector) continue;
-            (,,,, relaid) = abi.decode(entry.data, (uint256, uint256, uint256, uint256, uint256));
-            return relaid;
+            (log.ampsFees, log.counterFees, log.creatorAmps, log.creatorCounter, log.burned) =
+                abi.decode(entry.data, (uint256, uint256, uint256, uint256, uint256));
+            return log;
         }
         revert("no Compound");
+    }
+
+    /// @dev One round of "trade, compound, and check the creator got `creatorBps / ampsFeeBps` of both sides".
+    function _assertCreatorFraction(string memory label) private {
+        _tradeForAmpsFees();
+        hook.setHighWaterTick(hubPool, tickOf(hubPool));
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        syncMarket();
+
+        uint256 ampsBefore = amps.balanceOf(CREATOR);
+        uint256 usdgBefore = usdg.balanceOf(CREATOR);
+
+        delete _logs;
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        (uint256 ampsFees,) = vault.compound(hubPool);
+
+        Compounded memory log = _lastCompound();
+        uint256 feeBps = hook.ampsFeeBps();
+        uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
+        assertGt(ampsFees, 0, string.concat(label, ": the sell paid an AMPS-side fee"));
+        assertGt(log.counterFees, 0, string.concat(label, ": the buy paid a counter-side fee"));
+        assertEq(
+            amps.balanceOf(CREATOR) - ampsBefore, ampsFees * creatorBps / feeBps, string.concat(label, ": AMPS slice")
+        );
+        assertEq(
+            usdg.balanceOf(CREATOR) - usdgBefore,
+            log.counterFees * creatorBps / feeBps,
+            string.concat(label, ": counter slice")
+        );
+        delete _logs;
     }
 
     /// @dev The last `BountyPaid` in the recorded logs. `vm.recordLogs()` must have been armed before the call.
@@ -873,10 +1066,21 @@ contract VaultCompoundTest is PlacementFixture {
         }
     }
 
-    /// @dev The burn the fee split alone accounts for, so a test can tell it apart from a buyback.
+    /// @dev The burn the fee split alone accounts for, so a test can tell it apart from a buyback: since
+    ///      revision 6 that is the whole AMPS-side fee less the creator's slice.
     function _expectedBurnCut(uint256 ampsFees) private view returns (uint256) {
-        uint256 creatorCut = ampsFees * vault.creatorBpsAt(block.timestamp) / hook.ampsFeeBps();
-        uint256 stakerCut = (ampsFees - creatorCut) * vault.stakerBps() / Constants.BPS;
-        return (ampsFees - creatorCut - stakerCut) * vault.burnBps() / Constants.BPS;
+        uint256 feeBps = hook.ampsFeeBps();
+        uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
+        if (creatorBps > feeBps) creatorBps = feeBps;
+        return ampsFees - ampsFees * creatorBps / feeBps;
+    }
+
+    /// @dev The counter a pool's bid cells have been committed in total, which is what a counter re-placement
+    ///      adds to.
+    function _bidAmountTotal() private view returns (uint256 total) {
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        for (uint256 i; i < records.length; ++i) {
+            if (!records[i].above) total += records[i].amount;
+        }
     }
 }

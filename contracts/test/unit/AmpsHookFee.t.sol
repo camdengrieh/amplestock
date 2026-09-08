@@ -29,32 +29,53 @@ contract AmpsHookFeeTest is HookTestFixture {
     // The base table (§1.4 step 3)
     // -----------------------------------------------------------------------------------------------------------
 
+    /// @notice Revision 6: `ampsFeeBps` is the base on **both** directions of every pool, and `buyFeeBps` is the
+    ///         pass-through base — reachable only by the protocol router's rotation hop.
     function test_baseFeeTableByDirectionAndClass() public view {
-        // Entry pools: 30 bp to buy, 500 bp to sell.
+        // Every ordinary swap, in either direction and in any pool, is 500 bp.
         (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(usdgId, false, true, 1e18);
-        assertEq(base, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "entry buy base");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "entry buy base");
         assertEq(dyn, 0, "no dynamic component at zero deviation");
-        assertEq(pips, uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "entry buy pips");
+        assertEq(pips, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry buy pips");
 
         (pips, base,,) = hook.quoteFee(usdgId, true, true, 1e18);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "entry sell base");
         assertEq(pips, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry sell pips");
 
         (, base,,) = hook.quoteFee(wethId, false, true, 1e18);
-        assertEq(base, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "the WETH route is an entry pool too");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the WETH route is no different");
 
-        // Spokes: 5 bp to buy (10 bp for a high-volatility name), 500 bp to sell.
         (, base,,) = hook.quoteFee(stockId, false, true, 1e18);
-        assertEq(base, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "spoke buy base");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "spoke buy base");
 
         (, base,,) = hook.quoteFee(stockId, true, true, 1e18);
-        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the sell fee is protocol-wide");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "and the AMPS fee is protocol-wide");
+    }
+
+    /// @notice The pass-through table: 30 bp entry, 5 bp spoke, on both directions of a router rotation hop.
+    function test_thePassThroughTableIsTheOldBuyTable() public view {
+        (uint24 pips, uint16 base,,) = hook.quoteFee(usdgId, false, true, 1e18, true);
+        assertEq(base, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "entry hop 1");
+        assertEq(pips, uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "entry hop 1 pips");
+
+        (, base,,) = hook.quoteFee(usdgId, true, true, 1e18, true);
+        assertEq(base, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "entry hop 2, fully covered by its own hop 1");
+
+        (, base,,) = hook.quoteFee(stockId, false, true, 1e18, true);
+        assertEq(base, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "spoke hop 1");
+
+        (, base,,) = hook.quoteFee(stockId, true, true, 1e18, true);
+        assertEq(base, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "spoke hop 2");
+
+        // An exact-**output** sell consumes no credit, so even a flagged hop pays the AMPS fee.
+        (, base,,) = hook.quoteFee(stockId, true, false, 0, true);
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "exact output is never pass-through");
     }
 
     function test_theHighVolatilitySpokeBucketIsTenBasisPoints() public {
         vm.prank(TIMELOCK);
         hook.setBuyFeeBps(stockId, Constants.BUY_FEE_BPS_SPOKE_HIGH_VOL_DEFAULT);
-        (, uint16 base,,) = hook.quoteFee(stockId, false, true, 1e18);
+        (, uint16 base,,) = hook.quoteFee(stockId, false, true, 1e18, true);
         assertEq(base, 10, "SPOKE_HIGH_VOL");
     }
 
@@ -76,8 +97,8 @@ contract AmpsHookFeeTest is HookTestFixture {
         _buy(usdgKey, 1000e6);
         assertEq(
             _lastSwapFee(vm.getRecordedLogs()),
-            uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS,
-            "a buy pays 30 bp"
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            "an ordinary buy pays 500 bp"
         );
 
         vm.recordLogs();
@@ -85,8 +106,15 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(
             _lastSwapFee(vm.getRecordedLogs()),
             uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
-            "a lone sell pays 500 bp"
+            "and so does an ordinary sell"
         );
+
+        // And the one shape that does not: a router rotation, which pays each pool's pass-through fee.
+        vm.recordLogs();
+        _routerRotate(stockKey, usdgKey, 1e18);
+        uint24[] memory fees = _swapFees(vm.getRecordedLogs());
+        assertEq(fees[0], uint24(Constants.BUY_FEE_BPS_SPOKE_DEFAULT) * Constants.PIPS_PER_BPS, "hop 1: 5 bp");
+        assertEq(fees[1], uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS, "hop 2: 30 bp");
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -102,7 +130,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(selector, IHooks.beforeSwap.selector, "selector");
         assertEq(BeforeSwapDelta.unwrap(delta), BeforeSwapDelta.unwrap(BeforeSwapDeltaLibrary.ZERO_DELTA), "delta");
         assertTrue(fee & LPFeeLibrary.OVERRIDE_FEE_FLAG != 0, "the override flag is set");
-        assertEq(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, 3000, "30 bp in pips under the flag");
+        assertEq(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, 50_000, "500 bp in pips under the flag");
         assertLe(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, Constants.MAX_LP_FEE, "never above MAX_LP_FEE");
     }
 
@@ -110,12 +138,14 @@ contract AmpsHookFeeTest is HookTestFixture {
     // f_min (§1.4 step 6)
     // -----------------------------------------------------------------------------------------------------------
 
+    /// @dev The floor is only reachable through the pass-through base now: `ampsFeeBps` is banded at [100, 600],
+    ///      so an ordinary swap can never quote below 3 bp, while a 1 bp spoke rotation hop can.
     function test_theFeeFloorIsThreeBasisPoints() public {
         vm.prank(TIMELOCK);
         hook.setBuyFeeBps(stockId, Constants.BUY_FEE_BPS_SPOKE_MIN);
         policy.setDynOverride(0);
 
-        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18, true);
         assertEq(base, 1, "the base really is 1 bp");
         assertEq(dyn, 0, "and nothing dynamic");
         assertEq(pips, uint24(Constants.F_MIN_BPS) * Constants.PIPS_PER_BPS, "clamped up to f_min");
@@ -131,7 +161,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         _setGateDynCap(stockId, GateState.GREEN, Constants.DYN_CAP_NORMAL_BPS);
         (, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18);
         assertEq(dyn, Constants.DYN_CAP_NORMAL_BPS, "NORMAL caps at 300 bp");
-        assertEq(base, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "the base is untouched by the cap");
+        assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the base is untouched by the cap");
 
         _setGateDynCap(stockId, GateState.DEGRADED, Constants.DYN_CAP_DEGRADED_BPS);
         (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18);
@@ -161,7 +191,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         _buy(stockKey, 1e18);
         assertEq(
             _lastSwapFee(vm.getRecordedLogs()),
-            uint24(Constants.BUY_FEE_BPS_SPOKE_DEFAULT + Constants.FROZEN_FEE_FLOOR_BPS) * Constants.PIPS_PER_BPS,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT + Constants.FROZEN_FEE_FLOOR_BPS) * Constants.PIPS_PER_BPS,
             "base + frozen floor"
         );
     }
@@ -413,9 +443,26 @@ contract AmpsHookFeeTest is HookTestFixture {
     function test_theQuoteFeeContract() public {
         // 1. `amountIn == 0` gives the un-blended base, in both directions.
         (uint24 pips, uint16 base, uint16 dyn, bool refuse) = hook.quoteFee(usdgId, true, true, 0);
-        assertEq(base, hook.ampsFeeBps(), "a sell quotes ampsFeeBps");
+        assertEq(base, hook.ampsFeeBps(), "an ordinary sell quotes ampsFeeBps");
         (, base,,) = hook.quoteFee(usdgId, false, true, 0);
-        assertEq(base, hook.buyFeeBps(usdgId), "a buy quotes the pool's buyFeeBps");
+        assertEq(base, hook.ampsFeeBps(), "and so does an ordinary buy");
+
+        // 1b. The pass-through form answers the pool's `buyFeeBps` in both directions, `amountIn == 0` included:
+        //     the question it answers is "what would a rotation hop cost", not "what does a zero-sized one cost".
+        (, base,,) = hook.quoteFee(usdgId, false, true, 0, true);
+        assertEq(base, hook.buyFeeBps(usdgId), "a pass-through buy quotes the pool's buyFeeBps");
+        (, base,,) = hook.quoteFee(usdgId, true, true, 0, true);
+        assertEq(base, hook.buyFeeBps(usdgId), "and so does a pass-through exact-input sell");
+
+        // 1c. The four-argument form is a strict alias for `passThrough == false`.
+        (uint24 aliasPips, uint16 aliasBase, uint16 aliasDyn, bool aliasRefuse) =
+            hook.quoteFee(usdgId, true, true, 1e18);
+        (uint24 fivePips, uint16 fiveBase, uint16 fiveDyn, bool fiveRefuse) =
+            hook.quoteFee(usdgId, true, true, 1e18, false);
+        assertEq(aliasPips, fivePips, "alias pips");
+        assertEq(aliasBase, fiveBase, "alias base");
+        assertEq(aliasDyn, fiveDyn, "alias dyn");
+        assertEq(aliasRefuse, fiveRefuse, "alias refuse");
 
         // 2. `feePips` carries no override flag and is the clamped sum, in pips.
         (pips, base, dyn, refuse) = hook.quoteFee(usdgId, true, true, 1e18);
@@ -447,6 +494,7 @@ contract AmpsHookFeeTest is HookTestFixture {
     function testFuzz_everyQuoteDecomposesAsBasePlusDyn(
         bool sell,
         bool exactInput,
+        bool passThrough,
         uint96 amountIn,
         uint16 dynFromPolicy,
         uint8 gateStateRaw,
@@ -460,19 +508,26 @@ contract AmpsHookFeeTest is HookTestFixture {
         policy.setDynOverride(dynFromPolicy);
         _setGateFairAndCap(stockId, gateState, cap, _currentTick(stockId) + int24(fairOffset));
 
-        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, sell, exactInput, amountIn);
+        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, sell, exactInput, amountIn, passThrough);
 
-        uint16 sellFee = hook.ampsFeeBps();
-        assertGe(sellFee, Constants.AMPS_FEE_BPS_MIN, "ampsFeeBps floor");
-        assertLe(sellFee, Constants.AMPS_FEE_BPS_MAX, "ampsFeeBps ceiling");
+        uint16 ampsFee = hook.ampsFeeBps();
+        uint16 passThroughFee = hook.buyFeeBps(stockId);
+        assertGe(ampsFee, Constants.AMPS_FEE_BPS_MIN, "ampsFeeBps floor");
+        assertLe(ampsFee, Constants.AMPS_FEE_BPS_MAX, "ampsFeeBps ceiling");
 
-        if (sell) {
-            // Either the full sell fee or a blend between the buy fee and it; with no credit in a fresh
-            // transaction it is always the full sell fee.
-            assertEq(base, sellFee, "an uncredited sell pays the sell fee in full");
+        // I16: the base is one of exactly three things — the AMPS fee, the pool's pass-through fee, or a blend
+        // between them — and which one it is follows the flag and the direction and nothing else.
+        if (!passThrough) {
+            assertEq(base, ampsFee, "an ordinary hop pays the AMPS fee, whichever way it goes");
+        } else if (!sell) {
+            assertEq(base, passThroughFee, "a flagged buy is hop 1 of a rotation");
+        } else if (exactInput) {
+            assertEq(base, passThroughFee, "and a flagged exact-input sell is hop 2, fully covered");
         } else {
-            assertEq(base, hook.buyFeeBps(stockId), "a buy pays the pool's buy fee");
+            assertEq(base, ampsFee, "a flagged exact-output sell consumes no credit");
         }
+        assertGe(base, passThroughFee < ampsFee ? passThroughFee : ampsFee, "never below either leg of the blend");
+        assertLe(base, passThroughFee > ampsFee ? passThroughFee : ampsFee, "and never above either");
 
         assertLe(dyn, cap, "dyn <= dynCap_state");
         uint256 expected = uint256(base) + uint256(dyn);

@@ -12,9 +12,9 @@ import {console} from "forge-std/console.sol";
 
 /// @title Phase2InvariantTest
 /// @notice The plan's Verification section, run against the wired Phase 2 system rather than against mocks:
-///         I3, I5, I6, I8, I10, I12, I21, I22, I23, I24, I27, I28, I30, I36 and I38, driven by `Phase2Handler`
+///         I3, I5, I6, I8, I10, I12, I21, I22, I23, I24, I27, I28, I30 and I38, driven by `Phase2Handler`
 ///         over random interleavings of bonds, claims, redemptions, checkpoints, feed and hub moves, guardian
-///         freezes, staking and bounty funding.
+///         freezes and bounty funding. (I36 went with staking in plan revision 6.)
 ///
 /// @dev Runs and depth come from `foundry.toml` (64 x 64 by default, 256 x 128 under the `ci` profile) with
 ///      `fail_on_revert = false`; the handler catches every revert itself and records violations as ghosts, so a
@@ -28,8 +28,8 @@ contract Phase2InvariantTest is Phase2Fixture {
 
         handler = new Phase2Handler(_wiring());
 
-        // The handler is the redeemer and the staker; it gets its shares out of the POL tranche rather than from
-        // a mint, so `totalSupply` is still exactly `S0` when the campaign starts and I3 has a fixed origin.
+        // The handler is the redeemer; it gets its shares out of the POL tranche rather than from a mint, so
+        // `totalSupply` is still exactly `S0` when the campaign starts and I3 has a fixed origin.
         giveShares(address(handler), 1500e18);
 
         targetContract(address(handler));
@@ -47,15 +47,9 @@ contract Phase2InvariantTest is Phase2Fixture {
         selectors[10] = Phase2Handler.poke.selector;
         selectors[11] = Phase2Handler.freeze.selector;
         selectors[12] = Phase2Handler.unfreeze.selector;
-        selectors[13] = Phase2Handler.notifyReward.selector;
-        selectors[14] = Phase2Handler.stake.selector;
+        selectors[13] = Phase2Handler.fundPot.selector;
+        selectors[14] = Phase2Handler.donate.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
-
-        bytes4[] memory more = new bytes4[](3);
-        more[0] = Phase2Handler.unstake.selector;
-        more[1] = Phase2Handler.fundPot.selector;
-        more[2] = Phase2Handler.donate.selector;
-        targetSelector(FuzzSelector({addr: address(handler), selectors: more}));
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -199,7 +193,7 @@ contract Phase2InvariantTest is Phase2Fixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // Redemption, claims and staking
+    // Redemption and claims
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice I23: every redemption paid exactly `floor(floor(b x shares / T) x (BPS - fee) / BPS)` of every
@@ -215,15 +209,6 @@ contract Phase2InvariantTest is Phase2Fixture {
         assertFalse(handler.claimEverFailed(), "a vest already sold always completes");
     }
 
-    /// @notice I36: `AmpsStaking.totalAssets()` never fell except on a withdrawal, released never exceeds
-    ///         notified, and the staker slice is inside its hard cap.
-    function invariant_I36_stakingAssetsOnlyFallOnWithdrawals() public view {
-        assertFalse(handler.stakingAssetsEverFell(), "totalAssets never falls outside a withdrawal");
-        assertLe(staking.releasedRewards(), staking.totalNotified(), "released <= notified");
-        assertEq(staking.totalNotified(), handler.notifiedRewards(), "and only the vault ever notified");
-        assertLe(vault.stakerBps(), Constants.STAKER_BPS_MAX, "stakerBps <= 5000");
-    }
-
     // -------------------------------------------------------------------------------------------------------------
     // The campaign itself
     // -------------------------------------------------------------------------------------------------------------
@@ -237,10 +222,7 @@ contract Phase2InvariantTest is Phase2Fixture {
         handler.refreshFeeds();
         handler.checkpoint();
         handler.claim(0);
-        handler.stake(50e18);
-        handler.notifyReward(10e18);
         handler.warp(1 hours);
-        handler.unstake(Constants.BPS);
         handler.fundPot(100e6);
         handler.donate(1, 1e18);
         handler.moveFeed(2, 120);
@@ -258,7 +240,6 @@ contract Phase2InvariantTest is Phase2Fixture {
         assertGt(handler.redeemCount(), 0, "a redemption landed");
         assertGt(handler.mintedVesting(), 0, "the bond minted");
         assertGt(handler.burnedShares(), 0, "the redemption burned");
-        assertGt(handler.notifiedRewards(), 0, "the staker slice was paid");
 
         assertFalse(handler.navEverFell(), "and none of it lowered NAV/share");
         assertFalse(handler.bondEverDiluted(), "nor diluted a holder");
@@ -266,7 +247,6 @@ contract Phase2InvariantTest is Phase2Fixture {
         assertFalse(handler.claimEverFailed(), "nor blocked a vest");
         assertFalse(handler.capacityEverExceeded(), "nor over-issued");
         assertFalse(handler.referenceEverOutOfBand(), "nor unpinned the reference");
-        assertFalse(handler.stakingAssetsEverFell(), "nor lost staked assets");
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -292,7 +272,6 @@ contract Phase2InvariantTest is Phase2Fixture {
             vault: vault,
             amps: amps,
             bonds: bonds,
-            staking: staking,
             pot: pot,
             gate: gate,
             marketRef: marketRef,

@@ -7,7 +7,6 @@ import {BountyPot} from "../../src/keeper/BountyPot.sol";
 import {OracleGate} from "../../src/oracle/OracleGate.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
@@ -36,7 +35,6 @@ import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
 /// @param amps The AMPS token.
 /// @param hook The real `AmpsHook`.
 /// @param bonds The bonds shell.
-/// @param staking xAMPS.
 /// @param pot The keeper bounty pot.
 /// @param gate The oracle gate.
 /// @param registry The pool registry.
@@ -65,7 +63,6 @@ struct Phase3Wiring {
     Amps amps;
     AmpsHook hook;
     AmpsBonds bonds;
-    AmpsStaking staking;
     BountyPot pot;
     OracleGate gate;
     PoolRegistry registry;
@@ -125,9 +122,9 @@ contract Phase3Handler is CommonBase, StdCheats, StdUtils {
     OracleGate internal immutable GATE;
     PoolRegistry internal immutable REGISTRY;
     IPoolManager internal immutable POOL_MANAGER;
-    /// @dev The wiring this half of the action space does not use - the staking contract, the bounty pot, the
-    ///      quoter, the timelock, the keeper and the hub pool id - is carried by `Phase3Wiring` for the other
-    ///      half and by {Phase3Ghosts}, and is deliberately not held here: an unused immutable is bytecode.
+    /// @dev The wiring this half of the action space does not use - the bounty pot, the quoter, the timelock,
+    ///      the keeper and the hub pool id - is carried by `Phase3Wiring` for the other half and by
+    ///      {Phase3Ghosts}, and is deliberately not held here: an unused immutable is bytecode.
     IUniswapV4Router04 internal immutable ROUTER;
     IPermit2 internal immutable PERMIT2;
     address internal immutable USDG;

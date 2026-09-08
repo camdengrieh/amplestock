@@ -382,7 +382,7 @@ interface IPoolRegistry {
     /// @dev The registry names a vault in three places that matter: it is the address it asks to open a pool, the
     ///      address it reads `pRefX18` and `bonds` from, and the address the hook is told to accept. Leaving it
     ///      pointing at an evacuated shell would mean the standby could never register a pool, which is why the
-    ///      migration moves it alongside AMPS, `AmpsBonds`, `AmpsStaking`, `BountyPot` and the hook.
+    ///      migration moves it alongside AMPS, `AmpsBonds`, `BountyPot` and the hook.
     /// @param newVault The standby vault. Must be non-zero.
     function setVault(address newVault) external;
 }

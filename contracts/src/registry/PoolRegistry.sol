@@ -44,7 +44,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 /// @dev **Wiring.** `vault` and `hook` are written in the constructor, into the slots the state model reserves for
 ///      them (§1.4 slot 0 and slot 1). `hook` has no setter at all. `vault` has exactly one, {setVault}, and its
 ///      only caller is the vault itself: it exists so that `AmpsVault.emergencyMigrate` can hand the registry on
-///      to the standby in the same transaction as AMPS, `AmpsBonds`, `AmpsStaking`, `BountyPot` and the hook. No
+///      to the standby in the same transaction as AMPS, `AmpsBonds`, `BountyPot` and the hook. No
 ///      governance path — not even the 7-day timelock — reaches it, so from every direction but an evacuation the
 ///      pair is still set-once. `timelock`, `amps`, `weth9` and `usdg` are immutables, which is why they do not
 ///      appear in the documented storage layout: they live in code. They are passed explicitly rather than read

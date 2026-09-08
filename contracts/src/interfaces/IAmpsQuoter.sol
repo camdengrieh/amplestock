@@ -23,7 +23,7 @@ import {PoolClass} from "../types/Types.sol";
 ///
 ///      | bit | source                | what is zeroed when it is set                             |
 ///      |-----|-----------------------|-----------------------------------------------------------|
-///      | 0   | `AmpsHook`            | ticks, bands, fees, `refuseBuy`/`refuseSell`               |
+///      | 0   | `AmpsHook`            | ticks, bands, all fee legs, `refuseBuy`/`refuseSell`               |
 ///      | 1   | `OracleGate`          | `gateState`, `session`, `feedStale`, `corporateFreeze`     |
 ///      | 2   | `FeedRegistry`        | the counter-asset price feeding `pMktX18`                  |
 ///      | 3   | vault checkpoint      | `navPerShareX18`, `pRefX18`, `premiumX18`, `checkpointAge` |
@@ -55,11 +55,19 @@ interface IAmpsQuoter {
     /// @param fairTick The tick the deviation is measured against.
     /// @param innerBandTicks The inner band half-width in force, by session and class.
     /// @param outerRailTicks The outer rail half-width in force.
-    /// @param buyFeeBps The pool's base buy fee.
-    /// @param ampsFeeBps The protocol-wide base sell fee.
-    /// @param buyFeePips The **total** fee a buy would pay right now, in pips, base plus the clamped dynamic part.
-    /// @param sellFeePips The total fee an uncredited sell would pay right now, in pips. A sell inside a rotation
-    ///        pays less; use {quoteRotation} for that.
+    /// @param buyFeeBps The pool's **pass-through** base fee, in bps: what one hop of a protocol-router rotation
+    ///        costs. Revision 6 — it is not what an ordinary buy pays.
+    /// @param ampsFeeBps The protocol-wide AMPS fee, in bps: the base fee on **both** directions of this pool, and
+    ///        what every swap that is not a router rotation hop pays.
+    /// @param buyFeePips The **total** fee an ordinary buy would pay right now, in pips: `ampsFeeBps` plus the
+    ///        clamped dynamic part. This is the number a front end quotes a user who is buying AMPS.
+    /// @param sellFeePips The total fee an ordinary sell would pay right now, in pips. Same base, the sell
+    ///        direction's dynamic part.
+    /// @param passThroughBuyFeePips The total fee hop 1 of a protocol-router rotation would pay through this pool,
+    ///        in pips: `buyFeeBps` plus the buy direction's clamped dynamic part. **Appended field, revision 6.**
+    ///        Unreachable except through `AmpsRouter.rotate`; see {quoteRotation}.
+    /// @param passThroughSellFeePips The same for hop 2 — an exact-input sell fully covered by the credit hop 1
+    ///        created: `buyFeeBps` plus the sell direction's clamped dynamic part. **Appended field, revision 6.**
     /// @param dynBps The dynamic component in force, in bps.
     /// @param dynCapBps The cap on it for the pool's current gate state.
     /// @param refuseSell True when a sell would be refused for beginning beyond the outer rail on the
@@ -100,6 +108,8 @@ interface IAmpsQuoter {
         uint16 ampsFeeBps;
         uint24 buyFeePips;
         uint24 sellFeePips;
+        uint24 passThroughBuyFeePips;
+        uint24 passThroughSellFeePips;
         uint16 dynBps;
         uint16 dynCapBps;
         bool refuseSell;
@@ -133,20 +143,26 @@ interface IAmpsQuoter {
     /// @notice Prices a rotation — stock -> AMPS -> stock, or any two-hop path through an Amplestocks pool — with
     ///         the same-transaction rotation credit applied exactly as the hook would apply it.
     ///
+    /// @dev **This prices the `AmpsRouter.rotate` path and nothing else.** Both hops are quoted as pass-through —
+    ///      base `buyFeeBps[hop1]` and `buyFeeBps[hop2]` — because that is the fee the hook charges when, and only
+    ///      when, `sender == IAmpsHook.router()` and both hops carry `Constants.ROUTER_ROTATE`. The same two swaps
+    ///      built by hand through any other router each pay `ampsFeeBps`; use {quoteExactIn} twice for that.
+    ///
     /// @dev **The credit is simulated, never read.** `IAmpsHook.rotationCredit(sender)` lives in EIP-1153 transient
     ///      storage and is therefore always zero when read from a fresh `eth_call`; consulting it would make every
     ///      quote wrong in exactly the direction that matters. What this function does instead is model the credit
-    ///      the caller's *own* hop 1 will create:
+    ///      the router's own hop 1 will create:
     ///
     ///      ```
-    ///      hop 1: a buy in `hop1`, paying buyFeeBps[hop1]; the AMPS it yields is the credit
-    ///      hop 2: an exact-input sell in `hop2`, base fee
+    ///      hop 1: a pass-through buy in `hop1`, paying buyFeeBps[hop1]; the AMPS it yields is the credit
+    ///      hop 2: a pass-through exact-input sell of exactly that AMPS in `hop2`, base fee
     ///             = buyFeeBps[hop2] + ceilDiv((ampsFeeBps - buyFeeBps[hop2]) * (ampsIn - credit), ampsIn)
+    ///             = buyFeeBps[hop2], because `rotate` sells precisely what hop 1 bought
     ///      ```
     ///
     ///      That is the hook's own delta form, rounded up the same way, so the quote is exact rather than
     ///      approximate. Exact-**output** sells consume no credit and pay `ampsFeeBps` in full, which is why the
-    ///      dApp always builds hop 2 as `SWAP_EXACT_IN`.
+    ///      router only ever builds hop 2 as an exact-input swap.
     /// @param hop1 The pool bought through.
     /// @param hop2 The pool sold through.
     /// @param amountIn The input to hop 1, in `hop1`'s counter-asset raw units.

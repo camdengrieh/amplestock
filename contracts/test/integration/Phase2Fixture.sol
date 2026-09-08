@@ -12,7 +12,6 @@ import {OracleGate} from "../../src/oracle/OracleGate.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
 import {PoolRegistry} from "../../src/registry/PoolRegistry.sol";
 import {PoolRegistryLens} from "../../src/registry/PoolRegistryLens.sol";
-import {AmpsStaking} from "../../src/staking/AmpsStaking.sol";
 import {Amps} from "../../src/token/Amps.sol";
 import {Constants} from "../../src/types/Constants.sol";
 import {FeedConfig, InclusionRecord, PoolClass} from "../../src/types/Types.sol";
@@ -39,7 +38,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 /// @title Phase2Fixture
 /// @notice The whole Phase 2 system, real contract by real contract, on the local Uniswap v4 stack: `Amps`,
 ///         `AmpsVault` (+ the linked `VaultNavLib`), `PoolRegistry` + lens, `AmpsBonds` + `BondPolicy` + lens,
-///         `AmpsStaking`, `BountyPot`, `OracleGate` + `FeedRegistry` + `GatePriceMath`, `ZeroPositionValuer`, an
+///         `BountyPot`, `OracleGate` + `FeedRegistry` + `GatePriceMath`, `ZeroPositionValuer`, an
 ///         OZ `VestingWallet` for the team tranche, and the launch seed that puts NAV/share at $1.00.
 ///
 ///         Only three things in here are not the production contract: `AmpsHook` does not exist yet, so the
@@ -134,7 +133,6 @@ abstract contract Phase2Fixture is V4TestBase {
     AmpsBonds internal bonds;
     AmpsBondsLens internal bondsLens;
     BondPolicy internal policy;
-    AmpsStaking internal staking;
     BountyPot internal pot;
     OracleGate internal gate;
     FeedRegistry internal feeds;
@@ -275,14 +273,12 @@ abstract contract Phase2Fixture is V4TestBase {
         policy = new BondPolicy();
         bonds = new AmpsBonds(address(vault), address(registry), address(policy));
         bondsLens = new AmpsBondsLens();
-        staking = new AmpsStaking(IERC20(address(amps)), address(vault), TIMELOCK);
         pot = new BountyPot(address(usdg), address(vault), TIMELOCK);
         valuer = new ZeroPositionValuer();
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
 
         vm.label(address(registry), "PoolRegistry");
         vm.label(address(bonds), "AmpsBonds");
-        vm.label(address(staking), "AmpsStaking");
         vm.label(address(pot), "BountyPot");
         vm.label(address(gate), "OracleGate");
         vm.label(address(feeds), "FeedRegistry");
@@ -321,7 +317,6 @@ abstract contract Phase2Fixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
-        vault.setPolicyPointer(bytes32("staking"), address(staking));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feeds));

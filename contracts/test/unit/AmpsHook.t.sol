@@ -15,7 +15,7 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 /// @title AmpsHookTest
@@ -442,6 +442,85 @@ contract AmpsHookTest is HookTestFixture {
         assertEq(hook.feePolicy(), address(replacement), "pointer moved");
     }
 
+    /// @notice The router pointer — the whole of the pass-through exemption — is the timelock's alone, is
+    ///         replaceable, and accepts the zero address, which withdraws the exemption entirely.
+    /// @dev No code check and no zero check, deliberately: the hook never *calls* this address. It is a
+    ///      permission, compared against the `sender` the PoolManager reports, so a wrong value can move no value
+    ///      and block no swap — the worst it can do is be nobody, in which case nothing is ever pass-through.
+    function test_theRouterPointerIsTimelockOnlyAndClearable() public {
+        assertEq(hook.router(), address(router), "wired in the fixture");
+
+        vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, address(this)));
+        hook.setRouter(STRANGER);
+
+        vm.expectEmit(true, true, false, false, address(hook));
+        emit IAmpsHook.RouterChanged(address(router), STRANGER);
+        vm.prank(TIMELOCK);
+        hook.setRouter(STRANGER);
+        assertEq(hook.router(), STRANGER, "replaceable");
+
+        vm.prank(TIMELOCK);
+        hook.setRouter(address(0));
+        assertEq(hook.router(), address(0), "and clearable");
+    }
+
+    /// @notice With no router named, nothing in the system is pass-through — including a hop that carries the
+    ///         flag from the address that used to be the router.
+    function test_clearingTheRouterWithdrawsTheExemption() public {
+        bytes memory rotateFlag = abi.encode(Constants.ROUTER_ROTATE);
+        SwapParams memory buy = SwapParams({zeroForOne: false, amountSpecified: -1e6, sqrtPriceLimitX96: 0});
+
+        vm.prank(address(poolManager));
+        (,, uint24 withRouter) = hook.beforeSwap(address(router), usdgKey, buy, rotateFlag);
+
+        vm.prank(TIMELOCK);
+        hook.setRouter(address(0));
+
+        vm.prank(address(poolManager));
+        (,, uint24 without) = hook.beforeSwap(address(router), usdgKey, buy, rotateFlag);
+
+        assertEq(
+            withRouter & LPFeeLibrary.REMOVE_OVERRIDE_MASK,
+            uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS,
+            "pass-through while the router is named"
+        );
+        assertEq(
+            without & LPFeeLibrary.REMOVE_OVERRIDE_MASK,
+            uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS,
+            "and the AMPS fee once it is not"
+        );
+        // `address(0)` can never be a `sender`, so an unset router cannot accidentally exempt anybody.
+        vm.prank(address(poolManager));
+        (,, uint24 fromZero) = hook.beforeSwap(address(0), usdgKey, buy, rotateFlag);
+        assertEq(fromZero, without, "the zero address is nobody, not everybody");
+    }
+
+    /// @notice A `hookData` of the wrong length, or the right length and the wrong bytes, is not the flag.
+    function test_onlyTheExactFlagIsTheFlag() public {
+        SwapParams memory buy = SwapParams({zeroForOne: false, amountSpecified: -1e6, sqrtPriceLimitX96: 0});
+        uint24 ampsFeePips = uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS;
+
+        bytes[4] memory notTheFlag = [
+            bytes(""),
+            abi.encodePacked(Constants.ROUTER_ROTATE, uint8(0)),
+            abi.encodePacked(bytes31(Constants.ROUTER_ROTATE)),
+            abi.encode(keccak256("amplestocks.router.ROTATE "))
+        ];
+        for (uint256 i; i < notTheFlag.length; ++i) {
+            vm.prank(address(poolManager));
+            (,, uint24 fee) = hook.beforeSwap(address(router), usdgKey, buy, notTheFlag[i]);
+            assertEq(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, ampsFeePips, "not the flag, not pass-through");
+        }
+
+        vm.prank(address(poolManager));
+        (,, uint24 real) = hook.beforeSwap(address(router), usdgKey, buy, abi.encode(Constants.ROUTER_ROTATE));
+        assertEq(
+            real & LPFeeLibrary.REMOVE_OVERRIDE_MASK,
+            uint24(Constants.BUY_FEE_BPS_ENTRY_DEFAULT) * Constants.PIPS_PER_BPS,
+            "and the flag itself is"
+        );
+    }
+
     function test_gateCacheSecondsIsTimelockOnlyAndBanded() public {
         assertEq(hook.gateCacheSeconds(), Constants.GATE_CACHE_SECONDS_DEFAULT, "launch value");
 
@@ -556,6 +635,7 @@ contract AmpsHookTest is HookTestFixture {
         assertEq(hook.registry(), address(registry), "registry");
         assertEq(hook.timelock(), TIMELOCK, "timelock");
         assertEq(hook.oracleGate(), address(gate), "the gate, read through the vault");
+        assertEq(hook.router(), address(router), "the protocol router");
         assertEq(hook.TOTAL_FEE_BPS_MAX(), Constants.TOTAL_FEE_BPS_MAX, "2,600 bp");
     }
 

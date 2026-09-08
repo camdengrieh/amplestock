@@ -15,7 +15,6 @@ import {FeePolicy} from "../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../src/policy/LadderPolicy.sol";
 import {RolloutPolicy} from "../src/policy/RolloutPolicy.sol";
 import {PoolRegistry} from "../src/registry/PoolRegistry.sol";
-import {AmpsStaking} from "../src/staking/AmpsStaking.sol";
 import {Amps} from "../src/token/Amps.sol";
 import {Constants} from "../src/types/Constants.sol";
 import {LadderPositionValuer} from "../src/valuer/LadderPositionValuer.sol";
@@ -24,7 +23,6 @@ import {Calendar} from "./lib/Calendar.sol";
 import {Gov, ITimelock} from "./lib/Gov.sol";
 import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IExtsload} from "@uniswap/v4-core/src/interfaces/IExtsload.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -37,7 +35,7 @@ import {console2} from "forge-std/console2.sol";
 /// @notice Everything the Amplestocks system is made of, deployed in the one order the constructors allow, and
 ///         recorded in `script/config/deployments.json` and `script/config/constructor-args.json`.
 ///
-///         It stands in for the plan's `02_Token`, `03_Vault`, `07_Bonds` and `08_Staking` — those are one
+///         It stands in for the plan's `02_Token`, `03_Vault` and `07_Bonds` — those are one
 ///         transaction batch in practice, because the addresses are mutually dependent and splitting them across
 ///         scripts would mean re-predicting the same nonces four times. `02_Libraries` still runs first (the
 ///         vault cannot be *built* without the four library addresses), `04_MineHook` is the same salt search this
@@ -156,7 +154,6 @@ contract Core is Script {
         address registry;
         address hook;
         address bonds;
-        address staking;
         address bountyPot;
         address feedRegistry;
         address oracleGate;
@@ -333,7 +330,7 @@ contract Core is Script {
         set.registry = address(registry);
     }
 
-    /// @dev Everything that takes the four core addresses: the oracle layer, bonds, staking, the bounty pot, the
+    /// @dev Everything that takes the four core addresses: the oracle layer, bonds, the bounty pot, the
     ///      valuer, the three pure policies, the quoter and the team's vesting wallet.
     function _deployPeriphery(Config memory cfg, Set memory set) private {
         vm.startBroadcast(cfg.deployer);
@@ -346,9 +343,6 @@ contract Core is Script {
         }
         if (set.bondPolicy == address(0)) set.bondPolicy = address(new BondPolicy());
         if (set.bonds == address(0)) set.bonds = address(new AmpsBonds(set.vault, set.registry, set.bondPolicy));
-        if (set.staking == address(0)) {
-            set.staking = address(new AmpsStaking(IERC20(set.amps), set.vault, set.timelock));
-        }
         if (set.bountyPot == address(0)) set.bountyPot = address(new BountyPot(cfg.usdg, set.vault, set.timelock));
         if (set.positionValuer == address(0)) {
             set.positionValuer =
@@ -389,9 +383,6 @@ contract Core is Script {
         }
         if (vault.bonds() == address(0)) {
             Gov.send(ctx, set.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("bonds"), set.bonds)));
-        }
-        if (vault.staking() == address(0)) {
-            Gov.send(ctx, set.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("staking"), set.staking)));
         }
         if (vault.bountyPot() == address(0)) {
             Gov.send(ctx, set.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (bytes32("bountyPot"), set.bountyPot)));
@@ -575,7 +566,6 @@ contract Core is Script {
         set.registry = _address(json, ".core.registry", "AMPS_REGISTRY");
         set.hook = _address(json, ".core.hook", "AMPS_HOOK");
         set.bonds = _address(json, ".core.bonds", "AMPS_BONDS");
-        set.staking = _address(json, ".core.staking", "AMPS_STAKING");
         set.bountyPot = _address(json, ".core.bountyPot", "AMPS_BOUNTY_POT");
         set.feedRegistry = _address(json, ".core.feedRegistry", "AMPS_FEED_REGISTRY");
         set.oracleGate = _address(json, ".core.oracleGate", "AMPS_ORACLE_GATE");
@@ -603,7 +593,6 @@ contract Core is Script {
         vm.serializeAddress(core, "registry", set.registry);
         vm.serializeAddress(core, "hook", set.hook);
         vm.serializeAddress(core, "bonds", set.bonds);
-        vm.serializeAddress(core, "staking", set.staking);
         vm.serializeAddress(core, "bountyPot", set.bountyPot);
         vm.serializeAddress(core, "feedRegistry", set.feedRegistry);
         vm.serializeAddress(core, "oracleGate", set.oracleGate);
@@ -639,7 +628,7 @@ contract Core is Script {
     ///      rather than reconstructed later from memory; `12_Verify` turns this file into the commands.
     /// @param set The addresses.
     function writeConstructorArgs(Set memory set) public {
-        string[] memory items = new string[](14);
+        string[] memory items = new string[](13);
         items[0] = _argEntry("Amps", "src/token/Amps.sol:Amps", set.amps, abi.encode(set.vault));
         items[1] = _argEntry(
             "AmpsVault",
@@ -679,26 +668,20 @@ contract Core is Script {
             abi.encode(set.vault, set.registry, set.bondPolicy)
         );
         items[8] = _argEntry(
-            "AmpsStaking",
-            "src/staking/AmpsStaking.sol:AmpsStaking",
-            set.staking,
-            abi.encode(set.amps, set.vault, set.timelock)
-        );
-        items[9] = _argEntry(
             "BountyPot",
             "src/keeper/BountyPot.sol:BountyPot",
             set.bountyPot,
             abi.encode(set.usdg, set.vault, set.timelock)
         );
-        items[10] = _argEntry(
+        items[9] = _argEntry(
             "LadderPositionValuer",
             "src/valuer/LadderPositionValuer.sol:LadderPositionValuer",
             set.positionValuer,
             abi.encode(set.poolManager, set.vault, set.registry)
         );
-        items[11] = _argEntry("LadderPolicy", "src/policy/LadderPolicy.sol:LadderPolicy", set.ladderPolicy, "");
-        items[12] = _argEntry("RolloutPolicy", "src/policy/RolloutPolicy.sol:RolloutPolicy", set.rolloutPolicy, "");
-        items[13] = _argEntry(
+        items[10] = _argEntry("LadderPolicy", "src/policy/LadderPolicy.sol:LadderPolicy", set.ladderPolicy, "");
+        items[11] = _argEntry("RolloutPolicy", "src/policy/RolloutPolicy.sol:RolloutPolicy", set.rolloutPolicy, "");
+        items[12] = _argEntry(
             "AmpsQuoter",
             "src/periphery/AmpsQuoter.sol:AmpsQuoter",
             set.quoter,
@@ -805,7 +788,6 @@ contract Core is Script {
         vm.serializeString(obj, "registry", "AMPS_REGISTRY");
         vm.serializeString(obj, "hook", "AMPS_HOOK");
         vm.serializeString(obj, "bonds", "AMPS_BONDS");
-        vm.serializeString(obj, "staking", "AMPS_STAKING");
         vm.serializeString(obj, "bountyPot", "AMPS_BOUNTY_POT");
         vm.serializeString(obj, "feedRegistry", "AMPS_FEED_REGISTRY");
         vm.serializeString(obj, "oracleGate", "AMPS_ORACLE_GATE");
@@ -828,7 +810,6 @@ contract Core is Script {
         console2.log("feedRegistry   %s", set.feedRegistry);
         console2.log("oracleGate     %s", set.oracleGate);
         console2.log("bonds          %s", set.bonds);
-        console2.log("staking        %s", set.staking);
         console2.log("bountyPot      %s", set.bountyPot);
         console2.log("positionValuer %s", set.positionValuer);
         console2.log("ladderPolicy   %s", set.ladderPolicy);
