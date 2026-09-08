@@ -8,22 +8,33 @@
  * are history and aggregates. A failed fetch renders "indexer unavailable"; it never renders zero,
  * and it never blocks a trade.
  *
- * The routes are `docs/indexer.md` §7's typed HTTP layer, verbatim. Field-level shapes in
- * `./types` remain the dApp's requirement rather than a transcription of the indexer's own response
- * types, and every reader tolerates a missing field by rendering that panel as unavailable — so an
- * indexer that names a field differently costs one panel, not the page. `bigint` does not survive
- * `JSON.stringify`, so every numeric field crosses the wire as a decimal string.
+ * The routes are `docs/indexer.md` §7's typed HTTP layer, verbatim, and `./types` is a
+ * transcription of what those routes return rather than a wish list. Every reader still tolerates a
+ * missing field by rendering that panel as unavailable, so an indexer that renames a field costs
+ * one panel and not the page. `bigint` does not survive `JSON.stringify`, so every numeric field
+ * crosses the wire as a decimal string.
+ *
+ * **The `/api/*` layer answers named envelopes, not bare arrays** — `{points}`, `{pools}`,
+ * `{burns, total, count}`, `{status, transitions}`. The methods below unwrap them, so a surface
+ * holds the rows and never an envelope; an envelope whose key is absent unwraps to an empty list
+ * rather than to `undefined`, because "the indexer answered and there is nothing" and "the indexer
+ * did not answer" are different states and only the second is an unavailability.
  */
 
 import type {
-  BondBoardRow,
-  BurnEvent,
-  FlywheelMetrics,
-  GateStatusRow,
+  BondsResponse,
+  BurnHistory,
+  CreatorFeeStatus,
+  FlywheelResponse,
+  GateResponse,
   IndexerHealth,
-  LadderFill,
+  LadderDetail,
   NavPoint,
-  VaultSummary,
+  PointsResponse,
+  PoolRow,
+  PoolsResponse,
+  PremiumPoint,
+  VaultResponse,
 } from './types'
 
 export const ENDPOINTS = {
@@ -39,6 +50,9 @@ export const ENDPOINTS = {
   flywheel: '/api/flywheel',
   gateStatus: '/api/gate',
   burnHistory: '/api/burns',
+  /** The creator schedule and what it has paid in each currency. */
+  creatorFee: '/api/creator-fee',
+  supply: '/api/supply',
   constituents: '/api/constituents',
   parameters: '/api/parameters',
   reconciliation: '/api/reconciliation',
@@ -96,41 +110,75 @@ export class IndexerClient {
     return this.get<IndexerHealth>(ENDPOINTS.health)
   }
 
-  vaultSummary(): Promise<IndexerResult<VaultSummary>> {
-    return this.get<VaultSummary>(ENDPOINTS.vaultSummary)
+  /** The vault summary, the last share sample and the last NAV reconciliation, in one call. */
+  vaultSummary(): Promise<IndexerResult<VaultResponse>> {
+    return this.get<VaultResponse>(ENDPOINTS.vaultSummary)
   }
 
   /** NAV/share, `A` and `T` over time, oldest first. */
-  navHistory(params: {since?: number; limit?: number} = {}): Promise<IndexerResult<NavPoint[]>> {
-    return this.get<NavPoint[]>(ENDPOINTS.navHistory, {since: params.since, limit: params.limit ?? 500})
+  async navHistory(params: {since?: number; limit?: number} = {}): Promise<IndexerResult<readonly NavPoint[]>> {
+    return unwrap(
+      await this.get<PointsResponse<NavPoint>>(ENDPOINTS.navHistory, {
+        since: params.since,
+        limit: params.limit ?? 500,
+      }),
+      (data) => data.points ?? [],
+    )
   }
 
-  /** Every registered pool with its live state and ladder totals. */
-  pools(): Promise<IndexerResult<LadderFill[]>> {
-    return this.get<LadderFill[]>(ENDPOINTS.pools)
+  /** `P_ref`, `P_mkt` and the premium over time, oldest first. */
+  async premiumHistory(params: {since?: number; limit?: number} = {}): Promise<IndexerResult<readonly PremiumPoint[]>> {
+    return unwrap(
+      await this.get<PointsResponse<PremiumPoint>>(ENDPOINTS.premiumHistory, {
+        since: params.since,
+        limit: params.limit ?? 500,
+      }),
+      (data) => data.points ?? [],
+    )
+  }
+
+  /** Every registered pool with its live state and ladder totals — not its cells. */
+  async pools(): Promise<IndexerResult<readonly PoolRow[]>> {
+    return unwrap(await this.get<PoolsResponse>(ENDPOINTS.pools), (data) => data.pools ?? [])
   }
 
   /** One pool's ladder, cell by cell: side, liquidity, principal, fill, proceeds. */
-  ladderFill(poolId: string): Promise<IndexerResult<LadderFill>> {
-    return this.get<LadderFill>(ENDPOINTS.ladderFill(poolId))
+  ladderFill(poolId: string): Promise<IndexerResult<LadderDetail>> {
+    return this.get<LadderDetail>(ENDPOINTS.ladderFill(poolId))
   }
 
-  bondBoard(): Promise<IndexerResult<BondBoardRow[]>> {
-    return this.get<BondBoardRow[]>(ENDPOINTS.bondBoard)
+  bondBoard(): Promise<IndexerResult<BondsResponse>> {
+    return this.get<BondsResponse>(ENDPOINTS.bondBoard)
   }
 
-  flywheel(params: {days?: number} = {}): Promise<IndexerResult<FlywheelMetrics>> {
-    return this.get<FlywheelMetrics>(ENDPOINTS.flywheel, {days: params.days})
+  flywheel(params: {days?: number} = {}): Promise<IndexerResult<FlywheelResponse>> {
+    return this.get<FlywheelResponse>(ENDPOINTS.flywheel, {days: params.days})
   }
 
-  gateStatus(): Promise<IndexerResult<GateStatusRow[]>> {
-    return this.get<GateStatusRow[]>(ENDPOINTS.gateStatus)
+  gateStatus(): Promise<IndexerResult<GateResponse>> {
+    return this.get<GateResponse>(ENDPOINTS.gateStatus)
   }
 
-  /** Burn history by reason, with the total. */
-  burnHistory(params: {reason?: string} = {}): Promise<IndexerResult<BurnEvent[]>> {
-    return this.get<BurnEvent[]>(ENDPOINTS.burnHistory, {reason: params.reason})
+  /** Burn history by reason, with the running total and the count behind it. */
+  burnHistory(params: {reason?: string} = {}): Promise<IndexerResult<BurnHistory>> {
+    return this.get<BurnHistory>(ENDPOINTS.burnHistory, {reason: params.reason})
   }
+
+  /**
+   * The creator schedule and what it has paid, in each currency.
+   *
+   * Revision 6 pays the creator in kind out of every currency's fees, so the answer has two paid
+   * totals — AMPS and a USD aggregate of the counter assets — and the surface shows both rather
+   * than adding them into one number that would be neither.
+   */
+  creatorFee(): Promise<IndexerResult<CreatorFeeStatus>> {
+    return this.get<CreatorFeeStatus>(ENDPOINTS.creatorFee)
+  }
+}
+
+/** Map a successful result's payload; a failure passes through untouched. */
+function unwrap<T, U>(result: IndexerResult<T>, pick: (data: T) => U): IndexerResult<U> {
+  return result.ok ? {ok: true, data: pick(result.data)} : result
 }
 
 /** A client that reports "no indexer configured" for everything. The default in development. */

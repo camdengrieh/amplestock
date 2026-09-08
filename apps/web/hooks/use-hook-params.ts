@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 'use client'
 
-import {useReadContracts} from 'wagmi'
+import {useReadContract, useReadContracts} from 'wagmi'
 
 import {contract} from '@/lib/contracts'
-import {AMPS_FEE_FUNCTION, AMPS_FEE_MAX_FUNCTION, AMPS_FEE_MIN_FUNCTION} from '@/lib/fees'
+import {ZERO_ADDRESS} from '@/lib/protocol'
 
 /**
  * The AMPS fee and its band, live from `AmpsHook`.
@@ -14,18 +14,18 @@ import {AMPS_FEE_FUNCTION, AMPS_FEE_MAX_FUNCTION, AMPS_FEE_MIN_FUNCTION} from '@
  * the interface can say "governance can move this, and only this far" without hardcoding the
  * numbers it is claiming are hardcoded.
  *
- * The three function names come from `lib/fees.ts` rather than being spelled here, because on chain
- * the fee is still called the sell fee. Revision 6 charges it in both directions and the rename is
- * pending; when it lands, three lines in `lib/fees.ts` change and this file does not.
+ * `ampsFeeBps` is the base fee on **both** directions of every pool. There is no second getter for
+ * the buy side, because there is no second fee: the pool's own `buyFeeBps` is the pass-through
+ * base, which only `AmpsRouter.rotate` can reach.
  */
 export function useAmpsFee() {
   const hook = contract('hook')
   const query = useReadContracts({
     contracts: hook
       ? ([
-          {...hook, functionName: AMPS_FEE_FUNCTION},
-          {...hook, functionName: AMPS_FEE_MIN_FUNCTION},
-          {...hook, functionName: AMPS_FEE_MAX_FUNCTION},
+          {...hook, functionName: 'ampsFeeBps'},
+          {...hook, functionName: 'AMPS_FEE_BPS_MIN'},
+          {...hook, functionName: 'AMPS_FEE_BPS_MAX'},
           {...hook, functionName: 'TOTAL_FEE_BPS_MAX'},
         ] as const)
       : [],
@@ -100,5 +100,36 @@ export function usePoolFeeBands() {
     entryBand: entryMin !== undefined && entryMax !== undefined ? {min: entryMin, max: entryMax} : null,
     spokeBand: spokeMin !== undefined && spokeMax !== undefined ? {min: spokeMin, max: spokeMax} : null,
     maxConstituents: at(4),
+  }
+}
+
+/**
+ * The router pointer the hook honours, live.
+ *
+ * This is the whole of the pass-through exemption: a hop is priced at the pool's `buyFeeBps` only
+ * when the PoolManager reports `sender == AmpsHook.router()` **and** the hop carries
+ * `Constants.ROUTER_ROTATE`. The Rotate surface compares it against the address it is about to
+ * call, so a router that has been replaced or withdrawn is visible before a transaction is signed
+ * rather than after it has paid the AMPS fee twice.
+ *
+ * `setRouter` is a 7-day timelock class — the same class as the fee policy, because it moves the
+ * same lever — and `address(0)` is a legitimate setting: it withdraws the exemption entirely and
+ * every swap then pays `ampsFeeBps`.
+ */
+export function useHookRouter() {
+  const hook = contract('hook')
+  const query = useReadContract({
+    ...(hook ?? {address: undefined as unknown as `0x${string}`, abi: [] as never}),
+    functionName: 'router',
+    query: {enabled: hook !== undefined, refetchInterval: 60_000},
+  })
+  const raw = query.data as `0x${string}` | undefined
+  return {
+    ...query,
+    enabled: hook !== undefined,
+    /** The address the hook honours, or `undefined` when the read failed. */
+    router: raw,
+    /** True when the hook honours no router at all, so nothing can be priced pass-through. */
+    exemptionWithdrawn: raw !== undefined && raw.toLowerCase() === ZERO_ADDRESS,
   }
 }

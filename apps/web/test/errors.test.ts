@@ -10,6 +10,14 @@ const errorsAbi = [
   {type: 'error', name: 'CapacityExceeded', inputs: [{name: 'requested', type: 'uint256'}, {name: 'available', type: 'uint256'}]},
   {type: 'error', name: 'GateNotHealthy', inputs: [{name: 'state', type: 'uint8'}, {name: 'poolId', type: 'bytes32'}]},
   {type: 'error', name: 'PlacementCooldown', inputs: [{name: 'poolId', type: 'bytes32'}, {name: 'readyAt', type: 'uint32'}]},
+  // `AmpsRouter`, revision 6.
+  {type: 'error', name: 'DeadlineExpired', inputs: [{name: 'deadline', type: 'uint256'}, {name: 'timestamp', type: 'uint256'}]},
+  {type: 'error', name: 'SameHop', inputs: [{name: 'poolId', type: 'bytes32'}]},
+  {type: 'error', name: 'AmpsResidual', inputs: [{name: 'delta', type: 'int256'}]},
+  {type: 'error', name: 'UnexpectedValue', inputs: [{name: 'value', type: 'uint256'}]},
+  {type: 'error', name: 'NativeTransferFailed', inputs: [{name: 'to', type: 'address'}, {name: 'amount', type: 'uint256'}]},
+  {type: 'error', name: 'NotWrappedNative', inputs: [{name: 'counter', type: 'address'}]},
+  {type: 'error', name: 'UnknownPool', inputs: [{name: 'poolId', type: 'bytes32'}]},
 ] as const satisfies Abi
 
 function revert(name: string, args: readonly unknown[]) {
@@ -17,12 +25,60 @@ function revert(name: string, args: readonly unknown[]) {
 }
 
 describe('every named error the write surfaces can hit has an explanation', () => {
-  it.each(['BeyondRail', 'SlippageExceeded', 'CapacityExceeded', 'GateNotHealthy', 'PlacementCooldown'])(
-    '%s',
-    (name) => {
-      expect(explainedErrors).toContain(name)
-    },
-  )
+  it.each([
+    'BeyondRail',
+    'SlippageExceeded',
+    'CapacityExceeded',
+    'GateNotHealthy',
+    'PlacementCooldown',
+    'UnconfirmedNav',
+    'HighWaterResetFailed',
+    // The router's own, all reachable from Rotate.
+    'DeadlineExpired',
+    'SameHop',
+    'AmpsResidual',
+    'UnexpectedValue',
+    'NativeTransferFailed',
+    'NotWrappedNative',
+    'UnknownPool',
+  ])('%s', (name) => {
+    expect(explainedErrors).toContain(name)
+  })
+})
+
+describe('the router’s errors decode and explain the router’s own rules', () => {
+  it('SameHop says why a rotation into the same pool is not a rotation', () => {
+    const surfaced = surfaceError(revert('SameHop', [`0x${'11'.repeat(32)}`]), [errorsAbi])
+    expect(surfaced.name).toBe('SameHop')
+    expect(surfaced.detail).toMatch(/round trip/i)
+  })
+
+  it('DeadlineExpired says nothing moved', () => {
+    const surfaced = surfaceError(revert('DeadlineExpired', [1n, 2n]), [errorsAbi])
+    expect(surfaced.name).toBe('DeadlineExpired')
+    expect(surfaced.detail).toMatch(/nothing moved/i)
+  })
+
+  it('AmpsResidual is named as a safety assertion rather than something to retry', () => {
+    const surfaced = surfaceError(revert('AmpsResidual', [-1n]), [errorsAbi])
+    expect(surfaced.name).toBe('AmpsResidual')
+    expect(surfaced.action).toMatch(/not a timing one/i)
+  })
+
+  it('the wrapping errors point at the WETH leg', () => {
+    expect(surfaceError(revert('NotWrappedNative', ['0x0000000000000000000000000000000000000001']), [errorsAbi]).detail).toMatch(
+      /wrapped native/i,
+    )
+    expect(surfaceError(revert('UnexpectedValue', [1n]), [errorsAbi]).action).toMatch(/native ETH/i)
+    expect(
+      surfaceError(revert('NativeTransferFailed', ['0x0000000000000000000000000000000000000001', 1n]), [errorsAbi]).action,
+    ).toMatch(/WETH/i)
+  })
+
+  it('UnknownPool says the registry is the gate on which pools exist', () => {
+    const surfaced = surfaceError(revert('UnknownPool', [`0x${'22'.repeat(32)}`]), [errorsAbi])
+    expect(surfaced.detail).toMatch(/PoolRegistry/)
+  })
 })
 
 describe('surfaceError', () => {

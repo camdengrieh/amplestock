@@ -4,6 +4,7 @@ import {describe, expect, it} from 'vitest'
 
 import {
   BurnHistoryTable,
+  FeeFlowPanel,
   GateStatusTable,
   LadderFillPanel,
   NavHistoryPanel,
@@ -92,8 +93,22 @@ describe('indexer-backed panels', () => {
     render(
       <NavHistoryPanel
         points={[
-          {timestamp: 1, navPerShareX18: '1000000000000000000', pRefX18: '1', pMktX18: '1', totalSupply: '1'},
-          {timestamp: 2, navPerShareX18: '1010000000000000000', pRefX18: '1', pMktX18: '1', totalSupply: '1'},
+          {
+            blockNumber: '1',
+            timestamp: '1',
+            navPerShareX18: '1000000000000000000',
+            totalAssetsUsd18: '1',
+            totalSupply: '1',
+            navChangeBps: 0,
+          },
+          {
+            blockNumber: '2',
+            timestamp: '2',
+            navPerShareX18: '1010000000000000000',
+            totalAssetsUsd18: '1',
+            totalSupply: '1',
+            navChangeBps: 100,
+          },
         ]}
       />,
     )
@@ -101,31 +116,153 @@ describe('indexer-backed panels', () => {
     expect(screen.getByRole('img', {name: /NAV per share over time/i})).toBeInTheDocument()
   })
 
-  it('render ladder cells with their proceeds', () => {
-    render(
+  it('render the pool rows from /api/pools, which carries totals and not cells', () => {
+    render(<LadderFillPanel pools={[poolRow()]} />)
+    const panel = screen.getByTestId('ladder-fill')
+    // Bid depth and ask inventory come from the pool's own ladder totals…
+    expect(panel).toHaveTextContent('2500')
+    expect(panel).toHaveTextContent('1662')
+    // …and the fill is the indexer's `ladderFillBps`, not a mean over an array this route omits.
+    expect(panel).toHaveTextContent('25%')
+    expect(screen.getByText(/entire bid under AMPS in this pool/i)).toBeInTheDocument()
+  })
+
+  it('render the open pool’s cells from the ladder detail, and say so while it loads', () => {
+    const {rerender} = render(<LadderFillPanel pools={[poolRow()]} openPoolId={'0x01'} />)
+    expect(screen.getByTestId('ladder-fill')).toHaveTextContent(/Loading this pool’s cells/i)
+    rerender(
       <LadderFillPanel
-        fills={[
-          {
-            poolId: '0x01',
-            counter: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
-            symbol: 'WETH',
-            poolClass: 1,
-            bidDepth: '2500',
-            askInventory: '1662.5',
-            rolloutWeightBps: 200,
-            rolloutMovedToday: '0',
-            cells: [
-              {bucketIndex: 0, lowerTick: 0, upperTick: 60, above: true, amount: '100', liquidity: '5', proceeds: '12', filledFraction: 0.25, placedAt: 1},
-            ],
-          },
-        ]}
+        pools={[poolRow()]}
+        openPoolId={'0x01'}
+        detail={{
+          pool: poolRow(),
+          cells: [
+            {
+              bucketIndex: 0,
+              tickLower: 0,
+              tickUpper: 60,
+              above: true,
+              amount: '100',
+              liquidity: '5',
+              proceeds: '12',
+              filledBps: 2_500,
+              placedAt: '1',
+            },
+          ],
+          totals: {ampsInLadder: '1662.5', counterInLadder: '2500', askCells: 1, bidCells: 0, fillBps: 2_500},
+        }}
       />,
     )
     expect(screen.getByTestId('ladder-fill')).toHaveTextContent('12')
-    expect(screen.getByTestId('ladder-fill')).toHaveTextContent('25%')
-    expect(screen.getByText(/entire bid under AMPS in this pool/i)).toBeInTheDocument()
+  })
+
+  it('put the burn total and count under the table rather than only the rows', () => {
+    render(
+      <BurnHistoryTable
+        history={{
+          burns: [
+            {
+              blockNumber: '1',
+              timestamp: '1800000000',
+              txHash: '0xdead',
+              amount: '5',
+              reason: 'compound',
+              reasonRaw: '0x00',
+              poolId: null,
+            },
+          ],
+          total: '5',
+          count: 1,
+        }}
+      />,
+    )
+    const table = screen.getByTestId('burn-history')
+    expect(table).toHaveTextContent('Fee burn')
+    expect(table).toHaveTextContent('1 burns, 5 AMPS in total')
   })
 })
+
+describe('burnReasonLabel', () => {
+  it('names the four reasons the vault actually emits', () => {
+    expect(burnReasonLabel('buyback')).toMatch(/buyback/i)
+    expect(burnReasonLabel('compound')).toBe('Fee burn')
+    expect(burnReasonLabel('redeem')).toBe('Redemption')
+    expect(burnReasonLabel('redeemInventory')).toMatch(/released inventory/i)
+  })
+
+  it('accepts the raw bytes32 as well as the decoded string', () => {
+    const raw = `0x${Buffer.from('compound').toString('hex').padEnd(64, '0')}`
+    expect(burnReasonLabel(raw)).toBe('Fee burn')
+  })
+
+  it('does not invent a label for a reason it has never seen', () => {
+    expect(burnReasonLabel('somethingElse')).toBe('somethingElse')
+  })
+})
+
+describe('FeeFlowPanel', () => {
+  const summary = {
+    feesAmpsTotal: '1000',
+    feesCounterUsd18: (25n * 10n ** 18n).toString(),
+    creatorPaidAmpsTotal: '10',
+    creatorPaidCounterUsd18: (1n * 10n ** 18n).toString(),
+    burnedTotal: '990',
+  } as never
+
+  it('keeps the two currencies apart instead of adding them into one number', () => {
+    render(<FeeFlowPanel summary={summary} creatorFee={{currentBps: 50} as never} />)
+    const panel = screen.getByTestId('fee-flow')
+    expect(panel).toHaveTextContent('1000')
+    expect(panel).toHaveTextContent('990')
+    expect(panel).toHaveTextContent('$25.00')
+    expect(panel).toHaveTextContent('0.50%')
+  })
+
+  it('says there is no staker slice at all', () => {
+    render(<FeeFlowPanel summary={summary} />)
+    expect(screen.getByTestId('fee-flow')).toHaveTextContent(/no staking/i)
+  })
+
+  it('is unavailable rather than zero when the indexer did not answer', () => {
+    render(<FeeFlowPanel unavailable reason="ECONNREFUSED" />)
+    expect(screen.getByTestId('indexer-unavailable')).toBeInTheDocument()
+  })
+})
+
+/** A `/api/pools` row: ladder totals, no cells. */
+function poolRow() {
+  return {
+    id: '0x01',
+    counter: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+    counterSymbol: 'WETH',
+    counterDecimals: 18,
+    poolClass: 1,
+    poolClassLabel: 'ENTRY',
+    constituentId: 0,
+    tickSpacing: 60,
+    gridBaseTick: 0,
+    buyFeeBps: 30,
+    tick: 0,
+    liquidity: '1',
+    gateState: 0,
+    gateStateLabel: 'GREEN',
+    diverged: false,
+    divergenceBps: 0,
+    sellVolumeAmps: '0',
+    buyVolumeAmps: '0',
+    sellFeeAmps: '0',
+    buyFeeCounter: '0',
+    rotationCreditedAmps: '0',
+    swapCount: 0,
+    askCells: 1,
+    bidCells: 0,
+    ampsInLadder: '1662.5',
+    counterInLadder: '2500',
+    ladderFillBps: 2_500,
+    realisedLvrUsd18: '0',
+    feeRevenueUsd18: '0',
+  } as const
+}
 
 describe('PolDepthTable — the number the plan says must be published', () => {
   const rows = [

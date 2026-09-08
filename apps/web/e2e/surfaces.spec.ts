@@ -51,6 +51,11 @@ test('Buy / Sell loads, quotes from the chain and states the fee rules both ways
   // The AMPS fee and its band come from the hook, not from a constant in the bundle.
   await expect(page.getByTestId('fee-breakdown')).toContainText('AMPS fee — both ways')
   await expect(page.getByTestId('fee-breakdown')).toContainText('1.00% – 6.00%')
+  // An ordinary buy pays the AMPS fee; the pass-through price is disclosed beside it and is not
+  // available on this page. 500 bp against 30 bp on the entry pool.
+  await expect(page.getByTestId('fee-breakdown')).toContainText('5.00%')
+  await expect(page.getByTestId('fee-breakdown')).toContainText('The same hop inside a rotation')
+  await expect(page.getByTestId('fee-breakdown')).toContainText('0.30%')
   // The pool list came from `quoteAll()` on the mocked chain.
   await expect(page.getByTestId('pool-select')).toContainText('AMPS / WETH')
   await expect(page.getByTestId('pool-select')).toContainText('AMPS / USDG')
@@ -79,10 +84,24 @@ test('Rotate says why only the protocol’s router can prove a round trip', asyn
   await expect(page.getByTestId('rotate-surface')).toBeVisible()
   await expect(page.getByTestId('router-only-note')).toContainText('rotate(hop1, hop2, amountIn, minOut, to, unwrap, deadline)')
   await expect(page.getByTestId('router-only-note')).toContainText('Any other router pays the AMPS fee')
+  // The exemption is an address plus a flag, and the page prints both rather than describing them.
+  await expect(page.getByTestId('router-only-note')).toContainText('AmpsHook.router()')
   await expect(page.getByTestId('rotation-comparison')).toBeVisible()
   await expect(page.getByText('One transaction, through AMPS')).toBeVisible()
-  await expect(page.getByText('The same two swaps, separately')).toBeVisible()
+  await expect(page.getByText('The same two swaps through any other router')).toBeVisible()
   await expect(page.getByTestId('rotate-from')).toContainText('NVDA')
+  // The hook's pointer matches the configured router on the mocked chain, so no mismatch warning.
+  await expect(page.getByTestId('router-mismatch')).toHaveCount(0)
+})
+
+test('Rotate prices both legs of the other-router route at the AMPS fee', async ({page}) => {
+  await page.goto('/rotate')
+  await page.getByTestId('rotate-amount').fill('1')
+  const comparison = page.getByTestId('rotation-comparison')
+  // Two pass-through hops at 5 bp against two AMPS fees at 500 bp: 0.10% against 10.00%.
+  await expect(comparison).toContainText('0.10%')
+  await expect(comparison).toContainText('10.00%')
+  await expect(comparison).toContainText('9.90%')
 })
 
 test('Auction reads both legs and explains the mechanism', async ({page}) => {
@@ -148,6 +167,9 @@ test('Vault shows NAV, weights against targets, the gate per pool and a free che
   await expect(page.getByTestId('indexer-unavailable').first()).toContainText('it is not zero')
   // Staking is gone, and with it the whole vocabulary.
   await expect(page.getByTestId('vault-surface')).not.toContainText('xAMPS')
+  // The fee-flow disclosure exists and opens; with no indexer it says so rather than showing zeros.
+  await page.getByRole('button', {name: /Where the fees went/i}).click()
+  await expect(page.getByTestId('vault-section-fees')).toContainText(/unavailable|not configured/i)
 })
 
 test('Vault renders a degraded pool’s market price as unavailable', async ({page}) => {
@@ -156,6 +178,14 @@ test('Vault renders a degraded pool’s market price as unavailable', async ({pa
   // The AAPL pool comes back with the TWAP-coverage bit raised and pMktX18 == 0.
   const unavailable = page.locator('[data-unavailable="true"]')
   await expect(unavailable.first()).toBeVisible()
+})
+
+test('Governance names the router pointer and its seven-day class', async ({page}) => {
+  await page.goto('/governance')
+  const pointers = page.getByTestId('pointer-table')
+  await expect(pointers).toBeVisible()
+  await expect(page.getByTestId('pointer-AmpsHook.router')).toContainText('7d')
+  await expect(page.getByTestId('pointer-AmpsHook.router')).toContainText(/pass-through exemption/i)
 })
 
 test('Governance shows live parameters next to their hard bands, and no staking parameters', async ({page}) => {

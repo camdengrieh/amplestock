@@ -9,19 +9,26 @@
  * the root entry resolves to an empty module under Turbopack. The subpath is declared in the
  * package's own `exports` map and points straight at the file.
  *
- * `@amplestocks/abis` is generated from the Foundry artefacts and committed, so this file needs no
- * hand-written ABI and cannot drift from the contracts. Every helper returns `undefined` rather
- * than a zero address when the contract is not deployed, which is what stops a surface from
- * issuing reads against `0x0` and rendering the answers as data.
+ * `@amplestocks/abis` is generated from the Foundry artefacts and committed, so an entry taken from
+ * it cannot drift from the contracts. Every helper returns `undefined` rather than a zero address
+ * when the contract is not deployed, which is what stops a surface from issuing reads against `0x0`
+ * and rendering the answers as data.
+ *
+ * **Four entries are hand-written, on purpose and temporarily.** The generated package has not been
+ * regenerated since revision 6, so its `AmpsVault` still exposes `staking()`/`stakerBps()`/
+ * `burnBps()` and the old five-way `Compound`, its `AmpsQuoter` is missing the two appended
+ * pass-through fee legs of `PoolQuote` — a positional decode, so reading a revision-6 quote against
+ * it shifts every field after `sellFeePips` — its `AmpsHook` has no `router()`/`setRouter` and a
+ * four-argument `quoteFee`, and `AmpsRouter` has no artefact at all. `lib/abi/{vault,quoter,hook,
+ * router}.ts` are transcribed from the interfaces in `contracts/src/interfaces/`. When the package
+ * regenerates, each of those four imports moves back to `@amplestocks/abis/generated` and the four
+ * files go away; a compile error is the worst that can happen.
  */
 
 import {
   ampsAbi,
   ampsBondsAbi,
   ampsBondsLensAbi,
-  ampsHookAbi,
-  ampsQuoterAbi,
-  ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
@@ -29,7 +36,10 @@ import {
 } from '@amplestocks/abis/generated'
 import type {Abi, Address} from 'viem'
 
+import {ampsHookAbi} from './abi/hook'
+import {ampsQuoterAbi} from './abi/quoter'
 import {ampsRouterAbi} from './abi/router'
+import {ampsVaultAbi} from './abi/vault'
 import {deployment, type AmpsContractKey, type Deployment} from './deployment'
 
 export const abis = {
@@ -38,10 +48,7 @@ export const abis = {
   quoter: ampsQuoterAbi,
   bonds: ampsBondsAbi,
   bondsLens: ampsBondsLensAbi,
-  /**
-   * The protocol's own router. Hand-written in `lib/abi/router.ts` because the contract has no
-   * Foundry artefact yet; every other entry here is generated and cannot drift.
-   */
+  /** The protocol's own router: the only sender whose rotation hops are priced pass-through. */
   router: ampsRouterAbi,
   registry: poolRegistryAbi,
   registryLens: poolRegistryLensAbi,

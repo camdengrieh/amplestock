@@ -9,6 +9,7 @@ import {
   BurnHistoryTable,
   CheckpointBar,
   CreatorSchedulePanel,
+  FeeFlowPanel,
   GateStatusTable,
   HoldingsTable,
   LadderFillPanel,
@@ -53,7 +54,7 @@ export function VaultSurface() {
   const vaultAddress = addressOf('vault')
   const ampsToken = contract('amps')
   const now = Math.floor(Date.now() / 1000)
-  const [open, setOpen] = React.useState({supply: true, params: false, pol: false})
+  const [open, setOpen] = React.useState({supply: true, params: false, pol: false, fees: false})
   const toggle = (key: keyof typeof open) => setOpen((state) => ({...state, [key]: !state[key]}))
 
   const snapshot = useVaultSnapshot()
@@ -87,10 +88,19 @@ export function VaultSurface() {
   })
 
   const navHistory = useIndexerQuery(['nav-history'], (client) => client.navHistory({limit: 200}))
-  // `/api/pools` carries every pool with its ladder totals; the per-cell detail is one call per
-  // pool at `/api/pools/:poolId/ladder`, which the pool drill-down uses.
+  // `/api/pools` carries every pool with its ladder totals and **not** its cells; the per-cell
+  // detail is one call per pool at `/api/pools/:poolId/ladder`, issued only for the row the reader
+  // has opened. The open row is state here rather than inside the panel precisely so that the
+  // fetch can hang off it.
   const ladder = useIndexerQuery(['pools'], (client) => client.pools())
+  const [openLadderPoolId, setOpenLadderPoolId] = React.useState<string | null>(null)
+  const ladderDetail = useIndexerQuery(
+    ['ladder', openLadderPoolId],
+    (client) => client.ladderFill(openLadderPoolId as string),
+    {enabled: openLadderPoolId !== null},
+  )
   const burns = useIndexerQuery(['burns'], (client) => client.burnHistory())
+  const creatorFee = useIndexerQuery(['creator-fee'], (client) => client.creatorFee(), {refetchInterval: 60_000})
   const vaultSummary = useIndexerQuery(['vault-summary'], (client) => client.vaultSummary(), {refetchInterval: 30_000})
 
   const checkpoint = snapshot.checkpoint
@@ -280,14 +290,16 @@ export function VaultSurface() {
             {...(targetBps !== undefined ? {targetBps} : {})}
           />
           <FieldRow
-            label="peg_dev_bp"
-            hint="Intraday pool-versus-NAV deviation, from the indexer. A monitoring metric; it is never substituted for the beta inclusion rule."
+            label="Premium to NAV, last checkpoint"
+            hint="From the indexer's own copy of the reference checkpoint, so it can be read against the history below. The live number is in the headline."
           >
             <Value
-              unavailable={vaultSummary.value?.pegDevBp === undefined}
+              unavailable={vaultSummary.value?.summary?.premiumBps === undefined}
               reason={vaultSummary.configured ? vaultSummary.reason : 'No indexer configured'}
             >
-              {vaultSummary.value?.pegDevBp !== undefined ? formatBps(vaultSummary.value.pegDevBp) : null}
+              {vaultSummary.value?.summary?.premiumBps !== undefined
+                ? formatBps(vaultSummary.value.summary.premiumBps)
+                : null}
             </Value>
           </FieldRow>
           <FieldRow
@@ -307,6 +319,22 @@ export function VaultSurface() {
           id="vault-section-pol"
         >
           <PolDepthTable rows={polRows} now={now} />
+        </Disclosure>
+
+        <Disclosure
+          n="04"
+          title="Where the fees went"
+          note="Two currencies, treated differently on purpose: the AMPS side is burned, the counter side stays as bids."
+          open={open.fees}
+          onToggle={() => toggle('fees')}
+          id="vault-section-fees"
+        >
+          <FeeFlowPanel
+            {...(vaultSummary.value?.summary ? {summary: vaultSummary.value.summary} : {})}
+            {...(creatorFee.value ? {creatorFee: creatorFee.value} : {})}
+            unavailable={vaultSummary.unavailable || !vaultSummary.configured}
+            {...(vaultSummary.reason ? {reason: vaultSummary.reason} : {})}
+          />
         </Disclosure>
       </DisclosureStack>
 
@@ -328,7 +356,10 @@ export function VaultSurface() {
         />
         <div className="mt-1">
           <LadderFillPanel
-            {...(ladder.value ? {fills: ladder.value} : {})}
+            {...(ladder.value ? {pools: ladder.value} : {})}
+            {...(ladderDetail.value ? {detail: ladderDetail.value} : {})}
+            openPoolId={openLadderPoolId}
+            onToggle={setOpenLadderPoolId}
             unavailable={ladder.unavailable || !ladder.configured}
             {...(ladder.reason ? {reason: ladder.reason} : {})}
           />
@@ -358,7 +389,7 @@ export function VaultSurface() {
         <SectionHead title="Burns" note="Every AMPS the protocol has destroyed, and why." aside="Indexer series" />
         <div className="mt-5">
           <BurnHistoryTable
-            {...(burns.value ? {burns: burns.value} : {})}
+            {...(burns.value ? {history: burns.value} : {})}
             unavailable={burns.unavailable || !burns.configured}
             {...(burns.reason ? {reason: burns.reason} : {})}
           />

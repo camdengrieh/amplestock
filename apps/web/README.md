@@ -4,7 +4,14 @@ The Amplestocks dApp: Auction, Buy/Sell, Rotate, Bond, Redeem, Vault, Governance
 static `/risk` page, behind a geo gate and a terms gate.
 
 There is no Stake surface. Plan revision 6 removes staking: no xAMPS, no staker slice of the fee,
-no reward stream. The AMPS side of every fee is burned after the creator slice.
+no reward stream. The AMPS side of every fee is burned after the creator slice, in full.
+
+The fee model the surfaces are built on: `AmpsHook.ampsFeeBps` is the base on **both** directions of
+every pool, and the pool's own `buyFeeBps` is the *pass-through* price — what one hop of an
+`AmpsRouter.rotate` pays instead, and nothing else can reach it. The hook grants that price on a hop
+only when the swap's sender is the address in `AmpsHook.router()` and the hop carries
+`Constants.ROUTER_ROTATE`, so Rotate builds `AmpsRouter.rotate` and Buy / Sell quotes the AMPS fee
+in both directions.
 
 The interface is **Ledger** — a paper/ink two-theme system of hairline rules, a serif for text and a
 mono for every label and figure. The design's tokens, type scale and component vocabulary are in
@@ -57,8 +64,14 @@ components/common/   Value, Stat, DegradedNotice, TxButton — the shared vocabu
 hooks/               wagmi read hooks, the write/simulate hook, approvals, the indexer hook
 lib/                 the pure maths and policy: fees, route encoding, auction Q96 maths, bonds,
                      redeem, quoter, theme, geo, terms, copy, config and the indexer client
-lib/abi/             the two hand-written ABIs: AmpsRouter (no artefact yet) and the Continuous
-                     Clearing Auction (a third-party dependency)
+lib/abi/             the hand-written ABIs. `cca.ts` is a third-party dependency with no artefact
+                     here; `router.ts`, `hook.ts`, `quoter.ts` and `vault.ts` are temporary and
+                     say so — `@amplestocks/abis` has not been regenerated since revision 6, and
+                     its AmpsVault still exposes staking(), its AmpsQuoter is missing the two
+                     appended pass-through fee legs of PoolQuote (a positional decode, so reading
+                     a revision-6 quote against it shifts every later field), and its AmpsHook has
+                     no router(). When the package regenerates, four imports in lib/contracts.ts
+                     move and these four files go away.
 lib/docs/            the documentation as data: pages, blocks, the figure catalogue and the pure
                      resolver that turns live reads into the strings a page prints
 proxy.ts             the IP half of the geo gate (Next 16's name for middleware)

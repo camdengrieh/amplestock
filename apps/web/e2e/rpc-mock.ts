@@ -20,9 +20,6 @@ import {
   ampsAbi,
   ampsBondsAbi,
   ampsBondsLensAbi,
-  ampsHookAbi,
-  ampsQuoterAbi,
-  ampsVaultAbi,
   ladderPositionValuerAbi,
   oracleGateAbi,
   poolRegistryAbi,
@@ -41,7 +38,13 @@ import {
 } from 'viem'
 
 import {ccaAbi, chainlinkAggregatorAbi} from '../lib/abi/cca'
+// The hook, the quoter and the vault come from the app's own revision-6 ABIs rather than from the
+// generated package, for the same reason the app does: the mock has to encode the struct the app
+// will decode, and a `PoolQuote` encoded from the revision-5 tuple decodes into a different one.
+import {ampsHookAbi} from '../lib/abi/hook'
+import {ampsQuoterAbi} from '../lib/abi/quoter'
 import {ampsRouterAbi} from '../lib/abi/router'
+import {ampsVaultAbi} from '../lib/abi/vault'
 import {E2E, MULTICALL3} from './addresses'
 
 const WAD = 10n ** 18n
@@ -94,10 +97,14 @@ function poolQuote(overrides: Record<string, unknown> = {}) {
     fairTick: 100,
     innerBandTicks: 200,
     outerRailTicks: 2_000,
+    // Revision 6's four legs: an ordinary buy and an ordinary sell both pay `ampsFeeBps`; both
+    // hops of a protocol-router rotation pay the pool's pass-through base.
     buyFeeBps: 30,
     ampsFeeBps: 500,
-    buyFeePips: 3_000,
+    buyFeePips: 50_000,
     sellFeePips: 50_000,
+    passThroughBuyFeePips: 3_000,
+    passThroughSellFeePips: 3_000,
     dynBps: 0,
     dynCapBps: 300,
     refuseSell: false,
@@ -126,7 +133,8 @@ const QUOTES = [
     counter: NVDA,
     poolClass: 2,
     buyFeeBps: 5,
-    buyFeePips: 500,
+    passThroughBuyFeePips: 500,
+    passThroughSellFeePips: 500,
     bondQX18: 8n * WAD,
     bondDiscountBps: 1_250,
     bondCapacityLeft: 50n * WAD,
@@ -137,7 +145,8 @@ const QUOTES = [
     counter: AAPL,
     poolClass: 2,
     buyFeeBps: 5,
-    buyFeePips: 500,
+    passThroughBuyFeePips: 500,
+    passThroughSellFeePips: 500,
     // One degraded pool, so the surfaces have to render an unavailable field somewhere.
     degraded: 0b100000,
     pMktX18: 0n,
@@ -166,6 +175,7 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
   [E2E.quoter.toLowerCase()]: {
     quoteAll: [QUOTES],
     quotePool: [QUOTES[0]],
+    // Both hops at the pools' pass-through base (5 bp = 500 pips), and the credit hop 1 created.
     quoteRotation: [8n * WAD, 500, 500, 10n * WAD],
     bondQuote: [8n * WAD, 1_250, 50n * WAD, true, 0],
     quoteExactIn: [95n * WAD, 50_000, false, 0],
@@ -224,13 +234,16 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     symbol: ['AMPS'],
   },
   [E2E.hook.toLowerCase()]: {
-    // The AMPS fee, read straight from the hook. Still named `ampsFeeBps` on chain; the app reads
-    // it through one accessor so the pending rename is a single line.
+    // The AMPS fee, read straight from the hook: the base on both directions of every pool.
     ampsFeeBps: [500],
     AMPS_FEE_BPS_MIN: [100],
     AMPS_FEE_BPS_MAX: [600],
     TOTAL_FEE_BPS_MAX: [2_600],
+    // The pass-through base — what a rotation hop pays, and nothing else.
     buyFeeBps: [30],
+    // The router the hook honours. It matches the configured address, so Rotate shows no mismatch;
+    // the mismatch path is covered by the component test instead, where it can be forced.
+    router: [E2E.router],
   },
   [E2E.auctionUsdg.toLowerCase()]: {
     currency: [USDG],

@@ -7,7 +7,7 @@ import type {Address} from 'viem'
 
 import {useAuction} from './use-auction'
 import {useBondParameters, useDailyIssuance} from './use-bonds'
-import {useAmpsFee, usePoolFeeBands} from './use-hook-params'
+import {useAmpsFee, useHookRouter, usePoolFeeBands} from './use-hook-params'
 import {useRegistrySummary} from './use-registry'
 import {useCreatorBps, useVaultSnapshot} from './use-vault'
 import {activeChainId} from '@/lib/chains'
@@ -32,6 +32,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
   const now = Math.floor(Date.now() / 1000)
 
   const fee = useAmpsFee()
+  const hookRouter = useHookRouter()
   const feeBands = usePoolFeeBands()
   const vault = useVaultSnapshot()
   const creator = useCreatorBps(now)
@@ -86,6 +87,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
       ...(vault.creatorFeeBps !== undefined ? {creatorFeeBps: vault.creatorFeeBps} : {}),
       ...(vault.creatorDecaySeconds !== undefined ? {creatorDecaySeconds: vault.creatorDecaySeconds} : {}),
       ...(creator.creatorBps !== undefined ? {creatorBpsNow: creator.creatorBps} : {}),
+      ...(hookRouter.router !== undefined ? {hookRouter: hookRouter.router} : {}),
 
       ...(vault.checkpoint
         ? {
@@ -140,6 +142,7 @@ export function useDocsFigures(): Record<FigureId, FigureValue> {
       vault.creatorFeeBps,
       vault.creatorDecaySeconds,
       creator.creatorBps,
+      hookRouter.router,
       vault.checkpoint,
       vault.totalAssetsUsd18,
       vault.inventoryAmps,

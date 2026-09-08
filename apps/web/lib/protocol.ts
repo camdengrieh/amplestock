@@ -11,6 +11,8 @@
  * move without a migration, and the launch defaults used to render a band next to a live value.
  */
 
+import {keccak256, toBytes} from 'viem'
+
 // ---------------------------------------------------------------------------------------------
 // Scales
 // ---------------------------------------------------------------------------------------------
@@ -77,10 +79,13 @@ export const F_WALL_BPS = 1_500
 export const K_DEV_BPS = 25
 
 /**
- * Launch defaults. Governed; the live value is read from the hook through `AmpsQuoter`.
+ * Launch defaults and hard bands. Governed; the live value is read from the hook or the vault, and
+ * every surface that can read it does. These exist to render a band next to a live number.
  *
- * `SELL_FEE_*` is the **AMPS fee** — revision 6 charges it on buys as well as sells, and the
- * on-chain rename is pending. Read it through `lib/fees.ts`'s accessors, never by this name.
+ * `AMPS_FEE_BPS_*` is the **AMPS fee**: `AmpsHook.ampsFeeBps()`, the base fee on *both* directions
+ * of every pool. `BUY_FEE_BPS_*` is the **pass-through** base — `AmpsHook.buyFeeBps(poolId)`, the
+ * price of moving through a pool — and it is charged only on a hop of `AmpsRouter.rotate`. They
+ * are two different fees on two different paths, not a buy price and a sell price.
  */
 export const AMPS_FEE_BPS_DEFAULT = 500
 export const AMPS_FEE_BPS_BAND = {min: 100, max: 600} as const
@@ -89,7 +94,7 @@ export const BUY_FEE_BPS_ENTRY_BAND = {min: 5, max: 100} as const
 export const BUY_FEE_BPS_SPOKE_DEFAULT = 5
 export const BUY_FEE_BPS_SPOKE_HIGH_VOL_DEFAULT = 10
 export const BUY_FEE_BPS_SPOKE_BAND = {min: 1, max: 50} as const
-export const REDEEM_FEE_BPS_DEFAULT = 100
+export const REDEEM_FEE_BPS_DEFAULT = 250
 export const REDEEM_FEE_BPS_MAX = 500
 /**
  * There is no `burnBps` and no `stakerBps` under revision 6. The AMPS side of every fee is burned
@@ -98,6 +103,19 @@ export const REDEEM_FEE_BPS_MAX = 500
  */
 export const CREATOR_FEE_BPS = 100
 export const CREATOR_DECAY_SECONDS = 30 * 86_400
+
+/**
+ * `Constants.ROUTER_ROTATE` — the `hookData` that, when it arrives from `AmpsHook.router()` and
+ * from nobody else, buys a hop the pass-through price.
+ *
+ * **Derived, not transcribed.** It is `keccak256("amplestocks.router.ROTATE")` in the contracts, so
+ * it is the same hash here, computed from the same string. A 32-byte literal copied by hand would
+ * be a number in this repository that nothing checks; this cannot disagree with the contract
+ * unless the string does. `AmpsRouter.ROTATE_FLAG()` returns it on chain for the same reason —
+ * so an integrator can verify the exemption keys on what the comments say it does.
+ */
+export const ROUTER_ROTATE_STRING = 'amplestocks.router.ROTATE' as const
+export const ROUTER_ROTATE = keccak256(toBytes(ROUTER_ROTATE_STRING))
 
 // ---------------------------------------------------------------------------------------------
 // Bonds, ladder, timing

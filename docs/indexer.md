@@ -19,7 +19,7 @@ reasoning that is too fine-grained for here.
 |---|---|---|---|
 | `AmpsVault` | logs | its address | NAV and reference checkpoints, redemption, burns, placements, compounds, gate mirrors, the exit sweep's residue disclosures, every governed parameter |
 | `AmpsBonds` | logs | its address | markets, purchases, positions, claims, per-epoch and per-day issuance and accretion, forwarded collateral, the vault pointer |
-| `AmpsStaking` | logs | its address | the reward stream, the xAMPS share price, the realised APR |
+| `AmpsRouter` | logs | its address | `Bought`, `Sold` and `Rotated` — which trades came through the protocol's own router, and which of them were rotations |
 | `Amps` | logs | its address | the token's vault pointer |
 | `PoolRegistry` | logs | its address | **the allowlist**: which pools and constituents are ours; bond-market detachments and the vault pointer |
 | `OracleGate` | logs | its address | gate state per pool, watchdog, divergence, freezes |
@@ -75,7 +75,7 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | `nav_checkpoint` | event | `navPerShareX18`, `A`, `T`, and the change in bps since the previous checkpoint |
 | `ref_checkpoint` | event | `pRefX18`, `pMktX18`, `rateLimited`, `navFloored`, the NAV in force, the premium |
 | `share_point` | block | shares by class: `totalSupply`, `inventory`, `vesting`, `staked`, `bondUnvested`, `circulating` |
-| `vault_summary` | singleton | the Vault page in one row: live NAV/`P_ref`/`P_mkt`/premium, shares by class, cumulative fees, creator/staker/burn/re-ladder totals, bond issuance, redemptions, net supply change |
+| `vault_summary` | singleton | the Vault page in one row: live NAV/`P_ref`/`P_mkt`/premium, shares by class (three, not four — there is no staked class), cumulative fees **in each currency**, the creator's cumulative take in each currency, cumulative burned, bond issuance, redemptions, net supply change |
 | `redemption` | event | `owner`, `to`, `shares`, `inventoryBurned`, `feeBps`, the NAV it paid at, gross and fee in USD |
 | `burn_event` | event | `amount`, the raw `bytes32` reason and its decoded label |
 | `vesting_mint` | event | the team `VestingWallet` draws |
@@ -87,7 +87,7 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | `placement` | event | `poolId`, `above`, `buckets`, `amount`, `anchorTick`, the vault's own `reason` (raw and decoded) and the `action` it maps to, the caller, the `lowerTick`/`upperTick` range written, the cell count, and the liquidity the same transaction added |
 | `ladder_cell` | `"<poolId>-<tickLower>"` | the durable ladder record: `cellIndex` (`m - GRID_MIN_M`), `m`, the tick bounds, live `liquidity`, `above`, cumulative `principal`, and — recomputed at the pool's live price — `ampsRemaining`, `counterRaised` and `fillBps` |
 | `liquidity_change` | event | every `ModifyLiquidity` on our pools: the audit trail behind `ladder_cell` |
-| `compound_event` | event | the four-way split (`creatorPaid`, `stakerPaid`, `burned`, `relaid`), the creator bps in force, NAV either side and the change in bps, the bounty paid |
+| `compound_event` | event | the revision-6 `Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`: what was collected in each currency, the creator's slice of each taken in kind, and the AMPS burned — the fee remainder plus the buyback. Plus the creator bps in force, NAV either side and the change in bps, and the bounty paid. There is no `stakerPaid` and no `relaid` column: the AMPS side is burned in full and the counter side is re-placed in the same pool, so neither number exists |
 | `rollout_event` | event | `AmpsVault.Rollout`: `constituentId`, the destination `toPoolId`, `movedAmps` taken out of the entry pools' unfilled asks and `placedAmps` the destination ladder committed, the caller |
 
 ### Pools and swaps
@@ -116,7 +116,7 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | `feed_jump` | event | `AnswerJumpPending`: a jump the two-confirmation rule held back |
 | `multiplier_point` | job or event | the `uiMultiplier` state-diff series — **one row per change, never one per poll** |
 
-### Bonds and staking
+### Bonds
 
 | Table | Key | What it holds |
 |---|---|---|
@@ -127,8 +127,9 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | `bond_claim` | event | every claim |
 | `bond_epoch` | `"<marketId>-<epochStart>"` | issuance, collateral, accretion, bond count, the discount range, how often the floor bound |
 | `bond_day` | `"<marketId>-<day>"` | the same per UTC day |
-| `staking_state` | singleton | xAMPS assets and supply, share price, stream end, cumulative and trailing-24 h rewards, the realised APR |
-| `staking_reward` | event | every `RewardNotified` with the assets it was paid into |
+
+There are no staking tables. Plan revision 6 removed `AmpsStaking` from the protocol, so there is no
+share price to track, no reward stream to sample and no APR to realise.
 
 ### Keeper, governance, alarms
 
@@ -393,7 +394,7 @@ query away. The typed layer is for the shapes the dApp asks for repeatedly:
 | `GET /api/share-history` | shares by class over time |
 | `GET /api/supply` | net supply change, decomposed |
 | `GET /api/burns?reason=` | burn history by reason, with the total |
-| `GET /api/creator-fee` | the decaying creator schedule and what it has paid |
+| `GET /api/creator-fee` | the decaying creator schedule and what it has paid **in each currency**: AMPS by transfer, counter assets in kind, aggregated in 18-decimal USD |
 | `GET /api/pools` | every registered pool with live state and ladder totals |
 | `GET /api/pools/:poolId/ladder` | the ladder cell by cell: side, liquidity, principal, fill, proceeds |
 | `GET /api/pools/:poolId/placements` | placements with the action that produced each |
@@ -402,8 +403,7 @@ query away. The typed layer is for the shapes the dApp asks for repeatedly:
 | `GET /api/gate` | gate status per pool plus recent transitions |
 | `GET /api/bonds` | the bond board and recent purchases |
 | `GET /api/bonds/positions/:owner` | one address's positions and claims |
-| `GET /api/staking` | xAMPS state and the realised APR |
-| `GET /api/flywheel?days=` | the dashboard: sell-fee revenue, bond issuance and accretion, fee revenue vs realised LVR per pool, NAV, premium, net supply change |
+| `GET /api/flywheel?days=` | the dashboard: fee revenue in both currencies, bond issuance and accretion, fee revenue vs realised LVR per pool, NAV, premium, net supply change. No `staking` key |
 | `GET /api/constituents` | the constituent set with status, weights, feed and polled issuer state |
 | `GET /api/constituents/:id/multiplier` | the `uiMultiplier` state-diff series |
 | `GET /api/alerts?kind=&severity=` | every alert |
@@ -507,11 +507,24 @@ inferred, and that is the number the reconciliation compares against `Amps.total
 - **The hook and the registry gained a vault pointer.** `AmpsHook.vault` is storage rather than an
   immutable now, with a `setVault`, and `PoolRegistry` gained the same handover; both announce it
   with `VaultChanged(previousVault, newVault)`. They land in `parameter_state` as
-  `hook.pointer:vault` and `registry.pointer:vault`, beside the pointers `AmpsBonds`, `AmpsStaking`,
-  `BountyPot` and `Amps` already emit, so a migration is legible from one table.
+  `hook.pointer:vault` and `registry.pointer:vault`, beside the pointers `AmpsBonds`, `BountyPot` and
+  `Amps` already emit, so a migration is legible from one table. **`AmpsHook.RouterChanged(previous,
+  new)`** lands the same way as `hook.pointer:router`: it is the pass-through exemption, and a move
+  of it re-prices every rotation from the next block, so it belongs in the parameter history rather
+  than only in a log.
 - **`AmpsHook.rotationCredit()` is now `rotationCredit(address sender)`.** Nothing off-chain reads
   it: the indexer takes the credit from `RotationCreditConsumed` (§3) and the dApp takes it from the
   quoter's simulation, so the signature change touches no handler.
+- **Revision 6 changed what a swap's `baseFeeBps` means.** `ampsFeeBps` is now the base on *both*
+  directions of every pool, and a pool's `buyFeeBps` appears only on a hop of `AmpsRouter.rotate` —
+  one whose `sender` is `AmpsHook.router()` and whose `hookData` is `Constants.ROUTER_ROTATE`. A
+  swap row whose `baseFeeBps` equals the pool's `buyFeeBps` is therefore evidence of a rotation hop,
+  and `RotationCreditConsumed` marks its second leg. `swap.sender` (the router, not the trader) is
+  what joins the two, and `AmpsRouter`'s own `Rotated` log gives the pair directly.
+- **`AmpsQuoter.PoolQuote` gained two appended fields**, `passThroughBuyFeePips` and
+  `passThroughSellFeePips`. Appended, so every earlier field decodes unchanged; a consumer that
+  decodes the struct positionally must still regenerate its ABI, because the two new fields sit
+  before `dynBps`.
 
 ## 9. Licence
 

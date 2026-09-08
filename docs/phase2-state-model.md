@@ -13,16 +13,19 @@ but is not implemented until the hook exists.
 answer converted through `PriceLib`; `X18` is 1e18 fixed point; `usd8`/`usd18` are 8- and 18-decimal USD; bps are
 basis points of `Constants.BPS` = 10,000.
 
-Contracts and their mutability: `Amps`, `AmpsVault`, `AmpsBonds`, `AmpsStaking`, `PoolRegistry`, `BountyPot`,
-`AmpsHook`, `AmpsQuoter` are **immutable bytecode**. `OracleGate`, `FeedRegistry`, `BondPolicy`, `LadderPolicy`,
+Contracts and their mutability: `Amps`, `AmpsVault`, `AmpsBonds`, `PoolRegistry`, `BountyPot`, `AmpsHook`,
+`AmpsQuoter` and `AmpsRouter` are **immutable bytecode**. (`AmpsStaking` was on that list until plan revision 6
+removed staking from the protocol; `AmpsRouter` is what revision 6 added in its place, and it holds no funds
+between transactions and has no owner.) `OracleGate`, `FeedRegistry`, `BondPolicy`, `LadderPolicy`,
 `FeePolicy`, `RolloutPolicy` and the Phase 2 `IPositionValuer` are **pointer-upgradeable** behind the 7-day
 timelock and hold no funds.
 
 Deployment order and why the wiring is not all immutable: `Amps`'s constructor takes the vault and the vault's
 constructor takes AMPS, so the AMPS address is CREATE2-mined first (`script/01_MineAmps`) and passed to the vault
-as an *immutable* before `Amps` itself is deployed at that address. `PoolRegistry`, `AmpsBonds`, `AmpsStaking`,
-`BountyPot` and `AmpsHook` each take the vault in *their* constructors, so the vault holds them as **set-once**
-storage pointers, frozen by the `genesis()` latch.
+as an *immutable* before `Amps` itself is deployed at that address. `PoolRegistry`, `AmpsBonds`, `BountyPot` and
+`AmpsHook` each take the vault in *their* constructors, so the vault holds them as **set-once** storage pointers,
+frozen by the `genesis()` latch. `AmpsRouter` names no vault at all — it reads the registry and the PoolManager
+and nothing else — so it is deployed independently and reached only by `AmpsHook.setRouter`.
 
 ## 1. Storage layouts
 
@@ -41,8 +44,8 @@ slot 1   uint128 pMktX18                   [  0..127]   Checkpoint word 1
          uint32  checkpointBlock           [160..191]
          (free)                            [192..255]
 slot 2   uint16  redeemFeeBps              [  0.. 15]   the whole governed numeric set, one SLOAD
-         uint16  burnBps                   [ 16.. 31]
-         uint16  stakerBps                 [ 32.. 47]
+         (reserved)                        [ 16.. 47]   burnBps and stakerBps lived here until revision 6;
+                                                        declared rather than implied so the layout is stable
          uint16  refUpRateBps              [ 48.. 63]
          uint16  refDivergenceBps          [ 64.. 79]
          uint32  twapWindow                [ 80..111]
@@ -58,7 +61,11 @@ slot 3   address creator                   [  0..159]
          bool    initialized               [192..199]   the genesis latch, one-way
          bool    wiringFrozen              [200..207]   set by genesis(); set-once pointers refuse afterwards
          (free)                            [208..255]
-slot 4-7   address registry / bonds / staking / bountyPot        set-once, frozen by genesis()
+slot 4,5,7 address registry / bonds / bountyPot                  set-once, frozen by genesis()
+slot 6     (reserved)                                            the xAMPS staking vault lived here until
+                                                                 revision 6; kept as a hole so slots 7+ do not
+                                                                 move under a standby vault written against
+                                                                 this layout
 slot 8     address marketReference                               pointer-upgradeable (7 d) through setPolicyPointer,
                                                                  exactly like slots 9-13: a mock in Phase 2, pointed
                                                                  at AmpsHook in Phase 3, and re-pointable again after
@@ -110,24 +117,18 @@ cached copies: the gate pointer is 7-day upgradeable and the haircut table belon
 calendar, so each has exactly one home.
 ```
 
-### 1.3 `AmpsStaking`
+### 1.3 (removed) `AmpsStaking`
 
-OZ `ERC20` + `ERC4626` occupy slots 0-4 (`_balances`, `_allowances`, `_totalSupply`, `_name`, `_symbol`); `asset`
-and the decimals offset are immutable.
+Plan revision 6 removed staking from the protocol. There is no xAMPS share token, no reward stream, no
+`stakerBps` and no `notifyReward`, and the vault's slot 6 and the `[16..47]` band of slot 2 are reserved holes
+where they used to live. The AMPS side of every fee is **burned** at `compound()` after the creator's slice
+(`docs/phase3-state-model.md` §3.6), and the counter-asset side stays as bids in the pool that earned it. Nothing
+is distributed to anybody, so there is nothing for a share price to accrue to.
 
-```
-slot 5   address vault                     [  0..159]   reassigned only by setVault (migration)
-         uint32  rewardStreamSeconds       [160..191]
-         uint32  streamEnd                 [192..223]
-         uint32  lastAccrualAt             [224..255]
-slot 6   uint128 pendingRewards            [  0..127]   notified but not yet released
-         uint128 rewardRatePerSecond       [128..255]
-slot 7   uint256 totalNotified                          cumulative, for the realised-APR view
-```
-
-`totalAssets() = amps.balanceOf(address(this)) - pendingRewards`. That single line is what makes the
-compound-sandwich worthless and I36 true: a notified tranche is invisible to the share price until the stream has
-released it, and a donation to the contract raises `totalAssets` for everyone rather than for the donor.
+The invariant that used to live here (I36: `totalAssets` never decreasing except by withdrawals, rewards released
+never exceeding rewards notified, only the vault notifying, `stakerBps <= 5000`) is **deleted** rather than
+restated. What made the compound-sandwich worthless was the stream; what makes it worthless now is that there is
+no stream and no claim on one.
 
 ### 1.4 `PoolRegistry`
 
@@ -211,9 +212,9 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsBonds` | `setMarketOpen` | timelock, **or `PoolRegistry`** | 48 h |
 | `AmpsBonds` | every other `set*` (the `h_session` table lives in `OracleGate`) | timelock | 48 h |
 | `AmpsBonds` | `setVault` | vault | — |
-| `AmpsStaking` | `deposit`/`mint`/`withdraw`/`redeem`, `accrue` | **P** | — |
-| `AmpsStaking` | `notifyReward`, `setVault` | vault | — |
-| `AmpsStaking` | `setRewardStreamSeconds` | timelock | 48 h |
+| `AmpsRouter` | `buy`, `sell`, `rotate` | **P** | — |
+| `AmpsRouter` | *(nothing else)* — no owner, no setter, no pause, no fee | — | — |
+| `AmpsHook` | `setRouter` | timelock | 7 d |
 | `PoolRegistry` | every read | **P** | — |
 | `PoolRegistry` | `addConstituent`, `retire`, `reinstate`, `reconfigure`, `setIndexWeights`, `registerEntryPool`, `withdrawRetiredBids` | timelock | 7 d |
 | `OracleGate` | `poke`, `pokePool`, `pokePools`, `pokeConstituent` | **P** (unpaid) | — |
@@ -304,6 +305,7 @@ redeem  (structurally ungated)
     Amps.burn(msg.sender, shares)                      effects before interactions
     for each pool (Phase 3): remove floor(L_p * shares / T) from every PlacementRecord
     for each asset j != AMPS: pay floor(b_j * shares / T) * (BPS - redeemFeeBps) / BPS
+      -- redeemFeeBps: 250 bp at launch (revision 6 raised it from 100), governed at 48 h, hard cap 500
     burn the AMPS released from the vault's own inventory   -> T falls by MORE than `shares`
     payout (VaultRedeemLib.payout): try the ERC-20 unlock under gasleft() - REDEEM_PAYOUT_RESERVE_GAS, per asset
       take{gas: 4 x STOCK_TOKEN_PROBE_GAS} -> claim on refusal; on ANY failure (a hostile transfer opening a
@@ -323,11 +325,14 @@ checkpoint  (permissionless, unpaid)
     pMkt = PriceLib(hub TWAP, USDG answer);  pRef = max(nav, rateLimited(pMkt))
     write Checkpoint; emit NavCheckpoint, RefCheckpoint
 
-notifyReward  (inside compound, Phase 3)
-  vault.compound(poolId)
-    -> Amps.transfer(staking, stakerCut); staking.notifyReward(stakerCut)
-         accrue(); pending += amount; streamEnd = now + rewardStreamSeconds
-         rewardRatePerSecond = pending / rewardStreamSeconds
+compound's fee split  (inside compound, Phase 3; `docs/phase3-state-model.md` §3.6)
+  anyone -> vault.compound(poolId)
+    collect fees in both currencies inside one unlock
+    creatorCounter = counterFees * creatorBps(t) / ampsFeeBps   -> paid in kind, best effort, claim fallback
+    creatorAmps    = ampsFees   * creatorBps(t) / ampsFeeBps   -> Amps.transfer(creator, ...)
+    Amps.burn(self, ampsFees - creatorAmps)                     -> the whole AMPS-side remainder, plus the buyback
+    place (counterFees - creatorCounter) as bids in the SAME pool, below the tick
+    -- no staking call and no re-ladder: revision 6 removed both. Nothing is distributed to anybody.
 
 lifecycle  (every action leaves NAV/share unchanged: I37)
   timelock -> registry.addConstituent(params)
@@ -558,11 +563,17 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
   relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call. The idle ERC-20 leg of `evacuate`
   is a gas-capped best-effort transfer (re-audit finding 5), so a gas-burning constituent cannot starve the roles
   handed over after it.
-* **What follows in the same transaction.** `VaultNavLib.handover`: `Amps.setVault`, `AmpsBonds.setVault`,
-  `AmpsStaking.setVault`, `BountyPot.setVault`, `PoolRegistry.setVault` and a best-effort, gas-bounded
-  `AmpsHook.setVault` (the hook's `vault` is storage since audit fix 12). All six are `onlyVault`, which is why
+* **What follows in the same transaction.** `VaultNavLib.handover` moves **five** roles: `Amps.setVault`,
+  `AmpsBonds.setVault`, `BountyPot.setVault`, `PoolRegistry.setVault` and a best-effort, gas-bounded
+  `AmpsHook.setVault` (the hook's `vault` is storage since audit fix 12). All five are `onlyVault`, which is why
   they can be handed on atomically and why nobody else can hand them on at all; the hook leg is best-effort so a
-  hook without the setter can never veto an evacuation.
+  hook without the setter can never veto an evacuation. A sixth leg handed `AmpsStaking` on until plan revision 6
+  removed staking; the registry and the hook are the other two contracts that name a vault, and leaving either
+  behind would let a standby fail to open a pool while the old hook still trusted the evacuated shell.
+* **What the migration does not have to move.** `AmpsRouter` names no vault: it reads the PoolManager and the
+  registry, both of which survive a migration unchanged, so an evacuation does not touch it. What *would* need
+  attention is `AmpsHook.setRouter` if a migration ever replaced the hook, which it does not — the hook is
+  immutable and is handed on, not redeployed.
 * **What does not move.** Vesting positions stay in `AmpsBonds`, whose bytecode is immutable and whose `claim`
   never reads the vault, so a migration cannot strand a vest.
 
@@ -590,7 +601,7 @@ initialised hook pool has no observations at all, so with the gate already wired
 cannot acquire without existing. The Phase 2 integration fixture resolves it the only way the contracts allow, and
 the deploy runbook (`script/05_Registry`, `script/06_Genesis`) must use the same order:
 
-1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `staking`, `bountyPot`) and the
+1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `bountyPot`) and the
    pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave `oracleGate` unset**
    (`_requireGate` returns when the pointer is zero);
 2. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate);

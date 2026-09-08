@@ -182,50 +182,53 @@ export function netOfBps(amount: bigint, bps: number): bigint {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The AMPS fee, behind one accessor
+// Reading the two bases out of a quote
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The **AMPS fee** — the protocol's own fee, charged on every swap that touches AMPS, in both
- * directions.
+ * The **AMPS fee** in bps, out of a quote: the protocol's own fee, and the base on **both**
+ * directions of every pool.
  *
- * Revision 6 changed two things about it. It is charged on buys as well as sells, and the pool's
- * base fee is charged on top of it only for a pass-through route. What did *not* change yet is the
- * name on chain: `AmpsHook` still exposes it as `ampsFeeBps()` / `AMPS_FEE_BPS_MIN` /
- * `AMPS_FEE_BPS_MAX`, and `IAmpsQuoter.PoolQuote` still carries it as `ampsFeeBps`/`sellFeePips`.
- *
- * Everything in the app reads it through the four accessors below and nothing reads the struct
- * field or the function name directly, so the rename — when the hook lands it — is these four
- * lines and nothing else. `test/fees.test.ts` asserts that they agree with the fields they wrap.
+ * On chain it is `AmpsHook.ampsFeeBps()`, banded `[100, 600]` by the hook's own compiled
+ * constants, and `IAmpsQuoter.PoolQuote.ampsFeeBps` is read straight off the sell leg of
+ * `quoteFee(..., passThrough = false)`. Entering the index and leaving it are the same trade seen
+ * from two sides, so a fee charged on one side alone is a fee a round trip halves.
  */
-export const AMPS_FEE_FUNCTION = 'ampsFeeBps' as const
-export const AMPS_FEE_MIN_FUNCTION = 'AMPS_FEE_BPS_MIN' as const
-export const AMPS_FEE_MAX_FUNCTION = 'AMPS_FEE_BPS_MAX' as const
-
-/** The AMPS fee in bps, out of a quote. Charged on both sides of the pool. */
 export function ampsFeeBpsOf(quote: {ampsFeeBps: number}): number {
   return quote.ampsFeeBps
 }
 
-/** The same fee in pips — the unit the pool manager's fee override speaks. */
-export function ampsFeePipsOf(quote: {sellFeePips: number}): number {
-  return quote.sellFeePips
-}
-
 /**
- * The **pool base fee** in bps: 30 bp in an entry pool, 5–10 bp in a spoke.
+ * The **pass-through base fee** in bps: 30 bp in an entry pool, 5–10 bp in a spoke.
  *
- * On chain this is `buyFeeBps`, and under revision 6 it is charged **on top of** the AMPS fee only
- * when the swap is one leg of a pass-through. A direct buy or sell pays the AMPS fee alone.
+ * On chain this is `AmpsHook.buyFeeBps(poolId)`, and under revision 6 it is not what an ordinary
+ * buy pays: it is the price of moving *through* a pool, charged only on a hop where the hook sees
+ * `sender == router()` and `hookData == ROUTER_ROTATE`. Every other swap, in either direction,
+ * pays {ampsFeeBpsOf} instead.
  */
 export function poolBaseFeeBpsOf(quote: {buyFeeBps: number}): number {
   return quote.buyFeeBps
 }
 
 /**
- * What a direct swap pays, in pips, in the direction given — the authority is the quoter, which
- * has already applied the dynamic component and the clamps.
+ * What an ordinary swap pays, in pips, in the direction given — the net-trade total, with the
+ * dynamic component and the clamps already applied by the quoter, which is the authority.
  */
 export function directFeePipsOf(quote: {buyFeePips: number; sellFeePips: number}, side: 'buy' | 'sell'): number {
   return side === 'buy' ? quote.buyFeePips : quote.sellFeePips
+}
+
+/**
+ * What one hop of an `AmpsRouter.rotate` would pay through this pool, in pips.
+ *
+ * `'buy'` is hop 1 and `'sell'` is hop 2 — the latter priced as an exact-input sell fully covered
+ * by the credit hop 1 created, which is what `rotate` always builds. Unreachable through any other
+ * route: it is disclosure of the alternative price, never a quote for a swap the caller can make
+ * by hand.
+ */
+export function passThroughFeePipsOf(
+  quote: {passThroughBuyFeePips: number; passThroughSellFeePips: number},
+  hop: 'buy' | 'sell',
+): number {
+  return hop === 'buy' ? quote.passThroughBuyFeePips : quote.passThroughSellFeePips
 }

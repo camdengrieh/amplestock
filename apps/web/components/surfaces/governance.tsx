@@ -11,7 +11,7 @@ import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {Badge} from '@/components/ui/badge'
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
 import {useBondParameters} from '@/hooks/use-bonds'
-import {useAmpsFee, usePoolFeeBands} from '@/hooks/use-hook-params'
+import {useAmpsFee, useHookRouter, usePoolFeeBands} from '@/hooks/use-hook-params'
 import {symbolForCounter} from '@/hooks/use-pools'
 import {useActiveConstituents, useConstituentRecords, useRegistrySummary, useTimelockAddress} from '@/hooks/use-registry'
 import {useVaultSnapshot} from '@/hooks/use-vault'
@@ -70,6 +70,63 @@ export function ParameterTable({rows}: {rows: readonly ParameterRow[]}) {
                 </Value>
               </TableCell>
               <TableCell align="right" className="text-dim">{row.delay}</TableCell>
+              <TableCell className="max-w-[52ch] whitespace-normal text-[13px] leading-[1.5] text-dim">
+                {row.note}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </section>
+  )
+}
+
+/**
+ * A pointer: an address one governance action can replace, and what replacing it would change.
+ *
+ * Pointers are the other half of what governance can do, and they do not fit the parameter table —
+ * an address has no band and no format. The `router` pointer is the one that matters most under
+ * revision 6, because it is the whole of the pass-through exemption: the hook charges the pool's
+ * base fee instead of `ampsFeeBps` on a hop only when the swap's sender is *this* address and the
+ * hop carries the router's rotation flag. Moving it to another contract moves the exemption;
+ * setting it to the zero address withdraws it, and every swap then pays `ampsFeeBps`.
+ */
+export interface PointerRow {
+  name: string
+  address?: string
+  delay: string
+  note: string
+}
+
+export function PointerTable({rows}: {rows: readonly PointerRow[]}) {
+  return (
+    <section data-testid="pointer-table">
+      <SectionHead
+        title="Pointers, and what moving one would change"
+        note="An address a timelocked proposal can replace. None of them can move funds; each of them changes how something is priced or shaped."
+        aside={`${rows.length} pointers`}
+      />
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Pointer</TableHead>
+            <TableHead align="right">Live</TableHead>
+            <TableHead align="right">Delay</TableHead>
+            <TableHead>What it does</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((row) => (
+            <TableRow key={row.name} data-testid={`pointer-${row.name}`}>
+              <TableCell className="whitespace-nowrap tracking-[0.05em]">{row.name}</TableCell>
+              <TableCell align="right" className="font-mono text-[13px]">
+                <Value unavailable={row.address === undefined} {...(row.address ? {title: row.address} : {})}>
+                  {row.address ? shortAddress(row.address) : null}
+                </Value>
+              </TableCell>
+              <TableCell align="right" className="text-dim">
+                {row.delay}
+              </TableCell>
               <TableCell className="max-w-[52ch] whitespace-normal text-[13px] leading-[1.5] text-dim">
                 {row.note}
               </TableCell>
@@ -226,6 +283,7 @@ export function GovernanceSurface() {
   const snapshot = useVaultSnapshot()
   const fee = useAmpsFee()
   const feeBands = usePoolFeeBands()
+  const hookRouter = useHookRouter()
   const bonds = useBondParameters()
   const timelock = useTimelockAddress()
 
@@ -236,7 +294,7 @@ export function GovernanceSurface() {
       format: formatBps,
       band: fee.band,
       delay: formatDuration(launchParameters.governance.timelockFastSeconds),
-      note: 'The protocol’s own fee, charged on every swap that touches AMPS — buying it and selling it alike. Read live from AmpsHook; the band is the hook’s own compiled constant. (On chain the getter is still named ampsFeeBps.)',
+      note: 'The protocol’s own fee, and the base on both directions of every pool: buying AMPS and selling it are the same trade seen from two sides. Read live from AmpsHook; the band is the hook’s own compiled constant.',
     },
     {
       name: 'redeemFeeBps',
@@ -252,14 +310,14 @@ export function GovernanceSurface() {
       format: formatBps,
       band: feeBands.entryBand,
       delay: formatDuration(launchParameters.governance.timelockFastSeconds),
-      note: 'AMPS/WETH and AMPS/USDG. Charged on top of the AMPS fee only when the swap is one leg of a pass-through. The live value is per pool and is shown on Buy / Sell.',
+      note: 'AMPS/WETH and AMPS/USDG. This is the pass-through price, not a second fee on top of the AMPS fee: it is what one hop of an AmpsRouter.rotate pays, and an ordinary buy or sell never pays it. The live value is per pool and is shown on Buy / Sell.',
     },
     {
       name: 'buyFeeBps (spokes)',
       format: formatBps,
       band: feeBands.spokeBand,
       delay: formatDuration(launchParameters.governance.timelockFastSeconds),
-      note: 'AMPS/<stock>. High-volatility names default higher inside the same band.',
+      note: 'AMPS/<stock>. High-volatility names default higher inside the same band. Pass-through only, like the entry pools’.',
     },
     {
       name: 'bond discount d',
@@ -314,7 +372,38 @@ export function GovernanceSurface() {
       format: formatBps,
       band: null,
       delay: 'Immutable',
-      note: 'One per cent of trade volume at genesis, decaying linearly to exactly zero at day 30. There is no setter and no governance path to it; the remaining schedule is on the Vault page.',
+      note: 'One per cent of trade volume at genesis, decaying linearly to exactly zero at day 30, taken in kind from each currency’s fees at compound(). There is no setter and no governance path to it; the remaining schedule is on the Vault page.',
+    },
+  ]
+
+  const pointerRows: PointerRow[] = [
+    {
+      name: 'AmpsHook.router',
+      ...(hookRouter.router ? {address: hookRouter.router} : {}),
+      delay: formatDuration(launchParameters.governance.timelockSlowSeconds),
+      note: hookRouter.exemptionWithdrawn
+        ? 'The exemption is withdrawn: the hook honours no router, so every swap in every pool pays the AMPS fee. Rotate is priced accordingly.'
+        : 'The whole of the pass-through exemption. A hop pays the pool’s base fee instead of the AMPS fee only when the swap’s sender is this address and the hop carries the router’s rotation flag. Moving it moves the exemption; the zero address withdraws it.',
+    },
+    {
+      name: 'AmpsHook.feePolicy',
+      delay: formatDuration(launchParameters.governance.timelockSlowSeconds),
+      note: 'The dynamic component: volatility, deviation, divergence, session and surge. It cannot move funds and it cannot change the base fee.',
+    },
+    {
+      name: 'AmpsVault.ladderPolicy',
+      delay: formatDuration(launchParameters.governance.timelockSlowSeconds),
+      note: 'The shape of a ladder — cell weights and bounds. It proposes; the vault re-checks every limit itself.',
+    },
+    {
+      name: 'AmpsVault.rolloutPolicy',
+      delay: formatDuration(launchParameters.governance.timelockSlowSeconds),
+      note: 'How fast unfilled entry-pool inventory migrates into the spokes, inside the vault’s own daily budget and entry floor.',
+    },
+    {
+      name: 'AmpsVault.standbyVault',
+      delay: formatDuration(launchParameters.governance.timelockStandbySeconds),
+      note: 'The only migration target. Registering one is the longest delay in the system, and migrating still needs the predicate to be met.',
     },
   ]
 
@@ -364,11 +453,12 @@ export function GovernanceSurface() {
         <p>
           There is no <code className="font-mono">burnBps</code> and no <code className="font-mono">stakerBps</code>.
           Revision 6 removes staking, and the burn is no longer a governed share: the AMPS side of every fee is burned
-          after the creator slice.
+          after the creator slice, in full.
         </p>
       </Callout>
 
       <ParameterTable rows={rows} />
+      <PointerTable rows={pointerRows} />
       <ConstituentTable
         rows={constituentRows}
         {...(registry.indexCapBps !== undefined ? {capBps: registry.indexCapBps} : {})}

@@ -40,6 +40,12 @@ export const FIGURES = {
   creatorFeeGenesis: {label: 'Creator fee at genesis', source: 'chain', from: 'AmpsVault.CREATOR_FEE_BPS()'},
   creatorDecay: {label: 'Creator fee decays over', source: 'chain', from: 'AmpsVault.CREATOR_DECAY_SECONDS()'},
   creatorFeeNow: {label: 'Creator fee in force now', source: 'chain', from: 'AmpsVault.creatorBpsAt(now)'},
+  /**
+   * The router pointer, read from the hook rather than from the address book: the exemption is
+   * whatever the hook says it is, and a deployment record can disagree with it.
+   */
+  hookRouter: {label: 'Router the hook honours', source: 'chain', from: 'AmpsHook.router()'},
+  rotateFlag: {label: 'Pass-through flag', source: 'config', from: 'keccak256("amplestocks.router.ROTATE")'},
 
   // --- Redemption ---------------------------------------------------------------------------
   redeemFee: {label: 'Redemption fee, live', source: 'chain', from: 'AmpsVault.redeemFeeBps()'},

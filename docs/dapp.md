@@ -66,8 +66,9 @@ NEXT_PUBLIC_AMPS_RPC_URL       optional override; defaults to the chain's public
 NEXT_PUBLIC_REOWN_PROJECT_ID   empty -> AppKit is not mounted; injected connector only
 NEXT_PUBLIC_AMPS_INDEXER_URL   empty -> indexed panels render "indexer unavailable"
 
-NEXT_PUBLIC_AMPS_TOKEN / _VAULT / _QUOTER / _BONDS / _BONDS_LENS / _STAKING /
+NEXT_PUBLIC_AMPS_TOKEN / _VAULT / _QUOTER / _BONDS / _BONDS_LENS / _ROUTER /
 NEXT_PUBLIC_AMPS_REGISTRY / _REGISTRY_LENS / _HOOK / _ORACLE_GATE / _TIMELOCK
+NEXT_PUBLIC_AMPS_AUCTION_USDG / _AUCTION_ETH
 
 NEXT_PUBLIC_FLAG_ACROSS_ZAP     "1" shows the (inert) Across USDC->USDG entry point
 NEXT_PUBLIC_FLAG_TESTNET_BANNER "1" shows the testnet badge
@@ -103,8 +104,12 @@ revert and to say which of its sub-reads failed.
 - **Writes**: `UniversalRouter.execute(commands, inputs, deadline)` — `WRAP_ETH` (optional),
   `V4_SWAP`, `UNWRAP_WETH` (optional). The router address is `@amplestocks/config`'s
   `universalRouter`, never the SDK's own default.
-- Shows the sell fee and the rotation-credit rule on the surface, not in a tooltip. Shows the amount
-  received and the minimum the transaction signs for, both from the chain. Renders a refusal as
+- **Shows the AMPS fee in both directions**, from `PoolQuote.buyFeePips`/`sellFeePips` — the
+  net-trade totals, i.e. `AmpsHook.quoteFee(..., passThrough = false)` — with the hook's own
+  `[100, 600]` band beside them, and prints what this same hop *would* cost inside a rotation
+  (`passThroughBuyFeePips`/`passThroughSellFeePips`) so the difference is visible rather than
+  implied. The pass-through price is not available on this surface and the row says so. Shows the
+  amount received and the minimum the transaction signs for, both from the chain. Renders a refusal as
   "this swap would revert", distinguishing `bytes32("rail")` from `bytes32("uninitialized")`, and
   never invents one from a degraded read — both the quote's flags and `wouldRevert` fail open for
   display.
@@ -114,14 +119,23 @@ revert and to say which of its sub-reads failed.
 ### Rotate
 `app/(gated)/rotate` → `components/surfaces/rotate.tsx`
 
-Stock → AMPS → stock, exact input, one transaction.
+Stock → AMPS → stock, exact input, one transaction, **through `AmpsRouter` and nowhere else**.
 
 - **Reads**: `AmpsQuoter.quoteRotation(hop1, hop2, amountIn)` → `(amountOut, hop1FeePips,
-  hop2FeePips, creditUsed)`; `quoteAll()` for the spoke list, per-pool fees and both hop keys.
-- **Writes**: `UniversalRouter.execute` with one `V4_SWAP` carrying one `SWAP_EXACT_IN` and a
-  two-element `PathKey[]`.
-- Shows the credited second hop next to the same two swaps done separately. It does **not** claim
-  to have surveyed the market: no external aggregator is configured, and the panel says so.
+  hop2FeePips, creditUsed)`, which prices both hops as pass-through with the credit hop 1 creates
+  modelled rather than read; `quoteAll()` for the spoke list and all four fee legs per pool;
+  `AmpsHook.router()` for the pointer the hook actually honours.
+- **Writes**: `AmpsRouter.rotate(hop1, hop2, amountIn, minOut, to, unwrap, deadline)` →
+  `(amountOut, ampsThrough)`. Not the Universal Router: a hop is priced pass-through only when the
+  PoolManager reports `sender == AmpsHook.router()` **and** the hop carries
+  `Constants.ROUTER_ROTATE`, so a route built through any other router pays `ampsFeeBps` on **both**
+  legs. When `NEXT_PUBLIC_AMPS_ROUTER` is empty the surface renders "not deployed on this chain"
+  rather than offering a two-transaction fallback that would cost more.
+- Puts the rotation next to *the same two swaps through any other router* — both legs of that
+  column at the AMPS fee, because buying AMPS and selling it are both taxed. It prints the hook's
+  router pointer and the rotation flag, and warns when the pointer disagrees with the address the
+  page would call. It does **not** claim to have surveyed the market: no external aggregator is
+  configured, and the panel says so.
 
 ### Bond
 `app/(gated)/bond` → `components/surfaces/bond.tsx`
@@ -149,15 +163,13 @@ Stock → AMPS → stock, exact input, one transaction.
   released inventory AMPS burned alongside disclosed — which is why total supply falls by more than
   the amount redeemed. The surface says plainly that it pays assets, not cash.
 
-### Stake
-`app/(gated)/stake` → `components/surfaces/stake.tsx`
+### (removed) Stake
 
-- **Reads**: `AmpsStaking.totalAssets/totalSupply/pendingRewards/releasedRewards/streamEnd/
-  streamSecondsRemaining/rewardStreamSeconds/totalNotified/balanceOf`; the indexer's
-  `stakingStats()` for the realised APR.
-- **Writes**: `AmpsStaking.deposit(assets, receiver)`, `AmpsStaking.withdraw(assets, receiver, owner)`.
-- The APR is realised — computed from sell fees already collected and streamed over a past window —
-  and is labelled as such. With no indexer it is unavailable, not zero.
+There is no Stake surface, no `app/(gated)/stake` and no `AmpsStaking` read anywhere in the app.
+Plan revision 6 removed staking from the protocol: no xAMPS, no reward stream, no staker slice of
+the fee. The AMPS side of every fee is burned after the creator's slice, and the counter side stays
+as bids in the pool that earned it, so there is nothing for a share price to accrue to and no APR to
+report. `lib/surfaces.ts` carries the absence as a comment rather than leaving it to be noticed.
 
 ### Vault
 `app/(gated)/vault` → `components/surfaces/vault.tsx`, `vault-panels.tsx`
@@ -165,13 +177,23 @@ Stock → AMPS → stock, exact input, one transaction.
 The disclosure page.
 
 - **Reads (chain)**: `AmpsVault.checkpointData` (NAV/share, `P_ref`, `P_mkt`, timestamp),
-  `previewNavPerShareX18`, `totalAssetsUsd18`, `inventoryAmps`, `redeemFeeBps`, `burnBps`,
-  `stakerBps`, `genesisTimestamp`, `liveCells`, `initialized`, `positionValuer`,
-  `lastPlacementAt(poolId)`; `LadderPositionValuer.amountsOf(poolId)` per pool;
-  `Amps.totalSupply` and `Amps.balanceOf(bonds)`; `AmpsStaking.totalAssets`;
-  `AmpsQuoter.quoteAll` for the per-pool gate table.
-- **Reads (indexer)**: NAV/share history, the ladder cell by cell with proceeds, burn history,
-  `peg_dev_bp`. History only — the live per-pool numbers come from the chain.
+  `previewNavPerShareX18`, `totalAssetsUsd18`, `inventoryAmps`, `redeemFeeBps`,
+  `REDEEM_FEE_BPS_MAX`, `creatorBpsAt(now)`, `CREATOR_FEE_BPS`, `CREATOR_DECAY_SECONDS`,
+  `genesisTimestamp`, `liveCells`, `initialized`, `positionValuer`, `lastPlacementAt(poolId)`;
+  `LadderPositionValuer.amountsOf(poolId)` per pool; `Amps.totalSupply` and
+  `Amps.balanceOf(bonds)`; `AmpsQuoter.quoteAll` for the per-pool gate table. There is no
+  `burnBps`, no `stakerBps` and no staking read: none of the three exists.
+- **Reads (indexer)**: NAV/share history, `/api/pools` for the ladder totals and
+  `/api/pools/:poolId/ladder` for the open pool's cells, `/api/burns` for the burn history with its
+  running total, and `/api/creator-fee` for what the schedule has actually paid in each currency.
+  History and aggregates only — every live per-pool number comes from the chain.
+- **The fee-flow disclosure** is its own section, because revision 6 gave a compound two currencies
+  and they are not interchangeable: what was collected in AMPS and in counter assets, the creator's
+  slice of **each** taken in kind, the AMPS-side remainder burned in full, and the counter side
+  placed back as bids in the pool that earned it. The counter figures are USD aggregates across up
+  to thirty-two assets with different decimals and are labelled as such rather than printed as
+  quantities. Burn history is broken out by reason: `buyback`, `compound`, `redeem`,
+  `redeemInventory`.
 - **Per-pool POL depth is published from the chain.** `LadderPositionValuer.amountsOf` decomposes
   the vault's grid cells at the same reference price the vault values `A` at, so the counter column
   is to the wei the term NAV credits that pool with, and the AMPS column is the unfilled ask
@@ -191,7 +213,13 @@ Read-only.
   indexFloorBps/hubPoolId/wethPoolId`; `PoolRegistryLens.activeConstituents/indexWeights`;
   the vault's fee parameters; the timelock address.
 - Every parameter is shown next to the band hardcoded in the contract that consumes it, with the
-  timelock delay. The pending-operations panel refuses to imply the queue is empty:
+  timelock delay: `ampsFeeBps` [100, 600] with the note that it is charged both ways, `redeemFeeBps`
+  against the vault's own `REDEEM_FEE_BPS_MAX`, and the pass-through `buyFeeBps` bands per pool
+  class. There is no `burnBps` row and no `stakerBps` row, and the page says why.
+- **A pointer table beside it**, because an address has no band: `AmpsHook.router` (7 d) — the whole
+  of the pass-through exemption, read live from the hook, with the zero address named as the
+  legitimate "withdraw it" setting — `AmpsHook.feePolicy`, the vault's ladder and rollout policies,
+  and the standby vault at 14 d. The pending-operations panel refuses to imply the queue is empty:
   `TimelockController` answers only for an operation id you already hold, and enumerating the queue
   needs the `CallScheduled` log stream from the indexer.
 
@@ -280,22 +308,23 @@ Run `pnpm --filter @amplestocks/web build` afterwards to restore the ordinary bu
 
 ## Tests
 
-**vitest — 237 tests in 21 files**, all offline.
+**vitest — 358 tests in 25 files**, all offline.
 
 | File | What it pins |
 |---|---|
-| `test/fees.test.ts` | the rotation-credit blend `buyFee + ceilDiv((sellFee - buyFee)(in - c), in)`, its rounding direction and monotonicity; the fee clamp and the degraded fee floor; the creator schedule reaching exactly zero at day 30 |
+| `test/fees.test.ts` | the rotation-credit blend `buyFee + ceilDiv((ampsFee - buyFee)(in - c), in)`, its rounding direction and monotonicity; the fee clamp and the degraded fee floor; the creator schedule reaching exactly zero at day 30 |
 | `test/route.test.ts` | the **golden vector** below, the wrap/unwrap commands, that AMPS stays `currency0`, and `poolKeyFromQuote` refusing to guess a key from a registry-degraded quote |
 | `test/bonds.test.ts` | `minAmpsOut` is exactly the quote and `assertBondMinAmpsOut` refuses anything else; capacity-clamp detection; `q_floor`; the linear vest |
 | `test/quoter.test.ts` | all eight degraded bits → the per-field availability map; `isTradeable` false for any degraded quote |
 | `test/redeem.test.ts` | pro-rata preview, fee reconstruction, the floor as arithmetic |
 | `test/geo.test.ts`, `test/terms.test.ts` | the two gates |
 | `test/copy.test.ts` | scans `app/`, `components/` and `lib/` for language the plan forbids, and asserts each required disclosure is present |
-| `test/errors.test.ts`, `test/format.test.ts`, `test/indexer.test.ts`, `test/deployment.test.ts` | error surfacing, "never a zero for an unavailable value", the indexer client, address handling |
-| `test/components/*.test.tsx` (9 files) | degraded rendering, the swap quote, the terms gate, the bond board and quote panel, the redeem preview, the rotation comparison, the vault panels, the governance tables, the transaction states |
+| `test/errors.test.ts`, `test/format.test.ts`, `test/indexer.test.ts`, `test/deployment.test.ts` | error surfacing including the router's six own errors, "never a zero for an unavailable value", the indexer client's envelope unwrapping, address handling |
+| `test/components/*.test.tsx` (9 files) | degraded rendering, the swap quote, the terms gate, the bond board and quote panel, the redeem preview, the rotation comparison (both hops of the other-router column at the AMPS fee, and the router-pointer mismatch), the vault panels including the fee-flow disclosure, the governance parameter and pointer tables, the transaction states |
 
-**Playwright — 17 tests in 2 files**: every surface loads and renders chain data from the mock;
-both gates behave; `/risk` is reachable with nothing accepted and from a blocked jurisdiction.
+**Playwright — 28 tests in 3 files**: every surface loads and renders chain data from the mock;
+both gates behave; `/risk` is reachable with nothing accepted and from a blocked jurisdiction; and
+the screenshot run captures every surface in both themes at both widths.
 
 ### The route-encoding golden vector
 
@@ -333,8 +362,9 @@ Enforced by `test/copy.test.ts`, which scans every `.ts`, `.tsx` and `.css` file
   issuance; redemption is a pro-rata claim on the vault. Neither is an arrangement with the token
   issuer, and `/risk` says there is no authorised participant at all.
 - **No promised return.** No "guaranteed returns/profit/yield/income/price", no "risk-free", no
-  "APY" (staking pays realised fees, not a compounding yield), no "passive income", no "assured
-  returns".
+  "APY", no "passive income", no "assured returns". There is nothing that pays anybody anything:
+  the AMPS side of every fee is burned and the counter side becomes bid depth, so there is no
+  distribution to dress up as a yield in the first place.
 - **No price forecast.** No "price target", no "will increase / rise / go up / appreciate", no "to
   the moon", no "cannot lose".
 - **The premium is a number.** Signed, explicit, described as the arithmetic difference between the
@@ -357,21 +387,32 @@ Enforced by `test/copy.test.ts`, which scans every `.ts`, `.tsx` and `.css` file
   `LadderPositionValuer` is deliberately *not* one of them: its address is read from
   `AmpsVault.positionValuer()`, which is both one fewer variable and the only answer that cannot go
   stale.
-- **The indexer's field shapes are the dApp's requirement, not a transcription.** `ENDPOINTS` in
-  `lib/indexer/client.ts` matches `docs/indexer.md` §7 route for route; the response types in
-  `lib/indexer/types.ts` are what the panels need. Every reader tolerates a missing field by
-  rendering that panel as unavailable, so a name that differs costs one panel rather than the page.
-  `bigint` crosses the wire as a decimal string, per that document.
+- **Four ABIs are hand-written and temporary.** `@amplestocks/abis` has not been regenerated since
+  revision 6, so `lib/abi/{vault,quoter,hook,router}.ts` are transcribed from the interfaces in
+  `contracts/src/interfaces/` and `lib/contracts.ts` imports them instead. The generated package's
+  `AmpsVault` still exposes `staking()`, its `AmpsQuoter` is missing `PoolQuote`'s two appended
+  pass-through fee legs — a positional decode, so reading a revision-6 quote against it shifts every
+  field after `sellFeePips` — its `AmpsHook` has no `router()`, and `AmpsRouter` has no artefact at
+  all. When the package regenerates, four imports move and four files go away; `e2e/rpc-mock.ts`
+  imports the same four, because the mock has to encode what the app decodes.
+- **The indexer's field shapes are a transcription now, not a wish list.** `ENDPOINTS` in
+  `lib/indexer/client.ts` matches `docs/indexer.md` §7 route for route, and `lib/indexer/types.ts`
+  mirrors the `/api/*` envelopes — `{points}`, `{pools}`, `{burns, total, count}`,
+  `{summary, shares, reconciliation}` — which the client unwraps so a surface holds rows rather than
+  envelopes. Every reader still tolerates a missing field by rendering that panel as unavailable, so
+  a name that differs costs one panel rather than the page. `bigint` crosses the wire as a decimal
+  string, per that document.
 - **Protocol-wide unvested bonded AMPS is still an upper bound.** `AmpsBonds` cannot enumerate its
   own positions — they live in per-owner arrays — so `AmpsBondsLens.unvested(bonds, owners)` is
   exact only over an owner set the caller supplies. The Bond surface passes the connected wallet and
   gets an exact figure; the Vault surface's supply split still uses `Amps.balanceOf(bonds)` and is
   labelled "upper bound", because the distinct `Bond.buyer` set lives in the indexer and is not
   served yet. Closing this is an indexer change, not a contract one.
-- **`peg_dev_bp` has no chain view** and comes from the indexer, and **`TimelockController` cannot
-  enumerate its own queue** — it answers only for an operation id you already hold — so the
-  pending-operations panel says so rather than implying the queue is empty. Both need the indexer's
-  log streams.
+- **`TimelockController` cannot enumerate its own queue** — it answers only for an operation id you
+  already hold — so the pending-operations panel says so rather than implying the queue is empty.
+  That needs the indexer's `CallScheduled` stream. (`peg_dev_bp` is no longer claimed anywhere: the
+  indexer's schema has no such column, and the Vault surface shows the indexer's own `premiumBps`
+  from the reference checkpoint instead, beside the live premium in the headline.)
 
 ### Closed since the first pass
 

@@ -21,6 +21,7 @@ import {
 import {formatUnits, type Address} from 'viem'
 
 import {FIGURE_IDS, type FigureId, type FigureValue} from './figures'
+import {ROUTER_ROTATE} from '../protocol'
 import {CCA_LENS_ADDRESS} from '../abi/cca'
 import type {Deployment, GenesisAuctions} from '../deployment'
 import {formatAmount, formatBps, formatDuration, formatPremiumX18, formatUsd18} from '../format'
@@ -81,6 +82,12 @@ export interface DocsChainReads {
   activeConstituentCount?: number
   indexCapBps?: number
   indexFloorBps?: number
+
+  /**
+   * `AmpsHook.router()`. Read from the hook, not from the address book: the pass-through exemption
+   * is whatever the hook says it is, and a deployment record can be out of date with it.
+   */
+  hookRouter?: Address
 
   /** One entry per genesis auction, keyed by its deployment key. */
   auctions?: Partial<Record<'usdg' | 'eth', DocsAuctionRead>>
@@ -191,6 +198,10 @@ export function resolveDocFigures(input: DocsResolveInput): Record<FigureId, Fig
     creatorFeeGenesis: num(reads.creatorFeeBps, formatBps),
     creatorDecay: num(reads.creatorDecaySeconds, formatDuration),
     creatorFeeNow: num(reads.creatorBpsNow, formatBps),
+    hookRouter: address(reads.hookRouter, REASONS.chain),
+    // Derived from the same string the contracts hash, so it cannot disagree with them unless the
+    // string does — which is why it is a `config` figure and not a `chain` one.
+    rotateFlag: value(ROUTER_ROTATE),
 
     // --- Redemption -------------------------------------------------------------------------
     redeemFee: num(reads.redeemFeeBps, formatBps),

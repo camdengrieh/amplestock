@@ -110,3 +110,42 @@ Disposition of every finding and lead in [`amplestock-pashov-ai-audit-report-202
 | Off-grid anchor reverts the placement | Accepted — reachable only through a mis-configured `gridBaseTick` |
 | `_propose` reports a stale window | **Fixed** with finding 6 |
 | Bounty over-counts a two-hop upkeep | Accepted — bounded by the 3x gas cap and the daily ceiling |
+
+---
+
+## Revision 6 — the code paths earlier findings applied to, and what happened to them
+
+Plan revision 6 (user directive, 2026-09-07) rewrote the fee model: `ampsFeeBps` on **both** directions of every
+pool, the pass-through fee granted only to `AmpsRouter.rotate`, the creator paid in kind out of each currency at
+`compound()`, the whole AMPS-side remainder burned, no staking. Several earlier findings and leads were about code
+that revision 6 **deleted**. This section records which, so that a reader of the two audit reports can tell a fix
+from a removal — and so that nobody re-fixes something that no longer exists.
+
+### Removed, not fixed
+
+| Earlier item | What happened |
+|---|---|
+| **The staking sandwich** (first-wave design note; doc invariant I36) — `AmpsStaking.totalAssets()` excluded `pendingRewards` so a same-block stake/unstake around `compound` could not capture a notified tranche, and I36 constrained the stream. | **The contract is gone.** There is no `AmpsStaking`, no xAMPS, no `notifyReward` and no reward stream, so there is no tranche to sandwich and nothing for a share price to accrue to. `AmpsVault` slot 6 and slot 2's `[16..47]` band are reserved holes where `staking` and `stakerBps`/`burnBps` lived. **I36 is deleted** rather than restated (`docs/phase3-state-model.md` §8.2); `docs/phase2-state-model.md` §1.3 records the removal in place of the old layout. `test/invariant/Phase2.invariant.t.sol` says so at the top of the file. |
+| **`burnBps` as a governed share** (finding 6's neighbourhood; decision 6) — the burn was `(ampsFees − creatorCut − stakerCut) × burnBps / BPS`, bounded `≤ 2500`. | **There is no parameter left to bound.** The whole AMPS-side remainder is burned after the creator's slice, so the burn is a whole share rather than a fraction of one. `BURN_BPS_*` and `STAKER_BPS_*` are removed from `Constants`, from the launch parameter table, from the governance surface and from `docs/launch-runbook.md` §7's 48-hour list. |
+| **Finding 6 — the creator divisor floor (ruling AG)**: `divisor = max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT)`, so a fee cut could not enlarge the creator's slice past a fifth of AMPS-side fees. | **Removed with the thing it protected.** The creator is now paid `creatorBps(t)/ampsFeeBps` of **each currency's** fees, and `creatorBps(t) ≤ ampsFeeBps` is structural: the schedule starts at 100 bp and the fee's band floor is 100 bp. I31 becomes per-currency. What survives is the accepted over-statement: `ampsFees` was collected at `base + dyn`, so the realised slice exceeds the schedule by up to `(base + dynCap)/base` (1.6× under `GREEN`), still documented rather than tracked per swap. |
+| **Ruling AI — `compound` re-ladders at the reference anchor** (finding 16), and the re-ladder anchor generally. | **`compound` places no asks at all.** Step 6 of §3.6 is gone; the AMPS side is burned. That is what turns I10 into an equality (ask inventory is the genesis POL tranche less sales and rollout moves) and removes the only path on which a compound could re-sell AMPS the protocol had just bought back. The anchor rules still bind `place`, `rollout` and `deployBonded`, which are the placements that lay asks. |
+| **Lead — `rollout`'s harvest realises accrued AMPS fees without the split** ("revisit in revision 6, where the AMPS side is burned"). | **Moot.** The split's AMPS half is now "burn the remainder", so an unsplit realisation leaves AMPS in the vault's own inventory rather than skipping a distribution to somebody. It is still not ideal — the creator's slice of those fees is not taken — and stays recorded as a lead against a future public collect entry point. |
+| **Lead — the bid re-ladder's placement surge on a dust counter fee**, and finding 11's zero-work gating. | **Tightened by the rewrite.** `compound`'s surge and high-water reset are now gated on exactly `burned != 0`, an AMPS-side fact, because the fee burn takes the whole AMPS-side remainder and the buyback is the other half of the same condition. One wei of counter-side fee can no longer arm `SURGE_MAX_BPS`. The cooldown still follows what was actually placed. |
+| **Lead AZ — the rotation credit shared within one settlement contract** ("rotation-equivalent flow", accepted under revision 5). | **Closed by construction.** A credit is granted only on a hop where `sender == AmpsHook.router()` **and** `hookData == ROUTER_ROTATE`, and spent only on such a hop's exact-input sell. No ordinary buy — the protocol router's own `buy` included — mints anything to discount with, so a batching settlement contract can no longer pair a stranger's entry with its own exit. I26 is restated to say so. |
+| **Lead — `_writeRecords` overwrites `record.above` on a merge** ("revisit with revision 6's split rewrite"). | **Still open, and narrower.** `compound` no longer writes ask records, so the side-flip case is now reachable only through a bid cell that a rollout or a governance `place` later re-uses as an ask. Recorded as a lead against `VaultPlacementLib._writeRecords`. |
+
+### Still open, unchanged by revision 6
+
+`AmpsQuoter._quote`'s premium on a zero `pRefX18` (masked by the degraded bit — the revision-6 quoter slice
+touched the fee legs, not the premium); the index weight sum enforced only in `setIndexWeights`; the migration's
+single-transaction fit at a full constituent set (part of the user-owned constituent-cap decision); the `Migrated`
+event not naming a failed hook leg; the bounty's two-hop over-count.
+
+### New surface revision 6 adds, and what it will need audited
+
+`AmpsRouter` (`contracts/src/periphery/AmpsRouter.sol`) is new, immutable, ownerless and feeless. The properties
+an audit should attack: that both hops of `rotate` settle inside one `unlock` and hop 2 sells exactly hop 1's
+realised output; that the zero-AMPS-delta assertion cannot be bypassed; that the best-effort sweep cannot be used
+to strand or steal a caller's residue; that `hop1 != hop2` is enforced; that native-value handling is confined to
+the WETH leg; and — the one that matters most — that nothing but `rotate` ever puts `Constants.ROUTER_ROTATE` on
+a hop, since the hook's whole exemption rests on that.

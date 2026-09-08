@@ -70,9 +70,10 @@ keeper self-healing after an outage.
   the vault's own measurement and the pot's own payout, so `chost`, the daily ceiling, the 3× cap and the pot's
   balance are all already applied to it (§3.2).
 * **Fallback**, on a node without `eth_simulateV1`:
-  * `compound` — `(ampsFees + boughtBack) x P_ref`, where `boughtBack = burned - burnCut` and `burnCut` comes
-    from re-running §3.6 step 5's split client-side. Counter-side fees are not returned by the call and are not
-    counted, so this is a **lower bound** — the safe direction for a dust guard.
+  * `compound` — `burned x P_ref`. Under revision 6 `burned` is the *whole* AMPS-side movement of the call: the
+    fee remainder after the creator's slice plus whatever the pool's own bids bought back, so there is no split
+    left to re-run client-side. Counter-side fees are not returned by the call and are not counted, so this is a
+    **lower bound** — the safe direction for a dust guard.
   * `rollout` — `moved x P_ref`.
   * `deployBonded` — the placed slice of the idle collateral, valued at the feed.
   The payout is then `BountyPot._quote` re-run client-side against that work value and
@@ -121,7 +122,9 @@ Arbitrum Nitro does not guarantee it — so the first bountied job that simulate
 nothing to configure; the log line `eth_simulateV1 did not yield a BountyPaid` records the fallback.
 
 **Its own estimate is a lower bound.** `compound` returns `(ampsFees, burned)` and says nothing about the
-counter-side fees, which the vault does price in. So the fallback path under-states the work and can skip a job
+counter-side fees, which the vault does price in. The `Compound` log carries the rest —
+`(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)` — so a keeper that wants the full picture
+reads the receipt rather than the return value. So the fallback path under-states the work and can skip a job
 the vault would have paid for; it never sends one the vault would refuse. `amps_keeper_measured_work_value_usd`
 against `amps_keeper_reported_work_value_usd` (from the confirmed `BountyPaid`) is exactly that gap, and the
 chain suite asserts `measured ≤ reported`.
@@ -142,8 +145,9 @@ the keeper works whatever the gas costs — the honest setting until Phase 0 res
 
 `AmpsVault.lastPlacementAt(PoolId)` exists, and the keeper reads it per pool every scan. It previously had no
 getter, and the keeper reconstructed it from the newest `placedAt` across the ladder — a lower bound, because a
-`compound` that relaid nothing stamps the map without touching a record — and corrected it from the
-`PlacementCooldown` revert. Both workarounds are gone.
+`compound` that placed nothing still stamped the map — and corrected it from the `PlacementCooldown` revert. Both
+workarounds are gone. (Since revision 6 the cooldown follows what was actually placed, and a `compound` whose
+counter side committed nothing takes no cooldown at all.)
 
 Within a single scan the keeper layers an overlay on top: the snapshot is taken once, and a job sent early
 stamps pools that later candidates in the same cycle would otherwise still see as free. The overlay is
@@ -167,9 +171,10 @@ Everything is environment. **No endpoint and no address is a literal in a code p
 from `@amplestocks/config`'s chain records (4663 and 46630), which Phase 0 re-verifies on chain.
 
 The keeper is told **one** address — AMPS — and resolves the rest every scan: `Amps.vault()` names the live
-vault, so an `emergencyMigrate` is followed without a redeploy, and the vault names the registry, the bonds,
-the staking contract, the bounty pot, the oracle gate and the hook. A governance pointer move is a value that
-changes between two scans, not an outage.
+vault, so an `emergencyMigrate` is followed without a redeploy, and the vault names the registry, the bonds, the
+bounty pot, the oracle gate and the hook. There is no staking contract to resolve: revision 6 removed staking, so
+the keeper reads nothing about a reward stream and has no `notifyReward` to watch. A governance pointer move is a
+value that changes between two scans, not an outage.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -304,8 +309,8 @@ interval is too long for the pool's activity, or two of your own instances are r
 the same relayer, or stagger the scan intervals.
 
 Two reverts are not races (second remediation wave, 2026-09-07). `HighWaterResetFailed(poolId)` means an ask
-placement (`compound` with fee AMPS to re-lay, `rollout`, `deployBonded` never) could not reset the hook's
-high-water mark: the vault's market reference does not answer, or answers malformed. That is a wiring fault, not
+placement — `rollout` or a governance `place`; since revision 6 `compound` places no asks at all and
+`deployBonded` never did — could not reset the hook's high-water mark: the vault's market reference does not answer, or answers malformed. That is a wiring fault, not
 a timing one — page the operator; do not retry. And a `rollout` that lands less than it harvested is not a
 failure: the window is charged on what left the entry pools, the remainder is re-placed into them in the same call
 (`Placed` with `reason = "rollback"`), and the bounty is paid on what was placed, which the `chost` guard may round

@@ -109,6 +109,51 @@ const CATALOGUE: Readonly<Record<string, Omit<SurfacedError, 'name' | 'args'>>> 
     detail: 'A governed parameter was set outside the band hardcoded in the consuming contract. Bands cannot be widened.',
     action: '',
   },
+
+  // `AmpsRouter` (`contracts/src/periphery/AmpsRouter.sol`). Every entry point takes a deadline and
+  // a minimum, holds nothing between transactions, and sweeps what it touched back to the caller.
+  DeadlineExpired: {
+    title: 'The deadline passed before the transaction landed',
+    detail:
+      'Every router entry point takes a deadline you sign for. A swap that sits in the mempool across a session change is a different trade from the one that was quoted, so it reverts rather than executing late. Nothing moved.',
+    action: 'Re-quote and sign again.',
+  },
+  SameHop: {
+    title: 'A rotation needs two different pools',
+    detail:
+      'Both hops named the same pool. Buying AMPS in a pool and selling it straight back into it is a round trip that moves the tick out and back, not a rotation — and pricing it at two pass-through fees would make that pool’s liquidity pay for the noise.',
+    action: 'Pick a different destination.',
+  },
+  AmpsResidual: {
+    title: 'The rotation did not consume its own AMPS',
+    detail:
+      'The router asserts its AMPS balance on the PoolManager is exactly zero before it settles anything, so a rotation that somehow failed to sell all of what it bought reverts rather than banking the difference. Nobody can end a rotate holding AMPS.',
+    action: 'Nothing to retry blindly — this is a safety assertion, not a timing one. Report it.',
+  },
+  UnexpectedValue: {
+    title: 'Ether sent where it cannot be used',
+    detail:
+      'Native value reached an entry point that cannot spend it: either the pool’s counter asset is not the wrapped native token, or the value sent did not match the input amount being swapped.',
+    action: 'Turn off "use native ETH" for this pool, or match the value to the amount exactly.',
+  },
+  NativeTransferFailed: {
+    title: 'The ETH payout was rejected',
+    detail:
+      'Unwrapping was requested and the recipient refused the ether. Only reachable on the WETH leg, and only when the destination is a contract that will not accept a plain transfer.',
+    action: 'Take WETH instead of native ETH, or send to an address that accepts ether.',
+  },
+  NotWrappedNative: {
+    title: 'Wrapping is a WETH-leg convenience only',
+    detail:
+      'Wrapping or unwrapping was asked for on a pool whose counter asset is not the wrapped native token the router was deployed against. It means nothing on a USDG or a stock leg.',
+    action: 'Turn wrapping off for this pool.',
+  },
+  UnknownPool: {
+    title: 'The registry does not know this pool',
+    detail:
+      'Every pool the router touches is resolved through PoolRegistry, so it cannot be pointed at a pool the protocol has not registered. An unregistered id is refused before anything is spent.',
+    action: 'Pick a pool from the list on this page; it is built from the registry.',
+  },
 }
 
 const USER_REJECTED = /user (rejected|denied)|rejected the request|ACTION_REJECTED/i

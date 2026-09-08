@@ -226,15 +226,15 @@ export const PAGES: readonly DocsPage[] = [
     blocks: [
       {
         kind: 'p',
-        text: 'There are two fees and they are charged in different circumstances. The AMPS fee is the protocol’s own, and it is taken on every swap that touches AMPS — buying it and selling it alike. The pool’s base fee is the pool’s own, and under revision 6 it is charged on top of the AMPS fee only when the swap is one leg of a pass-through.',
+        text: 'There are two fees and they price two different things. The AMPS fee is the protocol’s own, and it is the base on both directions of every pool: buying AMPS and selling it are the same trade seen from two sides, and a fee taken on one side alone is a fee a round trip halves. The pool’s base fee is the price of moving through a pool rather than entering or leaving the index through it, and it is charged on one thing only — a hop of AmpsRouter.rotate. It is not a surcharge on top of the AMPS fee; it is what replaces it on that one path.',
       },
       {
         kind: 'rows',
         title: 'Live',
         rows: [
-          {label: 'AMPS fee', figure: 'ampsFee', hint: 'Charged on buys and on sells'},
+          {label: 'AMPS fee', figure: 'ampsFee', hint: 'The base on buys and on sells alike'},
           {label: 'Band hardcoded in the hook', figure: 'ampsFeeBand'},
-          {label: 'Entry-pool base fee band', figure: 'entryBaseFeeBand', hint: 'AMPS/WETH and AMPS/USDG'},
+          {label: 'Entry-pool base fee band', figure: 'entryBaseFeeBand', hint: 'AMPS/WETH and AMPS/USDG — pass-through only'},
           {label: 'Spoke base fee band', figure: 'spokeBaseFeeBand', hint: 'High-volatility names default higher inside it'},
           {label: 'Absolute ceiling on base plus dynamic', figure: 'totalFeeMax'},
         ],
@@ -242,8 +242,8 @@ export const PAGES: readonly DocsPage[] = [
       {
         kind: 'note',
         tone: 'default',
-        title: 'The getter is still called ampsFeeBps',
-        text: 'On chain the AMPS fee is still exposed as AmpsHook.ampsFeeBps(), from before it was charged in both directions. The interface reads it through one accessor so the rename is a single line; the value you see is the live one either way.',
+        title: 'What the quoter reports, and which number is yours',
+        text: 'AmpsQuoter.quotePool answers four fee legs per pool, not two. buyFeePips and sellFeePips are what an ordinary trade pays in each direction — base ampsFeeBps plus the clamped dynamic part — and those are the numbers this interface quotes you. passThroughBuyFeePips and passThroughSellFeePips are the two hops of a rotation, based on the pool’s own buyFeeBps, and are unreachable through any other route. Both pairs are shown on Buy / Sell so the difference is visible rather than implied.',
       },
       {kind: 'h', level: 2, text: 'The dynamic component'},
       {
@@ -253,13 +253,17 @@ export const PAGES: readonly DocsPage[] = [
       {kind: 'h', level: 2, text: 'Where the fee goes'},
       {
         kind: 'p',
-        text: 'Every compound takes the creator slice first, then burns the AMPS side of the fee. The counter-asset side is not distributed: it stays in the pool as bids, which is the same thing as saying it deepens the floor. There is no staker slice and no reward stream — revision 6 removed both.',
+        text: 'A compound collects a pool’s fees in two currencies and treats them differently on purpose. The creator’s slice is taken from each of them in kind — AMPS by transfer, counter assets by transfer with an ERC-6909 claim fallback, so a token that refuses a transfer can never block the call. What is left of the AMPS side is burned, all of it. What is left of the counter side stays as bids in the pool that earned it, which is the same thing as saying it deepens the floor you can sell into. There is no staker slice, no reward stream and no governed burn share — revision 6 removed all three, and there is no re-ladder of fee AMPS into asks either.',
+      },
+      {
+        kind: 'p',
+        text: 'The one consequence worth stating plainly: ask inventory is finite and never grows. It is the genesis tranche, redistributed from the entry pools into the spokes by the rollout, and nothing adds to it. Every trade therefore either raises the assets behind a share or lowers the number of shares.',
       },
       {
         kind: 'rows',
         title: 'The creator schedule, which is immutable',
         rows: [
-          {label: 'At genesis', figure: 'creatorFeeGenesis'},
+          {label: 'At genesis', figure: 'creatorFeeGenesis', hint: 'Of trade volume, taken in kind from each currency’s fees'},
           {label: 'Decays linearly to zero over', figure: 'creatorDecay'},
           {label: 'In force now', figure: 'creatorFeeNow'},
         ],
@@ -278,18 +282,26 @@ export const PAGES: readonly DocsPage[] = [
     title: 'Pass-through and the router',
     kicker: 'The router',
     lede: 'Why stock-to-stock has exactly one route, and what happens if you take another.',
-    source: 'AmpsRouter.rotate\nlib/abi/router.ts',
+    source: 'AmpsRouter.rotate\nAmpsHook.router\nlib/abi/router.ts',
     group: 'surfaces',
     blocks: [
       {
         kind: 'p',
-        text: 'A pass-through is stock to stock through AMPS: buy AMPS in one pool, sell it in another, in one transaction. Its second leg pays the destination pool’s base fee instead of the AMPS fee, which is what makes rotating between constituents cheap.',
+        text: 'A pass-through is stock to stock through AMPS: buy AMPS in one pool, sell it in another, in one transaction. Both of its hops pay the pools’ own base fees instead of the AMPS fee, which is what makes rotating between constituents affordable — a rotation is not an entry and not an exit, and taxing it as though it were two of each would make the index unusable as an index.',
       },
       {
         kind: 'note',
         tone: 'warning',
-        title: 'Only the protocol’s own router can do it',
-        text: 'The hook fixes a hop’s fee in beforeSwap, before that hop runs. The only thing that can prove to it that the AMPS being sold was bought moments ago in the same transaction is the credit the router creates and spends inside that transaction, in EIP-1153 transient storage. A third-party router calling the PoolManager twice creates no such credit, so its AMPS-buying leg pays the AMPS fee like any other buy.',
+        title: 'Only the protocol’s own router can do it, and the hook checks two things',
+        text: 'The hook fixes a hop’s fee in beforeSwap, before that hop runs, so it cannot infer from the swap that another hop follows: that is a fact about the caller’s intentions, not about the pool. What it checks instead is a declaration it can verify — the sender the PoolManager reports is the address in AmpsHook.router(), and the hop’s hookData is exactly the router’s rotation flag. Both, or the hop pays ampsFeeBps. A third-party router calling the PoolManager twice satisfies neither, so both of its legs pay the AMPS fee.',
+      },
+      {
+        kind: 'rows',
+        title: 'The exemption, as the hook holds it',
+        rows: [
+          {label: 'Router the hook honours', figure: 'hookRouter', hint: 'Moved by setRouter, a seven-day timelock class. The zero address withdraws the exemption entirely.'},
+          {label: 'Flag both hops must carry', figure: 'rotateFlag', hint: 'AmpsRouter.ROTATE_FLAG(), so an integrator can check it rather than trust a comment'},
+        ],
       },
       {
         kind: 'code',
@@ -302,11 +314,21 @@ export const PAGES: readonly DocsPage[] = [
     address to,
     bool unwrap,
     uint256 deadline
-) external payable returns (uint256 amountOut);`,
+) external payable returns (uint256 amountOut, uint256 ampsThrough);`,
       },
       {
         kind: 'p',
-        text: 'The credit is transient by construction. It cannot cross a transaction boundary, so splitting a rotation into two transactions throws it away entirely; and an exact-output sell consumes none of it, which is why the router always builds the second leg as exact input.',
+        text: 'Both hops run inside one PoolManager unlock, and hop 2 sells exactly the AMPS hop 1 realised — read from the swap’s own balance delta, not from anything quoted beforehand. The router’s AMPS delta is asserted to be zero before it settles anything, so nobody can end a rotation holding AMPS; ampsThrough is that amount, returned so a caller can reconcile what it was quoted. The two hops must be different pools: buying AMPS in a pool and selling it straight back is a round trip that moves the tick out and back, and pricing it at two pass-through fees would make that pool’s liquidity pay for the caller’s own noise.',
+      },
+      {
+        kind: 'p',
+        text: 'The credit that lets hop 2 be cheap is transient by construction. It cannot cross a transaction boundary, so splitting a rotation into two transactions throws it away entirely; an exact-output sell consumes none of it, which is why the router always builds the second leg as exact input; and a sell larger than the buy that funded it pays the AMPS fee on the excess, so a rotation cannot be padded into a discounted exit.',
+      },
+      {
+        kind: 'note',
+        tone: 'default',
+        title: 'The router’s own buy and sell are not pass-through',
+        text: 'AmpsRouter.buy and AmpsRouter.sell pass empty hookData and pay ampsFeeBps like any swap through any other router — and calling them in the same transaction is a round trip, not a rotation, so it pays the AMPS fee twice. Routing an exit through the protocol’s own front end must not make the exit cheaper.',
       },
       {
         kind: 'rows',
@@ -355,6 +377,10 @@ export const PAGES: readonly DocsPage[] = [
       {
         kind: 'p',
         text: 'Unfilled entry-pool inventory migrates into the spokes at a governed daily rate, subject to a floor that stops it draining the entry pools. It is a rate rather than an event, so the index reaches its target weights over days rather than at a single block anyone could front-run.',
+      },
+      {
+        kind: 'p',
+        text: 'The rollout is also the only thing that moves ask inventory at all. Nothing adds to it: the AMPS side of every fee is burned instead of being re-offered, so the asks above the anchor are the genesis tranche and nothing else, spread across the pools over time. Above the top of a ladder a pool quotes bids only.',
       },
       {
         kind: 'rows',

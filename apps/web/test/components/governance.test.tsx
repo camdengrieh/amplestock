@@ -2,7 +2,14 @@
 import {render, screen} from '@testing-library/react'
 import {describe, expect, it} from 'vitest'
 
-import {ConstituentTable, ParameterTable, TimelockQueue, type ParameterRow} from '@/components/surfaces/governance'
+import {
+  ConstituentTable,
+  ParameterTable,
+  PointerTable,
+  TimelockQueue,
+  type ParameterRow,
+  type PointerRow,
+} from '@/components/surfaces/governance'
 import {formatBps} from '@/lib/format'
 
 const rows: ParameterRow[] = [
@@ -23,6 +30,32 @@ describe('ParameterTable', () => {
     render(<ParameterTable rows={rows} />)
     const row = screen.getByTestId('param-ampsFeeBps')
     expect(row.querySelector('[data-unavailable="true"]')).not.toBeNull()
+  })
+})
+
+const pointers: PointerRow[] = [
+  {
+    name: 'AmpsHook.router',
+    address: '0x00000000000000000000000000000000000000A1',
+    delay: '7 d',
+    note: 'The whole of the pass-through exemption. The zero address withdraws it.',
+  },
+  {name: 'AmpsHook.feePolicy', delay: '7 d', note: 'The dynamic component. It cannot move funds.'},
+]
+
+describe('PointerTable', () => {
+  it('names the router pointer, its address and its seven-day class', () => {
+    render(<PointerTable rows={pointers} />)
+    const row = screen.getByTestId('pointer-AmpsHook.router')
+    expect(row).toHaveTextContent('7 d')
+    expect(row).toHaveTextContent(/pass-through exemption/i)
+  })
+
+  it('renders an unread pointer as unavailable rather than as the zero address', () => {
+    render(<PointerTable rows={pointers} />)
+    const row = screen.getByTestId('pointer-AmpsHook.feePolicy')
+    expect(row.querySelector('[data-unavailable="true"]')).not.toBeNull()
+    expect(row).not.toHaveTextContent('0x0000')
   })
 })
 

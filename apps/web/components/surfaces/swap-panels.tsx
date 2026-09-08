@@ -9,7 +9,14 @@ import {Value} from '@/components/common/value'
 import {Callout, DataRow, RowGroup} from '@/components/ledger/primitives'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {NOTES} from '@/lib/copy'
-import {ampsFeeBpsOf, directFeePipsOf, pipsToBps, pipsToPercent, poolBaseFeeBpsOf} from '@/lib/fees'
+import {
+  ampsFeeBpsOf,
+  directFeePipsOf,
+  passThroughFeePipsOf,
+  pipsToBps,
+  pipsToPercent,
+  poolBaseFeeBpsOf,
+} from '@/lib/fees'
 import {formatAmount, formatBps, formatPremiumX18, formatUsd18} from '@/lib/format'
 import {sessionLabels} from '@/lib/protocol'
 import {gateStateName, quoteAvailability, sessionName, type PoolQuote} from '@/lib/quoter'
@@ -28,10 +35,12 @@ function decodeReason(reason: `0x${string}`): string | null {
  * The quote, in the design's shape: one `Quote` label, a 2px ink rule, and a run of `k / v / b` rows
  * — a serif label, a dim gloss under it, and the figure in mono on the right. No panels, no boxes.
  *
- * The design shows nine rows and this shows eleven, because revision 6 splits the fee into the AMPS
- * fee (charged both ways) and the pool base fee (pass-through only), and prints the hook's own band
- * beside the first. Everything else is the design's row order: what you receive, what you sign for,
- * the fee, the prices, the gate.
+ * The design shows nine rows and this shows twelve, because revision 6 has two prices per direction
+ * rather than one: the AMPS fee, charged both ways, is what this swap pays; the pool's base fee is
+ * the pass-through price, reachable only through `AmpsRouter.rotate`, and is shown beside it with
+ * what this same hop would cost inside one. The hook's own band sits under the first. Everything
+ * else is the design's row order: what you receive, what you sign for, the fee, the prices, the
+ * gate.
  */
 export interface SwapQuoteViewProps {
   side: 'buy' | 'sell'
@@ -147,6 +156,14 @@ export function SwapQuoteView({
         </DataRow>
         <DataRow label="Pool base fee — pass-through only" note={NOTES.poolBaseFee}>
           <Value unavailable={!avail.fees}>{avail.fees ? formatBps(blendedBaseBps ?? baseBps) : null}</Value>
+        </DataRow>
+        <DataRow
+          label="The same hop inside a rotation"
+          note="What this hop would cost as one leg of an AmpsRouter.rotate — the pass-through base plus this direction’s dynamic part. It is not available for the swap on this page: only the protocol router’s rotation hops are priced at it."
+        >
+          <Value unavailable={!avail.fees} reason="Hook read failed">
+            {avail.fees ? pipsToPercent(passThroughFeePipsOf(quote, side)) : null}
+          </Value>
         </DataRow>
         <DataRow
           label="Dynamic component"

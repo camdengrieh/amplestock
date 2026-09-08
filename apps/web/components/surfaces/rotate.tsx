@@ -14,7 +14,7 @@ import {DataRow, Inverted, RowGroup} from '@/components/ledger/primitives'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {Label} from '@/components/ui/label'
 import {Select} from '@/components/ui/select'
-import {useAmpsFee} from '@/hooks/use-hook-params'
+import {useAmpsFee, useHookRouter} from '@/hooks/use-hook-params'
 import {usePoolDirectory} from '@/hooks/use-pools'
 import {useRotationQuote} from '@/hooks/use-quotes'
 import {useTx} from '@/hooks/use-tx'
@@ -23,37 +23,72 @@ import {activeChainId} from '@/lib/chains'
 import {addressOf} from '@/lib/contracts'
 import {NOTES} from '@/lib/copy'
 import {explorerTxUrl} from '@/lib/deployment'
-import {ampsFeeBpsOf, blendedAmpsFeeBps, bpsToPips, pipsToPercent, poolBaseFeeBpsOf} from '@/lib/fees'
+import {
+  ampsFeeBpsOf,
+  blendedAmpsFeeBps,
+  bpsToPips,
+  directFeePipsOf,
+  passThroughFeePipsOf,
+  pipsToPercent,
+  poolBaseFeeBpsOf,
+} from '@/lib/fees'
 import {formatAmount, parseAmount, shortAddress} from '@/lib/format'
+import {ROUTER_ROTATE} from '@/lib/protocol'
 import {minOutFromSlippage} from '@/lib/route'
 
 const DEFAULT_SLIPPAGE_BPS = 50
 
 /**
- * The comparison the Rotate surface exists to show.
+ * The comparison the Rotate surface exists to show, and the one revision 6 changed.
  *
- * A pass-through's second hop pays the destination pool's base fee instead of the AMPS fee, because
- * the AMPS it is selling was bought by the first hop in the same transaction and the hook credits
- * exactly that. Doing the same two swaps as two transactions throws it away: the credit lives in
- * EIP-1153 transient storage and cannot cross a transaction boundary.
+ * **Both hops move, not just the second.** Through `AmpsRouter.rotate` the hook prices hop 1 at the
+ * source pool's pass-through base and hop 2 at the destination pool's — the second because the AMPS
+ * it is selling is exactly what hop 1 bought, which the transient rotation credit proves. The same
+ * two swaps built by hand through any other router pay `ampsFeeBps` **on both legs**: entering the
+ * index and leaving it are what those two swaps are, seen one at a time. The saving is therefore
+ * the whole difference between two AMPS fees and two pass-through fees, not one leg's worth of it.
  *
- * Both columns are computed from the same fee law, so the difference is the credit and nothing else.
+ * Both columns come from the quoter's own four fee legs where it has answered, so the dynamic
+ * component is in both, and the difference is the pass-through and nothing else.
  */
 export interface RotationComparison {
+  /** Hop 1 through the protocol router: the source pool's pass-through base plus its dynamic part. */
   hop1FeePips: number
+  /** Hop 2 through the protocol router, fully covered by the credit hop 1 created. */
   rotatedHop2FeePips: number
+  /** Hop 1 through anything else: an ordinary buy, at `ampsFeeBps`. */
+  separateHop1FeePips: number
+  /** Hop 2 through anything else: an ordinary sell, at `ampsFeeBps`. */
   separateHop2FeePips: number
   hop2BaseBpsRotated: number
   hop2BaseBpsSeparate: number
   creditUsed: bigint
+  /** The two legs together, one way against the other. */
+  rotatedTotalPips: number
+  separateTotalPips: number
   savedPips: number
 }
 
+/**
+ * The comparison, from the two pools' quotes.
+ *
+ * `hop1PassThroughFeePips` / `hop2PassThroughFeePips` and their ordinary counterparts are the
+ * quoter's legs when it has answered; when it has not, the caller passes the bases and this falls
+ * back to the fee law, which is the same arithmetic in the same rounding direction.
+ */
 export function compareRotation(params: {
   hop1BuyFeeBps: number
   hop2BuyFeeBps: number
   ampsFeeBps: number
   ampsFromHop1: bigint
+  /** From `PoolQuote.passThroughBuyFeePips` of hop 1, or `quoteRotation`'s `hop1FeePips`. */
+  hop1PassThroughFeePips?: number
+  /** From `PoolQuote.passThroughSellFeePips` of hop 2, or `quoteRotation`'s `hop2FeePips`. */
+  hop2PassThroughFeePips?: number
+  /** From `PoolQuote.buyFeePips` of hop 1 — what an ordinary buy in that pool costs. */
+  hop1OrdinaryFeePips?: number
+  /** From `PoolQuote.sellFeePips` of hop 2 — what an ordinary sell in that pool costs. */
+  hop2OrdinaryFeePips?: number
 }): RotationComparison {
   const rotatedBase = blendedAmpsFeeBps({
     ampsFeeBps: params.ampsFeeBps,
@@ -61,14 +96,23 @@ export function compareRotation(params: {
     amountIn: params.ampsFromHop1,
     credit: params.ampsFromHop1,
   })
+  const hop1FeePips = params.hop1PassThroughFeePips ?? bpsToPips(params.hop1BuyFeeBps)
+  const rotatedHop2FeePips = params.hop2PassThroughFeePips ?? bpsToPips(rotatedBase)
+  const separateHop1FeePips = params.hop1OrdinaryFeePips ?? bpsToPips(params.ampsFeeBps)
+  const separateHop2FeePips = params.hop2OrdinaryFeePips ?? bpsToPips(params.ampsFeeBps)
+  const rotatedTotalPips = hop1FeePips + rotatedHop2FeePips
+  const separateTotalPips = separateHop1FeePips + separateHop2FeePips
   return {
-    hop1FeePips: bpsToPips(params.hop1BuyFeeBps),
-    rotatedHop2FeePips: bpsToPips(rotatedBase),
-    separateHop2FeePips: bpsToPips(params.ampsFeeBps),
+    hop1FeePips,
+    rotatedHop2FeePips,
+    separateHop1FeePips,
+    separateHop2FeePips,
     hop2BaseBpsRotated: rotatedBase,
     hop2BaseBpsSeparate: params.ampsFeeBps,
     creditUsed: params.ampsFromHop1,
-    savedPips: bpsToPips(params.ampsFeeBps - rotatedBase),
+    rotatedTotalPips,
+    separateTotalPips,
+    savedPips: separateTotalPips - rotatedTotalPips,
   }
 }
 
@@ -93,6 +137,7 @@ export function RotateSurface() {
 
   const routerAddress = addressOf('router')
   const fee = useAmpsFee()
+  const hookRouter = useHookRouter()
 
   const from = React.useMemo(() => spokes.find((p) => p.poolId === fromPoolId) ?? spokes[0], [spokes, fromPoolId])
   const to = React.useMemo(() => spokes.find((p) => p.poolId === toPoolId) ?? spokes[1] ?? spokes[0], [spokes, toPoolId])
@@ -110,11 +155,19 @@ export function RotateSurface() {
     // either way, so the comparison is exact in the fee dimension even before the quoter answers.
     const credit = rotation.rotation?.creditUsed ?? (amount ?? 0n)
     if (credit <= 0n) return null
+    // The pass-through column prefers `quoteRotation`, which prices this exact amount; the pool
+    // quotes' own pass-through legs are the amount-independent fallback. The ordinary column is
+    // always the pool quotes' net-trade totals — what these two swaps cost through any other
+    // router, in the direction each of them actually goes.
     return compareRotation({
       hop1BuyFeeBps: poolBaseFeeBpsOf(from.quote),
       hop2BuyFeeBps: poolBaseFeeBpsOf(to.quote),
       ampsFeeBps: fee.ampsFeeBps ?? ampsFeeBpsOf(to.quote),
       ampsFromHop1: credit,
+      hop1PassThroughFeePips: rotation.rotation?.hop1FeePips ?? passThroughFeePipsOf(from.quote, 'buy'),
+      hop2PassThroughFeePips: rotation.rotation?.hop2FeePips ?? passThroughFeePipsOf(to.quote, 'sell'),
+      hop1OrdinaryFeePips: directFeePipsOf(from.quote, 'buy'),
+      hop2OrdinaryFeePips: directFeePipsOf(to.quote, 'sell'),
     })
   }, [from, to, rotation.rotation, amount, fee.ampsFeeBps])
 
@@ -248,6 +301,7 @@ export function RotateSurface() {
           degraded={(from?.quote.degraded ?? 0) | (to?.quote.degraded ?? 0)}
           routerDeployed={routerAddress !== undefined}
           {...(routerAddress ? {routerAddress} : {})}
+          {...(hookRouter.router ? {hookRouter: hookRouter.router} : {})}
         />
       </div>
     </div>
@@ -262,6 +316,7 @@ export function RotationComparisonPanel({
   degraded,
   routerDeployed = true,
   routerAddress,
+  hookRouter,
 }: {
   comparison: RotationComparison | null
   amountOut?: bigint
@@ -270,7 +325,14 @@ export function RotationComparisonPanel({
   degraded: number
   routerDeployed?: boolean
   routerAddress?: string
+  /** `AmpsHook.router()`, live. The exemption is this address and no other. */
+  hookRouter?: string
 }) {
+  // A mismatch is only a claim when both halves have been read. An unread pointer says nothing.
+  const routerMismatch =
+    routerAddress !== undefined &&
+    hookRouter !== undefined &&
+    routerAddress.toLowerCase() !== hookRouter.toLowerCase()
   return (
     <div className="space-y-[26px]" data-testid="rotation-comparison">
       <DegradedNotice degraded={degraded} />
@@ -286,22 +348,28 @@ export function RotationComparisonPanel({
             {minOut !== undefined ? `${formatAmount(minOut, 18)} ${outSymbol}` : null}
           </Value>
         </DataRow>
-        <DataRow label="Hop 1 — buy AMPS" labelClassName="text-[17px]">
+        <DataRow label="Hop 1 — buy AMPS, pass-through" labelClassName="text-[17px]">
           <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
         </DataRow>
         <DataRow label="Hop 2 — sell AMPS, credited" labelClassName="text-[17px]">
           <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.rotatedHop2FeePips) : null}</Value>
         </DataRow>
+        <DataRow label="Both hops together" labelClassName="text-[17px]">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.rotatedTotalPips) : null}</Value>
+        </DataRow>
       </RowGroup>
 
-      <RowGroup label="The same two swaps, separately" rule="rule" className="pt-2">
-        <DataRow label="Hop 1 — buy AMPS" labelClassName="text-[17px] text-dim">
-          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.hop1FeePips) : null}</Value>
+      <RowGroup label="The same two swaps through any other router" rule="rule" className="pt-2">
+        <DataRow label="Hop 1 — buy AMPS, at the AMPS fee" labelClassName="text-[17px] text-dim">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.separateHop1FeePips) : null}</Value>
         </DataRow>
-        <DataRow label="Hop 2 — sell AMPS, uncredited" labelClassName="text-[17px] text-dim">
+        <DataRow label="Hop 2 — sell AMPS, at the AMPS fee" labelClassName="text-[17px] text-dim">
           <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.separateHop2FeePips) : null}</Value>
         </DataRow>
-        <DataRow label="Difference on the second hop" labelClassName="text-[17px] text-dim">
+        <DataRow label="Both hops together" labelClassName="text-[17px] text-dim">
+          <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.separateTotalPips) : null}</Value>
+        </DataRow>
+        <DataRow label="Difference" labelClassName="text-[17px] text-dim">
           <Value unavailable={!comparison}>{comparison ? pipsToPercent(comparison.savedPips) : null}</Value>
         </DataRow>
       </RowGroup>
@@ -316,7 +384,26 @@ export function RotationComparisonPanel({
           AmpsRouter {routerAddress ? shortAddress(routerAddress) : 'not deployed on this chain'} ·
           rotate(hop1, hop2, amountIn, minOut, to, unwrap, deadline)
         </p>
+        <p className="mt-2 font-mono text-[12px] opacity-60">
+          hookData {shortAddress(ROUTER_ROTATE)} · AmpsHook.router(){' '}
+          {hookRouter !== undefined ? shortAddress(hookRouter) : '—'}
+        </p>
       </Inverted>
+
+      {routerMismatch ? (
+        <Alert variant="warning" data-testid="router-mismatch">
+          <AlertTitle>The hook does not honour this router</AlertTitle>
+          <AlertDescription>
+            <p>
+              The pass-through price is granted to exactly one address, and{' '}
+              <code className="font-mono">AmpsHook.router()</code> is not the address this page would call. Until the
+              two agree, a rotation built here pays the AMPS fee on both hops — the right-hand column, not the left.
+              Governance moves the pointer through <code className="font-mono">setRouter</code>, a seven-day timelock
+              class.
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
 
       {routerDeployed ? null : (
         <Alert variant="warning" data-testid="router-missing">

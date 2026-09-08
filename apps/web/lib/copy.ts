@@ -30,7 +30,7 @@ export const RISK_DISCLOSURES: readonly Disclosure[] = [
     body: [
       'Every one of the 32 pools is protocol-owned. There is no public liquidity-provider tier, and there will not be one: the vault is the only entity placing liquidity, so the bid depth under AMPS is exactly the counter-assets the protocol has earned and holds, pool by pool.',
       'That number is published per pool on the Vault page rather than hidden. If you want to know what would happen to the price if you sold, read it: it is the whole answer, and it is finite.',
-      'Ask inventory is finite too. It is the genesis tranche plus the re-laddered share of AMPS collected as fees, and it is never minted. AMPS bought back by the protocol’s own bids is burned, not re-placed.',
+      'Ask inventory is finite too, and it is exactly one thing: the genesis tranche, redistributed from the entry pools into the spokes by the rollout. It is never minted, and nothing adds to it — the AMPS side of every fee is burned rather than re-laddered, and AMPS bought back by the protocol’s own bids is burned too.',
     ],
   },
   {
@@ -80,7 +80,7 @@ export const RISK_DISCLOSURES: readonly Disclosure[] = [
     title: 'The AMPS fee is charged in both directions, and a pass-through has one route',
     body: [
       'The protocol’s own fee is taken on every swap that touches AMPS — buying it and selling it — inside a band hardcoded in the hook. It is not a spread you can route around, and the live value for the pool you are trading is shown before you sign.',
-      'A pass-through — stock to stock through AMPS — pays the two pools’ base fees instead of the AMPS fee on its middle leg, and it is available only through the protocol’s own router. The hook fixes a hop’s fee before that hop runs, so the only thing that can prove a round trip happened is the credit the router creates and spends inside one transaction. Any other router pays the AMPS fee on its AMPS-buying leg.',
+      'A pass-through — stock to stock through AMPS — pays the two pools’ base fees on both of its hops instead of the AMPS fee, and it is available through the protocol’s own router and nowhere else. The hook fixes a hop’s fee before that hop runs, so what it checks instead is a declaration it can verify: the swap’s sender is the router address the hook holds, and the hop carries the router’s rotation flag. Any other router pays the AMPS fee on both legs.',
       'The AMPS side of every fee is burned after the creator slice is taken. The counter-asset side stays in the pool as bids. Neither is a distribution to anybody.',
     ],
   },
@@ -118,11 +118,11 @@ export const NOTES = {
   ampsFee:
     'The protocol’s own fee, charged on every swap that touches AMPS — buying it and selling it alike. Governed inside a band hardcoded in the hook; the live value for this pool is read from the chain.',
   poolBaseFee:
-    'The pool’s own base fee: 30 bp in an entry pool, 5–10 bp in a spoke. Charged on top of the AMPS fee only when the swap is one leg of a pass-through.',
+    'The pool’s own base fee: 30 bp in an entry pool, 5–10 bp in a spoke. It is the pass-through price — what one hop of a protocol-router rotation pays instead of the AMPS fee, not something added on top of it. An ordinary buy or sell never pays it.',
   rotationCredit:
-    'Buying AMPS in one pool and selling it in another inside the same transaction pays the two pools’ base fees on the middle leg instead of the AMPS fee. The credit lives in transient storage: it never carries across transactions, and an exact-output sell does not consume it at all.',
+    'Buying AMPS in one pool and selling it in another, in one call through the protocol’s own router, pays the two pools’ base fees instead of the AMPS fee — on both hops. The credit that proves the second hop is selling what the first hop bought lives in transient storage: it never carries across transactions, and an exact-output sell does not consume it at all, which is why the router always builds hop 2 as exact input.',
   routerOnly:
-    'A hop’s fee is fixed before that hop runs, so the only thing that can prove a round trip is the credit the protocol’s own router creates and spends inside one transaction. Any other router pays the AMPS fee on its AMPS-buying leg.',
+    'A hop’s fee is fixed before that hop runs, so the exemption cannot be inferred from the swap — it has to be declared by an address the hook trusts. The hook grants it to one address, held in AmpsHook.router() and movable only by a seven-day timelock, and only for hops carrying that router’s rotation flag. Any other router pays the AMPS fee on both legs.',
   noAggregator:
     'No external aggregator is configured, so no third-party route is quoted. The comparison is between the same two pools priced with and without the credit — not a claim about the whole market.',
   redemptionFloor:
@@ -138,9 +138,9 @@ export const NOTES = {
   polDepth: 'The pools are protocol-owned. This is the entire bid under AMPS in this pool.',
   checkpoint: 'Recomputes NAV and the reference price from live balances. Anyone may call it and it costs only gas.',
   burnSink:
-    'Every compound takes the creator slice first, then burns the AMPS side of the fee. The counter-asset side stays in the pool as bids. The high-water buyback burns what the protocol’s own bids bought back.',
+    'Every compound takes the creator’s slice of each currency first — AMPS by transfer, counter assets in kind — then burns the whole AMPS-side remainder. The counter-asset side stays as bids in the pool that earned it. The high-water buyback burns what the protocol’s own bids bought back, in the same call and before anything is placed.',
   creatorSchedule:
-    'One per cent of trade volume at genesis, decaying linearly to exactly zero at day 30. Immutable: there is no setter, and the schedule expires by itself.',
+    'One per cent of trade volume at genesis, decaying linearly to exactly zero at day 30, paid in kind out of each currency’s fees at compound(). Immutable: there is no setter, and the schedule expires by itself.',
   targetVsRealised:
     'The target weight is what the registry says the index should hold. The realised weight is what the vault holds right now, at the reference price. Rollout and market moves are why they differ.',
 } as const
@@ -201,12 +201,12 @@ export const LANDING_COPY = {
     {
       n: '03',
       h: 'The creator slice is taken, then the AMPS side is burned',
-      b: 'The creator schedule first — one per cent of trade volume at genesis, decaying to exactly zero at day 30 — and then the whole AMPS side of the fee is burned. There is no staker slice and no governed burn share.',
+      b: 'The creator schedule first, taken in kind from each currency — one per cent of trade volume at genesis, decaying to exactly zero at day 30 — and then the whole AMPS side of the fee is burned. There is no staker slice and no governed burn share.',
     },
     {
       n: '04',
       h: 'The counter-asset side stays as bids',
-      b: 'What was collected in the pool’s own counter asset goes back into the grid as depth. The assets behind each share go up; the share count goes down.',
+      b: 'What was collected in the pool’s own counter asset goes back into that same pool’s grid as bid depth — never moved to another pool. The assets behind each share go up; the share count goes down.',
     },
   ],
   feeSplit: [
@@ -217,8 +217,8 @@ export const LANDING_COPY = {
     },
     {
       k: 'Counter-asset side',
-      v: 'Re-laddered',
-      b: 'Back into the grid as bid depth. This is the part that deepens the floor you can sell into.',
+      v: 'Placed as bids',
+      b: 'Back into the grid of the pool that earned it, as bid depth. This is the part that deepens the floor you can sell into.',
     },
     {
       k: 'Stakers',

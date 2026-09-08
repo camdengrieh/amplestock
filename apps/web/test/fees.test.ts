@@ -78,7 +78,7 @@ describe('blendedAmpsFeeBps — the rotation-credit blend', () => {
     }
   })
 
-  it('refuses the sellFee < buyFee case, which the hard bands make unreachable on chain', () => {
+  it('refuses the ampsFee < buyFee case, which the hard bands make unreachable on chain', () => {
     expect(() => blendedAmpsFeeBps({ampsFeeBps: 5, buyFeeBps: 500, amountIn: WAD, credit: 0n})).toThrow()
   })
 

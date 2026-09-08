@@ -21,7 +21,14 @@ import {
   formatUsd18,
   shortAddress,
 } from '@/lib/format'
-import type {BurnEvent, LadderFill, NavPoint} from '@/lib/indexer/types'
+import type {
+  BurnHistory,
+  CreatorFeeStatus,
+  LadderDetail,
+  NavPoint,
+  PoolRow,
+  VaultSummary,
+} from '@/lib/indexer/types'
 import {PLACEMENT_COOLDOWN_SECONDS, constituentStatusNames, sessionLabels} from '@/lib/protocol'
 import {gateStateName, sessionName} from '@/lib/quoter'
 
@@ -579,10 +586,15 @@ export function GateStatusTable({rows}: {rows: readonly GateRow[]}) {
   )
 }
 
-/** The weighted mean fill of a pool's cells, as the design's `Filled` column. */
-function meanFill(fill: LadderFill): number | undefined {
-  if (fill.cells.length === 0) return undefined
-  return fill.cells.reduce((sum, cell) => sum + cell.filledFraction, 0) / fill.cells.length
+/**
+ * The pool's fill, as the design's `Filled` column.
+ *
+ * The indexer maintains it per pool (`ladderFillBps`) rather than leaving it to be averaged from
+ * the cells, and that matters: `/api/pools` carries the totals and not the cells, so a mean taken
+ * over `cells` here would have been a mean over an array that route never sends.
+ */
+function poolFill(pool: PoolRow): number | undefined {
+  return pool.ladderFillBps === undefined ? undefined : pool.ladderFillBps / 10_000
 }
 
 /**
@@ -599,20 +611,27 @@ function meanFill(fill: LadderFill): number | undefined {
  * real measure of what the market has bought rather than an artefact of a keeper moving ranges.
  */
 export function LadderFillPanel({
-  fills,
+  pools,
+  detail,
+  openPoolId,
+  onToggle,
   unavailable,
   reason,
 }: {
-  fills?: readonly LadderFill[]
+  /** `/api/pools`: one row per pool, with its ladder totals. It carries no cells. */
+  pools?: readonly PoolRow[]
+  /** `/api/pools/:poolId/ladder` for the open pool, fetched by the parent when a row opens. */
+  detail?: LadderDetail
+  openPoolId?: string | null
+  onToggle?: (poolId: string | null) => void
   unavailable?: boolean
   reason?: string
 }) {
-  const [open, setOpen] = React.useState<string | null>(null)
   const [all, setAll] = React.useState(false)
-  if (unavailable || !fills) {
+  if (unavailable || !pools) {
     return <IndexerUnavailable what="Ladder fill" {...(reason ? {reason} : {})} />
   }
-  const shown = all ? fills : fills.slice(0, 6)
+  const shown = all ? pools : pools.slice(0, 6)
   return (
     <div data-testid="ladder-fill">
       <div className="ledger-micro hidden gap-3.5 border-b border-rule pb-2.5 pt-3 lg:grid lg:grid-cols-[minmax(0,1fr)_104px_92px_60px_88px_60px_66px]">
@@ -620,92 +639,98 @@ export function LadderFillPanel({
         <span className="text-right">Bid depth</span>
         <span className="text-right">Ask inventory</span>
         <span className="text-right">Cells</span>
-        <span className="text-right">Rollout</span>
+        <span className="text-right">Swaps</span>
         <span className="text-right">Filled</span>
         <span />
       </div>
-      {shown.map((fill) => {
-        const isOpen = open === fill.poolId
-        const mean = meanFill(fill)
+      {shown.map((pool) => {
+        const isOpen = openPoolId === pool.id
+        const fill = poolFill(pool)
+        const symbol = pool.counterSymbol ?? shortAddress(pool.counter)
         return (
-          <div key={fill.poolId} className="border-b border-hair">
+          <div key={pool.id} className="border-b border-hair">
             <button
               type="button"
-              onClick={() => setOpen(isOpen ? null : fill.poolId)}
+              onClick={() => onToggle?.(isOpen ? null : pool.id)}
               aria-expanded={isOpen}
-              aria-controls={`ladder-${fill.poolId}`}
+              aria-controls={`ladder-${pool.id}`}
               className="grid w-full grid-cols-2 items-center gap-x-3.5 gap-y-1 py-3 text-left hover:bg-hair lg:grid-cols-[minmax(0,1fr)_104px_92px_60px_88px_60px_66px]"
             >
               <span className="col-span-2 flex min-w-0 items-center gap-3 lg:col-span-1">
-                <AssetMark symbol={fill.symbol} />
-                <span className="whitespace-nowrap font-mono text-[13px] tracking-[0.05em]">AMPS / {fill.symbol}</span>
+                <AssetMark symbol={symbol} />
+                <span className="whitespace-nowrap font-mono text-[13px] tracking-[0.05em]">AMPS / {symbol}</span>
               </span>
               <span className="ledger-cell text-right">
                 <span className="ledger-micro mr-2 lg:hidden">Bid</span>
-                {fill.bidDepth}
+                {pool.counterInLadder}
               </span>
               <span className="ledger-cell text-right text-dim">
                 <span className="ledger-micro mr-2 lg:hidden">Ask</span>
-                {fill.askInventory}
+                {pool.ampsInLadder}
               </span>
               <span className="ledger-cell text-right text-dim">
                 <span className="ledger-micro mr-2 lg:hidden">Cells</span>
-                {fill.cells.length}
+                {pool.askCells + pool.bidCells}
               </span>
               <span className="ledger-cell text-right text-dim">
-                <span className="ledger-micro mr-2 lg:hidden">Rollout</span>
-                {formatBps(fill.rolloutWeightBps)}
+                <span className="ledger-micro mr-2 lg:hidden">Swaps</span>
+                {pool.swapCount}
               </span>
               <span className="ledger-cell text-right">
                 <span className="ledger-micro mr-2 lg:hidden">Filled</span>
-                <Value unavailable={mean === undefined}>
-                  {mean !== undefined ? `${Math.round(mean * 100)}%` : null}
+                <Value unavailable={fill === undefined}>
+                  {fill !== undefined ? `${Math.round(fill * 100)}%` : null}
                 </Value>
               </span>
               <span className="ledger-micro text-right">{isOpen ? 'Close' : 'Cells'}</span>
             </button>
-            <div id={`ladder-${fill.poolId}`} hidden={!isOpen} className="pb-[26px]">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Cell</TableHead>
-                    <TableHead>Tick range</TableHead>
-                    <TableHead>Side</TableHead>
-                    <TableHead align="right">Placed</TableHead>
-                    <TableHead align="right">Filled</TableHead>
-                    <TableHead align="right">Proceeds</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {fill.cells.map((cell) => (
-                    <TableRow key={cell.bucketIndex}>
-                      <TableCell>{cell.bucketIndex}</TableCell>
-                      <TableCell className="text-dim">
-                        {cell.lowerTick} … {cell.upperTick}
-                      </TableCell>
-                      <TableCell className="text-[10px] tracking-[0.12em] uppercase">
-                        {cell.above ? 'Ask' : 'Bid'}
-                      </TableCell>
-                      <TableCell align="right">{cell.amount}</TableCell>
-                      <TableCell align="right">{Math.round(cell.filledFraction * 100)}%</TableCell>
-                      <TableCell align="right">{cell.proceeds}</TableCell>
+            <div id={`ladder-${pool.id}`} hidden={!isOpen} className="pb-[26px]">
+              {detail && detail.pool?.id === pool.id ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Cell</TableHead>
+                      <TableHead>Tick range</TableHead>
+                      <TableHead>Side</TableHead>
+                      <TableHead align="right">Placed</TableHead>
+                      <TableHead align="right">Filled</TableHead>
+                      <TableHead align="right">Proceeds</TableHead>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHeader>
+                  <TableBody>
+                    {detail.cells.map((cell) => (
+                      <TableRow key={cell.bucketIndex}>
+                        <TableCell>{cell.bucketIndex}</TableCell>
+                        <TableCell className="text-dim">
+                          {cell.tickLower} … {cell.tickUpper}
+                        </TableCell>
+                        <TableCell className="text-[10px] tracking-[0.12em] uppercase">
+                          {cell.above ? 'Ask' : 'Bid'}
+                        </TableCell>
+                        <TableCell align="right">{cell.amount}</TableCell>
+                        <TableCell align="right">{Math.round(cell.filledBps / 100)}%</TableCell>
+                        <TableCell align="right">{cell.proceeds}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="pt-3 text-[13px] leading-[1.55] text-dim">Loading this pool’s cells…</p>
+              )}
             </div>
           </div>
         )
       })}
-      {fills.length > 6 ? (
+      {pools.length > 6 ? (
         <Button variant="outline" className="mt-[18px]" onClick={() => setAll((v) => !v)} data-testid="ladder-toggle">
-          {all ? 'Collapse to the six largest pools' : `Show all ${fills.length} pools`}
+          {all ? 'Collapse to the six largest pools' : `Show all ${pools.length} pools`}
         </Button>
       ) : null}
       <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
         Ladders are static. A cell is placed once and only ever removed by a redemption, the daily rollout, a high-water
         buyback burn or a migration — nothing is re-centred or re-widened, so <em>filled</em> is a real measure of what
-        the market bought. Bid depth is the entire bid under AMPS in this pool, because every pool is protocol-owned.
+        the market bought. Bid depth is the entire bid under AMPS in this pool, because every pool is protocol-owned,
+        and it only grows: the counter-asset side of every fee is placed back here as bids.
       </p>
     </div>
   )
@@ -719,32 +744,41 @@ export function LadderFillPanel({
  * that is the whole AMPS side of the fee after the creator slice, not a governed share of it.
  */
 export function burnReasonLabel(reason: string): string {
+  // The four the vault emits, and no others: `VaultPlacementLib` burns `buyback` and `compound`,
+  // `AmpsVault.redeemProRata` burns `redeem` and `redeemInventory`.
   const LABELS: Readonly<Record<string, string>> = {
-    redeem: 'Redemption',
     buyback: 'High-water buyback',
-    fee: 'Fee sink',
-    compound: 'Compound',
+    compound: 'Fee burn',
+    redeem: 'Redemption',
+    redeemInventory: 'Redemption — released inventory',
   }
-  let decoded = ''
-  try {
-    decoded = hexToString(reason as `0x${string}`, {size: 32}).replace(/\0+$/, '')
-  } catch {
-    decoded = ''
-  }
+  // The indexer decodes the `bytes32` and serves the short string; a raw `bytes32` is accepted too,
+  // because a consumer reading the log directly has one and the label should not depend on which.
+  const decoded = reason.startsWith('0x') ? decodeBytes32(reason) : reason
   if (decoded === '') return reason.slice(0, 10)
   return LABELS[decoded] ?? decoded
 }
 
+function decodeBytes32(value: string): string {
+  try {
+    return hexToString(value as `0x${string}`, {size: 32}).replace(/\0+$/, '')
+  } catch {
+    return ''
+  }
+}
+
 export function BurnHistoryTable({
-  burns,
+  history,
   unavailable,
   reason,
 }: {
-  burns?: readonly BurnEvent[]
+  /** `/api/burns`: the rows, the running total and the count behind it. */
+  history?: BurnHistory
   unavailable?: boolean
   reason?: string
 }) {
-  if (unavailable || !burns) return <IndexerUnavailable what="Burn history" {...(reason ? {reason} : {})} />
+  if (unavailable || !history) return <IndexerUnavailable what="Burn history" {...(reason ? {reason} : {})} />
+  const burns = history.burns ?? []
   return (
     <div data-testid="burn-history">
       {burns.length === 0 ? (
@@ -763,7 +797,7 @@ export function BurnHistoryTable({
           <TableBody>
             {burns.map((burn) => (
               <TableRow key={burn.txHash}>
-                <TableCell className="text-dim">{formatTimestamp(burn.timestamp)}</TableCell>
+                <TableCell className="text-dim">{formatTimestamp(Number(burn.timestamp))}</TableCell>
                 <TableCell align="right">{burn.amount}</TableCell>
                 <TableCell align="right">
                   <Badge variant="muted">{burnReasonLabel(burn.reason)}</Badge>
@@ -773,7 +807,94 @@ export function BurnHistoryTable({
           </TableBody>
         </Table>
       )}
-      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">{NOTES.burnSink}</p>
+      <p className="mt-4 max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        {history.count} burns, {history.total} AMPS in total. {NOTES.burnSink}
+      </p>
+    </div>
+  )
+}
+
+/**
+ * Where a compound's fees actually went, in each currency.
+ *
+ * This is the disclosure revision 6 made necessary. Before it, one number — AMPS — covered the
+ * whole split. Now a compound touches two currencies and treats them differently on purpose: the
+ * creator's slice is taken from **each** of them in kind, the AMPS-side remainder is burned in
+ * full, and the counter-asset remainder is placed straight back into the pool that earned it as
+ * bids. Adding the two into one figure would hide exactly the distinction that matters.
+ *
+ * The AMPS figures are amounts. The counter figure is a USD aggregate across up to thirty-two
+ * different assets with different decimals, and is labelled as such rather than being printed as
+ * though it were a quantity of something.
+ */
+export function FeeFlowPanel({
+  summary,
+  creatorFee,
+  unavailable,
+  reason,
+}: {
+  summary?: VaultSummary
+  creatorFee?: CreatorFeeStatus
+  unavailable?: boolean
+  reason?: string
+}) {
+  if (unavailable || !summary) {
+    return <IndexerUnavailable what="Fee flow" {...(reason ? {reason} : {})} />
+  }
+  return (
+    <div className="space-y-1" data-testid="fee-flow">
+      <FieldRow
+        label="Collected in AMPS"
+        hint="The sell side of every fee, cumulative. It is the only side that is ever burned."
+      >
+        <Value unavailable={summary.feesAmpsTotal === undefined}>{summary.feesAmpsTotal ?? null}</Value>
+      </FieldRow>
+      <FieldRow
+        label="Collected in counter assets"
+        hint="The buy side, valued in USD at the time of each collection. Thirty-two assets with different decimals cannot be added as amounts."
+      >
+        <Value unavailable={summary.feesCounterUsd18 === undefined}>
+          {summary.feesCounterUsd18 !== undefined ? formatUsd18(BigInt(summary.feesCounterUsd18)) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow label="Creator — paid in AMPS" hint={NOTES.creatorSchedule}>
+        <Value unavailable={summary.creatorPaidAmpsTotal === undefined}>
+          {summary.creatorPaidAmpsTotal ?? null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Creator — paid in counter assets"
+        hint="In kind, per currency, by transfer with an ERC-6909 claim fallback so a gated token can never block a compound."
+      >
+        <Value unavailable={summary.creatorPaidCounterUsd18 === undefined}>
+          {summary.creatorPaidCounterUsd18 !== undefined
+            ? formatUsd18(BigInt(summary.creatorPaidCounterUsd18))
+            : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Creator schedule in force"
+        hint="Immutable. There is no setter, and it reaches exactly zero at day 30."
+      >
+        <Value unavailable={creatorFee?.currentBps === undefined}>
+          {creatorFee?.currentBps !== undefined ? formatBps(creatorFee.currentBps) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Burned at compound"
+        hint="The whole AMPS-side remainder after the creator slice, plus whatever the pool’s own bids bought back."
+      >
+        <Value unavailable={summary.burnedTotal === undefined}>{summary.burnedTotal ?? null}</Value>
+      </FieldRow>
+      <FieldRow
+        label="Counter side, re-placed as bids"
+        hint="Never moved to another pool and never distributed: it stays as depth in the pool that earned it, which is the floor you can sell into."
+      >
+        <span className="text-dim">Everything not paid to the creator</span>
+      </FieldRow>
+      <FieldRow label="Stakers" hint="There is no staking, no xAMPS and no reward stream.">
+        <span className="text-dim">None</span>
+      </FieldRow>
     </div>
   )
 }
