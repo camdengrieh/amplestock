@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
 import {IAmpsBonds} from "../../src/interfaces/IAmpsBonds.sol";
+import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsQuoter} from "../../src/interfaces/IAmpsQuoter.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
@@ -581,15 +582,14 @@ contract AmpsQuoterTest is QuoterFixture {
         assertEq(quote.degraded & 0x01, 0x01, "and bit 0 says where the rest went");
     }
 
-    /// @notice The selector this contract hand-encodes really is the five-argument `IAmpsHook.quoteFee`.
-    /// @dev `quoteFee` is overloaded on `IAmpsHook` — the four-argument form is the `passThrough == false` alias —
-    ///      so `.selector` does not resolve and `AmpsQuoter` spells the signature out. This is the drift guard on
-    ///      that spelling: without it a signature change would degrade every quote silently, because a call to a
-    ///      selector nothing implements just fails, and the quoter's whole contract is that a failed read is a
-    ///      bit rather than a revert.
+    /// @notice The selector `AmpsQuoter` hand-encodes is `IAmpsHook.quoteFee`, and that is the five-argument form.
+    /// @dev The quoter reaches the hook through a bounded `staticcall`, so the selector is assembled rather than
+    ///      called through the interface, and a call to a selector nothing implements simply fails — which the
+    ///      quoter reports as a degraded bit rather than a revert. That is exactly the failure this pins: the
+    ///      selector must be the one `IAmpsHook` declares, and `IAmpsHook` must declare only this one shape.
     function test_theHookSelectorIsTheOneTheInterfaceDeclares() public view {
         assertEq(
-            quoter.QUOTE_FEE_SELECTOR(),
+            IAmpsHook.quoteFee.selector,
             bytes4(keccak256("quoteFee(bytes32,bool,bool,uint256,bool)")),
             "the five-argument form"
         );

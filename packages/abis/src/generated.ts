@@ -1919,23 +1919,6 @@ export const ampsHookAbi = [
   },
   {
     type: 'function',
-    inputs: [
-      { name: 'poolId', internalType: 'PoolId', type: 'bytes32' },
-      { name: 'zeroForOne', internalType: 'bool', type: 'bool' },
-      { name: 'exactInput', internalType: 'bool', type: 'bool' },
-      { name: 'amountIn', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'quoteFee',
-    outputs: [
-      { name: '', internalType: 'uint24', type: 'uint24' },
-      { name: '', internalType: 'uint16', type: 'uint16' },
-      { name: '', internalType: 'uint16', type: 'uint16' },
-      { name: '', internalType: 'bool', type: 'bool' },
-    ],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
     inputs: [],
     name: 'registry',
     outputs: [{ name: '', internalType: 'address', type: 'address' }],
@@ -2538,13 +2521,6 @@ export const ampsQuoterAbi = [
     inputs: [],
     name: 'PROBE_GAS',
     outputs: [{ name: '', internalType: 'uint256', type: 'uint256' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    inputs: [],
-    name: 'QUOTE_FEE_SELECTOR',
-    outputs: [{ name: '', internalType: 'bytes4', type: 'bytes4' }],
     stateMutability: 'view',
   },
   {

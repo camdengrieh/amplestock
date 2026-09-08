@@ -9,8 +9,16 @@ import {GateState, PoolClass, Session} from "../../src/types/Types.sol";
 import {Test} from "forge-std/Test.sol";
 
 /// @notice Unit tests for the launch fee law: the fee table by direction, class, session and gate state, the
-///         rotation blend, the deviation wall, and the surge and dividend-capture decay curves at `t = 0`, one
-///         half-life, five half-lives and the zero point.
+///         deviation wall, and the surge and dividend-capture decay curves at `t = 0`, one half-life, five
+///         half-lives and the zero point.
+///
+/// @dev **What this contract is and is not responsible for, after revision 6.** `AmpsHook` reads only `dynBps`
+///      out of the returned `FeeQuote`; the base fee, the rotation credit and the rail are the hook's own. The
+///      base fee now depends on whether a swap is one hop of an `AmpsRouter.rotate` — a fact about the
+///      PoolManager's `sender` and the hop's `hookData`, neither of which is in `FeeInput` — so this policy
+///      reports the **ordinary-swap** base, `ampsFeeBps` in both directions, and never a pass-through base or a
+///      credit blend. The tests below pin exactly that, and `test/unit/AmpsHookFee.t.sol` owns the pass-through
+///      half.
 ///
 /// @dev `FeePolicy` declares `is IFeePolicy`, so the compiler enforces conformance; §12.1's resolution of the
 ///      `pure`-versus-`immutable` collision made `IFeePolicy.quoteFee` `view`. The two conformance tests below are
@@ -71,7 +79,7 @@ contract FeePolicyTest is Test {
         IFeePolicy handle = IFeePolicy(address(policy));
 
         IFeePolicy.FeeQuote memory quote = handle.quoteFee(_buy());
-        assertEq(quote.baseBps, BUY_ENTRY, "the interface handle returns the same quote");
+        assertEq(quote.baseBps, SELL, "the interface handle returns the same quote");
 
         assertEq(handle.innerBandTicks(PoolClass.SPOKE, Session.REGULAR, 0), Constants.INNER_BAND_REGULAR_TICKS);
         assertEq(handle.outerRailTicks(PoolClass.ENTRY, 200), Constants.OUTER_RAIL_ENTRY_TICKS);
@@ -152,29 +160,54 @@ contract FeePolicyTest is Test {
 
     /* --------------------------------------------- the fee table --------------------------------------------- */
 
-    /// @dev The launch table with nothing armed: a buy pays its pool's buy fee and a sell pays `ampsFeeBps`,
-    ///      with no dynamic component at all.
+    /// @dev The launch table with nothing armed: **both** directions of **every** class pay `ampsFeeBps`, with
+    ///      no dynamic component at all. Revision 6's whole base-fee rule, in one table.
     function test_feeTableAtRest() public view {
         // entry pool buy / sell
-        _assertFee(_buy(), BUY_ENTRY, 0);
+        _assertFee(_buy(), SELL, 0);
         _assertFee(_sell(), SELL, 0);
 
         // spoke buy / sell
         IFeePolicy.FeeInput memory input = _buy();
         input.poolClass = PoolClass.SPOKE;
         input.buyFeeBps = BUY_SPOKE;
-        _assertFee(input, BUY_SPOKE, 0);
+        _assertFee(input, SELL, 0);
 
         input = _sell();
         input.poolClass = PoolClass.SPOKE;
         input.buyFeeBps = BUY_SPOKE;
         _assertFee(input, SELL, 0);
 
-        // high-volatility spoke buy: same law, a different governed buy fee
+        // high-volatility spoke buy: same law, and its governed buy fee still does not enter it
         input = _buy();
         input.poolClass = PoolClass.SPOKE_HIGH_VOL;
         input.buyFeeBps = 10;
-        _assertFee(input, 10, 0);
+        _assertFee(input, SELL, 0);
+    }
+
+    /// @dev The negative half of the same statement: `buyFeeBps` does not reach the returned base at all. It is
+    ///      the **pass-through** base — the price of one hop of an `AmpsRouter.rotate` — and only `AmpsHook`,
+    ///      which can see the swap's `sender` and `hookData`, is in a position to apply it. A policy that blended
+    ///      it in here would be quoting a price no ordinary swapper can get, and the hook would then have to
+    ///      unpick it; §1.4's `passThrough` argument is on `AmpsHook.quoteFee` for exactly that reason.
+    function test_theBuyFeeNeverReachesTheBase() public view {
+        uint16[4] memory buyFees = [uint16(0), BUY_SPOKE, BUY_ENTRY, 100];
+        for (uint256 i; i < buyFees.length; ++i) {
+            IFeePolicy.FeeInput memory buy = _buy();
+            buy.buyFeeBps = buyFees[i];
+            assertEq(policy.quoteFee(buy).baseBps, SELL, "a buy is quoted at the AMPS fee whatever the pool charges");
+
+            IFeePolicy.FeeInput memory sell = _sell();
+            sell.buyFeeBps = buyFees[i];
+            assertEq(policy.quoteFee(sell).baseBps, SELL, "and so is a sell");
+        }
+
+        // And the base follows `ampsFeeBps` when governance moves it, on both sides.
+        IFeePolicy.FeeInput memory moved = _buy();
+        moved.ampsFeeBps = Constants.AMPS_FEE_BPS_MIN;
+        assertEq(policy.quoteFee(moved).baseBps, Constants.AMPS_FEE_BPS_MIN, "the buy base is ampsFeeBps");
+        moved.zeroForOne = true;
+        assertEq(policy.quoteFee(moved).baseBps, Constants.AMPS_FEE_BPS_MIN, "and so is the sell base");
     }
 
     /// @dev `f_session` is 0 / 5 / 10 / 25 bp and applies to **stock legs only**: an entry pool passes
@@ -280,53 +313,38 @@ contract FeePolicyTest is Test {
         assertEq(uint256(quote.feePips), uint256(Constants.TOTAL_FEE_BPS_MAX) * Constants.PIPS_PER_BPS);
     }
 
-    /// @dev The absolute floor: a pool whose buy fee has been governed to zero still charges `F_MIN_BPS`.
+    /// @dev The absolute floor: a pool whose base fee has been governed to zero still charges `F_MIN_BPS`.
     function test_theFloorIsFMinBps() public view {
         IFeePolicy.FeeInput memory input = _buy();
-        input.buyFeeBps = 0;
+        input.ampsFeeBps = 0;
         IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
         assertEq(uint256(quote.baseBps) + quote.dynBps, Constants.F_MIN_BPS, "3 bp");
         assertEq(uint256(quote.feePips), uint256(Constants.F_MIN_BPS) * Constants.PIPS_PER_BPS);
     }
 
-    /* ------------------------------------------ the rotation blend ------------------------------------------ */
+    /* --------------------------------- the rotation credit is not this contract's -------------------------- */
 
-    function test_rotationBlendIsExactWhenItDivides() public view {
-        IFeePolicy.FeeInput memory input = _sell();
-        input.poolClass = PoolClass.SPOKE;
-        input.buyFeeBps = BUY_ENTRY;
-        input.amountIn = 1000;
-        input.rotationCredit = 400;
+    /// @dev **No blend, at any size, in any direction, at any credit.** `FeeInput` still carries `amountIn` and
+    ///      `rotationCredit` — the hook fills them in and the struct is the frozen ABI — but this policy cannot
+    ///      see `passThrough`, so it cannot know a credit is spendable, and quoting as though it were would price
+    ///      every exit as a rotation. The hook blends, and only for the one `sender` that can hold a credit.
+    function test_aRotationCreditNeverMovesTheBase() public view {
+        uint256[4] memory credits = [uint256(0), 1, 400, 5000];
+        for (uint256 i; i < credits.length; ++i) {
+            IFeePolicy.FeeInput memory input = _sell();
+            input.poolClass = PoolClass.SPOKE;
+            input.buyFeeBps = BUY_ENTRY;
+            input.amountIn = 1000;
+            input.rotationCredit = credits[i];
 
-        IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
-        // (30 * 400 + 500 * 600) / 1000 == 312
-        assertEq(quote.baseBps, 312, "the blended base");
-        assertEq(quote.creditConsumed, 400, "the hook decrements by exactly this");
+            IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
+            assertEq(quote.baseBps, SELL, "the base is the AMPS fee whatever credit is in the input");
+            assertEq(quote.creditConsumed, 0, "and nothing is reported as consumed");
+        }
     }
 
-    function test_rotationBlendRoundsUp() public view {
-        IFeePolicy.FeeInput memory input = _sell();
-        input.buyFeeBps = BUY_ENTRY;
-        input.amountIn = 1000;
-        input.rotationCredit = 333;
-
-        IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
-        // (30 * 333 + 500 * 667) / 1000 == 343.49, rounded **up** against the swapper.
-        assertEq(quote.baseBps, 344, "the blend never rounds a fee down");
-        assertEq(quote.creditConsumed, 333);
-    }
-
-    function test_aFullCreditPaysTheBuyFeeAndConsumesOnlyWhatItNeeds() public view {
-        IFeePolicy.FeeInput memory input = _sell();
-        input.buyFeeBps = BUY_ENTRY;
-        input.amountIn = 1000;
-        input.rotationCredit = 5000;
-
-        IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
-        assertEq(quote.baseBps, BUY_ENTRY, "a fully credited sell pays the buy fee");
-        assertEq(quote.creditConsumed, 1000, "and consumes only the amount it swapped");
-    }
-
+    /// @dev The same for the two shapes that never blended even under revision 5, so the statement is total: a
+    ///      buy, and an exact-output sell.
     function test_exactOutputSellsAndBuysConsumeNoCredit() public view {
         IFeePolicy.FeeInput memory input = _sell();
         input.exactInput = false;
@@ -340,20 +358,8 @@ contract FeePolicyTest is Test {
         buy.rotationCredit = 5000;
         buy.amountIn = 1000;
         quote = policy.quoteFee(buy);
-        assertEq(quote.baseBps, BUY_ENTRY, "a buy is a buy");
+        assertEq(quote.baseBps, SELL, "a buy pays it too");
         assertEq(quote.creditConsumed, 0, "buys never consume credit");
-    }
-
-    /// @dev A one-wei credit unlocks one wei of buy-fee treatment and no more; the blend still rounds up.
-    function test_aOneWeiCreditBuysOneWei() public view {
-        IFeePolicy.FeeInput memory input = _sell();
-        input.buyFeeBps = BUY_ENTRY;
-        input.amountIn = 1e18;
-        input.rotationCredit = 1;
-
-        IFeePolicy.FeeQuote memory quote = policy.quoteFee(input);
-        assertEq(quote.baseBps, SELL, "one wei of credit does not move a whole basis point");
-        assertEq(quote.creditConsumed, 1);
     }
 
     /* -------------------------------------- the deviation wall -------------------------------------- */

@@ -680,7 +680,8 @@ exact; `liquidityForAmount0Above` / `liquidityForAmount1Below` rounded down. Rev
 `[6, 14]`, halvings `[2, 8]`.
 
 **`FeePolicy` (`directional-wall-v1`)** — `quoteFee(FeeInput) -> FeeQuote` implements section 1.4 steps 3-7 in
-pure form: the rotation blend (rounded up, `creditConsumed` returned so the hook decrements by exactly that);
+pure form: the base is `ampsFeeBps` in both directions and `creditConsumed` is always zero (the pass-through blend and
+the credit decrement are the hook's, section 1.4 step 3);
 `f_vol` capped at 100 bp; `f_dev` quadratic inside the band and a quadratic ramp to `F_WALL_BPS = 1500` between
 band and rail, `refuse = true` beyond the rail **and only when `deviationIncreasing`**; `f_div =
 surgeDecay(captureFeeBps, captureElapsed)` on `captureDirectionTakesStock` only; `f_session` 0/5/10/25 bp with

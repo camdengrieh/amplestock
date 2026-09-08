@@ -113,7 +113,7 @@ contract VaultCompoundTest is PlacementFixture {
 
     /// @notice I31: `creatorBps(t)` is monotone non-increasing and exactly zero from `genesis + 30 days`, and the
     ///         schedule is immutable — nothing but time changes it.
-    function test_i31_creatorScheduleDecaysToZeroAndStaysThere() public {
+    function test_i31_creatorScheduleDecaysToZeroAndStaysThere() public view {
         uint32 genesis = vault.genesisTimestamp();
         uint16 previous = type(uint16).max;
         for (uint256 day; day <= 31; ++day) {
@@ -1030,6 +1030,7 @@ contract VaultCompoundTest is PlacementFixture {
     /// @dev The last `BountyPaid` in the recorded logs. `vm.recordLogs()` must have been armed before the call.
     function _lastBountyPaid()
         private
+        view
         returns (uint256 workValueUsd18, uint256 paidUsd18, uint256 paidRaw, bytes32 reason)
     {
         Vm.Log[] memory logs = vm.getRecordedLogs();

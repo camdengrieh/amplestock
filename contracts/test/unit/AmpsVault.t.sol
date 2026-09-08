@@ -1176,7 +1176,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @dev The `navPerShareBefore` and `navPerShareAfter` of the recorded `Migrated` event.
-    function _migratedNav() private returns (uint256 navBefore, uint256 navAfter) {
+    function _migratedNav() private view returns (uint256 navBefore, uint256 navAfter) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].topics.length != 2 || logs[i].topics[0] != IAmpsVault.Migrated.selector) continue;

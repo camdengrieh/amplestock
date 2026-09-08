@@ -309,7 +309,7 @@ contract Preflight is Script {
     /// @notice Which of the deployment's own addresses already hold code, i.e. what a re-run would skip.
     function checkDeploymentState() public {
         string memory json = vm.readFile(DEPLOYMENTS_PATH);
-        string[12] memory names = [
+        string[13] memory names = [
             "timelock",
             "guardian",
             "amps",
@@ -321,14 +321,15 @@ contract Preflight is Script {
             "feedRegistry",
             "oracleGate",
             "positionValuer",
-            "quoter"
+            "quoter",
+            "router"
         ];
         uint256 deployed;
         for (uint256 i; i < names.length; ++i) {
             address target = _readOptional(json, string.concat(".core.", names[i]));
             if (target != address(0) && target.code.length != 0) ++deployed;
         }
-        _pass("deploymentState", string.concat(vm.toString(deployed), " of 12 core addresses already hold code"));
+        _pass("deploymentState", string.concat(vm.toString(deployed), " of 13 core addresses already hold code"));
     }
 
     // -----------------------------------------------------------------------------------------------------------

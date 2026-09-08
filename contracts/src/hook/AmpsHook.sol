@@ -1270,7 +1270,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      to the basis point, rather than an approximation of it. `AmpsQuoter.quoteSellWithCredit` is where a
     ///      partially covered sell is priced, and it takes the credit as an argument for the same reason.
     function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn, bool passThrough)
-        public
+        external
         view
         returns (uint24, uint16, uint16, bool)
     {
@@ -1291,15 +1291,6 @@ contract AmpsHook is BaseHook, IAmpsHook {
             ctx
         );
         return (uint24(q.feeBps) * Constants.PIPS_PER_BPS, q.baseBps, q.dynBps, q.refuse);
-    }
-
-    /// @inheritdoc IAmpsHook
-    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
-        external
-        view
-        returns (uint24, uint16, uint16, bool)
-    {
-        return quoteFee(poolId, zeroForOne, exactInput, amountIn, false);
     }
 
     /// @inheritdoc IAmpsHook

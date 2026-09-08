@@ -499,7 +499,9 @@ contract Phase3Handler is CommonBase, StdCheats, StdUtils {
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
     {
-        try HOOK.quoteFee(poolId, zeroForOne, exactInput, amountIn) returns (uint24 f, uint16 b, uint16 d, bool r) {
+        try HOOK.quoteFee(poolId, zeroForOne, exactInput, amountIn, false) returns (
+            uint24 f, uint16 b, uint16 d, bool r
+        ) {
             return (f, b, d, r);
         } catch {
             return (0, 0, 0, false);

@@ -33,22 +33,22 @@ contract AmpsHookFeeTest is HookTestFixture {
     ///         pass-through base — reachable only by the protocol router's rotation hop.
     function test_baseFeeTableByDirectionAndClass() public view {
         // Every ordinary swap, in either direction and in any pool, is 500 bp.
-        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(usdgId, false, true, 1e18);
+        (uint24 pips, uint16 base, uint16 dyn,) = hook.quoteFee(usdgId, false, true, 1e18, false);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "entry buy base");
         assertEq(dyn, 0, "no dynamic component at zero deviation");
         assertEq(pips, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry buy pips");
 
-        (pips, base,,) = hook.quoteFee(usdgId, true, true, 1e18);
+        (pips, base,,) = hook.quoteFee(usdgId, true, true, 1e18, false);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "entry sell base");
         assertEq(pips, uint24(Constants.AMPS_FEE_BPS_DEFAULT) * Constants.PIPS_PER_BPS, "entry sell pips");
 
-        (, base,,) = hook.quoteFee(wethId, false, true, 1e18);
+        (, base,,) = hook.quoteFee(wethId, false, true, 1e18, false);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the WETH route is no different");
 
-        (, base,,) = hook.quoteFee(stockId, false, true, 1e18);
+        (, base,,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "spoke buy base");
 
-        (, base,,) = hook.quoteFee(stockId, true, true, 1e18);
+        (, base,,) = hook.quoteFee(stockId, true, true, 1e18, false);
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "and the AMPS fee is protocol-wide");
     }
 
@@ -82,12 +82,12 @@ contract AmpsHookFeeTest is HookTestFixture {
     function test_theGovernedSellFeeMovesEveryPool() public {
         vm.prank(TIMELOCK);
         hook.setAmpsFeeBps(100);
-        (, uint16 base,,) = hook.quoteFee(stockId, true, true, 1e18);
+        (, uint16 base,,) = hook.quoteFee(stockId, true, true, 1e18, false);
         assertEq(base, 100, "floor of the band");
 
         vm.prank(TIMELOCK);
         hook.setAmpsFeeBps(600);
-        (, base,,) = hook.quoteFee(usdgId, true, true, 1e18);
+        (, base,,) = hook.quoteFee(usdgId, true, true, 1e18, false);
         assertEq(base, 600, "ceiling of the band");
     }
 
@@ -159,16 +159,16 @@ contract AmpsHookFeeTest is HookTestFixture {
         policy.setDynOverride(type(uint16).max - 1); // the law would return an absurd number
 
         _setGateDynCap(stockId, GateState.GREEN, Constants.DYN_CAP_NORMAL_BPS);
-        (, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (, uint16 base, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.DYN_CAP_NORMAL_BPS, "NORMAL caps at 300 bp");
         assertEq(base, Constants.AMPS_FEE_BPS_DEFAULT, "the base is untouched by the cap");
 
         _setGateDynCap(stockId, GateState.DEGRADED, Constants.DYN_CAP_DEGRADED_BPS);
-        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "DEGRADED caps at 1,000 bp");
 
         _setGateDynCap(stockId, GateState.DIVERGED, Constants.DYN_CAP_ESCALATION_BPS);
-        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.DYN_CAP_ESCALATION_BPS, "band escalation caps at 2,000 bp");
     }
 
@@ -177,12 +177,12 @@ contract AmpsHookFeeTest is HookTestFixture {
         policy.setDynOverride(0);
 
         _setGateDynCap(stockId, GateState.GREEN, Constants.DYN_CAP_NORMAL_BPS);
-        (,, uint16 dyn, bool refuse) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 dyn, bool refuse) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, 0, "green: nothing");
         assertFalse(refuse, "green: not refused");
 
         _setGateDynCap(stockId, GateState.WATCHDOG, Constants.DYN_CAP_DEGRADED_BPS);
-        (,, dyn, refuse) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, dyn, refuse) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.FROZEN_FEE_FLOOR_BPS, "degraded: the 100 bp frozen floor");
         assertFalse(refuse, "a gate reason is never a refusal");
 
@@ -201,13 +201,13 @@ contract AmpsHookFeeTest is HookTestFixture {
         policy.setDynOverride(0);
         vm.warp(block.timestamp + Constants.GATE_CACHE_MAX_AGE + 1);
 
-        (,, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.FROZEN_FEE_FLOOR_BPS, "the frozen floor applies while the cache is stale");
         assertEq(hook.innerBandTicks(stockId), Constants.INNER_BAND_MAX_TICKS, "widest band for the class");
         assertEq(hook.outerRailTicks(stockId), Constants.INNER_BAND_MAX_TICKS * 3, "and the rail that follows");
 
         policy.setDynOverride(type(uint16).max - 1);
-        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "and the degraded cap");
     }
 
@@ -219,10 +219,10 @@ contract AmpsHookFeeTest is HookTestFixture {
         // Put the pool 150 ticks above fair. A sell pushes the tick down, so a sell is price-improving.
         _setFairTick(stockId, _currentTick(stockId) - 150);
 
-        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18);
+        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18, false);
         assertEq(dynSell, 0, "a deviation-reducing swap pays no f_dev");
 
-        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dynBuy, (uint256(Constants.K_DEV_BPS) * 150 * 150) / Constants.BPS, "k_dev * dev^2 / 1e4");
         assertGt(dynBuy, 0, "the deviation-increasing direction pays");
     }
@@ -230,10 +230,10 @@ contract AmpsHookFeeTest is HookTestFixture {
     function test_theDeviationComponentIsQuadraticInsideTheBand() public {
         int24 tick = _currentTick(stockId);
         _setFairTick(stockId, tick - 100);
-        (,, uint16 atOneHundred,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 atOneHundred,) = hook.quoteFee(stockId, false, true, 1e18, false);
 
         _setFairTick(stockId, tick - 200);
-        (,, uint16 atTwoHundred,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 atTwoHundred,) = hook.quoteFee(stockId, false, true, 1e18, false);
 
         assertEq(atOneHundred, 25, "25 * 100^2 / 1e4");
         assertEq(atTwoHundred, 100, "25 * 200^2 / 1e4 - four times the fee for twice the deviation");
@@ -244,10 +244,10 @@ contract AmpsHookFeeTest is HookTestFixture {
         int24 tick = _currentTick(stockId);
         _setFairTick(stockId, tick - 900); // 900 > the 800-tick spoke rail
 
-        (,,, bool refuseBuy) = hook.quoteFee(stockId, false, true, 1e18);
+        (,,, bool refuseBuy) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertTrue(refuseBuy, "a buy would push it further out");
 
-        (,,, bool refuseSell) = hook.quoteFee(stockId, true, true, 1e18);
+        (,,, bool refuseSell) = hook.quoteFee(stockId, true, true, 1e18, false);
         assertFalse(refuseSell, "a sell brings it back and is always allowed");
 
         vm.expectRevert(
@@ -272,10 +272,10 @@ contract AmpsHookFeeTest is HookTestFixture {
         _refreshGate(stockKey);
         _refreshGate(usdgKey);
 
-        (,, uint16 spokeDyn,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 spokeDyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(spokeDyn, Constants.F_SESSION_OVERNIGHT_BPS, "10 bp overnight on a spoke");
 
-        (,, uint16 entryDyn,) = hook.quoteFee(usdgId, false, true, 1e18);
+        (,, uint16 entryDyn,) = hook.quoteFee(usdgId, false, true, 1e18, false);
         assertEq(entryDyn, 0, "entry pools pass Session.REGULAR unconditionally");
         assertEq(uint8(hook.poolState(usdgId).session), uint8(Session.OVERNIGHT), "even though the cache knows");
     }
@@ -283,15 +283,15 @@ contract AmpsHookFeeTest is HookTestFixture {
     function test_aSurgeDecaysOnItsHalfLife() public {
         hook.armSurge(stockId, Constants.SURGE_MAX_BPS, "placement");
 
-        (,, uint16 atZero,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 atZero,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(atZero, Constants.DYN_CAP_NORMAL_BPS, "500 bp armed, capped at the 300 bp NORMAL cap");
 
         vm.warp(block.timestamp + Constants.SURGE_HALF_LIFE);
-        (,, uint16 atOneHalfLife,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 atOneHalfLife,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(atOneHalfLife, 250, "half of it");
 
         vm.warp(block.timestamp + Constants.SURGE_HALF_LIFE * 8);
-        (,, uint16 atTheHorizon,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 atTheHorizon,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(atTheHorizon, 0, "gone at eight half-lives");
     }
 
@@ -303,18 +303,18 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(hook.poolState(stockId).surgeBps, Constants.SURGE_MAX_BPS, "a step also arms a surge");
         _quiet(stockId);
 
-        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18);
-        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18);
+        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18, false);
+        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertGt(dynSell, dynBuy, "the sell takes stock out, so it pays the capture");
 
         assertEq(dynSell - dynBuy, 40, "exactly the capture fee, and only on the stock-out direction");
         assertEq(dynBuy, 0, "the other direction pays nothing for it");
     }
 
-    function test_theCaptureFeeDoesNotApplyToEntryPools() public {
+    function test_theCaptureFeeDoesNotApplyToEntryPools() public view {
         // The entry pools have no `uiMultiplier()` to step, and their counter is not a stock.
         assertEq(hook.poolState(usdgId).captureFeeBps, 0, "never armed");
-        (,, uint16 dyn,) = hook.quoteFee(usdgId, true, true, 1e18);
+        (,, uint16 dyn,) = hook.quoteFee(usdgId, true, true, 1e18, false);
         assertEq(dyn, 0, "and nothing to pay");
     }
 
@@ -366,7 +366,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         // Quote the deviation-*reducing* direction, so `f_dev` is out of the way and the dynamic part is f_vol
         // alone (the pool is an entry pool, so `f_session` is zero and there is no capture fee).
         bool sellReducesDeviation = hook.poolState(usdgId).lastTick > hook.fairTick(usdgId);
-        (,, uint16 dyn,) = hook.quoteFee(usdgId, sellReducesDeviation, true, 1e18);
+        (,, uint16 dyn,) = hook.quoteFee(usdgId, sellReducesDeviation, true, 1e18, false);
         assertEq(dyn, expected, "the charged dynamic component is exactly f_vol");
         assertEq(dyn, hook.poolState(usdgId).fVolBps, "and the cached fallback agrees with it");
     }
@@ -390,7 +390,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         // the fee is still the cap rather than a revert.
         uint256 varianceX18 = uint256(hook.poolState(usdgId).varianceX18) * 1e6;
         assertEq(_fVol(_realPolicy(), uint128(varianceX18)), Constants.F_VOL_CAP_BPS, "capped");
-        (uint24 pips,,,) = hook.quoteFee(usdgId, true, true, 1e18);
+        (uint24 pips,,,) = hook.quoteFee(usdgId, true, true, 1e18, false);
         assertGt(pips, 0, "and quoting still answers");
     }
 
@@ -440,11 +440,11 @@ contract AmpsHookFeeTest is HookTestFixture {
     /// @notice What `AmpsQuoter` is entitled to assume about {IAmpsHook.quoteFee}.
     /// @dev The second parameter is `zeroForOne`, and `zeroForOne == true` is a **sell** (AMPS is `currency0` in
     ///      all 32 pools). It is not "isBuy".
-    function test_theQuoteFeeContract() public {
+    function test_theQuoteFeeContract() public view {
         // 1. `amountIn == 0` gives the un-blended base, in both directions.
-        (uint24 pips, uint16 base, uint16 dyn, bool refuse) = hook.quoteFee(usdgId, true, true, 0);
+        (uint24 pips, uint16 base, uint16 dyn, bool refuse) = hook.quoteFee(usdgId, true, true, 0, false);
         assertEq(base, hook.ampsFeeBps(), "an ordinary sell quotes ampsFeeBps");
-        (, base,,) = hook.quoteFee(usdgId, false, true, 0);
+        (, base,,) = hook.quoteFee(usdgId, false, true, 0, false);
         assertEq(base, hook.ampsFeeBps(), "and so does an ordinary buy");
 
         // 1b. The pass-through form answers the pool's `buyFeeBps` in both directions, `amountIn == 0` included:
@@ -454,18 +454,19 @@ contract AmpsHookFeeTest is HookTestFixture {
         (, base,,) = hook.quoteFee(usdgId, true, true, 0, true);
         assertEq(base, hook.buyFeeBps(usdgId), "and so does a pass-through exact-input sell");
 
-        // 1c. The four-argument form is a strict alias for `passThrough == false`.
-        (uint24 aliasPips, uint16 aliasBase, uint16 aliasDyn, bool aliasRefuse) =
-            hook.quoteFee(usdgId, true, true, 1e18);
-        (uint24 fivePips, uint16 fiveBase, uint16 fiveDyn, bool fiveRefuse) =
-            hook.quoteFee(usdgId, true, true, 1e18, false);
-        assertEq(aliasPips, fivePips, "alias pips");
-        assertEq(aliasBase, fiveBase, "alias base");
-        assertEq(aliasDyn, fiveDyn, "alias dyn");
-        assertEq(aliasRefuse, fiveRefuse, "alias refuse");
+        // 1c. There is exactly **one** fee entry point, and `passThrough` is not optional. An earlier revision
+        //     carried a four-argument alias meaning `passThrough == false`; it was removed because an alias for
+        //     the honest case is a way to quote the dishonest one by accident, and because an overloaded
+        //     `quoteFee` makes `IAmpsHook.quoteFee.selector` ambiguous — which forced `AmpsQuoter` to hand-spell
+        //     the signature. This is the drift guard on the one shape that is left.
+        assertEq(
+            IAmpsHook.quoteFee.selector,
+            bytes4(keccak256("quoteFee(bytes32,bool,bool,uint256,bool)")),
+            "the five-argument form is the whole surface"
+        );
 
         // 2. `feePips` carries no override flag and is the clamped sum, in pips.
-        (pips, base, dyn, refuse) = hook.quoteFee(usdgId, true, true, 1e18);
+        (pips, base, dyn, refuse) = hook.quoteFee(usdgId, true, true, 1e18, false);
         assertEq(pips & LPFeeLibrary.OVERRIDE_FEE_FLAG, 0, "no override flag on the view");
         uint256 expected = uint256(base) + uint256(dyn);
         if (expected < Constants.F_MIN_BPS) expected = Constants.F_MIN_BPS;
@@ -474,7 +475,7 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertFalse(refuse, "and nothing is refused inside the rail");
 
         // 3. An unknown pool answers rather than reverting.
-        (pips, base, dyn, refuse) = hook.quoteFee(PoolId.wrap(keccak256("nothing")), true, true, 1e18);
+        (pips, base, dyn, refuse) = hook.quoteFee(PoolId.wrap(keccak256("nothing")), true, true, 1e18, false);
         assertEq(pips, 0, "no fee");
         assertTrue(refuse, "and a swap through it would indeed be refused");
 

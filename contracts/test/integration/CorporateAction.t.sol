@@ -50,8 +50,8 @@ contract CorporateActionTest is Phase3Fixture {
         refreshGateCache(spoke);
         warpBy(Constants.SURGE_HALF_LIFE * 8 + 1);
 
-        (,, uint16 sellDynBefore,) = hook.quoteFee(spoke, true, true, 1e18);
-        (,, uint16 buyDynBefore,) = hook.quoteFee(spoke, false, true, 1e15);
+        (,, uint16 sellDynBefore,) = hook.quoteFee(spoke, true, true, 1e18, false);
+        (,, uint16 buyDynBefore,) = hook.quoteFee(spoke, false, true, 1e15, false);
         assertLt(sellDynBefore, Constants.DYN_CAP_NORMAL_BPS, "the fee is not already at its cap");
 
         // A 0.5% dividend reinvestment: 50 bp, inside `DIVIDEND_STEP_BPS_MAX`, so it is a capture and not an
@@ -80,8 +80,8 @@ contract CorporateActionTest is Phase3Fixture {
         // §12.1 ruling I, which would otherwise show up in the difference.)
         forceTick(spoke, hook.fairTick(spoke));
         warpBy(Constants.SURGE_HALF_LIFE + 5);
-        (,, uint16 sellDynAfter,) = hook.quoteFee(spoke, true, true, 1e18);
-        (,, uint16 buyDynAfter,) = hook.quoteFee(spoke, false, true, 1e15);
+        (,, uint16 sellDynAfter,) = hook.quoteFee(spoke, true, true, 1e18, false);
+        (,, uint16 buyDynAfter,) = hook.quoteFee(spoke, false, true, 1e15, false);
 
         console.log("sell dyn before", sellDynBefore, "after", sellDynAfter);
         console.log("buy dyn before", buyDynBefore, "after", buyDynAfter);
@@ -97,7 +97,7 @@ contract CorporateActionTest is Phase3Fixture {
         // It decays: `DIVIDEND_CAPTURE_HALF_LIFE` is 300 s, so eight half-lives later there is nothing left.
         warpBy(Constants.DIVIDEND_CAPTURE_HALF_LIFE * 8 + 1);
         refreshGateCache(spoke);
-        (,, uint16 sellDynDecayed,) = hook.quoteFee(spoke, true, true, 1e18);
+        (,, uint16 sellDynDecayed,) = hook.quoteFee(spoke, true, true, 1e18, false);
         assertLe(sellDynDecayed, sellDynBefore, "and the capture fee decays back to nothing");
     }
 

@@ -879,7 +879,7 @@ contract VaultPlacementTest is PlacementFixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev The last `Placement` for `poolId` in the recorded logs. `vm.recordLogs()` must have been armed first.
-    function _lastPlacement(PoolId poolId) private returns (uint8 buckets, int24 lowerTick, int24 upperTick) {
+    function _lastPlacement(PoolId poolId) private view returns (uint8 buckets, int24 lowerTick, int24 upperTick) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i = logs.length; i != 0; --i) {
             Vm.Log memory entry = logs[i - 1];

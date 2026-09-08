@@ -276,21 +276,12 @@ contract QuoterHookStub is IAmpsHook {
 
     /// @inheritdoc IAmpsHook
     function quoteFee(PoolId poolId, bool zeroForOne, bool, uint256, bool passThrough)
-        public
+        external
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
     {
         FeeAnswer memory answer = _fees[poolId][zeroForOne][passThrough];
         return (answer.feePips, answer.baseBps, answer.dynBps, answer.refuse);
-    }
-
-    /// @inheritdoc IAmpsHook
-    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
-        external
-        view
-        returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse)
-    {
-        return quoteFee(poolId, zeroForOne, exactInput, amountIn, false);
     }
 
     /// @inheritdoc IAmpsHook

@@ -212,7 +212,7 @@ contract VaultLayoutTest is AmpsVaultFixture {
     /// @dev The revert carries **no return data**: Solidity's generated getter for a dynamic array bounds-checks
     ///      with a bare `revert()`, not with `Panic(0x32)` the way an in-contract `arr[i]` would. A consumer must
     ///      therefore call {IAmpsVault-ladderLength} first rather than probing for a decodable error.
-    function test_slot18_ladderAtIsBoundsChecked() public {
+    function test_slot18_ladderAtIsBoundsChecked() public view {
         (bool ok, bytes memory returndata) =
             address(vault).staticcall(abi.encodeCall(IAmpsVault.ladderAt, (spokePool, 0)));
         assertFalse(ok, "reading past the end reverts");

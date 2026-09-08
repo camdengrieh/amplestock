@@ -247,6 +247,13 @@ interface IAmpsHook is IMarketReference {
     /// @dev Reads no transient storage. A credit belongs to the swap's `sender`, which an `eth_call` is not, so
     ///      the pass-through case is *modelled* rather than looked up. A partially covered sell — one larger than
     ///      the rotation that funds it — is priced by `AmpsQuoter.quoteSellWithCredit`.
+    ///
+    /// @dev **There is exactly one fee entry point, and `passThrough` is not optional.** An earlier revision
+    ///      carried a four-argument alias that meant `passThrough == false`; it was removed because an alias for
+    ///      the honest case is an invitation to quote the dishonest one by accident, and because an overloaded
+    ///      `quoteFee` makes `IAmpsHook.quoteFee.selector` ambiguous, which forced every off-chain and on-chain
+    ///      caller to hand-spell the signature. An ordinary swap — which is every swap that is not the protocol
+    ///      router's rotation hop — passes `false`.
     /// @param poolId The pool.
     /// @param zeroForOne True for a sell (AMPS in).
     /// @param exactInput True for an exact-input swap.
@@ -257,24 +264,6 @@ interface IAmpsHook is IMarketReference {
     /// @return dynBps The dynamic component after clamping.
     /// @return refuse Whether the swap would be refused for being deviation-increasing beyond the outer rail.
     function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn, bool passThrough)
-        external
-        view
-        returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse);
-
-    /// @notice {quoteFee} for an ordinary swap: the four-argument form, `passThrough == false`.
-    /// @dev Kept as a distinct entry point because it is the honest quote for every caller that is not the
-    ///      protocol router — which is every caller — and because an integration written against the Phase 3 ABI
-    ///      keeps working and keeps being right. It is a strict alias for
-    ///      `quoteFee(poolId, zeroForOne, exactInput, amountIn, false)`.
-    /// @param poolId The pool.
-    /// @param zeroForOne True for a sell (AMPS in).
-    /// @param exactInput True for an exact-input swap.
-    /// @param amountIn The input amount, or 0 when unknown.
-    /// @return feePips The fee in pips, without the override flag.
-    /// @return baseBps The base component, which for an ordinary swap is always `ampsFeeBps`.
-    /// @return dynBps The dynamic component after clamping.
-    /// @return refuse Whether the swap would be refused for being deviation-increasing beyond the outer rail.
-    function quoteFee(PoolId poolId, bool zeroForOne, bool exactInput, uint256 amountIn)
         external
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse);

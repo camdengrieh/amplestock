@@ -86,7 +86,7 @@ contract HubPumpThenDumpTest is Phase3Fixture {
         int24 fair = hook.fairTick(spoke);
         int24 rail = hook.outerRailTicks(spoke);
         if (fair - tickOf(spoke) > rail) {
-            (,,, bool refuse) = hook.quoteFee(spoke, true, true, bought / 4);
+            (,,, bool refuse) = hook.quoteFee(spoke, true, true, bought / 4, false);
             assertTrue(refuse, "the spoke refuses a dump while its reference is above it");
         }
         assertGt(bought, 0, "the pump happened");

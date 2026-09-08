@@ -11,6 +11,7 @@ import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {FeedRegistry} from "../../src/oracle/FeedRegistry.sol";
 import {OracleGate} from "../../src/oracle/OracleGate.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
+import {AmpsRouter} from "../../src/periphery/AmpsRouter.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
 import {FeePolicy} from "../../src/policy/FeePolicy.sol";
 import {LadderPolicy} from "../../src/policy/LadderPolicy.sol";
@@ -130,6 +131,12 @@ abstract contract Phase3Fixture is V4TestBase {
     LadderPolicy internal ladderPolicy;
     RolloutPolicy internal rolloutPolicy;
     AmpsQuoter internal quoter;
+
+    /// @dev The protocol router, deployed here and **named to the hook by the timelock**, so this world contains
+    ///      the one contract whose rotation hops are pass-through. Every other swap helper below goes through the
+    ///      ordinary v4 router and therefore pays `ampsFeeBps` in both directions, which is what makes the
+    ///      contrast in `Phase3Flywheel` and `RotationCreditGaming` a real one rather than a stipulated one.
+    AmpsRouter internal ampsRouter;
     VestingWallet internal teamVesting;
 
     MockERC20 internal weth;
@@ -287,11 +294,15 @@ abstract contract Phase3Fixture is V4TestBase {
             address(gate),
             address(feeds)
         );
+        ampsRouter = new AmpsRouter(poolManager, address(amps), address(registry), address(weth));
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
 
-        vm.prank(TIMELOCK);
+        vm.startPrank(TIMELOCK);
         hook.setFeePolicy(address(feePolicy));
+        hook.setRouter(address(ampsRouter));
+        vm.stopPrank();
 
+        vm.label(address(ampsRouter), "AmpsRouter");
         vm.label(address(gate), "OracleGate");
         vm.label(address(feeds), "FeedRegistry");
         vm.label(address(bonds), "AmpsBonds");
@@ -751,6 +762,28 @@ abstract contract Phase3Fixture is V4TestBase {
         vm.prank(who);
         swapRouter.swapExactTokensForTokens(amountIn, 0, Currency.wrap(counterIn), path, who, type(uint256).max);
         amountOut = IERC20(counterOut).balanceOf(who) - before;
+    }
+
+    /// @notice A rotation through the **protocol router**: `hop1 counter -> AMPS -> hop2 counter`, both hops
+    ///         carrying `Constants.ROUTER_ROTATE`, which is the one shape in the system the hook prices at the
+    ///         pass-through fee. {rotate} above is the same trade through an ordinary v4 router, and pays
+    ///         `ampsFeeBps` on both hops.
+    /// @param hop1 The pool bought in.
+    /// @param hop2 The pool sold into.
+    /// @param who The rotator, funded and approved by this call.
+    /// @param amountIn Hop-1 counter asset in.
+    /// @return amountOut Hop-2 counter asset out.
+    /// @return ampsThrough The AMPS that passed through: hop 1's realised output and hop 2's whole input.
+    function routerRotate(PoolId hop1, PoolId hop2, address who, uint256 amountIn)
+        internal
+        returns (uint256 amountOut, uint256 ampsThrough)
+    {
+        address counter = registry.poolConfig(hop1).counter;
+        fund(counter, who, amountIn);
+        vm.startPrank(who);
+        IERC20(counter).approve(address(ampsRouter), type(uint256).max);
+        (amountOut, ampsThrough) = ampsRouter.rotate(hop1, hop2, amountIn, 0, who, false, type(uint256).max);
+        vm.stopPrank();
     }
 
     /// @notice {buyAmps} as an external self-call, so a scenario can wrap it in `try`/`catch` and treat a

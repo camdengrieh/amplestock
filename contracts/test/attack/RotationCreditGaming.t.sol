@@ -277,7 +277,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         require(msg.sender == address(this), "self-call only");
         buyAmps(hubPool, ALICE, 1);
         credit = hook.rotationCredit(address(swapRouter));
-        (, baseBps,,) = hook.quoteFee(hubPool, true, true, 10e18);
+        (, baseBps,,) = hook.quoteFee(hubPool, true, true, 10e18, false);
         exitOut = sellAmps(hubPool, ALICE, 10e18);
     }
 
@@ -322,7 +322,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
     /// @dev Both halves are asserted. The first is the ABI — `rotate` takes one `amountIn` and no `amountOut`, and
     ///      hop 2's size is read off hop 1's realised delta — and the second is the hook's own rule, so a future
     ///      router that tried to build it would gain nothing.
-    function test_anExactOutputRotationHopIsUnreachableAndWouldPayInFullAnyway() public {
+    function test_anExactOutputRotationHopIsUnreachableAndWouldPayInFullAnyway() public view {
         (uint16 exactInputBase, uint16 exactOutputBase) = this.exactOutputHopEntry();
         assertEq(exactInputBase, registry.poolConfig(hubPool).buyFeeBps, "a flagged exact-input sell is pass-through");
         assertEq(exactOutputBase, hook.ampsFeeBps(), "a flagged exact-output sell is not");
@@ -349,7 +349,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
 
         uint256 bought = buyAmps(hubPool, ALICE, 2e6);
         assertGt(bought, 0, "the buy happened");
-        (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, bought);
+        (, uint16 baseBps,,) = hook.quoteFee(hubPool, true, true, bought, false);
         assertEq(baseBps, hook.ampsFeeBps(), "so the next transaction's exit pays the AMPS fee in full");
     }
 
