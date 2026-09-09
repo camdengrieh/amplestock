@@ -369,11 +369,11 @@ contract Phase3InvariantTest is Phase3Fixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
-    // Medusa properties (`contracts/medusa.json`, §8.3)
+    // Medusa properties (`contracts/medusa.phase3.json`, §8.3)
     // -------------------------------------------------------------------------------------------------------------
     //
     // The same statements as the `invariant_` functions above, in the boolean shape Medusa's property testing
-    // wants. `medusa.json` targets this contract with `testPrefixes: ["medusa_"]` and reuses this `setUp()`, so
+    // wants. `medusa.phase3.json` (run with `medusa fuzz --config medusa.phase3.json`) targets this contract with `testPrefixes: ["medusa_"]` and reuses this `setUp()`, so
     // the Foundry campaign and the Medusa campaign drive one fixture and check one set of properties. Every one
     // of these is a `view` over a ghost or a cheap read, per §8.3's second condition.
 

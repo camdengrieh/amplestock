@@ -1,18 +1,18 @@
 # X-Ray Report
 
-> Amplestocks ($AMPS) | 8,989 nSLOC | 1f6dd11 (`claude/amplestocks-rwa-token-xhtnn5`, working tree includes the uncommitted Phase 6 polish) | Foundry 1.8.1 · solc 0.8.30 · Uniswap v4 | 07/09/26
+> Amplestocks ($AMPS) | 10,597 nSLOC | `ccffe6c` (`claude/amplestocks-rwa-token-xhtnn5`) | Foundry | 09/09/26
 
 ---
 
 ## 1. Protocol Overview
 
-**What it does:** AMPS is a fixed-balance ERC-20 share of a vault that owns every position in 32 Uniswap v4 pools (AMPS/WETH, AMPS/USDG and 30 AMPS/tokenized-stock spokes) behind one hook; the share is floored by permissionless pro-rata redemption at NAV − 1 % and free-floats above it.
+**What it does:** A share token whose backing is a book of tokenized US equities, market-made by the protocol's own Uniswap v4 liquidity, priced against a NAV floor, and issued post-genesis only through discounted vesting bonds.
 
-- **Users**: traders (swap AMPS against WETH/USDG/stocks through the router), bonders (deposit a registered Stock Token for discounted, 12 h-vested AMPS), holders (redeem pro-rata; stake into xAMPS), keepers (bountied `compound` / `rollout` / `deployBonded`).
-- **Core flow**: every AMPS sell pays a 1–6 % fee in AMPS to the protocol-owned liquidity; at `compound` that fee is split creator → stakers → burn → re-laddered as asks, so volume either retires supply or returns as backing.
-- **Key mechanism**: static ask/bid ladders of one-sided range orders on a canonical doubling grid, never re-centred; NAV numerator valued at the previous checkpoint's reference price; a six-layer oracle gate (watchdog, 24/5 calendar, freshness, corporate action, divergence, reference integrity) that reprices rather than pauses.
-- **Token model**: `Amps` (18-dec share, vault-only mint/burn, `currency0` everywhere), `xAMPS` (ERC-4626 over AMPS fed by streamed sell fees), Stock Tokens / WETH / USDG as counter assets and bond collateral, USDG in a segregated `BountyPot`.
-- **Admin model**: Safe → OZ `TimelockController` (48 h / 7 d / 14 d by convention, one `minDelay` on-chain) for every parameter and pointer; a Guardian Safe with disable-only, self-expiring freezes and a predicate-gated `emergencyMigrate`; every parameter inside a hard band; `redeemProRata` and `claim` structurally ungated.
+- **Users**: traders (buy/sell/rotate AMPS through 32 v4 pools), redeemers (pro-rata claim on the whole asset book), bonders (deposit a registered collateral for AMPS at a discount, vesting linearly), keepers (paid in USDG for `compound` / `rollout` / `deployBonded`).
+- **Core flow**: swap into AMPS through an entry pool → the vault's ladders are the counterparty → redeem pro-rata at any time for a slice of every registered asset, less `redeemFeeBps`.
+- **Key mechanism**: the vault is the *sole* LP in every pool (`beforeAddLiquidity` refuses any other sender) and lays geometric doubling ladders on a canonical per-pool grid; an immutable hook charges a protocol-wide fee both ways, keeps a truncated-tick observation ring, and refuses only swaps beyond an outer rail.
+- **Token model**: `AMPS` (18-dec ERC-20 + permit, mint/burn by the vault only), ERC-6909 claims inside the PoolManager for every asset, `VestingPosition[]` per bonder inside `AmpsBonds`, `USDG` in a segregated `BountyPot`.
+- **Admin model**: one `TimelockController` address per contract (immutable), plus a guardian Safe whose entire power is expiring disable-only freezes and a predicate-gated evacuation. No proxies, no `initialize()`, no pause flag anywhere in `src/`.
 
 For a visual overview of the protocol's architecture, see the [architecture diagram](architecture.svg).
 
@@ -20,247 +20,257 @@ For a visual overview of the protocol's architecture, see the [architecture diag
 
 | Subsystem | Key Contracts | nSLOC | Role |
 |-----------|--------------|------:|------|
-| Share token | Amps | 30 | ERC-20 + permit; vault-only mint/burn/setVault |
-| Vault & placement | AmpsVault, VaultNavLib, VaultPlacementLib, VaultRedeemLib, VaultRolloutLib | 2,637 | Custody, NAV/reference checkpoint, genesis, redemption, ladder placement, compound, rollout, migration (four `DELEGATECALL` libraries share the vault's storage) |
-| Valuers | LadderPositionValuer, ZeroPositionValuer | 138 | Decompose ladder positions at the reference sqrt price for the NAV numerator |
-| Hook | AmpsHook, HookStateLib | 903 | One `0x38C0` hook for all pools: directional dynamic fee, rotation credit, truncated TWAP ring, rail |
-| Core libraries | PriceLib, LadderLib, TruncatedOracleLib, PoolStateLib | 765 | Decimal/tick conversions, ladder geometry, per-block-capped oracle, MIT `extsload` reader of v4 state |
-| Bonds | AmpsBonds, AmpsBondsLens, BondPolicy | 921 | Sole post-genesis issuance: collateral custody shell, capacity, linear vesting; pure pricing law |
-| Policies | LadderPolicy, FeePolicy, RolloutPolicy | 379 | Pure, pointer-upgradeable proposers for ladder shape, swap fee and rollout size |
-| Oracle gate | OracleGate, FeedRegistry, GatePriceMath, StreamsSchemaLib | 1,248 | Layers A–F gate, Chainlink freshness/jump confirmation, calendar, guardian freezes |
-| Registry | PoolRegistry, PoolRegistryLens | 562 | Pool allowlist, constituent lifecycle, index weights, inclusion record |
-| Staking & keeper | AmpsStaking, BountyPot | 304 | ERC-4626 xAMPS with a 24 h reward stream; segregated USDG bounty pot with caps |
-| Periphery | AmpsQuoter, QuoterSwapLib | 674 | Revert-free read surface with bounded staticcalls and a tick-walk simulator |
-| Shared types | Types, Constants, Errors | 428 | Structs/enums, every hard band and default, custom errors |
+| Vault | `AmpsVault`, `VaultPlacementLib`, `VaultNavLib`, `VaultRedeemLib`, `VaultRolloutLib` | 3,061 | Custody, NAV, reference price, pro-rata redemption, the whole placement engine |
+| Hook | `AmpsHook`, `HookStateLib` | 1,026 | Dynamic fee law, outer-rail refusal, truncated TWAP ring, high-water mark |
+| Oracle | `OracleGate`, `FeedRegistry`, `GatePriceMath`, `StreamsSchemaLib` | 1,303 | Six-layer gate (cadence, calendar, freshness, corporate actions, divergence, reference integrity) |
+| Bonds | `AmpsBonds`, `AmpsBondsLens` | 920 | The only post-genesis issuance path: discount, accretion floor, capacity, vesting |
+| Periphery | `AmpsQuoter`, `AmpsRouter`, `QuoterSwapLib` | 1,021 | Never-reverting quote surface and the buy / sell / rotate router |
+| Registry | `PoolRegistry`, `PoolRegistryLens` | 612 | Pool and constituent allowlist, index weights, lifecycle |
+| Genesis | `AmpsGenesis` | 366 | Two-leg Continuous Clearing Auction adapter and launch-price derivation |
+| Policy | `FeePolicy`, `LadderPolicy`, `BondPolicy`, `RolloutPolicy` | 441 | Pointer-upgradeable pure pricing and shaping laws |
+| Keeper | `BountyPot` | 182 | Segregated USDG bounty budget, excluded from NAV |
+| Valuer | `LadderPositionValuer`, `ZeroPositionValuer` | 138 | Decomposes v4 positions at the reference price for the NAV sum |
+| Token | `Amps` | 30 | Share token; `totalSupply` moves only where the vault moves it |
+| Types | `Constants`, `Types`, `Errors` | 443 | Hard bands, shared structs, shared errors |
+| Shared libs *(not in the enumerator's total — see note)* | `PriceLib`, `LadderLib`, `PoolStateLib`, `TruncatedOracleLib` | 784 | Price/tick conversions, ladder maths, `IExtsload` slot arithmetic, observation ring |
 
-Interfaces (`src/interfaces/*`, 887 nSLOC) and vendored libraries (`lib/`) are out of scope. `test/mocks/*` are not protocol code.
+The 10,597 figure is the enumerator's exact TOTAL. It excludes `src/lib/` (4 files, 784 nSLOC) because the tool's
+`-not -path '*/lib/*'` filter, meant for the Foundry dependency directory, also matches this project's own
+`src/lib/`. **True in-scope nSLOC is 11,381 across 33 protocol-authored files.**
 
-### Backwards-Compatibility and Unreferenced Code
+### Backwards-Compatibility Code
 
-- `ZeroPositionValuer` — the Phase 2 stub valuer (every pool worth zero). Superseded by `LadderPositionValuer`; no caller in `src/` or `script/`, kept as the documented pre-Phase-3 pointer target and a test fixture. Not live functionality once the deploy pipeline wires the ladder valuer.
-- `StreamsSchemaLib` — forward-looking groundwork for a v2 `StreamsRelay` ("Nothing wires this yet", `StreamsSchemaLib.sol:11`); no caller in `src/`.
-- `AmpsVault._requireWiringOpen()` (`AmpsVault.sol:1470`) and `VaultPlacementLib._setWord()` (`VaultPlacementLib.sol:1269`) — private helpers with no callers (the set-once check lives in `VaultNavLib.setPointer`; the rollout library has its own used copy of `_setWord`). Dead code, not active paths.
+- `AmpsVault._reservedSlot6` (slot 6) — held the xAMPS staking vault until plan revision 6 removed staking; no writer names it any more and `VaultLayout.t.sol` asserts it stays zero.
+- `AmpsVault._reservedFeeSplit` (slot 2 `[16..47]`) — held `burnBps` and `stakerBps` until the staker leg was retired and the burn became unconditional; retained so no field above it shifts.
+- `AmpsVault._checkpointReserved` / `_reservedSlot21` — declared packing fillers that keep the documented slot map literally true; never read or written.
+- `VaultRedeemLib.NAV_BEFORE` — a transient slot constant written by nothing since `emergencyMigrate` began measuring both sides of its bleed bound live.
+- `ConstituentConfig.freezeUntil` — written only as `0` at `PoolRegistry.sol:305` and read at `PoolRegistry.sol:1001`; the "future gate callback" that would set it does not exist, so the read-side freeze overlay is driven entirely by `caFreezeOverride`.
 
 ### How It Fits Together
 
-The core trick: AMPS is never minted to defend a price and never priced by the vault — the vault only ever *sells* protocol-owned AMPS through static ask ladders at or above NAV and *buys* it back through the bids those sales left behind, so every fill and every fee either raises the numerator or lowers the denominator of `NAV/share = A / totalSupply`.
+The core trick: the protocol is its own market maker, so every AMPS a trader buys comes off a ladder the vault
+placed at or above its own NAV, and every AMPS sold walks back down that ladder into inventory the vault burns.
 
-### Swap through the hook
+### Trading against protocol-owned liquidity
 
 ```
-Router.swap(key, params)
-└─ PoolManager.swap()
-   ├─ AmpsHook.beforeSwap()                       ← reads the pool's packed CONFIG/DYNAMIC/ARMED words, no gate call
-   │  ├─ base = zeroForOne ? ampsFeeBps : buyFeeBps[class]
-   │  ├─ credit = tload(ROTATION_CREDIT); blend base over min(amountIn, credit)   *transient, same tx only*
-   │  ├─ FeePolicy.quoteFee() (bounded staticcall) → dyn = f_vol + f_dev + f_session + surge + capture, clamped
-   │  └─ deviation-increasing and beyond outerRail? → revert BeyondRail   *the only swap revert*
-   ├─ PoolManager executes at fee | OVERRIDE_FEE_FLAG                     *fee accrues to the vault's positions*
-   └─ AmpsHook.afterSwap()
-      ├─ TruncatedOracleLib.write(): tick clamped to ±maxTickMovePerBlock, head accumulator exact, ring commit every 115 s
-      ├─ buy? tstore(ROTATION_CREDIT += delta.amount0())                  *credit = AMPS actually received*
-      ├─ every gateCacheSeconds: OracleGate.snapshotByPool() / FeePolicy bands / IStockToken.uiMultiplier() (all bounded staticcalls) → cached fairTick, bands, dynCap, session
-      └─ post-swap deviation beyond rail and increasing? → revert BeyondRail
+AmpsRouter.buy(poolId, amountIn, minAmpsOut, to, deadline)
+└─ PoolManager.unlock()
+   └─ PoolManager.swap(key, exactInput)
+      ├─ AmpsHook.beforeSwap()          ← three cold SLOADs; base fee = ampsFeeBps (500 bp)
+      │  └─ FeePolicy.quoteFee()         ← deviation, variance, session, surge, dividend-capture toll
+      │     └─ *refuses only when deviation-increasing AND beyond the outer rail*
+      └─ AmpsHook.afterSwap()
+         ├─ TruncatedOracleLib.write()   ← *tick capped at maxTickMovePerBlock; high-water mark advances*
+         └─ OracleGate.snapshotByPool()  ← *at most once per pool per gateCacheSeconds; failure keeps the cache*
 ```
 
-### Bond
+### Pro-rata redemption — the structurally ungated floor
+
+```
+AmpsVault.redeemProRata(shares, to)
+├─ Amps.burn(msg.sender, shares)         ← *effects first: shares gone before an asset moves*
+├─ PoolManager.unlock(ACTION_UNWIND)
+│  └─ VaultRedeemLib.unwind()            ← removes floor(L × shares / T) from every live cell in every pool
+├─ VaultRedeemLib.redemption()           ← *no gate, no price, no registry read on this path*
+└─ VaultRedeemLib.payout()
+   ├─ PoolManager.take() per asset       ← ERC-20 attempt, gas-bounded
+   └─ PoolManager.transfer() per asset   ← *fallback: hands over the ERC-6909 claim no token can refuse*
+```
+
+### Bonding — the only post-genesis issuance
 
 ```
 AmpsBonds.bond(marketId, amountIn, minAmpsOut, to)
-├─ OracleGate.checkBond(constituentId)            ← refuses only DIVERGED / SCHEDULED_FREEZE; stale feed ⇒ haircut
-├─ roll epoch / day counters
-├─ AmpsVault.depositBonded(marketId, collateral, bonder, amountIn)
-│  ├─ _registerAsset(collateral); _checkpoint()   *NAV re-read in this block, before pricing*
-│  └─ PoolManager.unlock(ACTION_SETTLE) → VaultRedeemLib.settleFrom(): sync → transferFrom(bonder → PoolManager) → settle → mint claim
-├─ _price(): m = AmpsHook.twapTick30m(spoke) · P_i = FeedRegistry.latestAnswer · BondPolicy.quote()
-│  └─ q = min(m / (1 − d), P_i(1 − h_session) / (nav(1 + minAccretion)))   *shell re-derives the floor and reverts if the policy exceeds it*
-├─ capacity clamp: ampsOut = min(priced, epochLeft, dailyLeft); require ampsOut ≥ minAmpsOut
-└─ _issue(): AmpsVault.mintVesting(AmpsBonds, ampsOut) → Amps.mint   *totalSupply rises now; position vests linearly over vestSeconds*
+├─ OracleGate.checkBond()                ← *only freeze or divergence refuses; staleness widens the haircut*
+├─ AmpsVault.depositBonded()
+│  ├─ AmpsVault._checkpoint()            ← *NAV is re-derived BEFORE the collateral lands*
+│  └─ VaultRedeemLib.settleFrom()        ← bonder → PoolManager → ERC-6909 claim to the vault
+├─ BondPolicy.quote()                    ← discount = dBase + k_w·deficit − k_c·fill, clamped
+├─ AmpsBonds._qFloorX18()                ← *the shell recomputes the floor and discards the policy's product*
+└─ AmpsVault.mintVesting() → Amps.mint() ← minted into AmpsBonds custody, vesting linearly
 ```
 
-### Compound (the flywheel)
+### The placement engine — permissionless and bountied
 
 ```
-AmpsVault.compound(poolId)                          ← permissionless, bountied, gate GREEN/REF_DIVERGED
-└─ VaultPlacementLib.compound()
-   ├─ gauntlet: cooldown 60 s · |tick − fairTick| ≤ 800 · OracleGate.checkPlacement()
-   ├─ PoolManager.unlock(ACTION_COMPOUND): modifyLiquidity(0) on every record → fees to claims
-   ├─ _burnback(): cells whose upper bound the high-water tick crossed → liquidity 0, AMPS burned   *never re-placed*
-   ├─ _split(ampsFees): creator (100 bp → 0 over 30 d) → stakers (stakerBps, streamed 24 h) → burn (burnBps) → relaid
-   ├─ _placeLadder(relaid, above): asks on the grid above the current tick at LadderPolicy weights
-   ├─ AmpsHook.resetHighWater() / armSurge()
-   ├─ payBounty(): BountyPot.pay(keeper, measured work value, EIP-150-corrected gas)
-   └─ AmpsVault._afterPlacement(): _checkpoint(); require navAfter ≥ navBefore·(1 − 2 bp); _sweepClean()
+AmpsVault.compound(poolId)               ← anyone; paid from BountyPot
+├─ OracleGate.checkPlacement()
+├─ VaultPlacementLib.compound()
+│  ├─ _collect()                          ← realise fees in both currencies; creator slice paid as a claim
+│  ├─ _burnback()                         ← *cells the high-water mark crossed are withdrawn and their AMPS burned*
+│  ├─ _split()                            ← *whole AMPS remainder burned; nothing is re-laddered as an ask*
+│  └─ _placeLadder(bids)                  ← counter side re-placed below the tick, on the canonical grid
+├─ AmpsHook.resetHighWater() / armSurge()
+└─ AmpsVault._afterPlacement()            ← *R1: reverts if NAV/share fell more than 2 bp*
 ```
 
-### Redeem
+### Genesis
 
 ```
-AmpsVault.redeemProRata(shares, to)                 ← no gate, no oracle, no guardian, no pointer read
-├─ supply = Amps.totalSupply(); Amps.burn(msg.sender, shares)        *effects first*
-├─ PoolManager.unlock(ACTION_UNWIND) → VaultRedeemLib.unwind(): every record −floor(L·shares/supply); principal → claims, fees stay
-├─ VaultRedeemLib.redemption(): payout_i = floor(b_i·shares/supply)·(1 − redeemFeeBps); inventoryBurned = floor(inv·shares/supply) + releasedAmps
-├─ PoolManager.unlock(ACTION_PAYOUT) → burn claims / take → to; idle ERC-20 → to
-└─ Amps.burn(vault, inventoryBurned)                                 *supply falls by more than shares*
+Timelock.genesisMint()  → mints S0 = 20,000 AMPS (team 1,000 / auction 10,000 / POL 9,000)
+Timelock.createAuctions() → two Continuous Clearing Auctions (USDG and native ETH legs)
+[bidding window]
+Anyone.settle()
+├─ sweepCurrency() + sweepUnsoldTokens() per leg
+├─ _launchPrice()                        ← *USDG leg wins when it graduated; it needs no oracle to become a price*
+└─ AmpsVault.genesisPlace()              ← *P_ref = max(p0, navPerShare); _initialized and _wiringFrozen latch*
 ```
 
 ---
 
 ## 2. Threat & Trust Model
 
-> **Bullet brevity rule:** one tight sentence per bullet; the `file:line` carries the evidence.
-
 ### Protocol Threat Profile
 
-> Protocol classified as: **Yield Vault / NAV-backed asset manager** with **AMM/DEX (Uniswap v4 hook)**, **Bonding/issuance** and **Staking/rewards** characteristics
+> Protocol classified as: **Yield Aggregator / Vault** with **DEX/AMM** and **Stablecoin** characteristics
 
-The vault owns every pool position and defines the share price as `A / totalSupply` with a pro-rata exit (vault signals: `redeemProRata`, `navPerShare`, `VIRTUAL_SHARES`, position valuer); the hook is a fee-only v4 hook with dynamic fees, TWAP observations and a rail (AMM signals); `AmpsBonds` is an Olympus-shaped discounted issuance with capacity and vesting; `AmpsStaking` is an ERC-4626 reward vault. Oracle dependence (Chainlink 24/5 equity feeds, issuer-controlled Stock Tokens) cuts across all four.
+Share-based accounting with `navPerShareX18`, `totalAssetsUsd18`, a virtual-share offset and a pro-rata redemption
+put the vault model first; a full Uniswap v4 hook with dynamic fees, TWAP observations and protocol-owned ladders
+adds the AMM profile; a NAV-anchored reference price, a haircut-adjusted accretion floor and an open redemption
+mechanism add the stablecoin profile without a peg target.
 
 ### Actors & Adversary Model
 
 | Actor | Trust Level | Capabilities |
 |-------|-------------|-------------|
-| Timelock (Safe 3/5 proposer, open executor) | Trusted (one on-chain `minDelay`; 48 h / 7 d / 14 d classes are signing policy) | 60 admin entry points: every fee/bond/ladder/rollout/oracle parameter inside a hard band; **re-point `positionValuer`, `oracleGate`, `feedRegistry`, `marketReference`, `ladderPolicy`, `rolloutPolicy`, `BondPolicy`, `FeePolicy`** (no band, changes NAV inputs); constituent lifecycle; `sweep` the bounty pot; register the standby vault. Cannot mint, cannot touch redemption or claims, cannot move liquidity. |
-| Guardian (Safe 2/4) | Bounded (disable-only, ≤ 7 d auto-expiry; `emergencyMigrate` needs the on-chain denylist predicate and a pre-registered standby) | Freeze one constituent or the protocol: closes placements, compounds and bonds, never swaps, redemption or claims. Triggers full evacuation to the standby — instant, no delay, all claims incl. AMPS. |
-| AmpsVault | Trusted (immutable; sole `IUnlockCallback`, sole minter/burner) | Owns every position, mints only for bonds, burns on redeem/compound, pays bounties, notifies staking, hands `onlyVault` roles to a standby on migration. |
-| PoolRegistry | Trusted (immutable, timelock-driven) | Opens pools through the vault, opens/closes bond markets atomically, withdraws retired bids; holds no funds. |
-| AmpsBonds | Trusted (immutable code, governed state) | Only address that can `depositBonded`/`mintVesting`; holds vesting AMPS; `claim` is ungated. |
-| Keeper | Bounded (permissionless, paid ≤ tip + 2 % of measured work, ≤ 3× gas, ≤ $25/day, ≥ $1 work) | Chooses which pool/constituent to `compound`/`rollout`/`deployBonded` and when (60 s cooldown per pool). |
-| Creator | Bounded (receives ≤ 1 pt of the sell fee, decaying to 0 at day 30) | Reassigns itself. |
-| Bonder / Trader / Holder / Staker | Untrusted | `bond`, swaps through the hook, `redeemProRata`, ERC-4626 deposit/withdraw. |
-| Stock Token issuer (beacon admin, codeless key) | External, unbounded | Denylist any address incl. the PoolManager, pause, change `uiMultiplier`, upgrade the token; the protocol only detects and evacuates. |
-| Chainlink (equity feeds, 24/5) | External, bounded by freshness/jump rules | Feeds hold Friday's close all weekend; a bad round ≥ 10 % is held for confirmation. |
-| Uniswap v4 PoolManager | External, immutable, trusted as ground truth | Custodies every asset (claims and positions); read via `extsload`. |
+| Timelock | Trusted | 59 setters across 8 contracts, all instant on-chain. Re-points `oracleGate`, `feedRegistry`, `positionValuer`, `marketReference`, `ladderPolicy`, `rolloutPolicy`, `genesis`; sets every fee, band and cap; `genesisMint`; `sweep`s the bounty pot; `addConstituent`/`retire`/`setIndexWeights`. Cannot move a user's funds, mint, or stop `redeemProRata`/`claim`. |
+| Guardian | Bounded (disable-only, all powers auto-expire ≤ 7 d) | `freezeProtocol` / `freezeConstituent` (no delay, expiring), `unfreeze*`, and `emergencyMigrate` — instant, no timelock, hands five `onlyVault` roles and the whole estate to the pre-registered standby. Cannot block redemption or claim. |
+| Vault (`AmpsVault`) | Trusted (immutable bytecode) | Sole minter/burner of AMPS, sole LP in all 32 pools, sole `pay` caller on `BountyPot`, holds every claim. Its own address is movable only by the guardian's evacuation. |
+| Creator | Bounded (fee recipient only) | Receives `creatorBps(t)` of each currency's collected fees, decaying to 0 at day 30; may re-assign the recipient. No other power. |
+| `PoolRegistry` | Trusted (timelock-only mutators) | Opens pools through the vault, opens/closes bond markets, sets index weights. |
+| `AmpsBonds` | Trusted (immutable) | The only contract that can make the vault mint post-genesis. |
+| Keeper | Bounded (paid, unprivileged) | Calls `compound`, `rollout`, `deployBonded` on any pool/constituent, once per pool per 60 s; chooses ordering and timing. Not subject to any pause — no pause exists. |
+| Genesis adapter | Bounded (one call, latched) | Sole auction-side caller of `genesisPlace`; ownerless and immutable. |
+| PoolManager (v4) | Trusted (external, immutable) | Holds every claim and every position; drives all five hook callbacks. |
 
 **Adversary Ranking** (ordered by threat level for this protocol type, adjusted by git evidence):
 
-1. **Stock Token issuer / beacon admin** — a codeless, un-timelocked key that can denylist or pause the only custody address and rewrite the display multiplier the hook and gate probe.
-2. **Governance proposer (timelock)** — the pointer slots that feed NAV (`positionValuer`, `oracleGate`, `feedRegistry`, `marketReference`) are not banded and the on-chain delay is one `minDelay`.
-3. **Swap-flow manipulator (MEV, hub pumper, TWAP pusher)** — the hub TWAP is `P_mkt` for every fee wall, rail, bond quote and, rate-limited, for the reference every ask anchors on.
-4. **Bonder / redeemer gaming issuance and exit arithmetic** — capacity, floor rounding and the inventory-burn path dependence (ruling U) all sit on user-chosen amounts and ordering.
-5. **Keeper** — chooses the pool, the moment and the pool state a bountied placement runs against; bounded by the pot's caps but not by intent.
-6. **Guardian** — disable-only, but `emergencyMigrate` is instant once the predicate holds.
+1. **Donation / share-price manipulator** — the vault's `A` is built from live balances and ERC-6909 claims, and any address can donate to the vault, the bonds shell, the router or a pool at any time.
+2. **Keeper-ordering adversary** — three permissionless, bountied entry points reshape protocol-owned liquidity and burn supply, and the caller picks which pool, which constituent and in what order.
+3. **Oracle manipulator** — every price in the system descends from Chainlink answers and the hook's own truncated TWAP, both of which the protocol reads through fail-open probes.
+4. **Compromised timelock holder** — one address holds 59 instant setters including every pointer the vault calls.
+5. **MEV searcher / sandwich attacker** — the ladders are a public, deterministic, grid-aligned order book with a 60-second placement cooldown.
+6. **Hostile constituent issuer** — Stock Tokens are third-party beacon proxies that can pause, denylist, restate a multiplier or burn gas on any call.
 
 See [entry-points.md](entry-points.md) for the full permissionless entry point map.
 
 ### Trust Boundaries
 
-- **Timelock → vault pointers** — `setPolicyPointer` (`AmpsVault.sol:1153-1158`) re-points six NAV/gate inputs with no band; the one on-chain delay is the timelock's `minDelay`, the 7-day class is policy. Worst instant action after the delay: a `positionValuer` that values positions at `slot0`, or a `marketReference` that reports a chosen TWAP. *Git signal: `IAmpsVault.sol` and `AmpsVault.sol` are the two most-modified files (4 each).*
-- **Vault → gate (fail-open)** — `_requireGate` (`AmpsVault.sol:1424-1441`) treats a reverting or zero gate as absent and skips the guardian-freeze read in the same `catch`; a bricked gate can never lock governance out, and can never lock anything else either.
-- **Guardian → everything gated** — `freezeProtocol` (`OracleGate.sol:636`) closes placements/compounds/bonds for ≤ 7 d without delay; `emergencyMigrate` (`AmpsVault.sol:1186`) moves every claim to the standby instantly once `migrationPredicate` (`VaultNavLib.sol:250-284`) holds; neither touches `redeemProRata` or `claim`.
-- **Registry ↔ bonds ↔ vault** — the registry is the only caller of `initializePool`/`withdrawRetiredBids` and a second accepted caller of `addCollateral`/`setMarketOpen` (`AmpsBonds.sol:1168-1171`); the bonds shell is the only caller of `depositBonded`/`mintVesting` (`AmpsVault.sol:851,888`).
-- **Vault → linked libraries** — four libraries reached by `DELEGATECALL` read and write vault storage by literal slot numbers (`VaultPlacementLib.sol` `SLOT_*`, `VaultNavLib.sol:319-321`); the layout contract between them is enforced by tests, not code.
-- **Hook → PoolManager** — `onlyPoolManager` on every callback (OZ `BaseHook`), `sender == vault` on initialise and add-liquidity (`AmpsHook.sol:232,297`); the hook never custodies and never reverts a swap except at the rail.
-- **Protocol → issuer** — every probe into a Stock Token is a gas-capped raw `staticcall` with "unknown ⇒ not paused / no change" defaults (`OracleGate.sol:1033-1047`, `AmpsHook.sol:846`); the denylist predicate is the only issuer signal that moves funds.
+- **Timelock → every governed contract** — one immutable address per contract, checked with a bare `msg.sender` comparison; the 48 h / 7 d / 14 d tiers exist only in the documentation and in the `TimelockController`'s single `minDelay`, which `script/03_Core.s.sol:296` deploys as **0** with an open executor until `CORE_STAGE=finalize` runs.
+
+- **Guardian → vault estate** — no delay at all; the only brake is the on-chain denylist predicate at `VaultNavLib.sol:406-427` and the requirement that the destination was pre-registered.
+
+- **Vault → oracle gate** — the vault treats an unreadable gate as *absent*, not as a refusal (`AmpsVault.sol:1641`), which is deliberate for an immutable contract but means gate enforcement is a liveness property of the gate's own implementation. *Git signal: `OracleGate.sol` appears in 6 source-touching commits, and `access_control` changed in 17 of 24 — elevated risk.*
+
+- **Vault → linked libraries** — `VaultNavLib`, `VaultPlacementLib`, `VaultRedeemLib` and `VaultRolloutLib` are `DELEGATECALL` targets fixed at link time, so they are part of the immutable vault, but they are also separately deployed contracts with `public` functions and their own (empty) storage.
+
+- **Protocol → Stock Tokens** — every read of an issuer's contract is a gas-capped, hand-decoded `staticcall` whose failure degrades rather than reverts; the one thing an issuer *can* do is make a redemption pay in ERC-6909 claims instead of tokens.
 
 ### Key Attack Surfaces
 
-- **Redemption path dependence** &nbsp;&#91;[I-30](invariants.md#i-30), [I-31](invariants.md#i-31), [E-3](invariants.md#e-3)&#93; — `VaultRedeemLib.redemption:356-406` burns `floor(inventory·shares/T) + releasedAmps` per call, so `T` falls by more than `shares` and the next slice's `shares/T` is larger; ruling U in the state model is still open. Worth tracing the optimal slicing against the 1 % fee and gas, and what the two candidate fixes do to `I-30`.
+- **Governance delay tiering is not on-chain** — `script/03_Core.s.sol:289-299` deploys one `TimelockController` with `minDelay = 0`, an open executor and the deployer as a proposer; every contract stores that one address (`AmpsVault.sol:314`, `OracleGate.sol:139`, `PoolRegistry.sol:125`, `AmpsHook.sol:185`, `BountyPot.sol:93`). Worth confirming what `CORE_STAGE=finalize` actually sets and whether anything distinguishes a 48-hour setter from a 14-day one after it.
 
-- **Un-banded NAV input pointers** &nbsp;&#91;[I-29](invariants.md#i-29), [I-3](invariants.md#i-3), [X-7](invariants.md#x-7)&#93; — `VaultNavLib.setPointer:290-322` lets a proposal replace `positionValuer`, `oracleGate`, `feedRegistry` and `marketReference` with any address, and the NatSpec's "exactly once more" for `marketReference` (`AmpsVault.sol:1149-1151`) has no latch. Worth checking what a hostile or buggy valuer/reference does to `_checkpoint` and hence to every bond floor and ask anchor in the window before governance notices.
+- **Vault gate reads fail open by construction** &nbsp;&#91;[X-3](invariants.md#x-3), [G-22](invariants.md#g-22), [G-23](invariants.md#g-23)&#93; — `AmpsVault._requireGate:1625-1650` returns without refusing whenever `_gateRead` cannot believe the answer, and both reads carry a 1,500,000-gas cap. Worth tracing which gated selectors remain reachable when the gate is merely expensive rather than broken.
 
-- **Fail-open gate reads in the vault** &nbsp;&#91;[X-3](invariants.md#x-3), [G-11](invariants.md#g-11), [G-12](invariants.md#g-12)&#93; — `AmpsVault._requireGate:1424-1441` returns on a reverting `state(0)` before reading `protocolFreezeUntil`, and `OracleGate.state` itself degrades on every failed bounded read. Worth confirming which gate failure modes (out-of-gas from a large calendar, a replaced pointer, a reverting registry) silently turn a guardian freeze or a `SCHEDULED_FREEZE` into GREEN for placements and bonds.
+- **Three permissionless entry points reshape protocol-owned liquidity** &nbsp;&#91;[I-4](invariants.md#i-4), [E-3](invariants.md#e-3), [G-20](invariants.md#g-20), [G-25](invariants.md#g-25)&#93; — `compound`, `rollout` and `deployBonded` (`AmpsVault.sol:1097-1125`) each remove, burn and re-place inventory under a 2 bp NAV bound and a 60-second per-pool cooldown, with the caller choosing the pool and the ordering. Worth tracing what a keeper who calls them in an adversarial sequence across pools can move that a single call cannot.
 
-- **Hook decisions on a cached gate view** &nbsp;&#91;[X-6](invariants.md#x-6), [G-40](invariants.md#g-40), [I-18](invariants.md#i-18)&#93; — `_beforeSwap:307-345` measures the rail and bands against `_dyn[id]` refreshed at most once per `gateCacheSeconds` in `_afterSwap:390-393` and forced only by `armSurge`; a quiet spoke can carry a `fairTick` up to `GATE_CACHE_MAX_AGE` old. Worth tracing the first swaps after a Chainlink move, a session change and an `effectiveAt` flip, and the "conservative substitute" path once the cache ages out.
+- **Registry and hook hold two copies of a pool's configuration** &nbsp;&#91;[X-1](invariants.md#x-1), [X-2](invariants.md#x-2)&#93; — the hook reads `buyFeeBps` and derives `gridBaseTick` once at `afterInitialize` (`AmpsHook.sol:345`, `:351`), and `PoolRegistry._openPool:829-835` mirrors the origin back inside a `try`/`catch` that leaves the field at zero on failure. Worth confirming which copy each consumer reads and what happens to the placement lattice if the mirror ever misses.
 
-- **Two prices, two speeds** &nbsp;&#91;[I-5](invariants.md#i-5), [I-19](invariants.md#i-19), [E-5](invariants.md#e-5)&#93; — `P_mkt` (hub truncated TWAP, `VaultNavLib.marketPrice:147`) drives fees, rails and bond quotes within one window while `P_ref` (`referencePrice:206-240`) chases it upward at ≤ 10 %/h and drops instantly; the numerator is valued at the *previous* `P_ref` (`AmpsVault.sol:1358` vs `1375`). Worth checking the hub-pump-then-bond and hub-dump-then-redeem sequences across one TWAP window and one checkpoint interval, including the `REF_DIVERGED` fallback to NAV.
+- **Index weight normalisation is enforced at one call site** &nbsp;&#91;[I-3](invariants.md#i-3), [E-6](invariants.md#e-6), [G-41](invariants.md#g-41)&#93; — `PoolRegistry.sol:479` checks the sum; `addConstituent:275`, `reconfigureConstituent:408` and the retire/reinstate counter moves at `:347`/`:374` check only the per-name band. Worth checking what the bond discount's deficit term and the rollout schedule price against a vector that no longer sums to `BPS`.
 
-- **Bond floor on a held Chainlink answer** &nbsp;&#91;[E-1](invariants.md#e-1), [I-8](invariants.md#i-8), [X-2](invariants.md#x-2)&#93; — `BondPolicy.qFloorX18:121-132` prices the floor off `FeedRegistry.latestAnswer` (Friday's close all weekend) minus `h_session`, while `m` is the live 24/7 spoke TWAP (`AmpsBonds._price:457-480`); capacity is a share of the *live* supply (`_capacity:1013-1035`) and a registry that cannot answer prices `deficit = 0`. Worth checking the Monday-gap bound at `h_session = 300 bp`, the `k_w` deficit term against `I-25`, and the accepted-answer jump hold (`I-28`) interacting with a real gap.
+- **Bond pricing chains three fail-open reads** &nbsp;&#91;[X-4](invariants.md#x-4), [X-7](invariants.md#x-7), [G-36](invariants.md#g-36), [G-37](invariants.md#g-37), [E-2](invariants.md#e-2)&#93; — `AmpsBonds._price:515-550` requires a same-block checkpoint, a confirmed-NAV flag read through a raw `staticcall` that answers `false` on failure (`:1312-1318`), and a policy answer it then re-derives. Worth tracing the three orderings in which the vault is readable for one of those and not the others.
 
-- **Placement gauntlet asymmetries** &nbsp;&#91;[I-13](invariants.md#i-13), [I-14](invariants.md#i-14), [I-15](invariants.md#i-15), [I-16](invariants.md#i-16)&#93; — `VaultPlacementLib._executePlace:543-603` opens cells under `strictBudget` only from `place`; bountied merges `continue` at 576, `_writeRecords:731-790` merges by cell index, `_burnback:860-891` zeroes a record and flips `above` on the high-water rule, and `subLiveCells` saturates at zero. Worth tracing record/cell bookkeeping across merge → burnback → unwind → harvest for the same cell, and what a bid cell converted from a filled ask looks like to `LadderPositionValuer.amountsOf`.
+- **The redemption floor's payout path is a gas budget** &nbsp;&#91;[I-9](invariants.md#i-9), [G-1](invariants.md#g-1), [G-2](invariants.md#g-2)&#93; — `VaultRedeemLib.payout:418-464` sizes a reserve as `32,000 × tokens.length + 60,000`, skips the ERC-20 leg entirely below `reserve + 200,000`, and pays idle dust only while `gasleft() >= 8 × STOCK_TOKEN_PROBE_GAS`. Worth measuring the reserve against the 66-asset maximum the collateral cap admits.
 
-- **Keeper-chosen state for bountied jobs** &nbsp;&#91;[I-11](invariants.md#i-11), [I-22](invariants.md#i-22), [X-8](invariants.md#x-8), [E-2](invariants.md#e-2)&#93; — `compound`/`rollout`/`deployBonded` are permissionless with a 60 s per-pool cooldown (G-24) and a 2 bp bleed allowance each (G-13); `payBounty:1102-1122` reports a work value the vault measures at feed prices and a gas figure it corrects itself. Worth checking the cheapest legal grind (tiny fee balances, 32 pools, one keeper) against `chost`, the daily ceiling and cumulative bleed, and whether a keeper can time `compound` around a pending `armSurge`.
+- **Guardian evacuation runs with no delay and a relaxed bleed bound** &nbsp;&#91;[G-16](invariants.md#g-16), [G-17](invariants.md#g-17), [G-18](invariants.md#g-18), [G-21](invariants.md#g-21)&#93; — `AmpsVault.emergencyMigrate:1319-1391` unwinds every position, moves every claim and hands over five `onlyVault` roles, and both halves of the 50 bp bound are skipped when either side is unpriceable (`:1360-1366`, `:1386-1388`). Worth checking what the predicate at `VaultNavLib.sol:406` accepts as evidence and who can produce it.
 
-- **Emergency migration surface** &nbsp;&#91;[G-16](invariants.md#g-16), [G-17](invariants.md#g-17), [G-18](invariants.md#g-18), [G-14](invariants.md#g-14), [X-11](invariants.md#x-11)&#93; — `emergencyMigrate:1186-1241` runs `ACTION_UNWIND` over every pool, `evacuate:332-350` transfers every claim including AMPS, then hands four `onlyVault` roles to a standby whose layout must match the libraries' slot constants; the predicate accepts two failed 1-wei self-transfer probes. Worth tracing what a partially-denylisted set (one token blocked at the PoolManager) does inside the single `unlock`, and how the standby resumes ladders, checkpoints and the `POOL_KEYS_SLOT` list it never received.
+- **The protocol is its own price oracle** &nbsp;&#91;[I-11](invariants.md#i-11), [X-5](invariants.md#x-5)&#93; — `P_mkt` comes from the hook's own ring (`AmpsHook._obs`), the gate's `fairTick` from the same ring plus a feed, and a spoke's realised index weight from the vault's own valuation of its own positions. Worth tracing which of those loops has an external anchor and which closes on protocol state.
 
-- **Library slot coupling and raw `sstore`** &nbsp;&#91;[X-11](invariants.md#x-11)&#93; — `VaultRolloutLib._setWord:472`, `VaultNavLib.setPointer:319-321` and the `SLOT_*` constants in `VaultPlacementLib` write vault storage by number; `VaultPlacementLib._setWord:1269` is an unreferenced copy. Worth confirming the storage-layout tests cover every constant and that no library reads a packed word with a stale bit layout after the Phase 6 field additions.
+- **Deployed libraries expose public entry points** — `VaultNavLib.setPointer/evacuate/handover/migrationPredicate`, `VaultPlacementLib.place/compound/unlockAction/payBounty/splitHarvestFees`, `VaultRedeemLib.unlockAction/settleFrom/payout/unwind/sweepClean` and the three `VaultRolloutLib` jobs are `public` on separately deployed addresses. Worth confirming that each reads only the caller's own (empty) storage when reached by `CALL` rather than `DELEGATECALL`.
 
-- **Rotation credit across pools and swap kinds** &nbsp;&#91;[I-17](invariants.md#i-17)&#93; — `_credit:427-434` adds `delta.amount0()` on any buy in any pool; `_beforeSwap:319-336` spends it on exact-input sells only and blends at the *current* pool's buy fee. Worth checking a buy in the cheapest-fee spoke followed by a sell in an entry pool, exact-output sells, and multi-hop paths where the same transaction re-enters `beforeSwap` before `afterSwap` credited the first hop.
+- **Keeper spend accounting is a resetting window** &nbsp;&#91;[I-20](invariants.md#i-20), [E-5](invariants.md#e-5)&#93; — `BountyPot._chargeWindow:376-386` opens a fresh window on the first payment 24 h after the last one opened, and the work value the caps are applied to is derived by the vault inside the same call (`VaultPlacementLib.payBounty:1670`). Worth checking the gas-reserve arithmetic at `_gasUsed:1704-1710` against a caller-chosen transaction gas limit.
 
-- **Index weight vector drifts between proposals** &nbsp;&#91;[I-25](invariants.md#i-25), [I-23](invariants.md#i-23)&#93; — only `setIndexWeights:445-470` checks `Σ == BPS`; `addConstituent:283-297`, `reconfigureConstituent:397` and every retire/reinstate change `n` or a weight without it. Worth tracing what `RolloutPolicy.propose:57-86` and `BondPolicy`'s `k_w·deficit` compute from an un-normalised vector, and whether `currentWeightBps` can make a deficit read as 100 %.
+- **Ladder bookkeeping diverges on one of four removal paths** &nbsp;&#91;[I-5](invariants.md#i-5)&#93; — `VaultRedeemLib.unwind:757` decrements `record.liquidity` without the matching `record.amount` write the other three paths make. Worth confirming nothing downstream prices from that field.
 
-- **Corporate-action detection defaults** &nbsp;&#91;[G-45](invariants.md#g-45), [X-6](invariants.md#x-6)&#93; — `OracleGate._corporateAction:1024-1047` reads `oraclePaused`/`effectiveAt`/`newUIMultiplier`/`uiMultiplier` through gas-capped raw calls with "unknown ⇒ not paused" and `AmpsHook._detectMultiplierStep:768-800` arms a capture fee for steps ≤ 2 % and `caArmed` above. Worth checking a token whose probe reverts exactly during a split window, the `DIVIDEND_STEP_BPS_MAX` boundary, and how `caArmed` clears (`_clearCorporateAction:814-825`).
+- **Feed jump confirmation has a keeperless path** &nbsp;&#91;[G-44](invariants.md#g-44)&#93; — `FeedRegistry._evaluate:658-696` falls back to comparing the candidate against `roundId - 1` and `roundId - 2` whenever no latch exists or the latch is older than one heartbeat, and every failed probe reads as "no previous round", i.e. not a jump. Worth tracing which branch a production deployment with no `refresh()` keeper actually takes.
 
-- **Reward stream re-timing** &nbsp;&#91;[I-21](invariants.md#i-21), [X-9](invariants.md#x-9)&#93; — `notifyReward:218-236` folds the unreleased remainder into a fresh `rewardStreamSeconds` window on every compound, so a frequent compounder keeps rewards perpetually mostly unreleased while `totalAssets` nets them out. Worth checking share-price behaviour for depositors around dense compound bursts and the `_decimalsOffset = 3` inflation bound against a first deposit of dust.
+### Upgrade Architecture Concerns
 
-- **Truncated-oracle ring after the ruling V rework** &nbsp;&#91;[I-19](invariants.md#i-19), [G-43](invariants.md#g-43)&#93; — `TruncatedOracleLib.write:238-309` keeps an exact head accumulator and commits a ring slot only every `MIN_INSERT_INTERVAL` (115 s); `consult` floors, `_interpolate` ceils, `observationCoverage` decides `WATCHDOG` for layer F. Worth checking the first 30 minutes after `initialize`, a pool idle longer than the ring covers, and the `WindowNotCovered` path the quoter and gate treat as "no reference".
+No proxies exist. The upgrade surface is instead a set of pointer slots the timelock rewrites in place:
+
+- **Ten pointer slots, one setter** — `AmpsVault.setPolicyPointer:1267` writes slots 4, 5, 7, 8, 9, 10, 11, 12, 13 and 22 by name through `VaultNavLib.setPointer:449-483` using raw `sstore`; only four are set-once, and the slot numbers are duplicated as private constants in `VaultPlacementLib` and `VaultRolloutLib`.
+- **`marketReference` carries no latch by design** — `AmpsVault.sol:1257-1266` documents the decision; the hook it points at is the protocol's own price reference, high-water mark and surge target.
+- **A standby vault is an unaudited second implementation** — `emergencyMigrate` hands it five `onlyVault` roles with no way back, and nothing in `src/` constrains its bytecode beyond `code.length != 0`.
 
 ### Protocol-Type Concerns
 
-**As a Yield Vault / NAV-backed share:**
-- `VaultNavLib.totalAssetsUsd18:80-116` reverts on any registered asset with a zero feed answer (G-23) — every gated path then refuses until the feed returns while `redeemProRata` continues at the last checkpoint-free arithmetic; worth confirming the intended behaviour for a delisted constituent whose feed is retired.
-- `PriceLib` rounds every conversion in the protocol's favour (`PriceLib.sol:100-270`: sqrt price up, USD values down, counter amounts up); `LadderLib.split:178-190` gives the last bucket the remainder. Worth checking the asymmetric rounding does not accumulate against redeemers across 32 pools × 24 cells.
-- `VIRTUAL_SHARES = 1e3` with `+1` on the numerator (`AmpsVault.sol:1360-1362`) is a divide-by-zero guard, not an inflation defence; the genesis latch and no-NAV-mint are what close the first-depositor vector.
+**As a Yield Aggregator / Vault:**
+- `VaultNavLib.totalAssetsUsd18:134-163` builds `A` from live `balanceOf` plus ERC-6909 claims plus a valuer term, so a donation of any registered asset lands in `A` at the next checkpoint; `VIRTUAL_SHARES = 1e3` is the only inflation offset and `S0 = 20,000e18` is minted before the first deposit.
+- An unreadable `balanceOf` contributes **zero** to `A` (`VaultNavLib.sol:580-585`), so one issuer can understate NAV for every asset it does not touch.
 
-**As an AMM / v4 hook:**
-- The hook's fee is applied by the PoolManager on the *input* currency, so sell fees accrue in AMPS and buy fees in the counter (`AmpsHook.sol:307-345`); the split and burn only happen at `compound`, so uncollected fees sit in positions and are excluded from NAV (`PoolStateLib.feesOwed:477`, valuer excludes fees).
-- Fees accrued while a pool has no in-range position are stranded by design (state model ruling 13); worth measuring how often an entry pool trades above its top ask.
-- `QuoterSwapLib` re-implements v4's swap step for quotes (`QuoterSwapLib.sol:90-184`); a divergence from the PoolManager's arithmetic mis-quotes but cannot move funds.
+**As a DEX/AMM:**
+- `VaultPlacementLib._cells:803-845` clips the bucket count to the grid's bounds rather than reverting, and the ask/bid anchors round in opposite directions with a documented one-tick-spacing residue on the first ask cell (`:1597-1627`).
+- `AmpsHook._updateVariance:821-838` stores the EWMA at X12 and saturates `uint64` five orders of magnitude below the arithmetic maximum; the clamp is what stops a wrap reporting a *lower* fee on the largest moves.
 
-**As a bonding / issuance mechanism:**
-- Capacity is computed against `Amps.totalSupply()` at each bond (`AmpsBonds._capacity:1013-1035`), so issuance compounds within an epoch as supply grows; the vesting mint counts toward the next bond's cap base immediately.
-- `_fillX18:1000-1004` rounds fill *up* and a zero-capacity market reads as full, narrowing the discount in the protocol's favour; `kFillX18 × fill` is subtracted with rounding up (`BondPolicy.sol:154`).
-
-**As a staking / rewards vault:**
-- `AmpsStaking.totalAssets:130-132` is `balanceOf − unreleased`; a direct AMPS donation raises the share price for everyone (documented), and `notifyReward` requires the balance to already cover the pending stream (G-36).
+**As a Stablecoin:**
+- `AmpsBonds._qFloorX18:994-1004` and `BondPolicy.qFloorX18` are deliberate duplicates compared at `AmpsBonds.sol:542`; the rounding directions (numerator down, denominator up, quotient down) must match exactly for the comparison to mean anything.
 
 ### Temporal Risk Profile
 
 **Deployment & Initialization:**
-- `genesis()` and `initializePool()` are gate-checked, and the gate's layer-F reads the hub TWAP, so the `oracleGate` pointer must stay unset until the hub has 30 minutes of history (`docs/phase2-state-model.md` §9.1); the runbook, not the code, enforces the order — worth checking what a proposal that sets the gate first can and cannot undo.
-- `AmpsVault.place` is timelock-or-registry only (`AmpsVault.sol:973`) and the check is in the body, not a modifier; the broadcast test caught a proposal built as if it were permissionless.
-- The four custody pointers freeze at `genesis` (G-22); anything wired wrong before that point (a mock bonds shell, a test staking contract) becomes permanent — worth confirming the deploy script's pre-genesis verification covers all four.
-- Genesis mints 5,000 AMPS against $5,000 of seed; every launch parameter is a `Constants` default and the ask ladder's top bucket alone can raise ~$540k (state model ruling 9). Early-window liquidity is thin by design.
+- The gate and the first pool are circular: `initializePool` and both genesis steps take the management policy, and the gate reports `WATCHDOG` on an unobserved hub, so the gate pointer must be set last (`docs/phase2-state-model.md` §9.1) — an ordering the contracts do not enforce.
+- `AmpsGenesis.settle()` is permissionless and one-shot; if the timelock runs the founders'-seed `genesisPlace` while the auctions are live, the raise is forwarded as plain balances and the `P_ref` seeding is lost (`AmpsGenesis.sol:273-285`).
+- `PoolRegistry._referencePriceUsd18:866-869` anchors every pool at $1.00 while `pRefX18() == 0`, and `AmpsVault.checkpoint` refuses before genesis specifically to keep that word zero.
 
 **Market Stress:**
-- A weekend gap larger than `h_session` (300 bp) on a bonded stock, or a sequencer stall longer than `graceSeconds` (1 h) with fewer than `elapsed/gapSeconds` blocks, moves the gate to `DEGRADED`/`WATCHDOG`: placements and compounds stop, bonds continue at the haircut (`OracleGate.sol:817-830, 936-950`), swaps and redemption never stop.
-- Under `DIVERGED` a spoke keeps trading at `DYN_CAP_DEGRADED_BPS` with bonds closed for that name only; under `REF_DIVERGED` every anchor falls to NAV (`VaultNavLib.referencePrice:220`). Worth checking a scenario where the WETH cross-rate feed is the one that is wrong.
+- `FeedRegistry._maxAge:624-628` disables the freshness bound entirely when the session is `CLOSED`, so a weekend answer never ages out; the bond haircut is the only thing pricing that.
+- `AmpsHook._effective:764-793` substitutes the *regular* band once the gate cache is older than 900 s, deliberately tightening the rail at the moment the fair tick falls back to the pool's own TWAP.
 
 **Deprecation:**
-- `ZeroPositionValuer` remains deployable as a valid `positionValuer` target: a proposal that re-points to it drops every position from NAV and makes the floor equal to idle claims only — legal governance action, large blast radius.
+- `_standbyVault` plus `emergencyMigrate` is a live migration path with no deadline and no rehearsal in `src/`; `AmpsStaking` was removed outright in revision 6, leaving the storage reservations listed in Section 1.
 
 ### Composability & Dependency Risks
 
 **Dependency Risk Map:**
 
-> **Uniswap v4 PoolManager** — via `AmpsVault.unlockCallback` / `VaultPlacementLib` / `VaultRedeemLib` (`unlock`, `modifyLiquidity`, `sync/settle`, `mint/burn/take`), `PoolStateLib` (`extsload`/`exttload`)
-> - Assumes: v4-core 1.0.2 storage layout (`POOLS_SLOT = 6`, offsets in `PoolStateLib.sol:76-98`), ERC-6909 claims, exact deltas, `Foundry ≥1.8` transient semantics in tests
-> - Validates: `msg.sender == PoolManager` on the callback, `settled` amounts, `opened == poolId`, defensive `currencyDelta` reads
+> **Uniswap v4 `PoolManager`** — via `AmpsVault.unlockCallback`, `AmpsRouter.unlockCallback`, `VaultPlacementLib`, `VaultRedeemLib`
+> - Assumes: `unlock` re-enters only the caller; `modifyLiquidity` returns `callerDelta` and `feesAccrued` separately; ERC-6909 `transfer` cannot be refused by a token
+> - Validates: `msg.sender == poolManager` plus a transient action discriminator (vault) or the entry-point lock (router)
 > - Mutability: Immutable
-> - On failure: placements/redemption revert atomically; quoter and valuer degrade to zeros
+> - On failure: reverts; the vault's `sweepClean` and `payout` legs wrap their own `unlock`s in `try`/`catch`
 
-> **Chainlink equity feeds (24/5, Standard proxies only)** — via `FeedRegistry._probe` (`latestRoundData`, gas-capped `try`), read by `OracleGate`, `VaultNavLib`, `AmpsBonds`, `PoolRegistry` (direct, governance paths)
-> - Assumes: 8 decimals, RDD heartbeat/threshold, Friday close held all weekend, no SVR proxy
-> - Validates: `answer > 0`, `updatedAt != 0`, per-feed min/max, session-scaled `maxAge`, ≥ 10 % jump held for confirmation, `isStandardProxy` allowlist
-> - Mutability: Chainlink can deprecate a feed; the allowlist and feed pointer are timelock-governed
-> - On failure: gate `DEGRADED` (placements stop, bonds haircut), NAV read reverts on a zero answer (G-23), redemption unaffected
+> **Chainlink aggregators** — via `FeedRegistry._probe` / `_probeRound`
+> - Assumes: `latestRoundData` is a Standard (not SVR) proxy, `decimals() <= 18`, positive answer, non-future `updatedAt`
+> - Validates: `code.length`, gas cap, positivity, per-ticker min/max band, session-scaled staleness, two-confirmation jump rule
+> - Mutability: Upgradeable behind a Chainlink proxy the protocol does not control; the aggregator behind it can be re-pointed
+> - On failure: the last latched answer stands and ages out; the gate degrades to `DEGRADED`
 
-> **Stock Tokens (Jersey-issued, beacon-proxied ERC-20s with `uiMultiplier`, denylist, pause)** — via bounded `staticcall`s in `OracleGate.sol:1033-1041`, `AmpsHook.sol:846`, `VaultNavLib.sol:250-284,472`, and plain `transferFrom`/`transfer` through the PoolManager
-> - Assumes: plain ERC-20 transfer semantics (no fee, no rebase, 18 decimals), raw balances never change on a split, `isBlocked(address)` exists
-> - Validates: settled amount equals `amountIn` (X-1), probe return lengths, gas caps, `uiMultiplier` change detection
-> - Mutability: Upgradeable by a codeless admin key with no timelock; `ACCESS_CONTROLLED_REGISTRY` semantics unknown (Phase 0 go/no-go)
-> - On failure: a blocked PoolManager freezes that asset for everyone; `emergencyMigrate` is the only answer, and it needs the predicate to see the block
+> **Stock Tokens (issuer beacon proxies)** — via `OracleGate._corporateAction`, `AmpsHook._probeMultiplier`, every vault balance read
+> - Assumes: nothing — every call is a gas-capped `staticcall` with a hand-decoded first word
+> - Validates: return length, gas, and (for `transfer`) SafeERC20's acceptance rule by hand
+> - Mutability: Upgradeable by the issuer; can pause, denylist and restate `uiMultiplier()` at will
+> - On failure: skipped, or read as evidence for the migration predicate
 
-> **WETH9 / USDG** — via the entry pools and bond `ENTRY` class (closed at launch)
-> - Assumes: 18 / 6 decimals, no fee-on-transfer, USDG never blacklists the PoolManager
-> - Validates: decimals through `PriceLib` bands; nothing about blacklists
-> - Mutability: USDG is an upgradeable stable
-> - On failure: same custody exposure as a Stock Token, without a denylist probe
+> **Continuous Clearing Auction factory** — via `AmpsGenesis._deploy` / `_harvest`
+> - Assumes: `create` or `initializeDistribution` returns an address; `clearingPrice()` is Q96 currency-per-token; `sweepCurrency`/`sweepUnsoldTokens` pay the recorded recipient
+> - Validates: the returned address holds code and the full tranche; the issuance schedule totals exactly 100% over the block window; both legs are past `claimBlock`
+> - Mutability: Third-party bytecode, fixed at `AmpsGenesis` construction
+> - On failure: `createAuctions` surfaces the factory's own revert; `settle()` is one-shot, so a failure there is terminal for the raise
 
-> **OpenZeppelin 5.x (`ERC20Permit`, `ERC4626`, `SafeERC20`, `TimelockController`, `VestingWallet`) and OZ `uniswap-hooks` `BaseHook`** — via inheritance
-> - Assumes: audited upstream behaviour; `uniswap-hooks` is labelled experimental upstream
-> - Validates: pinned submodules; licence gate in CI
-> - Mutability: Submodule pins
-> - On failure: n/a at runtime
+> **`OracleGate` / `FeedRegistry` / `LadderPositionValuer` / policies** — via every vault and hook read
+> - Assumes: shapes only — no return value is trusted without a length check and a range clamp
+> - Validates: gas caps of 50k / 400k / 1.5M by call site, hand-decoded words, saturating casts
+> - Mutability: **Governed** — all re-pointable by the timelock in one transaction
+> - On failure: degrade (cached value, target weight, `type(int24).min` high-water, `LadderLib` weights)
 
 **Token Assumptions** *(unvalidated only)*:
-- Stock Tokens / WETH / USDG: assumes no fee-on-transfer and no rebasing for pool *fees and positions* — a settled deposit is checked (X-1) but a token whose balance moves after settlement would drift NAV against the PoolManager's accounting.
-- USDG: assumes the PoolManager and the BountyPot are never blacklisted — impact if violated: the settlement hub and keeper economics stop; no probe or migration path covers it.
-- Stock Tokens: assumes the display multiplier never applies to raw balances — impact if violated: every ladder and NAV reads the wrong quantity (the design's central Phase 0 assumption).
+- Rebasing collateral: the vault settles a bond on the exact `amountIn` and rejects any mismatch, but a balance that rebases *after* settlement is absorbed into `A` at the next checkpoint with no attribution — impact: the rebase accrues to every holder rather than to the depositor.
+- ERC-777 / callback tokens: `VaultRedeemLib._absorb:336-354` moves the `transfer` outside the unlock precisely so a re-entrant token hits `ManagerLocked`, but the same token reached through `PoolManager.take` inside `_payOut:506` runs while the manager is unlocked — impact: a foreign delta opened there fails the whole unlock, which is what the claims-only second attempt exists to survive.
 
 **Shared State Exposure**:
-- The 32 hooked pools are POL-only, so no other protocol holds positions in them; but `P_mkt` is a *public* TWAP that any integrator may read as an AMPS price, and the entry pools sit next to the chain's deepest ETH/USDG pools, which the WETH cross-check (`OracleGate._referenceIntegrity:1099-1111`) implicitly depends on.
-- The same Chainlink equity feeds serve every stock-token venue on the chain; a feed incident is a chain-wide event, not a protocol one.
+- All 32 pools share one hook contract, one `OracleGate`, one `FeedRegistry` and one vault, so a per-pool fault (a stuck gate cache, a dead feed, a saturated variance) is scoped per pool but the gate's protocol-wide freeze and the `state(0)` read the vault gates on are not.
+- The hub `AMPS/USDG` pool's TWAP is the reference every spoke's fair tick is derived from, so hub depth is the protocol's own oracle depth.
 
 ---
 
@@ -270,12 +280,12 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 >
 > A dedicated reference file contains the complete invariant analysis — do not look here for the catalog.
 >
-> - **53 Enforced Guards** (`G-1` … `G-53`) — per-call preconditions with `Check` / `Location` / `Purpose`
-> - **33 Single-Contract Invariants** (`I-1` … `I-33`) — Conservation, Bound, Ratio, StateMachine, Temporal
-> - **11 Cross-Contract Invariants** (`X-1` … `X-11`) — caller/callee pairs that cross scope boundaries
-> - **7 Economic Invariants** (`E-1` … `E-7`) — higher-order properties deriving from `I-N` + `X-N`
+> - **45 Enforced Guards** (`G-1` … `G-45`) — per-call preconditions with `Check` / `Location` / `Purpose`
+> - **22 Single-Contract Invariants** (`I-1` … `I-22`) — Conservation, Bound, Ratio, StateMachine, Temporal
+> - **9 Cross-Contract Invariants** (`X-1` … `X-9`) — caller/callee pairs that cross scope boundaries
+> - **6 Economic Invariants** (`E-1` … `E-6`) — higher-order properties deriving from `I-N` + `X-N`
 >
-> Every inferred block cites a concrete Δ-pair, guard-lift + write-sites, state edge, temporal predicate, or NatSpec quote. The **On-chain=No** blocks (`I-25`, `I-29`, `I-31`, `X-3`, `X-6`, `X-11`, `E-2`, `E-3`) are the high-signal ones — each is simultaneously an invariant and a potential bug. Attack-surface bullets above cross-link directly into the relevant blocks.
+> Every inferred block cites a concrete Δ-pair, guard-lift + write-sites, state edge, temporal predicate, or NatSpec quote. The **On-chain=No** blocks are the high-signal ones — each is simultaneously an invariant and a potential bug. Attack-surface bullets above cross-link directly into the relevant blocks (e.g. `[X-1]`, `[I-3]`).
 
 ---
 
@@ -283,10 +293,17 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| README | Present | `README.md` (monorepo), `contracts/README.md` (toolchain, gates, layout) |
-| NatSpec | ~4,450 tags / ~7,500 doc lines over 8,989 nSLOC | Every contract, error, constant and public function annotated; `@inheritdoc` throughout; rounding directions and invariant IDs stated inline |
-| Spec/Whitepaper | Present | `docs/phase2-state-model.md` (612 lines) and `docs/phase3-state-model.md` (1,023 lines): call graphs, invariants I3–I39, rulings A–AB incl. open ruling U; plus the implementation plan. Claims tagged `(per spec)` in this report are from those files |
-| Inline Comments | Thorough | Design rationale ("why a contract and not a library", fail-open reasoning, EIP-170 trade-offs) is written next to the code; one NatSpec/code mismatch found (`marketReference` set-once claim, `I-29`) |
+| README | Present | `contracts/README.md` — toolchain pins, deployment pipeline, library-linking flags, the Foundry broadcast rule |
+| NatSpec | ~55 annotated files | Every source file carries `@notice`/`@dev`/`@param`/`@return`; roughly 55% of `src/` line count is comment, and the comments carry dated audit-fix rationale inline |
+| Spec/Whitepaper | Present | `docs/phase2-state-model.md` (751 lines), `docs/phase3-state-model.md` (1,440 lines), `docs/genesis-cca.md`, plus deploy/launch/keeper runbooks and `docs/audits/` |
+| Inline Comments | Thorough | Storage layouts documented slot-by-slot and asserted by `test/unit/VaultLayout.t.sol`; several comments record decisions *against* an audit finding with the reasoning |
+
+The state models are the executable spec: they carry the caller matrix (per spec, §2), the three gate policies
+(per spec, §7.1), the NAV and reference-price formulas (per spec, §4–§5) and a numbered invariant set `I1`–`I39`
+that the test suite references by name. Claims in Section 2 above are code-verified unless tagged `(per spec)`.
+
+One documentation gap is load-bearing: the delay tiers in the §2 caller matrix (48 h / 7 d / 14 d) have no
+on-chain representation — see the first attack surface.
 
 ---
 
@@ -294,135 +311,149 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Test files | 111 (incl. 26 mocks, 2 utils, 3 script tests) | File scan (always reliable) |
-| Test functions | 1,131 | File scan (always reliable) |
-| Line coverage | Unavailable — the in-report `forge coverage` run was cancelled after 25 min to keep the concurrent CI mirror inside the box's 16 GB (two via-IR solc builds); the CI `coverage` job publishes lcov + summary per push | Coverage tool (requires compilation) |
-| Branch coverage | Unavailable — same run; the plan's 100 % branch targets on `PriceLib`, `TruncatedOracleLib`, gate logic and bond pricing are asserted by the CI job, not verified here | Coverage tool (requires compilation) |
+| Test files | 125 | File scan (always reliable) |
+| Test functions | 1,388 | File scan (always reliable) |
+| Line coverage | Pending | `forge coverage` still running at report time |
+| Branch coverage | Pending | `forge coverage` still running at report time |
+
+`forge coverage` was launched in the background per the pipeline and had completed compilation (236 + 274 files,
+Solc 0.8.30) but had not emitted a coverage table when this report was written. Test *presence* below is from the
+file scan and is unaffected.
 
 ### Test Depth
 
 | Category | Count | Contracts Covered |
 |----------|-------|-------------------|
-| Unit | 903 functions / 38 files | broad — every contract and library incl. `GuardSymmetry`, selector gate, storage layout, hook address |
-| Integration | 57 functions / 8 files | Phase 2/3 fixtures, flywheel, hub pump, corporate action, launch shape, gas |
-| Attack | 39 functions / 12 files | named attacks: Arrakis-style flash bond, VTSwapHook round trip, rounding grind, JIT, first depositor, reentrant token, rotation-credit gaming, staking sandwich, TWAP-dump-then-bond, hub-pump-then-dump, creator wash, denylist drill |
-| Script / broadcast | 23 functions + `test/script/broadcast.sh` (anvil, real timelock) | deploy pipeline 00–12 |
-| Fork | 0 | none — blocked by the sandbox network policy (Phase 0 pending) |
-| Stateless Fuzz | 130 | PriceLib, LadderLib, TruncatedOracleLib, policies, staking, bonds pricing |
-| Stateful Fuzz (Foundry) | 36 invariant functions / 3 suites (`AmpsVault`, `Phase2`, `Phase3` with split handlers) | vault, bonds, hook, placement path |
-| Stateful Fuzz (Medusa) | config present (`medusa.json`), reuses the Foundry handlers; no Medusa-specific properties | — |
+| Unit | broad | `test/unit/` — layout, guard symmetry, hook packing, fee table, rotation credit, placement, compound, rollout, redemption, quoter, registry/bonds wiring |
+| Integration | present | `test/integration/` — Phase 2 and Phase 3 flywheel, hub pump, corporate action |
+| Attack | present | `test/attack/` — TWAP dump-then-bond, hub pump into spoke bids, JIT at an empty tick, rotation-credit gaming, creator-fee wash trading |
+| Fork | 0 | none |
+| Stateless Fuzz | 116 | `test/fuzz/` plus inline fuzz cases; `fuzz = { runs = 512 }`, CI profile 4,096 |
+| Stateful Fuzz (Foundry) | 37 | `test/invariant/` — `invariant = { runs = 64, depth = 64 }`, CI 256 × 128 |
 | Stateful Fuzz (Echidna) | 0 | none |
-| Formal Verification (Certora / Halmos / HEVM) | 0 | none |
+| Stateful Fuzz (Medusa) | 0 functions : 1 config | `medusa.json` present and targets `Phase3Handler`; no `medusa_`-prefixed property functions found |
+| Formal Verification (Certora) | 0 | none |
+| Formal Verification (Halmos) | 0 | none |
+| Formal Verification (HEVM) | 0 | none |
 
 ### Gaps
 
-- **No formal verification** on the money math (`PriceLib`, `LadderLib`, `VaultRedeemLib.redemption`, `BondPolicy`) — the highest-value gap for a protocol whose floor is an arithmetic promise.
-- **No fork tests** against real Stock Token bytecode, the real PoolManager or real feeds; every issuer behaviour (denylist, `uiMultiplier`, pause) is exercised only through `MockStockToken`.
-- **Medusa/Echidna** campaigns are configured but not yet run as a separate long-running property suite; the `fizz` step of Phase 6 is meant to add them.
-- Gas suite covers the hook and a 32-pool redemption at the launch shape, not the 64-constituent bound (`MAX_LIVE_CELLS` decision still open).
+- **No formal verification of the NAV and bond-floor arithmetic.** `navPerShareX18`, `qFloorX18`, the ladder split and the redemption pro-rata are the highest-value math in the codebase and are exercised only by fuzzing. `halmos-cheatcodes` is already vendored under `lib/openzeppelin-contracts`, so the symbolic path is available.
+- **Medusa is configured but not implemented.** `medusa.json` exists; no property function carries the `medusa_` prefix the config targets, so the campaign the Phase 3 spec describes cannot currently run.
+- **Invariant depth is shallow for a 512-cell ladder.** The default profile runs 64 × 64 and CI 256 × 128 against a four-pool fixture; the live system is 32 pools with a `MAX_LIVE_CELLS` budget of 512.
+- **No fork tests.** Every third-party assumption — the Chainlink Standard proxies, the Stock Token beacons, the Continuous Clearing Auction factory — is exercised only against local mocks.
+- **The deployment pipeline is tested without broadcast in CI.** `test/script/broadcast.sh` proves the nonce rule against a local anvil, but it is a separate job rather than part of `forge test`.
 
 ---
 
 ## 6. Developer & Git History
 
-> Repo shape: normal_dev — 34 commits over two days (2026-09-05 → 2026-09-06), 18 of them touching `contracts/src`, in phase-sized slices with a merge per phase.
+> Repo shape: **normal_dev** — 24 of 66 commits touch source, spread over 4 days (2026-09-05 → 2026-09-09) on branch `claude/amplestocks-rwa-token-xhtnn5`. Analyzed branch: `claude/amplestocks-rwa-token-xhtnn5` at `ccffe6c`.
 
 ### Contributors
 
 | Author | Commits | Source Lines (+/-) | % of Source Changes |
 |--------|--------:|--------------------|--------------------:|
-| Claude | 31 (18 on `contracts/src`) | +21,629 / −912 | 100 % |
-| Camden | 3 (initial commit, 2 merges) | +0 / −0 | 0 % |
+| Claude | 61 | +29,352 / -3,244 | 100% |
+| Camden | 5 | +0 / -0 | 0% |
 
-Single-developer dominance: every source line was authored by one agent-driven author; the second contributor's role is review and merge.
+Single-author source history: one contributor wrote 100% of `contracts/src/`. The second contributor's five
+commits touch no source file.
 
 ### Review & Process Signals
 
 | Signal | Value | Assessment |
 |--------|-------|------------|
-| Unique contributors | 2 | Single-dev codebase with one merger |
-| Merge commits | 2 of 34 (6 %) | PRs merged per phase; no line-level review comments visible in history |
-| Repo age | 2026-09-05 → 2026-09-06 | 2 days — the entire protocol was written in one sprint |
-| Recent source activity (30d) | 15 source commits (avg 1,373 lines each) | Active / late burst: everything is "recent" |
-| Test co-change rate | 93 % (14 of 15 source-touching commits per the analyser; 17 of 18 counting interface-only commits) | Source commits almost always ship with tests — measures co-modification, NOT coverage. The one exception is `ff33d7e` (interfaces, types and constants) |
+| Unique contributors | 2 | Single-dev on source |
+| Merge commits | 4 of 66 (6%) | Almost no merge-based review; changes land directly on the branch |
+| Repo age | 2026-09-05 → 2026-09-09 | 4 days |
+| Recent source activity (30d) | 24 commits | Entire history is inside the window — this is a first-audit codebase, not a mature one |
+| Test co-change rate | 95.8% | 23 of 24 source-touching commits also modify test files (co-modification, **not** coverage) |
 
 ### File Hotspots
 
 | File | Modifications | Note |
 |------|-------------:|------|
-| `contracts/src/vault/AmpsVault.sol` | 4 | Highest churn and the custody core — prioritise review |
-| `contracts/src/interfaces/IAmpsVault.sol` | 4 | Interface reshaped at every phase |
-| `contracts/src/types/Types.sol` | 3 | Packed layouts changed three times |
-| `contracts/src/types/Constants.sol` | 3 | Bands and defaults re-tuned (K_VOL, MAX_LIVE_CELLS) |
-| `contracts/src/registry/PoolRegistry.sol` | 3 | Lifecycle + opened-price read added |
-| `contracts/src/oracle/OracleGate.sol` | 3 | Hand-decoded reads (ruling AA) |
-| `contracts/src/bonds/AmpsBonds.sol` | 3 | Same-block checkpoint reorder |
-| `contracts/src/lib/TruncatedOracleLib.sol` | 2 | Ring rewrite (ruling V) |
+| `contracts/src/vault/AmpsVault.sol` | 11 | High churn — the NAV, custody and migration authority |
+| `contracts/src/types/Constants.sol` | 11 | Every hard band in the protocol; changes here move guards everywhere |
+| `contracts/src/interfaces/IAmpsVault.sol` | 10 | The vault's ABI was still moving four days before the audit |
+| `contracts/src/interfaces/IAmpsHook.sol` | 9 | Same for the hook |
+| `contracts/src/vault/VaultPlacementLib.sol` | 8 | The placement engine — prioritize review |
+| `contracts/src/vault/VaultNavLib.sol` | 8 | The NAV read side |
+| `contracts/src/periphery/AmpsQuoter.sol` | 8 | Never-reverting surface, rewritten repeatedly |
+| `contracts/src/hook/AmpsHook.sol` | 8 | Fee law and rail |
+| `contracts/src/registry/PoolRegistry.sol` | 7 | Constituent lifecycle |
+| `contracts/src/oracle/OracleGate.sol` | 6 | Six-layer gate |
 
 ### Security-Relevant Commits
 
-**Score** = weighted sum of fix-like signals in a commit: message keywords, diff patterns (deletes code, changes `require`/`assert`, touches access control or accounting), and change shape. **10+ warrants a manual diff.**
+**Score** = weighted sum of fix-like signals in a commit: message keywords, diff patterns (deletes code, changes `require`/`assert`, touches access control or accounting), and change shape (focused = higher). **10+ warrants a manual diff.**
 
 | SHA | Date | Subject | Score | Key Signal |
 |-----|------|---------|------:|------------|
-| a48281c | 2026-09-05 | Price bonds against a same-block checkpoint; add Phase 2 integration and invariant suites | 16 | involves oracle/pricing; adds runtime guards; spans 5 security domains — **the one real fix in history, manual diff warranted** |
-| 5949464 | 2026-09-05 | Add Amps share token, Stock Token and oracle mocks, and the CREATE2 miner | 16 | tightens access control (+9); feature addition |
-| 51614f0 | 2026-09-06 | Add AmpsHook, the hook miner and the real-hook gas baseline | 9 | adds runtime guards (+20); large change |
-| d94f3db | 2026-09-06 | Add the Phase 3 declarations, PoolStateLib and LadderPositionValuer | 9 | spans 5 security domains; large change |
-| aff7a1c | 2026-09-05 | Add AmpsVault core and VaultNavLib | 9 | changes token transfer + accounting logic |
-| 77e9038 | 2026-09-05 | Add AmpsBonds, BondPolicy and AmpsBondsLens | 9 | changes token transfer + accounting logic |
-| f58e1b2 | 2026-09-06 | Add the Phase 3 integration, attack and invariant suites | 8 | explicit security language (test-only commit) |
-| aae2bbf | 2026-09-06 | Add AmpsQuoter and the OracleGate hook-state read | 7 | spans 5 security domains |
-| c24d0d8 | 2026-09-06 | Add the vault placement path behind four linked libraries | 7 | very large change (>2,000 source lines) |
-| 0d7e8df | 2026-09-06 | Add LadderPolicy, FeePolicy and RolloutPolicy | 6 | changes accounting logic |
-
-All but `a48281c` are feature commits that score on size and domain spread rather than on fix signals. The second real fix, `5ab497e` "Keep TWAP coverage under active trading by rate-limiting ring insertion" (false `WATCHDOG` under real flow), scores below the table's threshold because its message carries no fix keyword.
+| `a48281c` | 2026-09-05 | Price bonds against a same-block checkpoint; add Phase 2 integration and invariant suites | 16 | Focused 3-file change spanning 5 security domains; +6 runtime guards |
+| `5949464` | 2026-09-05 | Add Amps share token, Stock Token and oracle mocks, and the CREATE2 miner | 16 | Tightens access control (+9/-0) across 4 domains |
+| `43b7cad` | 2026-09-09 | Remediate the revision-7 audit findings | 10 | 1,131 lines across 17 source files, 5 security domains — **the day before HEAD** |
+| `0cdfcf9` | 2026-09-08 | Charge the AMPS fee both ways, pay the creator in kind, burn the rest | 9 | 2,204 lines; +14/-4 runtime guards; rewrote the whole fee model |
+| `51614f0` | 2026-09-06 | Add AmpsHook, the hook miner and the real-hook gas baseline | 9 | +20 runtime guards in one commit |
+| `d94f3db` | 2026-09-06 | Add the Phase 3 declarations, PoolStateLib and LadderPositionValuer | 9 | 12 files, 5 domains |
+| `aff7a1c` | 2026-09-05 | Add AmpsVault core and VaultNavLib | 9 | 1,954 lines, 5 domains |
+| `77e9038` | 2026-09-05 | Add AmpsBonds, BondPolicy and AmpsBondsLens | 9 | 1,444 lines, 4 domains |
+| `f8a5211` | 2026-09-09 | Remediate the re-audit findings | 8 | 908 lines across 14 files — **HEAD's parent generation** |
+| `495d54a` | 2026-09-08 | Run genesis through a Uniswap Continuous Clearing Auction | 8 | 1,485 lines; replaced the entire launch mechanism |
 
 ### Dangerous Area Evolution
 
 | Security Area | Commits | Key Files |
 |--------------|--------:|-----------|
-| oracle_price | 15 | `AmpsBonds.sol`, `AmpsHook.sol`, `OracleGate.sol` |
-| state_machines | 14 | `AmpsBonds.sol`, `AmpsHook.sol`, `PoolRegistry.sol` |
-| fund_flows | 13 | `AmpsBonds.sol`, `AmpsHook.sol`, `BountyPot.sol`, `AmpsVault.sol` |
-| access_control | 10 | `AmpsVault.sol`, `OracleGate.sol`, `PoolRegistry.sol`, `BountyPot.sol` |
-| signatures (auth handling) | 10 | `IAmpsVault.sol`, `OracleGate.sol`, `FeePolicy.sol` |
+| fund_flows | 23 | `AmpsVault.sol`, `VaultPlacementLib.sol`, `AmpsBonds.sol` |
+| oracle_price | 23 | `OracleGate.sol`, `FeedRegistry.sol`, `AmpsHook.sol` |
+| state_machines | 22 | `AmpsVault.sol`, `AmpsGenesis.sol`, `PoolRegistry.sol` |
+| signatures | 21 | `AmpsBonds.sol`, `VaultPlacementLib.sol`, `PoolRegistry.sol` |
+| access_control | 17 | `AmpsVault.sol`, `OracleGate.sol`, `PoolRegistry.sol`, `BountyPot.sol` |
 
-Every area was touched by most of the 15 source-touching commits — expected for a codebase built in one sprint; the oracle/pricing area leads, consistent with where both real fixes landed.
+Every one of the five security domains changed in 17 or more of the 24 source-touching commits — there is no
+settled area of this codebase.
 
 ### Forked Dependencies
 
-All three libraries are pinned git submodules, not internalised copies: `lib/openzeppelin-contracts` (OZ 5.x), `lib/uniswap-hooks` (OZ hooks, bundles v4-core / v4-periphery), `lib/hookmate` (no known upstream mapping in the analyser; 9 files, `^0.8.26`). The CI licence gate bans BUSL/AGPL/GPL headers from the dependency graph, which is why `PoolStateLib` re-implements `StateLibrary`.
+None detected. All four `lib/` entries (`forge-std`, `openzeppelin-contracts`, `uniswap-hooks`, `hookmate`) are
+standard submodules; `forked_deps.detected_libs` is empty. `PoolStateLib` and `TruncatedOracleLib` are
+protocol-authored re-implementations rather than internalized copies — the README explains that v4-core pins
+`solc =0.8.26` and cannot share a compilation graph with the project's 0.8.30 sources.
 
 ### Technical Debt Markers
 
-None: no `TODO` / `FIXME` / `HACK` / `XXX` in `contracts/src`.
+None. `tech_debt.total_count == 0`, confirmed by an independent grep for `TODO`/`FIXME`/`HACK`/`XXX` across
+`src/`, which returns nothing.
 
 ### Security Observations
 
-- **Single author** — 100 % of source lines from one author in two days; no independent human review recorded in history.
-- **Phase-sized commits** — the largest source commits are 4,374 (`ff33d7e`), 2,973 (`c24d0d8`) and 2,215 (`7403717`) lines; unreviewable by diff.
-- **Two real fixes already in history** — `a48281c` (bond priced on a stale checkpoint) and `5ab497e` (TWAP ring coverage): both are in the pricing/oracle path that the attack surfaces above centre on.
-- **Vault interface reshaped every phase** — `IAmpsVault.sol` × 4, `Types.sol` × 3: consumers (keeper, indexer, quoter) were regenerated each time; worth checking ABI drift once more after the Phase 6 polish.
-- **EIP-170 pressure shaped the design** — `AmpsVault` sits 271 B under the limit, which is why four `DELEGATECALL` libraries write its storage by slot number (`X-11`).
-- **Uncommitted working tree** — the analysed tree carries the Phase 6 polish (bounty economics, event fields, hand-decoded gate reads) on top of `1f6dd11`; line references in this report are to the working tree.
+- **Single-author source** — one contributor wrote +29,352 / -3,244 source lines, 100% of the total.
+- **Almost no merge-based review** — 4 merge commits out of 66 (6%); source changes land on the branch directly.
+- **The two largest commits are the two most recent** — `f8a5211` (908 lines) and `43b7cad` (1,131 lines) both landed 2026-09-09, the same day as HEAD.
+- **Average commit size is 1,274 lines** — large enough that per-commit review is impractical; `ff33d7e` alone is 4,374.
+- **The fee model was replaced 2 days before HEAD** — `0cdfcf9` (2,204 lines) moved the AMPS fee to both directions, paid the creator in kind and made the burn unconditional.
+- **The launch mechanism was replaced 1 day before that** — `495d54a` routed genesis through a third-party Continuous Clearing Auction and added `AmpsGenesis.sol` whole.
+- **Test co-change is near-total but shallow in one place** — 23 of 24 source commits touch tests; the exception is `ff33d7e`, the 4,374-line interface and constants commit.
+- **A whole subsystem was deleted mid-history** — `contracts/src/staking/AmpsStaking.sol` appears in `da823a4` and `0cdfcf9` and is absent from HEAD, leaving the reserved storage listed in Section 1.
 
 ### Cross-Reference Synthesis
 
-- **`AmpsVault.sol` is #1 in churn AND the hub of five attack surfaces** (pointers, fail-open gate, redemption, migration, slot coupling) → highest-leverage review: `_checkpoint`, `_requireGate`, `redeemProRata`, `emergencyMigrate`, `setPolicyPointer`.
-- **Both real fix commits sit in pricing/oracle code** (`a48281c`, `5ab497e`) + `OracleGate.sol` × 3 churn → the bond-floor and reference-price surfaces (`E-1`, `E-5`, `X-6`) are where regressions have already happened once.
-- **Open ruling U + `I-31` On-chain=No** → the redemption path-dependence surface is a known, unresolved design decision, not a latent bug to discover; the auditor's value is quantifying it and reviewing the fix.
-- **NatSpec/code mismatch on `marketReference`** (`I-29`) + un-banded pointer slots → documentation promises more than `setPointer` enforces; worth deciding whether the code or the doc is wrong.
+- **`AmpsVault.sol` is #1 in churn *and* carries five of the twelve attack surfaces** → highest-leverage review: `_requireGate:1625`, `emergencyMigrate:1319`, `_afterPlacement:1456`, `setPolicyPointer:1267`, `redeemProRata:829`.
+- **`Constants.sol` at 11 modifications is the shared root of every `G-N` band** → a band that moved late moves guards in eight contracts at once; `43b7cad`, `f8a5211`, `0cdfcf9`, `7477f0c` and `495d54a` all touch it.
+- **`oracle_price` churned in 23 of 24 commits and every fail-open probe traces to it** → `X-3`, `X-4` and `X-5` all describe reads that degrade rather than refuse, in the subsystem with the least settled history.
+- **Zero TODOs against 24 source commits in 4 days** → the debt is not annotated in the code; it is in the interface churn (`IAmpsVault` 10, `IAmpsHook` 9) and in the two mechanism replacements that landed in the last 48 hours.
 
 ---
 
 ## X-Ray Verdict
 
-**HARDENED** — unit + stateless fuzz + Foundry invariant suites exist with a spec and thorough NatSpec, and access control is role-separated behind a timelock with an emergency freeze; no formal verification and no fork tests keep it below FORTIFIED.
+**ADEQUATE** — unit, stateless-fuzz and stateful-invariant suites all exist and documentation is thorough, but access control is a single instant-acting timelock address per contract with no on-chain delay tiering and no pause mechanism anywhere in `src/`.
 
 **Structural facts:**
-1. 8,989 nSLOC of protocol code across 12 subsystems and 32 files; no proxies, no upgradeable contracts, seven pointer-upgradeable pure/view policy and oracle contracts.
-2. 110 entry points: 21 permissionless, 29 role-gated (vault / bonds / registry / PoolManager / guardian / creator), 60 timelock-only, every numeric one band-checked.
-3. 1,131 test functions in 111 files: 130 stateless fuzz, 36 Foundry invariant functions, 39 named attack tests, 23 deploy-script tests plus an anvil broadcast rehearsal; 0 fork, 0 Echidna/Medusa properties, 0 formal verification.
-4. One author wrote 100 % of the source in two days across 18 source commits with a 94 % test co-change rate; two merges, no line-level review in history.
-5. 8 of 51 inferred invariants are not enforced on-chain, three of them by documented design (fail-open gate, cached hook view, slot coupling) and one by an open product decision (split redemption).
+1. 11,381 nSLOC across 33 protocol-authored source files in 12 subsystems (the enumerator's 10,597 excludes `src/lib/`, 784 nSLOC, via its `*/lib/*` filter).
+2. 110 state-changing entry points: 20 permissionless, 31 role-gated, 59 admin-only; all 59 admin functions resolve to one `TimelockController` address per contract, fixed at construction.
+3. Zero upgradeable proxies and zero `initialize()` functions; the mutable surface is 10 pointer slots the vault rewrites in place, 4 of which are set-once.
+4. 125 test files with 1,388 test functions, 116 stateless-fuzz and 37 Foundry-invariant functions; no formal verification, no fork tests, and a Medusa config with no matching property functions.
+5. One contributor authored 100% of source changes (+29,352 / -3,244) across 24 source-touching commits in 4 days, with 4 merge commits in the whole repository.

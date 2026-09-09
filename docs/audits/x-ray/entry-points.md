@@ -1,141 +1,157 @@
 # Entry Point Map
 
-> Amplestocks ($AMPS) | 110 entry points | 21 permissionless | 29 role-gated | 60 admin-only
+> Amplestocks ($AMPS) | 110 entry points | 20 permissionless | 31 role-gated | 59 admin-only
 
-Scope: every `external`/`public` non-view, non-pure function in `contracts/src/**` excluding interfaces and mocks, plus the five Uniswap v4 callbacks `AmpsHook` inherits from OZ `BaseHook` and the four ERC-4626 entry points `AmpsStaking` inherits from OZ `ERC4626`. The 14 `public` functions of the four linked vault libraries (`VaultNavLib`, `VaultPlacementLib`, `VaultRedeemLib`, `VaultRolloutLib`) are downstream `DELEGATECALL` targets of the vault, not entry points: Solidity refuses a direct `CALL` into a state-changing library function, and every one of them takes the vault's storage by reference.
+Scope: `contracts/src/**` at `ccffe6c`. View/pure functions, interface declarations, mocks and the four linked
+vault libraries' `public` functions are excluded. `AmpsQuoter`, `AmpsBondsLens`, `PoolRegistryLens`,
+`GatePriceMath` and all four policy contracts expose no state-changing external function at all.
 
 ---
 
 ## Protocol Flow Paths
 
-### Deployment & wiring (Timelock)
+### Deployment (Deployer → Timelock)
 
-`Amps(vault)` → `AmpsVault(amps, poolManager, timelock, guardian)` → `AmpsVault.setPolicyPointer("registry" | "bonds" | "staking" | "bountyPot" | "oracleGate" | "feedRegistry" | "marketReference" | "positionValuer" | "ladderPolicy" | "rolloutPolicy")`
-→ `FeedRegistry.setStandardProxy()` → `FeedRegistry.setFeed()` → `OracleGate.setFeedRegistry()` / `setRegistry()` / `setMarketReference()`
-→ `PoolRegistry.registerEntryPool()` ×2 → `PoolRegistry.addConstituent()` ×30  ◄── each opens the pool through `AmpsVault.initializePool()` and its bond market through `AmpsBonds.addCollateral()`
-→ `AmpsVault.genesis()`  ◄── mints S0, seeds ETH/USDG, freezes the four custody pointers
-→ `AmpsVault.place()` per pool  ◄── genesis ask ladders and seed bids; gate must be GREEN, which needs 30 min of hub TWAP history
+`03_Core: deploy Amps, AmpsVault, AmpsHook, PoolRegistry` → `AmpsVault.setPolicyPointer("registry"/"bonds"/"bountyPot"/"genesis")` → `FeedRegistry.setStandardProxy()` → `FeedRegistry.setFeed()` → `PoolRegistry.registerEntryPool()` ×2  ◄── vault `pRefX18() == 0`, so pools anchor at $1.00
 
-### Trader flow
+### Launch (Timelock → Genesis adapter → Anyone)
 
-`[wiring above]` → `PoolManager.swap()` → `AmpsHook.beforeSwap()` → `AmpsHook.afterSwap()`  ◄── fee = base + dyn; only a deviation-increasing swap beyond the outer rail reverts
-                                                └─→ same tx, second pool: rotation credit blends the sell fee
+`[deploy above]` → `AmpsVault.genesisMint()` → `AmpsGenesis.createAuctions()` → [bidding window] → `AmpsGenesis.settle()`
+                                                                                          ├─→ `AmpsVault.genesisPlace()`  ◄── at least one leg graduated
+                                                                                          └─→ [aborted: proceeds forwarded, timelock runs `genesisPlace` with the founders' seed]
 
-### Bonder flow
+`[genesisPlace above]` → `PoolRegistry.addConstituent()` ×30 → `AmpsVault.initializePool()` → `AmpsVault.place()` (seed ask) → `AmpsBonds.addCollateral()`
 
-`[wiring above]` → `[market open]` → `AmpsBonds.bond()`  ◄── gate not DIVERGED/SCHEDULED_FREEZE for the constituent; epoch and daily capacity left
-                                        └─→ [vestSeconds elapse, linearly] → `AmpsBonds.claim()` / `claimAll()`
+### Wiring the gate (Timelock, after the first pools exist)
 
-### Holder flow
+`[registerEntryPool above]` → `AmpsVault.setPolicyPointer("oracleGate")`  ◄── §9.1: the gate reports `WATCHDOG` on an unobserved hub, so it is pointed last
 
-`[genesis above]` → `AmpsVault.redeemProRata()`  ◄── no gate, no oracle, no guardian; only the transient lock
-`[genesis above]` → `AmpsStaking.deposit()` / `mint()` → [rewards stream from compounds] → `AmpsStaking.withdraw()` / `redeem()`
+### User — trade
 
-### Keeper flow
+`AmpsRouter.buy()`  ◄── pool registered and initialised
+`AmpsRouter.sell()`
+`AmpsRouter.rotate()`  ◄── at least one leg is a spoke; `hop1 != hop2`
+        └─→ `PoolManager.swap()` ×2 → `AmpsHook.beforeSwap()` / `afterSwap()`  ◄── refused only beyond the outer rail
 
-`[place above]` → [swaps accrue fees] → `AmpsVault.compound(poolId)`  ◄── gate GREEN/REF_DIVERGED, 60 s cooldown, tick within 800 of fair
-`[place above]` → [24 h rollout budget left] → `AmpsVault.rollout(constituentId)`
-`[bond above]` → [idle collateral ≥ deployThresholdUsd18] → `AmpsVault.deployBonded(constituentId)`
-`AmpsVault.checkpoint()` / `touch()` / `OracleGate.poke*()` / `FeedRegistry.refresh()` / `AmpsStaking.accrue()` / `BountyPot.fund()`  ◄── unpaid upkeep, any time
+### User — redeem
 
-### Lifecycle (Timelock)
+`[genesisPlace above]` → `AmpsVault.redeemProRata()`  ◄── `_initialized`; no gate, no price, no registry on the path
+        ├─→ ERC-20 payout per asset
+        └─→ ERC-6909 claim per asset  ◄── the ERC-20 leg failed for any reason
 
-`PoolRegistry.retireConstituent()` → `PoolRegistry.withdrawRetiredBids()` → `AmpsVault.withdrawRetiredBids()`
-                                  └─→ `PoolRegistry.reinstateConstituent()`
+### User — bond and claim
 
-### Emergency (Guardian)
+`[addCollateral above]` → `AmpsBonds.bond()`  ◄── market open; gate not frozen/diverged; checkpoint < 30 min; NAV confirmed
+        └─→ [vestSeconds elapse] → `AmpsBonds.claim()` / `claimAll()`  ◄── structurally ungated
 
-`OracleGate.freezeConstituent()` / `freezeProtocol()`  ◄── ≤ 7 days, disable-only, never touches redemption or claims
-`AmpsVault.setStandbyVault()` [Timelock, 14 d] → [issuer denylists the vault] → `AmpsVault.emergencyMigrate(standby)`  ◄── predicate: `isBlocked(vault)` or two failed 1-wei probes
+### Keeper — upkeep (bountied)
+
+`[genesisPlace above]` → `AmpsVault.checkpoint()`  ◄── gate not DIVERGED/frozen/WATCHDOG
+`[place above]` → [60 s cooldown] → [pool within 800 ticks of fair] → `AmpsVault.compound()`
+                                                                     ├─→ `AmpsVault.rollout()`  ◄── rollout policy wired; daily budget and entry floor have room
+                                                                     └─→ `AmpsVault.deployBonded()`  ◄── constituent ACTIVE; idle collateral ≥ `deployThresholdUsd18`
+
+### Keeper — oracle upkeep (unpaid)
+
+`OracleGate.poke()` / `pokePool()` / `pokePools()` / `pokeConstituent()`
+`FeedRegistry.refresh()` / `refreshMany()`  ◄── feed configured
+
+### Guardian — incident
+
+`OracleGate.freezeProtocol()` / `freezeConstituent()`  ◄── expiry ≤ 7 days ahead
+`[setStandbyVault above]` → `AmpsVault.emergencyMigrate()`  ◄── denylist predicate holds on-chain
+        └─→ `Amps.setVault()` + `AmpsBonds.setVault()` + `BountyPot.setVault()` + `PoolRegistry.setVault()` + `AmpsHook.setVault()`
+
+### Retirement (Timelock)
+
+`PoolRegistry.retireConstituent()` → `AmpsBonds.setMarketOpen(false)` → `PoolRegistry.withdrawRetiredBids()` → `AmpsVault.withdrawRetiredBids()`
 
 ---
 
 ## Permissionless
 
-Entry points callable by any address with no effective access restriction. Sorted by value flow: tokens-in first, tokens-out second, no-token-movement last.
+### `AmpsVault.redeemProRata()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | external, `locked` (EIP-1153 transient lock) |
+| Caller | Any AMPS holder |
+| Parameters | `shares` (user-controlled), `to` (user-controlled) |
+| Call chain | `→ Amps.burn() → PoolManager.unlock() → VaultRedeemLib.unwind() → PoolManager.modifyLiquidity() → VaultRedeemLib.redemption() → VaultRedeemLib.payout() → PoolManager.take()` |
+| State modified | `Amps.totalSupply`, `ladderAt[poolId][].liquidity`, `VaultRedeemLib` live-cell counter |
+| Value flow | Vault → recipient (ERC-20 per asset, or ERC-6909 claims on fallback); AMPS burned |
+| Reentrancy guard | yes |
 
 ### `AmpsBonds.bond()`
 
 | Aspect | Detail |
 |--------|--------|
-| Visibility | external, `lock` (transient reentrancy guard) |
-| Caller | Any holder of a registered collateral |
-| Parameters | marketId (user-controlled), amountIn (user-controlled), minAmpsOut (user-controlled), to (user-controlled) |
-| Call chain | `→ OracleGate.checkBond() → AmpsBonds._rollEpoch/_rollDay → AmpsVault.depositBonded() → AmpsVault._checkpoint() → PoolManager.unlock(ACTION_SETTLE) → VaultRedeemLib.settleFrom() → IERC20.transferFrom(bonder → PoolManager) → AmpsBonds._price() → AmpsVault.checkpointData() → FeedRegistry.latestAnswer() → AmpsHook.twapTick30m() → BondPolicy.quote() → AmpsBonds._issue() → AmpsVault.mintVesting() → Amps.mint(AmpsBonds)` |
-| State modified | `_markets[id].issuedThisEpoch/totalIssued/lastBondAt/epochStart`, `_dailyIssued`, `_dailyWindowStart`, `_positions[to]` (push); vault `_assets`/`_assetIndex`, checkpoint words; `Amps.totalSupply` |
-| Value flow | Collateral: bonder → PoolManager (vault claim); AMPS: minted to `AmpsBonds` (vesting) |
-| Reentrancy guard | yes (bonds `lock` + vault `locked`) |
-
-### `AmpsStaking.deposit()` / `AmpsStaking.mint()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | public (inherited from OZ `ERC4626`) |
-| Caller | Any AMPS holder |
-| Parameters | assets / shares (user-controlled), receiver (user-controlled) |
-| Call chain | `→ AmpsStaking._deposit() → AmpsStaking._accrue() → ERC4626._deposit() → IERC20.safeTransferFrom(staker → AmpsStaking) → ERC20._mint(xAMPS)` |
-| State modified | `_pendingRewards`, `lastAccrualAt`, xAMPS `totalSupply`/`balanceOf` |
-| Value flow | AMPS: staker → AmpsStaking |
-| Reentrancy guard | no (AMPS is a plain OZ ERC-20 with no hooks) |
-
-### `BountyPot.fund()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external |
-| Caller | Anyone (governance, sponsors) |
-| Parameters | amountRaw (user-controlled) |
-| Call chain | `→ IERC20.safeTransferFrom(funder → BountyPot)` |
-| State modified | none (balance only) |
-| Value flow | USDG: funder → BountyPot |
-| Reentrancy guard | no |
-
-### `AmpsVault.redeemProRata()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked` |
-| Caller | Any AMPS holder |
-| Parameters | shares (user-controlled), to (user-controlled) |
-| Call chain | `→ Amps.totalSupply() → Amps.burn(msg.sender) → PoolManager.unlock(ACTION_UNWIND) → VaultRedeemLib.unwind() → PoolManager.modifyLiquidity() per record → PoolManager.mint(claims) → VaultRedeemLib.redemption() → PoolManager.unlock(ACTION_PAYOUT) → VaultRedeemLib._payOut() → PoolManager.burn(claim) + PoolManager.take(to) / IERC20.safeTransfer(to) → Amps.burn(vault, inventoryBurned)` |
-| State modified | `ladderAt[*][*].liquidity` (−), `LIVE_CELLS_SLOT`; `Amps.totalSupply` (−shares −inventory) |
-| Value flow | AMPS: redeemer → burned; every non-AMPS asset: PoolManager/vault → `to`, net of `redeemFeeBps` |
-| Reentrancy guard | yes (transient lock; no gate, oracle, registry or guardian read on the path) |
+| Visibility | external, `lock` (transient bool) |
+| Caller | Any address holding a registered collateral |
+| Parameters | `marketId` (user-controlled), `amountIn` (user-controlled), `minAmpsOut` (user-controlled), `to` (user-controlled) |
+| Call chain | `→ OracleGate.checkBond() → AmpsVault.depositBonded() → AmpsVault._checkpoint() → PoolManager.unlock() → VaultRedeemLib.settleFrom() → BondPolicy.quote() → AmpsVault.mintVesting() → Amps.mint()` |
+| State modified | `_markets[id].issuedThisEpoch/.totalIssued/.lastBondAt/.epochStart`, `_dailyIssued`, `_positions[to]`, vault checkpoint words, `Amps.totalSupply` |
+| Value flow | Bonder → PoolManager (collateral); AMPS minted to `AmpsBonds` for vesting |
+| Reentrancy guard | yes (both contracts hold their own locks across the call) |
 
 ### `AmpsBonds.claim()` / `AmpsBonds.claimAll()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external, `lock` |
-| Caller | A bonder with a vesting position |
-| Parameters | positionId (user-controlled, `claim` only), to (user-controlled) |
-| Call chain | `→ AmpsBonds._vested() → IERC20(amps).transfer(to)` |
-| State modified | `_positions[msg.sender][i].claimed` |
-| Value flow | AMPS: AmpsBonds → `to` |
-| Reentrancy guard | yes (`lock`); structurally ungated: no pointer, gate or governance read |
+| Caller | Position owner (`_positions[msg.sender]` only) |
+| Parameters | `positionId` (user-controlled), `to` (user-controlled) |
+| Call chain | `→ Amps.transfer()` |
+| State modified | `_positions[msg.sender][id].claimed` |
+| Value flow | `AmpsBonds` → recipient (AMPS) |
+| Reentrancy guard | yes |
 
-### `AmpsStaking.withdraw()` / `AmpsStaking.redeem()`
+### `AmpsRouter.buy()`
 
 | Aspect | Detail |
 |--------|--------|
-| Visibility | public (inherited from OZ `ERC4626`) |
-| Caller | xAMPS holder or an approved spender |
-| Parameters | assets / shares (user-controlled), receiver (user-controlled), owner (user-controlled, allowance-checked) |
-| Call chain | `→ AmpsStaking._withdraw() → AmpsStaking._accrue() → ERC4626._withdraw() → ERC20._burn(xAMPS) → IERC20.safeTransfer(receiver)` |
-| State modified | `_pendingRewards`, `lastAccrualAt`, xAMPS `totalSupply`/`balanceOf` |
-| Value flow | AMPS: AmpsStaking → receiver |
-| Reentrancy guard | no |
+| Visibility | external payable, `nonReentrant`, `before(deadline)` |
+| Caller | Any |
+| Parameters | `poolId` (user-controlled), `amountIn` (user-controlled), `minAmpsOut` (user-controlled), `to` (user-controlled), `deadline` (user-controlled) |
+| Call chain | `→ PoolRegistry.poolKey() → PoolManager.unlock() → PoolManager.swap() → AmpsHook.beforeSwap()/afterSwap() → PoolManager.take()` |
+| State modified | Pool state in the PoolManager; hook DYNAMIC/ARMED words and observation ring |
+| Value flow | Caller → PoolManager (counter asset, or wrapped `msg.value`); AMPS → `to` |
+| Reentrancy guard | yes |
+
+### `AmpsRouter.sell()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | external, `nonReentrant`, `before(deadline)` |
+| Caller | Any |
+| Parameters | `poolId`, `ampsIn`, `minOut`, `to`, `unwrap` (all user-controlled), `deadline` (user-controlled) |
+| Call chain | `→ PoolRegistry.poolKey() → PoolManager.unlock() → PoolManager.swap() → AmpsHook.beforeSwap()/afterSwap() → PoolManager.take() → WETH9.withdraw()` (unwrap only) |
+| State modified | Pool state; hook DYNAMIC/ARMED words and observation ring |
+| Value flow | Caller → router → PoolManager (AMPS); counter asset or native ETH → `to` |
+| Reentrancy guard | yes |
+
+### `AmpsRouter.rotate()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | external payable, `nonReentrant`, `before(deadline)` |
+| Caller | Any |
+| Parameters | `hop1`, `hop2`, `amountIn`, `minOut`, `to`, `unwrap`, `deadline` (all user-controlled) |
+| Call chain | `→ PoolRegistry.poolKey() ×2 → PoolManager.unlock() → PoolManager.swap() ×2 with hookData = ROUTER_ROTATE → AmpsHook.beforeSwap()/afterSwap() ×2 → PoolManager.take()` |
+| State modified | Pool state in two pools; hook transient rotation credit and pass-through counter; hook DYNAMIC/ARMED words |
+| Value flow | Caller → PoolManager (hop-1 counter); hop-2 counter → `to`; AMPS delta asserted zero |
+| Reentrancy guard | yes |
 
 ### `AmpsVault.compound()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external, `locked` |
-| Caller | Keeper (bountied) |
-| Parameters | poolId (user-controlled) |
-| Call chain | `→ AmpsVault._requireHealthy() → OracleGate.state() → VaultPlacementLib.compound() → OracleGate.checkPlacement() → PoolStateLib.sqrtPriceAndTick() → PoolManager.unlock(ACTION_COMPOUND/BURNBACK) → PoolManager.modifyLiquidity(0) [collect] → Amps.burn(boughtBack) → VaultPlacementLib._split() → IERC20.safeTransfer(creator) → IERC20.safeTransfer(staking) + AmpsStaking.notifyReward() → Amps.burn(burnCut) → VaultPlacementLib._placeLadder() → PoolManager.unlock(ACTION_PLACE) → PoolManager.modifyLiquidity() → AmpsHook.resetHighWater() / armSurge() → VaultPlacementLib.payBounty() → BountyPot.pay(msg.sender) → AmpsVault._afterPlacement() → AmpsVault._checkpoint()` |
-| State modified | `ladderAt[poolId]`, `_lastPlacementAt[poolId]`, `LIVE_CELLS_SLOT`, checkpoint words; hook `_obs/_arm/_dyn`; staking stream; pot window; `Amps.totalSupply` (−) |
-| Value flow | Fees: PoolManager → vault claims; AMPS: vault → creator, → AmpsStaking, → burned; USDG bounty: BountyPot → keeper |
+| Caller | Keeper (anyone; paid from `BountyPot`) |
+| Parameters | `poolId` (user-controlled) |
+| Call chain | `→ OracleGate.checkPlacement() → VaultPlacementLib.compound() → PoolManager.unlock() → PoolManager.modifyLiquidity() → Amps.burn() → AmpsHook.resetHighWater() → AmpsHook.armSurge() → BountyPot.pay()` |
+| State modified | `ladderAt[poolId]`, `_lastPlacementAt[poolId]`, live-cell counter, checkpoint words, `Amps.totalSupply`, hook ARMED/DYNAMIC words, `BountyPot` window |
+| Value flow | Fees realised into claims; creator slice out; AMPS remainder burned; USDG bounty → caller |
 | Reentrancy guard | yes |
 
 ### `AmpsVault.rollout()`
@@ -143,11 +159,11 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external, `locked` |
-| Caller | Keeper (bountied) |
-| Parameters | constituentId (user-controlled) |
-| Call chain | `→ AmpsVault._requireHealthy() → VaultRolloutLib.rollout() → PoolRegistry.constituent()/poolIdOf()/currentWeightBps() → RolloutPolicy.propose() → VaultRolloutLib._harvestAsks() → PoolManager.unlock(ACTION_HARVEST) → PoolManager.modifyLiquidity() [entry pools] → VaultPlacementLib.place() [spoke asks] → VaultPlacementLib.payBounty() → BountyPot.pay() → AmpsVault._afterPlacement()` |
-| State modified | `ladderAt[entry]` (−), `ladderAt[spoke]` (+), `_lastPlacementAt`, `SLOT_ROLLOUT_WINDOW`, `LIVE_CELLS_SLOT`, checkpoint words |
-| Value flow | AMPS inventory: entry-pool positions → spoke positions (PoolManager-internal); USDG bounty: BountyPot → keeper |
+| Caller | Keeper (anyone; paid) |
+| Parameters | `constituentId` (user-controlled) |
+| Call chain | `→ OracleGate.checkPlacement() → VaultRolloutLib.rollout() → RolloutPolicy.propose() → PoolManager.unlock() → PoolManager.modifyLiquidity() → VaultPlacementLib.place() → BountyPot.pay()` |
+| State modified | `ladderAt` in up to three pools, `_lastPlacementAt`, rollout window (slot 15), live-cell counter, checkpoint words |
+| Value flow | AMPS moved between entry pools and one spoke; USDG bounty → caller |
 | Reentrancy guard | yes |
 
 ### `AmpsVault.deployBonded()`
@@ -155,11 +171,11 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external, `locked` |
-| Caller | Keeper (bountied) |
-| Parameters | constituentId (user-controlled) |
-| Call chain | `→ AmpsVault._requireHealthy() → VaultRolloutLib.deployBonded() → PoolRegistry.constituent()/poolConfig() → FeedRegistry.latestAnswer() → [idle ≥ deployThresholdUsd18] → VaultPlacementLib.place() [spoke bids] → PoolManager.unlock(ACTION_PLACE) → PoolManager.modifyLiquidity() → BountyPot.pay() → AmpsVault._afterPlacement()` |
-| State modified | `ladderAt[spoke]` (+ bids), `_lastPlacementAt`, `LIVE_CELLS_SLOT`, checkpoint words |
-| Value flow | Bonded collateral: vault claims → spoke bid positions; USDG bounty: BountyPot → keeper |
+| Caller | Keeper (anyone; paid) |
+| Parameters | `constituentId` (user-controlled) |
+| Call chain | `→ OracleGate.checkPlacement() → VaultRolloutLib.deployBonded() → FeedRegistry.latestAnswer() → VaultPlacementLib.place() → PoolManager.modifyLiquidity() → BountyPot.pay()` |
+| State modified | `ladderAt[poolId]`, `_lastPlacementAt`, live-cell counter, checkpoint words |
+| Value flow | Idle bonded collateral → v4 bid positions; USDG bounty → caller |
 | Reentrancy guard | yes |
 
 ### `AmpsVault.checkpoint()` / `AmpsVault.touch()`
@@ -167,339 +183,233 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external, `locked` |
-| Caller | Anyone (unpaid upkeep) |
+| Caller | Anyone (unpaid) |
 | Parameters | none |
-| Call chain | `→ OracleGate.poke() → AmpsVault._requireHealthy() → [checkpoint only] AmpsVault._checkpoint() → VaultNavLib.totalAssetsUsd18() → LadderPositionValuer.valuePool() → PoolManager.extsload() → FeedRegistry.latestAnswer() → VaultNavLib.marketPrice() → AmpsHook.twapTick() → VaultNavLib.referencePrice()` |
-| State modified | `_navPerShareX18`, `_pRefX18`, `_pMktX18`, `_checkpointTimestamp`, `_checkpointBlock` (`checkpoint` only); gate `_lastBlock/_lastTimestamp` |
-| Value flow | none |
+| Call chain | `→ OracleGate.poke() → OracleGate.state() → VaultNavLib.totalAssetsUsd18() → VaultNavLib.marketPrice() → VaultNavLib.referencePrice() → VaultRedeemLib.sweepClean()` |
+| State modified | `_navPerShareX18`, `_pRefX18`, `_pMktX18`, `_checkpointTimestamp`, `_checkpointBlock`, `_navUnconfirmed`; `touch` stamps the gate only |
+| Value flow | none (the exit sweep may absorb idle dust into claims) |
 | Reentrancy guard | yes |
+
+### `AmpsGenesis.settle()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | external |
+| Caller | Anyone, once, after both legs' `claimBlock` |
+| Parameters | none |
+| Call chain | `→ IContinuousClearingAuction.checkpoint()/isGraduated()/sweepCurrency()/sweepUnsoldTokens() → WETH9.deposit() → FeedRegistry.latestAnswerUsd18() → AmpsVault.genesisPlace()` |
+| State modified | `_settledLatch`, `_abortedLatch`, `_p0X18`, `_raisedUsdg`, `_raisedWeth`, `_unsoldAmps`, `_ethUsdX18`; vault genesis latches |
+| Value flow | Auctions → adapter → vault (USDG, WETH, unsold AMPS) |
+| Reentrancy guard | the one-shot latch, set before every interaction |
+
+### `FeedRegistry.refresh()` / `refreshMany()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | public / external |
+| Caller | Anyone (unpaid) |
+| Parameters | `token` / `tokens[]` (user-controlled) |
+| Call chain | `→ IAggregatorV3.latestRoundData() → IAggregatorV3.getRoundData() → OracleGate.sessionNow()` |
+| State modified | `_accepted[token]`, `_pending[token]` |
+| Value flow | none |
+| Reentrancy guard | no (no external value movement) |
 
 ### `OracleGate.poke()` / `pokePool()` / `pokePools()` / `pokeConstituent()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external / public |
-| Caller | Anyone (keeper, indexer) |
-| Parameters | poolId / poolIds / constituentId (user-controlled) |
-| Call chain | `→ OracleGate._stamp() → [pool variants] OracleGate._updateDivergence() → PoolRegistry.poolConfig() → AmpsHook.lastTruncatedTick() → GatePriceMath.fairTick() → [constituent] IStockToken.oraclePaused()/effectiveAt()/uiMultiplier() (bounded staticcalls)` |
+| Caller | Anyone (unpaid) |
+| Parameters | `poolId` / `poolIds[]` / `constituentId` (user-controlled) |
+| Call chain | `→ IMarketReference.lastTruncatedTick()/twapTick() → FeedRegistry.feedStatusIn() → GatePriceMath.fairTick() → IStockToken.oraclePaused()/effectiveAt()` |
 | State modified | `_lastBlock`, `_lastTimestamp`, `_divergedSince[poolId]` |
-| Value flow | none |
-| Reentrancy guard | no (no external state-changing calls) |
-
-### `FeedRegistry.refresh()` / `FeedRegistry.refreshMany()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | public / external |
-| Caller | Anyone |
-| Parameters | token / tokens (user-controlled; must be configured) |
-| Call chain | `→ FeedRegistry._probe() → IAggregatorV3.latestRoundData() (try, gas-capped) → OracleGate.sessionNow() (try) → FeedRegistry._latch()` |
-| State modified | `_accepted[token]`, `_pending[token]` |
 | Value flow | none |
 | Reentrancy guard | no |
 
-### `AmpsStaking.accrue()`
+### `BountyPot.fund()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external |
 | Caller | Anyone |
-| Parameters | none |
-| Call chain | `→ AmpsStaking._accrue()` |
-| State modified | `_pendingRewards`, `lastAccrualAt` |
-| Value flow | none |
+| Parameters | `amountRaw` (user-controlled) |
+| Call chain | `→ IERC20.safeTransferFrom()` |
+| State modified | none (balance only) |
+| Value flow | Funder → pot (USDG) |
 | Reentrancy guard | no |
 
 ---
 
 ## Role-Gated
 
-Entry points restricted by a role modifier or an in-body `msg.sender` check. Grouped by role.
+### `vault` (the `AmpsVault` address, movable only by `emergencyMigrate`)
 
-### `AmpsBonds` (bonds shell → vault)
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `Amps` | `mint()` | `to`, `amount` (protocol-derived) | `totalSupply`, `balanceOf` |
+| `Amps` | `burn()` | `from`, `amount` (protocol-derived) | `totalSupply`, `balanceOf` |
+| `Amps` | `setVault()` | `newVault` (protocol-derived) | `vault` |
+| `AmpsBonds` | `setVault()` | `newVault` (protocol-derived) | `vault` |
+| `BountyPot` | `pay()` | `to` (keeper-provided), `workValueUsd18`, `gasCostUsd18` (protocol-derived) | `_spentWindowUsd18`, `_windowStart`; USDG out |
+| `BountyPot` | `setVault()` | `newVault` (protocol-derived) | `vault` |
+| `PoolRegistry` | `setVault()` | `newVault` (protocol-derived) | `_vault` |
+| `AmpsHook` | `resetHighWater()` | `poolId` (protocol-derived) | `_obs[poolId].highWaterTick` |
+| `AmpsHook` | `armSurge()` | `poolId`, `surgeBps_`, `reason` (protocol-derived) | `_arm[poolId]`, `_dyn[poolId].gateAttemptedAt` |
+| `AmpsHook` | `setVault()` | `newVault` (protocol-derived) | `vault` |
+
+### `AmpsBonds` (the vault's set-once `bonds` pointer)
 
 #### `AmpsVault.depositBonded()`
 
 | Aspect | Detail |
 |--------|--------|
-| Visibility | external, `locked`, `msg.sender == _bonds` |
-| Caller | `AmpsBonds.bond()` |
-| Parameters | marketId (protocol-derived), collateral (protocol-derived), from (user-controlled via bond), amount (user-controlled via bond) |
-| Call chain | `→ AmpsVault._requireBondsHealthy() → AmpsVault._registerAsset() → AmpsVault._checkpoint() → PoolManager.unlock(ACTION_SETTLE) → VaultRedeemLib.settleFrom() → IERC20.safeTransferFrom(from → PoolManager) → PoolManager.settle() → PoolManager.mint(vault claim)` |
-| State modified | `_assets`, `_assetIndex`, checkpoint words |
-| Value flow | Collateral: bonder → PoolManager (vault claim) |
+| Visibility | external, `locked` |
+| Caller | `AmpsBonds`, from inside `bond()` |
+| Parameters | `marketId`, `collateral`, `from`, `amount` (all keeper-/user-provided, relayed by the shell) |
+| Call chain | `→ VaultRedeemLib.sweepClean() → _checkpoint() → PoolManager.unlock() → VaultRedeemLib.settleFrom() → PoolManager.settle()/mint()` |
+| State modified | `_assets`, `_assetIndex`, all five checkpoint fields, `_navUnconfirmed` |
+| Value flow | Bonder → PoolManager (ERC-6909 claim to the vault) |
 | Reentrancy guard | yes |
 
 #### `AmpsVault.mintVesting()`
 
 | Aspect | Detail |
 |--------|--------|
-| Visibility | external, `locked`, `msg.sender == _bonds`, `to == _bonds` |
-| Caller | `AmpsBonds._issue()` |
-| Parameters | to (protocol-derived), amount (protocol-derived) |
-| Call chain | `→ AmpsVault._requireBondsHealthy() → Amps.mint(AmpsBonds)` |
-| State modified | `Amps.totalSupply`, `Amps.balanceOf[AmpsBonds]` |
-| Value flow | AMPS: minted to AmpsBonds |
+| Visibility | external, `locked` |
+| Caller | `AmpsBonds` |
+| Parameters | `to` (must equal `bonds`), `amount` (protocol-derived) |
+| Call chain | `→ Amps.mint()` |
+| State modified | `Amps.totalSupply`, `Amps.balanceOf[bonds]` |
+| Value flow | AMPS minted into `AmpsBonds` custody |
 | Reentrancy guard | yes |
 
-### `PoolRegistry` (registry → vault)
+### `PoolRegistry`
 
-#### `AmpsVault.initializePool()`
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `AmpsVault` | `initializePool()` | `key`, `sqrtPriceX96` (protocol-derived) | `_poolKeys`, `_assets`, `_assetIndex`; opens the v4 pool |
+| `AmpsVault` | `place()` | `poolId`, `above`, `amount` (protocol-derived) — also callable by the timelock | `ladderAt`, `_lastPlacementAt`, live cells, checkpoint |
+| `AmpsVault` | `withdrawRetiredBids()` | `constituentId` (protocol-derived) | `ladderAt[poolId]`, `_lastPlacementAt`, live cells |
+| `AmpsBonds` | `addCollateral()` | 7 params (protocol-derived) — also callable by the timelock | `_markets`, `marketIdOf`, `marketCount` |
+| `AmpsBonds` | `setMarketOpen()` | `marketId`, `open` — also callable by the timelock | `_markets[id].open` |
 
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked`, `msg.sender == _registry` |
-| Caller | `PoolRegistry._openPool()` |
-| Parameters | key (protocol-derived, validated by registry), sqrtPriceX96 (timelock-provided) |
-| Call chain | `→ AmpsVault._requireHealthy() → VaultPlacementLib.alignedOpeningPrice() → PoolManager.initialize() → AmpsHook.beforeInitialize()/afterInitialize() → AmpsVault._registerAsset() ×2` |
-| State modified | `POOL_KEYS_SLOT` (push), `_assets`, `_assetIndex`; hook `_cfg/_obs/_dyn/_arm` |
-| Value flow | none |
-| Reentrancy guard | yes |
+### `guardian` (immutable Safe)
 
-#### `AmpsVault.withdrawRetiredBids()`
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `AmpsVault` | `emergencyMigrate()` | `standby` (must equal the registered address) | Every claim balance, five `onlyVault` role pointers, `ladderAt` (fully unwound) |
+| `OracleGate` | `freezeProtocol()` | `until` (guardian-provided, ≤ 7 d) | `_protocolFreezeUntil` |
+| `OracleGate` | `freezeConstituent()` | `constituentId`, `until` (guardian-provided, ≤ 7 d) | `_constituentFreezeUntil[id]` |
+| `OracleGate` | `unfreezeProtocol()` | none — also callable by the timelock | `_protocolFreezeUntil` |
+| `OracleGate` | `unfreezeConstituent()` | `constituentId` — also callable by the timelock | `_constituentFreezeUntil[id]` |
 
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked`, `msg.sender == _registry` |
-| Caller | `PoolRegistry.withdrawRetiredBids()` |
-| Parameters | constituentId (timelock-provided) |
-| Call chain | `→ AmpsVault._requireHealthy() → VaultRolloutLib.withdrawRetiredBids() → PoolManager.unlock(ACTION_HARVEST) → PoolManager.modifyLiquidity() → PoolManager.mint(claims) → AmpsVault._afterPlacement()` |
-| State modified | `ladderAt[spoke]` bids zeroed, `_lastPlacementAt`, `LIVE_CELLS_SLOT`, checkpoint words |
-| Value flow | Counter asset: spoke bid positions → vault claims |
-| Reentrancy guard | yes |
+### `creator`
 
-#### `AmpsBonds.addCollateral()` / `AmpsBonds.setMarketOpen()`
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `AmpsVault` | `setCreator()` | `newCreator` (user-controlled by the current creator) | `_creator` |
 
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `lock`, `_requireGovernance` (registry **or** timelock) |
-| Caller | `PoolRegistry.addConstituent()` / `retireConstituent()` / `reinstateConstituent()`, or the timelock directly |
-| Parameters | collateral, class, dBase/dMin/dMax, capBpsPerEpoch, open (protocol-derived from the proposal) |
-| Call chain | `→ IERC20Metadata.decimals() → PoolRegistry.constituentIdOf()/constituent()` |
-| State modified | `marketCount`, `marketIdOf`, `_markets[id]` |
-| Value flow | none |
-| Reentrancy guard | yes |
+### `genesis` adapter (set-once, latched at `genesisMint`)
 
-### Timelock **or** registry
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `AmpsVault` | `genesisPlace()` | `params` (adapter-derived) — also callable by the timelock | `_assets`, `_assetIndex`, `_genesisTimestamp`, `_initialized`, `_wiringFrozen`, `_pRefX18`, checkpoint |
 
-#### `AmpsVault.place()`
+### `PoolManager` (Uniswap v4, immutable)
 
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked`, `msg.sender == _TIMELOCK || msg.sender == _registry` (in body) |
-| Caller | Genesis proposal / registry seeding |
-| Parameters | poolId, above, amount (timelock-provided) |
-| Call chain | `→ AmpsVault._requireHealthy() → VaultPlacementLib.place(strictBudget = true) → OracleGate.checkPlacement() → LadderPolicy.weights() → PoolManager.unlock(ACTION_PLACE) → PoolManager.modifyLiquidity() → AmpsHook.armSurge() → AmpsVault._afterPlacement()` |
-| State modified | `ladderAt[poolId]`, `_lastPlacementAt`, `LIVE_CELLS_SLOT`, checkpoint words |
-| Value flow | Inventory: vault claims/idle → positions |
-| Reentrancy guard | yes |
-
-### Vault (`onlyVault`)
-
-#### `Amps.mint()` / `Amps.burn()` / `Amps.setVault()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyVault` |
-| Caller | `AmpsVault` (genesis, mintVesting, redemption, compound, migration) |
-| Parameters | to/from, amount, newVault (protocol-derived) |
-| Call chain | `→ ERC20._mint() / _burn()` |
-| State modified | `totalSupply`, `balanceOf`, `vault` |
-| Value flow | AMPS minted to / burned from the given account (no allowance) |
-| Reentrancy guard | no |
-
-#### `AmpsStaking.notifyReward()` / `AmpsStaking.setVault()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyVault` |
-| Caller | `VaultPlacementLib._split()` / `AmpsVault.emergencyMigrate()` |
-| Parameters | amount / newVault (protocol-derived) |
-| Call chain | `→ AmpsStaking._accrue() → IERC20.balanceOf(this)` |
-| State modified | `_pendingRewards`, `_rewardRatePerSecond`, `streamEnd`, `totalNotified`, `lastAccrualAt` / `vault` |
-| Value flow | none (AMPS already delivered) |
-| Reentrancy guard | no |
-
-#### `BountyPot.pay()` / `BountyPot.setVault()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyVault` |
-| Caller | `VaultPlacementLib.payBounty()` / `AmpsVault.emergencyMigrate()` |
-| Parameters | to (keeper, protocol-relayed), workValueUsd18, gasCostUsd18 (protocol-derived) / newVault |
-| Call chain | `→ BountyPot._quote() → IERC20.balanceOf(this) → BountyPot._chargeWindow() → IERC20.safeTransfer(to)` |
-| State modified | `_spentWindowUsd18`, `_windowStart` / `vault` |
-| Value flow | USDG: BountyPot → keeper |
-| Reentrancy guard | no |
-
-#### `AmpsBonds.setVault()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `lock`, `msg.sender == vault` |
-| Caller | `AmpsVault.emergencyMigrate()` |
-| Parameters | newVault (protocol-derived, the registered standby) |
-| Call chain | none |
-| State modified | `vault` |
-| Value flow | none |
-| Reentrancy guard | yes |
-
-#### `AmpsHook.resetHighWater()` / `AmpsHook.armSurge()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `msg.sender == vault` |
-| Caller | `VaultPlacementLib._resetHighWater()` / `_armSurge()` (try-wrapped) |
-| Parameters | poolId, surgeBps, reason (protocol-derived) |
-| Call chain | `→ TruncatedOracleLib.resetHighWater()` / `HookStateLib.pack*()` |
-| State modified | `_obs[poolId].highWaterTick` / `_arm[poolId]`, `_dyn[poolId].gateAttemptedAt` |
-| Value flow | none |
-| Reentrancy guard | no |
-
-### PoolManager (`onlyPoolManager`)
-
-#### `AmpsHook.beforeInitialize()` / `afterInitialize()` / `beforeAddLiquidity()` / `beforeSwap()` / `afterSwap()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyPoolManager` (OZ `BaseHook`) |
-| Caller | Uniswap v4 `PoolManager` during `initialize` / `modifyLiquidity` / `swap` |
-| Parameters | sender (protocol-derived: the vault or router), key, params, hookData (user-controlled through the router), delta (protocol-derived) |
-| Call chain | `→ PoolRegistry.poolConfig() [init] · FeePolicy.quoteFee() (bounded staticcall) [beforeSwap] · PoolStateLib.slot0() → TruncatedOracleLib.write() → OracleGate.snapshotByPool()/closedHours() · FeePolicy.innerBandTicks()/outerRailTicks() · IStockToken.uiMultiplier() (all bounded staticcalls) [afterSwap]` |
-| State modified | `_cfg`, `_obs`, `_dyn`, `_arm` per pool; transient `ROTATION_CREDIT_SLOT` |
-| Value flow | none (fee returned via `OVERRIDE_FEE_FLAG`, charged by the PoolManager on the input currency into the vault's positions) |
-| Reentrancy guard | no (PoolManager's own lock) |
-
-#### `AmpsVault.unlockCallback()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `msg.sender == _POOL_MANAGER` |
-| Caller | `PoolManager.unlock()` re-entering the vault |
-| Parameters | data (protocol-derived: encoded by the vault itself); action read from transient `UNLOCK_ACTION` |
-| Call chain | `→ VaultPlacementLib.unlockAction() [PLACE/COMPOUND/BURNBACK/HARVEST] or VaultRedeemLib.unlockAction() [SETTLE/PAYOUT/ABSORB/UNWIND] → PoolManager.modifyLiquidity()/sync()/settle()/mint()/burn()/take()` |
-| State modified | `ladderAt`, `LIVE_CELLS_SLOT` (per action) |
-| Value flow | Per action: settle in, pay out, absorb idle, add/remove liquidity |
-| Reentrancy guard | inherits the outer `locked` frame; a callback with `UNLOCK_ACTION == 0` reverts `UnknownUnlockAction` |
-
-### Creator
-
-#### `AmpsVault.setCreator()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked`, `msg.sender == _creator` |
-| Caller | The current creator |
-| Parameters | newCreator (user-controlled) |
-| Call chain | `→ AmpsVault._requireHealthy()` |
-| State modified | `_creator` |
-| Value flow | none |
-| Reentrancy guard | yes |
-
-### Guardian
-
-#### `AmpsVault.emergencyMigrate()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `locked`, `msg.sender == _GUARDIAN` |
-| Caller | Guardian Safe |
-| Parameters | standby (must equal `_standbyVault`) |
-| Call chain | `→ VaultNavLib.migrationPredicate() → IStockToken.isBlocked() / IERC20.transfer(self, 1) probes → PoolManager.unlock(ACTION_UNWIND) → VaultRedeemLib.unwind() → VaultNavLib.evacuate() → PoolManager.transfer(standby, claims) + IERC20.safeTransfer(standby) → Amps.setVault(standby) → AmpsBonds.setVault() → AmpsStaking.setVault() → BountyPot.setVault() → this.assetsUsd18Of() (try)` |
-| State modified | `ladderAt` (all liquidity removed), `LIVE_CELLS_SLOT`; `vault` pointer in Amps/Bonds/Staking/Pot |
-| Value flow | Every claim and idle balance incl. AMPS: vault → standby |
-| Reentrancy guard | yes; not gate-gated by design |
-
-#### `OracleGate.freezeConstituent()` / `OracleGate.freezeProtocol()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyGuardian` |
-| Caller | Guardian Safe |
-| Parameters | constituentId, until (guardian-provided, ≤ 7 days ahead) |
-| Call chain | none |
-| State modified | `_constituentFreezeUntil[id]` / `_protocolFreezeUntil` |
-| Value flow | none |
-| Reentrancy guard | no |
-
-### Guardian **or** Timelock
-
-#### `OracleGate.unfreezeConstituent()` / `OracleGate.unfreezeProtocol()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external, `onlyGuardianOrTimelock` |
-| Caller | Guardian Safe or timelock |
-| Parameters | constituentId |
-| Call chain | none |
-| State modified | `_constituentFreezeUntil[id]` (delete) / `_protocolFreezeUntil = 0` |
-| Value flow | none |
-| Reentrancy guard | no |
+| Contract | Function | Parameters | State Modified |
+|----------|----------|------------|----------------|
+| `AmpsVault` | `unlockCallback()` | `data` (protocol-derived; dispatched on a transient discriminator the vault set) | Depends on the action: claims, ladder records, live cells |
+| `AmpsRouter` | `unlockCallback()` | `data` (protocol-derived; also requires the router's own transient lock held) | Pool state only |
+| `AmpsHook` | `beforeInitialize()` / `afterInitialize()` | `sender`, `key`, `sqrtPriceX96`, `tick` | `_cfg[id]`, `_dyn[id]`, `_arm[id]`, `_obs[id]` |
+| `AmpsHook` | `beforeAddLiquidity()` | `sender`, `key`, `params` | none (refuses any non-vault sender) |
+| `AmpsHook` | `beforeSwap()` | `sender`, `key`, `params`, `hookData` (user-controlled) | Transient rotation credit and pass-through counter |
+| `AmpsHook` | `afterSwap()` | `sender`, `key`, `params`, `delta`, `hookData` (user-controlled) | `_dyn[id]`, `_arm[id]`, `_obs[id]`, transient credit |
 
 ---
 
 ## Admin-Only
 
-Entry points restricted to the governance timelock (`onlyTimelock` / `_requireTimelock`). Every numeric setter is band-checked against `Constants` (`OutOfBand`), and every vault setter also passes `_requireHealthy()`.
+All 59 rows below are gated on `msg.sender == timelock` — one `TimelockController` address per contract, fixed at
+construction. The 48-hour / 7-day / 14-day tiers the documentation assigns to these functions are a governance
+convention, not an on-chain distinction.
 
 | Contract | Function | Parameters | State Modified |
 |----------|----------|------------|----------------|
-| AmpsVault | `genesis()` | teamShares, polShares, teamVestingWallet, creator, seedTokens[], seedAmounts[] | mints S0; `_assets`; `_creator`; `_genesisTimestamp`; `_initialized`; `_wiringFrozen`; checkpoint words |
-| AmpsVault | `setRedeemFeeBps()` | value ≤ 500 | `_redeemFeeBps` |
-| AmpsVault | `setBurnBps()` | value ≤ 2500 | `_burnBps` |
-| AmpsVault | `setStakerBps()` | value ≤ 5000 | `_stakerBps` |
-| AmpsVault | `setRefUpRateBps()` | value ∈ [100, 5000] | `_refUpRateBps` |
-| AmpsVault | `setRefDivergenceBps()` | value ∈ [100, 2000] | `_refDivergenceBps` |
-| AmpsVault | `setTwapWindow()` | value ∈ [300, 7200] | `_twapWindow` |
-| AmpsVault | `setLadderShape()` | tiltX18 ∈ [1.0, 1.5]e18, doublings ∈ [6, 14], seedHalvings, bondBidHalvings ∈ [2, 8] | `_ladderTiltX18`, `_ladderDoublings`, `_seedHalvings`, `_bondBidHalvings` |
-| AmpsVault | `setRolloutParams()` | bpsPerDay ≤ 1000, floorBps ≤ 8000 | `_rolloutBpsPerDay`, `_entryFloorBps` |
-| AmpsVault | `setSpokeSeedBps()` | value ∈ [10, 1000] | `_spokeSeedBps` |
-| AmpsVault | `setDeployThresholdUsd18()` | value ∈ [10, 10000]e18 | `_deployThresholdUsd18` |
-| AmpsVault | `setPolicyPointer()` | slot name, newPointer | one of slots 4-13 (`registry`/`bonds`/`staking`/`bountyPot` frozen after genesis; `marketReference`/`oracleGate`/`feedRegistry`/`positionValuer`/`ladderPolicy`/`rolloutPolicy` free) |
-| AmpsVault | `setStandbyVault()` | standby | `_standbyVault` |
-| AmpsBonds | `removeCollateral()` | collateral | `marketIdOf` (delete), `_markets[id].open = false` |
-| AmpsBonds | `setDiscountParams()` | marketId, dBase/dMin/dMax ∈ [500, 2500] | `_markets[id].dBaseBps/dMinBps/dMaxBps` |
-| AmpsBonds | `setCoefficients()` | marketId (0 = default), kWeight/kFill ≤ 2e18 | `defaultKWeightX18/defaultKFillX18` or `_markets[id].kWeightX18/kFillX18` |
-| AmpsBonds | `setCapBpsPerEpoch()` | marketId, cap ≤ 200 | `_markets[id].capBpsPerEpoch` |
-| AmpsBonds | `setEpochSeconds()` | value ∈ [1 h, 7 d] | `epochSeconds` |
-| AmpsBonds | `setDailyCapBps()` | value ≤ 500 | `dailyCapBps` |
-| AmpsBonds | `setVestSeconds()` | value ∈ [1 h, 7 d] | `vestSeconds` (future positions only) |
-| AmpsBonds | `setMinAccretionBps()` | value ≤ 500 | `minAccretionBps` |
-| AmpsBonds | `setPolicy()` | newPolicy | `policy` |
-| AmpsStaking | `setRewardStreamSeconds()` | value ∈ [1 h, 7 d] | `rewardStreamSeconds` |
-| BountyPot | `sweep()` | to, amountRaw | none (USDG: pot → to) |
-| BountyPot | `setTipUsd18()` | value ≤ 5e18 | `tipUsd18` |
-| BountyPot | `setChipBps()` | value ≤ 1000 | `chipBps` |
-| BountyPot | `setChostUsd18()` | value ≤ 1000e18 | `chostUsd18` |
-| BountyPot | `setGasCapMultiple()` | value ∈ [1, 10] | `gasCapMultiple` |
-| BountyPot | `setDailyCeilingUsd18()` | value ≤ 100000e18 | `dailyCeilingUsd18` |
-| AmpsHook | `setAmpsFeeBps()` | value ∈ [100, 600] | `_ampsFee` |
-| AmpsHook | `setBuyFeeBps()` | poolId, value ∈ [5, 100] entry / [1, 50] spoke | `_cfg[poolId].buyFeeBps` |
-| AmpsHook | `setMaxTickMovePerBlock()` | poolId, value ∈ [10, 2000] | `_cfg[poolId].maxTickMovePerBlock` |
-| AmpsHook | `setFeePolicy()` | newPolicy (must have code) | `_policy` |
-| AmpsHook | `setGateCacheSeconds()` | value ∈ [1, 900] | `_gateCache` |
-| FeedRegistry | `setStandardProxy()` / `setStandardProxies()` | aggregator(s), standard flag(s) | `isStandardProxy` |
-| FeedRegistry | `setFeed()` | token, aggregator (Standard proxy), config | `_feeds[token]`, clears `_accepted`/`_pending`, probes and latches |
-| FeedRegistry | `configureFeed()` | token, heartbeat ∈ [60, 86400], thresholdBps, min/max answer | `_feeds[token]` bounds |
-| FeedRegistry | `setFreshnessMultiplier()` | session, multiplier ∈ [100, 2400] | `_freshness*` |
-| FeedRegistry | `setConfirmSeconds()` | value ∈ [300, 86400] | `_confirmSeconds` |
-| FeedRegistry | `setOracleGate()` | gate | `_oracleGate` |
-| OracleGate | `setGraceSeconds()` / `setGapSeconds()` | value (ordered: gap < grace) | `_graceSeconds` / `_gapSeconds` |
-| OracleGate | `setDivergenceBps()` / `setDivergenceSustainSeconds()` | value ≤ 2000 / ≤ 3600 | `_divergenceBps` / `_divergenceSustainSeconds` |
-| OracleGate | `setCorporateActionWindow()` | value ≤ 86400 | `_corporateActionWindow` |
-| OracleGate | `setRefDivergenceBps()` | value ∈ [100, 2000] | `_refDivergenceBps` |
-| OracleGate | `setHSessionBps()` | session, bps ≤ 1000 | `_hSession*` |
-| OracleGate | `setHolidayBitmap()` | year, bitmap[2] | `_holidayBitmap[year]` |
-| OracleGate | `setDstTable()` | starts[], ends[] | `_dstStarts`, `_dstEnds` |
-| OracleGate | `setFeedRegistry()` / `setRegistry()` / `setMarketReference()` | address | `_feedRegistry` / `_registry` / `_marketReference` |
-| PoolRegistry | `registerEntryPool()` | key, counterDecimals, buyFeeBps, feed | `_hubPoolId`/`_wethPoolId`, `_pools`, `_keys`, `_poolCount`; opens the pool via the vault |
-| PoolRegistry | `addConstituent()` | params (token, feed, weights, inclusion record, bond params) | `_constituents`, `_inclusion`, `_constituentIdOf`, `_poolIdOf`, `_pools`, `_keys`, counters; opens pool and bond market |
-| PoolRegistry | `retireConstituent()` | constituentId | `status = RETIRED`, `rolloutWeightBps = 0`, `retiredAt`, `_activeCount`; closes the market |
-| PoolRegistry | `reinstateConstituent()` | constituentId, rolloutWeightBps | `status = ACTIVE`, `rolloutWeightBps`, `_activeCount`; reopens the market |
-| PoolRegistry | `reconfigureConstituent()` | constituentId, params (fee class, buy fee, target/rollout weight, feed, h_session override, CA freeze override) | the named fields of `_constituents[id]` / `_pools[poolId]` |
-| PoolRegistry | `setIndexWeights()` | ids[], weightsBps[] (sum = 10,000, each within [floor_n, cap_n]) | `_constituents[id].targetWeightBps` |
-| PoolRegistry | `withdrawRetiredBids()` | constituentId (must be RETIRED) | none locally; `AmpsVault.withdrawRetiredBids()` |
+| `AmpsVault` | `genesisMint()` | `params` (tranche split, team wallet, creator, adapter) | `_genesisMinted`, `_creator`; mints all of `S0` |
+| `AmpsVault` | `setRedeemFeeBps()` | `value` ∈ [0, 500] | `_redeemFeeBps` |
+| `AmpsVault` | `setRefUpRateBps()` | `value` ∈ [100, 5000] | `_refUpRateBps` |
+| `AmpsVault` | `setRefDivergenceBps()` | `value` ∈ [100, 2000] | `_refDivergenceBps` |
+| `AmpsVault` | `setTwapWindow()` | `value` ∈ [300, 7200] | `_twapWindow` |
+| `AmpsVault` | `setLadderShape()` | `tiltX18`, `doublings`, `seedHalvings_`, `bondBidHalvings_` | `_ladderTiltX18`, `_ladderDoublings`, `_seedHalvings`, `_bondBidHalvings` |
+| `AmpsVault` | `setRolloutParams()` | `bpsPerDay` ∈ [0, 1000], `floorBps` ∈ [0, 8000] | `_rolloutBpsPerDay`, `_entryFloorBps` |
+| `AmpsVault` | `setSpokeSeedBps()` | `value` ∈ [10, 1000] | `_spokeSeedBps` |
+| `AmpsVault` | `setDeployThresholdUsd18()` | `value` ∈ [10e18, 10_000e18] | `_deployThresholdUsd18` |
+| `AmpsVault` | `setPolicyPointer()` | `slot` (short string), `newPointer` (must hold code) | One of slots 4, 5, 7, 8, 9, 10, 11, 12, 13, 22 |
+| `AmpsVault` | `setStandbyVault()` | `standby` (must hold code) | `_standbyVault` |
+| `AmpsBonds` | `removeCollateral()` | `collateral` | `marketIdOf[collateral]`, `_markets[id].open` |
+| `AmpsBonds` | `setDiscountParams()` | `marketId`, `dBaseBps`, `dMinBps`, `dMaxBps` ∈ [500, 2500] | `_markets[id]` discount triple |
+| `AmpsBonds` | `setCoefficients()` | `marketId` (0 = global), `kWeightX18`, `kFillX18` ≤ 2e18 | `_markets[id]` or `defaultKWeightX18`/`defaultKFillX18` |
+| `AmpsBonds` | `setCapBpsPerEpoch()` | `marketId`, `capBpsPerEpoch` ≤ 200 | `_markets[id].capBpsPerEpoch` |
+| `AmpsBonds` | `setEpochSeconds()` | `value` ∈ [1 h, 7 d] | `epochSeconds` |
+| `AmpsBonds` | `setDailyCapBps()` | `value` ≤ 500 | `dailyCapBps` |
+| `AmpsBonds` | `setVestSeconds()` | `value` ∈ [1 h, 7 d] | `vestSeconds` |
+| `AmpsBonds` | `setMinAccretionBps()` | `value` ≤ 500 | `minAccretionBps` |
+| `AmpsBonds` | `setPolicy()` | `newPolicy` | `policy` |
+| `AmpsHook` | `setAmpsFeeBps()` | `value` ∈ [100, 600] | `_ampsFee` |
+| `AmpsHook` | `setBuyFeeBps()` | `poolId`, `value` (class band) | `_cfg[poolId].buyFeeBps` |
+| `AmpsHook` | `setMaxTickMovePerBlock()` | `poolId`, `value` ∈ [10, 2000] | `_cfg[poolId].maxTickMovePerBlock` |
+| `AmpsHook` | `setFeePolicy()` | `newPolicy` (must hold code) | `_policy` |
+| `AmpsHook` | `setRouter()` | `newRouter` (zero permitted) | `router` |
+| `AmpsHook` | `setGateCacheSeconds()` | `value` ∈ [1, 900] | `_gateCache` |
+| `OracleGate` | `setGraceSeconds()` | `value` ∈ [300, 86400], `> gapSeconds` | `_graceSeconds` |
+| `OracleGate` | `setGapSeconds()` | `value` ∈ [1, 1800], `< graceSeconds` | `_gapSeconds` |
+| `OracleGate` | `setDivergenceBps()` | `value` ∈ [1, 2000] | `_divergenceBps` |
+| `OracleGate` | `setDivergenceSustainSeconds()` | `value` ≤ 3600 | `_divergenceSustainSeconds` |
+| `OracleGate` | `setCorporateActionWindow()` | `value` ≤ 86400 | `_corporateActionWindow` |
+| `OracleGate` | `setRefDivergenceBps()` | `value` ∈ [100, 2000] | `_refDivergenceBps` |
+| `OracleGate` | `setHSessionBps()` | `session`, `bps` ≤ 1000 | One of the four `_hSession*` fields |
+| `OracleGate` | `setHolidayBitmap()` | `year`, `bitmap[2]` (unvalidated content) | `_holidayBitmap[year]` |
+| `OracleGate` | `setDstTable()` | `starts[]`, `ends[]` (≤ 64, ascending, non-overlapping) | `_dstStarts`, `_dstEnds` |
+| `OracleGate` | `setFeedRegistry()` | `value` | `_feedRegistry` |
+| `OracleGate` | `setRegistry()` | `value` | `_registry` |
+| `OracleGate` | `setMarketReference()` | `value` | `_marketReference` |
+| `FeedRegistry` | `setStandardProxy()` | `aggregator`, `standard` | `isStandardProxy[aggregator]` |
+| `FeedRegistry` | `setStandardProxies()` | `aggregators[]`, `standard[]` | `isStandardProxy[]` |
+| `FeedRegistry` | `setFeed()` | `token`, `aggregator`, `config` | `_feeds[token]`, clears `_accepted`/`_pending`, re-latches |
+| `FeedRegistry` | `configureFeed()` | `token`, `heartbeat`, `thresholdBps`, `minAnswerUsd8`, `maxAnswerUsd8` | `_feeds[token]` bands |
+| `FeedRegistry` | `setFreshnessMultiplier()` | `session`, `multiplier` ∈ [100, 2400] | One of the four `_freshness*` fields |
+| `FeedRegistry` | `setConfirmSeconds()` | `value` ∈ [300, 86400] | `_confirmSeconds` |
+| `FeedRegistry` | `setOracleGate()` | `gate` | `_oracleGate` |
+| `PoolRegistry` | `registerEntryPool()` | `key`, `counterDecimals`, `buyFeeBps`, `feed` | `_pools`, `_keys`, `_poolCount`, `_hubPoolId` or `_wethPoolId`; opens the pool |
+| `PoolRegistry` | `addConstituent()` | `params` (token, class, weights, inclusion record, feed, tick spacing) | `_constituents`, `_inclusion`, `_constituentIdOf`, `_poolIdOf`, `_pools`, `_keys`, counters; opens the pool and the bond market |
+| `PoolRegistry` | `retireConstituent()` | `constituentId` | `status`, `rolloutWeightBps`, `retiredAt`, `_activeCount`; closes the bond market |
+| `PoolRegistry` | `reinstateConstituent()` | `constituentId`, `rolloutWeightBps` | `status`, `rolloutWeightBps`, `retiredAt`, `_activeCount`; re-opens the market |
+| `PoolRegistry` | `reconfigureConstituent()` | `constituentId`, `params` (8 optional fields) | `poolClass`, `buyFeeBps`, `targetWeightBps`, `rolloutWeightBps`, `feed`, `hSessionOverride*`, `caFreezeOverride` |
+| `PoolRegistry` | `setIndexWeights()` | `ids[]`, `weightsBps[]` (must sum to `BPS`) | `targetWeightBps` per named constituent |
+| `PoolRegistry` | `withdrawRetiredBids()` | `constituentId` | Calls `AmpsVault.withdrawRetiredBids` |
+| `BountyPot` | `sweep()` | `to`, `amountRaw` | USDG out of the pot |
+| `BountyPot` | `setTipUsd18()` | `value` ≤ 5e18 | `tipUsd18` |
+| `BountyPot` | `setChipBps()` | `value` ≤ 1000 | `chipBps` |
+| `BountyPot` | `setChostUsd18()` | `value` ≤ 1000e18 | `chostUsd18` |
+| `BountyPot` | `setGasCapMultiple()` | `value` ∈ [1, 10] | `gasCapMultiple` |
+| `BountyPot` | `setDailyCeilingUsd18()` | `value` ≤ 100_000e18 | `dailyCeilingUsd18` |
+| `AmpsGenesis` | `createAuctions()` | `usdgSpec`, `ethSpec`, `ethUsdX18_` | `_usdgAuction`, `_ethAuction`, `_startBlock`, `_endBlock`, `_ethUsdX18`, both floors; deploys and funds both auctions |
 
-### Initialization
+---
 
-No proxies and no `initialize()` functions exist: every contract is deployed with immutables. The one-time setup entry points are `AmpsVault.genesis()` (admin-only, latched by `_initialized`) and the set-once pointer slots of `setPolicyPointer()` (frozen by `genesis`). Deployment order matters: the oracle-gate pointer must stay unset until the hub pool has 30 minutes of TWAP history, or `genesis()`/`initializePool()` refuse on their own `WATCHDOG` verdict (`docs/phase2-state-model.md` §9.1).
+## Initialization
+
+No proxies and no `initialize()` functions: every contract is immutable bytecode with a constructor. The
+equivalent one-time surface is:
+
+| Function | Caller | Latch |
+|----------|--------|-------|
+| `AmpsVault.setPolicyPointer()` for `registry`, `bonds`, `bountyPot` | timelock | `_wiringFrozen`, closed by `genesisPlace` |
+| `AmpsVault.setPolicyPointer("genesis")` | timelock | `_genesisMinted`, closed by `genesisMint` |
+| `AmpsVault.genesisMint()` | timelock | `_genesisMinted` |
+| `AmpsVault.genesisPlace()` | genesis adapter or timelock | `_initialized` |
+| `AmpsGenesis.createAuctions()` | timelock | both auction addresses non-zero |
+| `AmpsGenesis.settle()` | anyone | `_settledLatch` |
+| `PoolRegistry.registerEntryPool()` | timelock | `_hubPoolId` / `_wethPoolId` per leg |
+| `AmpsVault.initializePool()` | registry | v4's own already-initialised check |

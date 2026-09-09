@@ -1036,7 +1036,7 @@ router, which must pay `ampsFeeBps` twice), `bond`, `claim`, `redeem`, `compound
 
 ### 8.3 Medusa readiness
 
-`medusa.json` targets `Phase3Handler` with the same assertions as `medusa_`-prefixed properties, `testLimit` 1e7,
+`medusa.phase3.json` (run with `medusa fuzz --config medusa.phase3.json`; the plain `medusa.json` is the fizz suite's config) targets `Phase3Handler` with the same assertions as `medusa_`-prefixed properties, `testLimit` 1e7,
 `workers` 8, reusing the Foundry fixture through `setUp()`. Two conditions make it useful: the handler must never
 revert on a *valid* action (reverts poison coverage), and every ghost must be readable through a `view` so
 property functions need no storage access. Run it over `src/hook/**`, `src/policy/**`, `src/vault/**` and
