@@ -1642,6 +1642,25 @@ export const ampsGenesisAbi = [
     anonymous: false,
     inputs: [
       {
+        name: 'stalePrice',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+      {
+        name: 'usedPrice',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'EthUsdNotRefreshed',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
         name: 'p0X18',
         internalType: 'uint256',
         type: 'uint256',
@@ -1679,6 +1698,19 @@ export const ampsGenesisAbi = [
       },
     ],
     name: 'Settled',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'amount',
+        internalType: 'uint256',
+        type: 'uint256',
+        indexed: false,
+      },
+    ],
+    name: 'TrancheSurplusSwept',
   },
   { type: 'error', inputs: [], name: 'AlreadySettled' },
   {
@@ -3263,6 +3295,7 @@ export const ampsQuoterAbi = [
     outputs: [
       { name: 'amountOut', internalType: 'uint256', type: 'uint256' },
       { name: 'complete', internalType: 'bool', type: 'bool' },
+      { name: 'tickAfter', internalType: 'int24', type: 'int24' },
     ],
     stateMutability: 'view',
   },
@@ -3556,6 +3589,14 @@ export const ampsRouterAbi = [
       { name: 'amount', internalType: 'uint256', type: 'uint256' },
     ],
     name: 'NativeTransferFailed',
+  },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'hop1', internalType: 'bytes32', type: 'bytes32' },
+      { name: 'hop2', internalType: 'bytes32', type: 'bytes32' },
+    ],
+    name: 'NotARotation',
   },
   {
     type: 'error',
@@ -4734,6 +4775,19 @@ export const ampsVaultAbi = [
       },
     ],
     name: 'Migrated',
+  },
+  {
+    type: 'event',
+    anonymous: false,
+    inputs: [
+      {
+        name: 'side',
+        internalType: 'bytes32',
+        type: 'bytes32',
+        indexed: false,
+      },
+    ],
+    name: 'MigrationBleedUnchecked',
   },
   {
     type: 'event',
