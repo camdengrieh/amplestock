@@ -494,6 +494,33 @@ contract AmpsGenesisTest is AmpsVaultFixture {
         adapter.settle();
     }
 
+    /// @notice **Re-audit lead.** `settle()` waits for the auction's `claimBlock`, not only for its `endBlock`.
+    ///
+    /// @dev `settle()` calls `sweepUnsoldTokens()`, and whether an auction is willing to return its unsold tranche
+    ///      between `endBlock` and `claimBlock` is a property of external bytecode this contract does not own and
+    ///      cannot re-run: `settle()` is one-shot, so a sweep that silently returned nothing in that window would
+    ///      strand the tranche for good. `claimBlock >= endBlock` is enforced at creation, so waiting for it costs
+    ///      an already-ended auction only the operator's patience and removes the question entirely.
+    function test_r16_settleWaitsForTheClaimBlockAndNotOnlyTheEndBlock() public {
+        _mint();
+        _create();
+        _bidUsdg(5000e6, adapter.floorUsdgQ96());
+        _bidEth(2e18, adapter.floorEthQ96());
+        _rollPastEnd();
+
+        // A leg whose claiming window opens ten blocks after its bidding window closes.
+        address leg = adapter.usdgAuction();
+        uint64 claimAt = uint64(block.number) + 10;
+        vm.mockCall(leg, abi.encodeWithSignature("claimBlock()"), abi.encode(claimAt));
+
+        vm.expectRevert(abi.encodeWithSelector(IAmpsGenesis.AuctionNotEnded.selector, leg, claimAt));
+        adapter.settle();
+
+        vm.roll(uint256(claimAt));
+        adapter.settle();
+        assertTrue(adapter.settled(), "and once claiming has opened it settles");
+    }
+
     /// @notice Settling twice is refused.
     function test_settle_twiceReverts() public {
         _settleBothLegs();

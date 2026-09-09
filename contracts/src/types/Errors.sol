@@ -269,6 +269,21 @@ error UnconfirmedNav();
 /// @param poolId The pool, as `PoolId.unwrap`.
 error HighWaterResetFailed(bytes32 poolId);
 
+/// @notice One spoke's realised index weight cannot be priced right now, so there is no weight to report.
+///
+/// @dev **Why "unknown" has to be a revert and not a zero** (audit fix, 2026-09-09). `VaultNavLib.spokeWeightBps`
+///      used to answer a clean `0` for a dead feed, an absent position valuer or a reference price outside
+///      `PriceLib`'s domain — and both consumers read a successful zero as a *true* weight. `deficit =
+///      (target - current) / target` then evaluates to `1e18`, the **maximum** deficit: the bond discount widens
+///      to `dMax` and the rollout schedule doubles for that name, which is the opposite of the direction an
+///      unreadable price should move either of them. Both consumers already implement the right fail-safe for a
+///      read that *fails* — `PoolRegistry.currentWeightBps` keeps `targetWeightBps`, which prices `deficit == 0` —
+///      and a successful zero is exactly what walked past it. Reverting is what puts that fail-safe back in
+///      charge. A literal `0` is reserved for the one case that means it: the vault holds none of the name.
+/// @param constituentId The constituent whose weight could not be priced.
+/// @param reason Which input was missing: `bytes32("answer")`, `bytes32("valuer")` or `bytes32("refPrice")`.
+error SpokeUnpriceable(uint16 constituentId, bytes32 reason);
+
 // -----------------------------------------------------------------------------------------------------------------
 // `AmpsRouter` (`src/periphery/AmpsRouter.sol`)
 // -----------------------------------------------------------------------------------------------------------------

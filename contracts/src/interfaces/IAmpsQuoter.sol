@@ -184,6 +184,15 @@ interface IAmpsQuoter {
     ///      That is the hook's own delta form, rounded up the same way, so the quote is exact rather than
     ///      approximate. Exact-**output** sells consume no credit and pay `ampsFeeBps` in full, which is why the
     ///      router only ever builds hop 2 as an exact-input swap.
+    ///
+    /// @dev **A route the router refuses is quoted as no route** (audit fix, 2026-09-09). `AmpsRouter.rotate`
+    ///      rejects `hop1 == hop2` (`SameHop`) and a pair with no constituent spoke on either leg (`NotARotation`,
+    ///      because the two entry pools are the way in and out of the index and a hop between them is not a
+    ///      rotation at any price). Quoting those shapes at the pass-through fee published an entry-to-entry
+    ///      route at 60 bp that always reverted on execution, which is the one failure a quoter exists to prevent.
+    ///      Both now return all zeros — including the fee legs, because there is no price to report for a route
+    ///      that cannot be built — and a consumer reads `amountOut == 0` as "no route", exactly as it already does
+    ///      for a rail refusal or an unreadable pool.
     /// @param hop1 The pool bought through.
     /// @param hop2 The pool sold through.
     /// @param amountIn The input to hop 1, in `hop1`'s counter-asset raw units.

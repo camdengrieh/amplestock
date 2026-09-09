@@ -263,7 +263,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
     // -----------------------------------------------------------------------------------------------------------
 
     function test_aSmallMultiplierStepArmsTheCaptureFee() public {
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 1e18, "cached at initialize");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 1e9, "cached at initialize, as X9");
 
         stock.setUIMultiplier(1.005e18); // +50 bp, a dividend reinvestment
         vm.recordLogs();
@@ -271,7 +271,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
 
         assertEq(hook.poolState(stockId).captureFeeBps, 40, "0.8 x 50 bp");
         assertEq(hook.poolState(stockId).captureArmedAt, uint32(block.timestamp), "armed now");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 1.005e18, "the cache moved");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 1.005e9, "the cache moved");
         assertEq(hook.poolState(stockId).gateFlags & 8, 0, "and it is not a corporate action");
 
         bool seen;
@@ -298,7 +298,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
         assertEq(hook.poolState(stockId).captureFeeBps, 0, "no capture fee for a split");
         assertTrue(HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_CA_ARMED), "caArmed");
         assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "escalation cap");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 10e18, "the cache still moved");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 10e9, "the cache still moved");
     }
 
     /// @notice The corporate-action flag comes back down when the action is over. `OracleGate` reads bit 3 to
@@ -344,21 +344,21 @@ contract AmpsHookObservationsTest is HookTestFixture {
     }
 
     // -----------------------------------------------------------------------------------------------------------
-    // The saturating cast (audit finding: the detector compared a saturated cache against an un-saturated read)
+    // The X9 store (re-audit finding 9: the X18 field saturated at 18.45x and silenced the detector for good)
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice A `uiMultiplier()` past `type(uint64).max` arms its step **once**, not on every refresh forever.
+    /// @notice **Re-audit finding 9.** A multiplier past the old X18 ceiling is stored exactly, and its step is
+    ///         armed once and then resolves — not re-armed on every refresh, and not made invisible.
     ///
-    /// @dev `Armed.uiMultiplierX18` is 64 bits, so the hook stores a *saturating* cast of what it read. Measuring
-    ///      the step against the raw reading rather than against that stored value made every later refresh
-    ///      recompute the same phantom jump: `FLAG_CA_ARMED` latched for good — and with it the escalation cap and
-    ///      `OracleGate`'s freeze of the constituent's bonds and placements — because {_clearCorporateAction} only
-    ///      runs when the measured step is small. Compared like with like, a saturated reading is a step of zero.
-    function test_aMultiplierBeyondUint64ArmsItsStepOnceAndResolves() public {
-        stock.setUIMultiplier(uint256(type(uint64).max) + 1e18); // ~18.45e18, past the packed field
+    /// @dev `Armed.uiMultiplierX9` is 64 bits holding `uiMultiplier() / 1e9`, so the ceiling is ~1.8e10x rather
+    ///      than the 18.45x an X18 store gave. `type(uint64).max + 1e18` is ~18.45e18 — the value that used to
+    ///      saturate — and it is now kept to the wei-over-1e9.
+    function test_r03_aMultiplierPastTheOldCeilingIsStoredExactly() public {
+        uint256 m = uint256(type(uint64).max) + 1e18; // ~18.45e18, the old saturation point
+        stock.setUIMultiplier(m);
         _refreshGate(stockKey);
 
-        assertEq(hook.poolState(stockId).uiMultiplierX18, type(uint64).max, "the cache saturates");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, uint64(m / 1e9), "the cache holds the real reading");
         assertTrue(_caArmed(), "the jump from 1.0 really is a corporate action");
         assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "escalation cap");
 
@@ -373,26 +373,57 @@ contract AmpsHookObservationsTest is HookTestFixture {
         assertEq(hook.poolState(stockId).captureFeeBps, 0, "and nothing was armed in its place");
     }
 
-    /// @notice A rise that happens entirely above the saturation point arms nothing, refresh after refresh.
-    /// @dev The other half of the same bug: a `+1%` step above `type(uint64).max` is invisible to a saturated
-    ///      cache, and measuring it against the raw reading re-armed a capture fee and a surge on *every* gate
-    ///      cache refresh, permanently. A saturated read is "unknown", and "unknown" arms nothing.
-    function test_aRiseAboveTheSaturationPointArmsNothingOnAnyRefresh() public {
-        stock.setUIMultiplier(uint256(type(uint64).max) + 1e18);
+    /// @notice **Re-audit finding 9, the live case.** A 20x name — one 5:1 split away from a 4.0x listing, and
+    ///         entirely above the old 18.45x ceiling — pays its dividend toll like any other.
+    ///
+    /// @dev Under the X18 store both readings clipped to `type(uint64).max`, `deltaBps` was identically zero, and
+    ///      the small-step branch then *cleared* any standing corporate-action flag on every single refresh: no
+    ///      capture toll, no surge and no freeze could ever arm for that constituent again. The step here is
+    ///      `20.0 -> 20.4`, exactly 200 bp, which is `DIVIDEND_STEP_BPS_MAX` — the largest move still treated as a
+    ///      dividend — and arms `0.8 x 200 = 160` bp of capture fee.
+    function test_r03_aStepAtTwentyTimesArmsTheToll() public {
+        stock.setUIMultiplier(20e18);
         _refreshGate(stockKey);
-        _refreshGate(stockKey); // resolves the corporate action the jump itself armed
+        _refreshGate(stockKey); // the 1.0 -> 20.0 jump is a corporate action; let it resolve
         assertFalse(_caArmed(), "resolved");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 20e9, "20x, stored exactly");
 
-        stock.setUIMultiplier(((uint256(type(uint64).max) + 1e18) * 101) / 100); // +1%, still off the top
+        stock.setUIMultiplier(20.4e18); // +2%, a dividend reinvestment on a 20x name
+        vm.recordLogs();
+        _refreshGate(stockKey);
 
-        for (uint256 i; i < 3; ++i) {
-            vm.recordLogs();
-            _refreshGate(stockKey);
-            assertFalse(_sawMultiplierStep(vm.getRecordedLogs()), "a step the cache cannot see is not a step");
-            assertEq(hook.poolState(stockId).captureFeeBps, 0, "so no capture fee is armed");
-            assertFalse(_caArmed(), "and no corporate action is armed");
-            assertEq(hook.poolState(stockId).uiMultiplierX18, type(uint64).max, "the cache stays saturated");
-        }
+        assertTrue(_sawMultiplierStep(vm.getRecordedLogs()), "the step is seen");
+        assertEq(hook.poolState(stockId).captureFeeBps, 160, "0.8 x 200 bp, measured correctly at 20x");
+        assertEq(hook.poolState(stockId).captureArmedAt, uint32(block.timestamp), "armed now");
+        assertEq(hook.poolState(stockId).surgeBps, Constants.SURGE_MAX_BPS, "and the surge with it");
+        assertFalse(_caArmed(), "a 2% step is a dividend, not a corporate action");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 20.4e9, "the cache moved to the new reading");
+    }
+
+    /// @notice **Re-audit finding 9, the far edge.** A reading that does not fit even the X9 field is a *probe
+    ///         failure*, not "nothing observed": `refreshFailed` rises, the cached value stands, and — the part
+    ///         that matters — a standing corporate-action flag is neither cleared nor re-armed by it.
+    function test_r03_aReadingBeyondTheX9CeilingIsAProbeFailure() public {
+        stock.setUIMultiplier(10e18); // a 10:1 split raises the flag
+        _refreshGate(stockKey);
+        assertTrue(_caArmed(), "armed by the split");
+
+        // Past `type(uint64).max * 1e9`: no honest issuer can mean this, and the detector cannot measure it.
+        stock.setUIMultiplier(type(uint256).max);
+        vm.recordLogs();
+        _refreshGate(stockKey);
+
+        assertTrue(
+            HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_REFRESH_FAILED),
+            "the probe is reported as failed"
+        );
+        assertFalse(_sawMultiplierStep(vm.getRecordedLogs()), "and no step is claimed");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 10e9, "the cached reading stands");
+        assertTrue(_caArmed(), "and an unreadable probe never clears a corporate action");
+        assertEq(hook.poolState(stockId).captureFeeBps, 0, "nothing armed either");
+
+        // And a swap still goes through: an unreadable probe is a flag, never a revert (I15).
+        assertGt(_buy(stockKey, 1e18), 0, "swaps are unaffected");
     }
 
     /// @dev Whether the hook reported a `uiMultiplier()` step in this batch of logs.
@@ -418,7 +449,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
 
         assertTrue(HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_CA_ARMED), "caArmed");
         assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "escalation cap");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 0.5e18, "and the cache is exactly what was read");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 0.5e9, "and the cache is exactly what was read");
     }
 
     /// @notice And a downward step small enough to be a dividend arms the capture fee, at the same 80% of the step
@@ -430,7 +461,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
         assertEq(hook.poolState(stockId).captureFeeBps, 40, "0.8 x 50 bp, whichever way the step went");
         assertEq(hook.poolState(stockId).captureArmedAt, uint32(block.timestamp), "armed now");
         assertEq(hook.poolState(stockId).gateFlags & 8, 0, "and it is not a corporate action");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 0.995e18, "the cache is what was read");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 0.995e9, "the cache is what was read");
     }
 
     /// @notice **The second half of finding 11.** A one-basis-point step cannot erase a standing toll. The capture
@@ -448,7 +479,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
         _refreshGate(stockKey);
         assertEq(hook.poolState(stockId).captureFeeBps, 160, "the standing toll survives a smaller step");
         assertEq(hook.poolState(stockId).captureArmedAt, armedAt, "with its original clock, so it still expires");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 1.020102e18, "and the cache is exactly what was read");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 1.020102e9, "and the cache is exactly what was read");
 
         // A step at least as large as the standing toll's own does replace it, clock included.
         stock.setUIMultiplier(1.04050404e18); // exactly another 200 bp
@@ -462,7 +493,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
         _refreshGate(stockKey);
 
         assertTrue(HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_REFRESH_FAILED), "flagged");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 1e18, "the cached value stands");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 1e9, "the cached value stands");
 
         // And a swap still goes through.
         assertGt(_buy(stockKey, 1e18), 0, "swaps are unaffected");
@@ -473,7 +504,7 @@ contract AmpsHookObservationsTest is HookTestFixture {
     function test_aGarbageMultiplierIsAFlagAndNotARevert() public {
         vm.mockCall(address(stock), abi.encodeWithSelector(IStockToken.uiMultiplier.selector), hex"01");
         _refreshGate(stockKey);
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 1e18, "the cached value stands");
+        assertEq(hook.poolState(stockId).uiMultiplierX9, 1e9, "the cached value stands");
         assertGt(_buy(stockKey, 1e18), 0, "swaps are unaffected");
     }
 

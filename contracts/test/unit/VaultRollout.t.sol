@@ -128,7 +128,14 @@ contract VaultRolloutTest is PlacementFixture {
         assertGt(placedAmps, 0, "the ladder merged into the cells it had");
         assertLt(placedAmps, movedAmps, "but could not take all of it");
 
-        assertEq(_rolloutMoved24h(), movedAmps, "the window was charged what left the entry pools");
+        // **The realised drain, not the gross harvest** (re-audit finding 12's second half). What the destination
+        // refused went straight back into the entry pools it came from in the same call, so the inventory that
+        // actually left them is `moved - returned`; charging the gross figure let a permissionless call whose
+        // harvest and rollback cancelled exactly consume a whole day's allowance for the price of its gas.
+        uint256 returnedAmps = _placedForReason(logs, bytes32("rollback"));
+        assertGt(returnedAmps, 0, "the remainder went back into the entry pools");
+        assertEq(_rolloutMoved24h(), movedAmps - returnedAmps, "the window was charged the realised drain");
+        assertLt(_rolloutMoved24h(), movedAmps, "which is strictly less than the harvest here");
 
         (uint256 workValueUsd18,,,) = _bountyIn(logs);
         assertEq(workValueUsd18, (placedAmps * pRefBefore) / 1e18, "and the bounty only what reached the spoke");
@@ -171,6 +178,7 @@ contract VaultRolloutTest is PlacementFixture {
     ///         at one full allowance per `PLACEMENT_COOLDOWN_SECONDS`.
     function test_i32_repeatedRolloutsAtASaturatedCellBudgetStayInsideTheDailyAllowance() public {
         uint256 entryBefore = _entryAskInventory();
+        uint256 opened = vm.getBlockTimestamp();
         uint256 moved;
 
         for (uint256 i; i < 12; ++i) {
@@ -183,8 +191,12 @@ contract VaultRolloutTest is PlacementFixture {
             syncMarket();
         }
 
-        assertLe(moved, DAILY_BUDGET, "twelve minutes cannot spend more than one day's allowance");
-        assertGe(_entryAskInventory(), entryBefore - DAILY_BUDGET, "and the entry pools are inside the same bound");
+        assertLe(moved, _allowanceOver(vm.getBlockTimestamp() - opened), "twelve minutes buy twelve minutes of it");
+        assertGe(
+            _entryAskInventory(),
+            entryBefore - _allowanceOver(vm.getBlockTimestamp() - opened),
+            "and the entry pools are inside the same bound"
+        );
         assertGe(_entryAskInventory(), ENTRY_FLOOR, "never below the floor either");
     }
 
@@ -244,13 +256,14 @@ contract VaultRolloutTest is PlacementFixture {
     /// @notice And the budget is a rolling 24 hours: whatever the schedule proposes, one day's moves add up to
     ///         at most `rolloutBpsPerDay` of the POL tranche, and the window rolls forward a day later.
     function test_i32_theBudgetIsARolling24Hours() public {
+        uint256 opened = vm.getBlockTimestamp();
         uint256 spent;
         for (uint256 i; i < 12; ++i) {
             spent += vault.rollout(constituentIds[0]);
             warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
         }
         assertGt(spent, 0, "the window was used");
-        assertLe(spent, DAILY_BUDGET, "and never past its budget");
+        assertLe(spent, _allowanceOver(vm.getBlockTimestamp() - opened), "and never past its budget");
 
         // Force the schedule to ask for the whole budget again: inside the window it is refused.
         _forceProposal(DAILY_BUDGET);
@@ -675,6 +688,20 @@ contract VaultRolloutTest is PlacementFixture {
         return uint256(uint128(uint256(vm.load(address(vault), bytes32(uint256(15))))));
     }
 
+    /// @dev What I32's rolling window can hand out over an interval of `elapsed` seconds.
+    ///
+    ///      Since the re-audit fix of 2026-09-09 the charge decays linearly to zero over a day from the last
+    ///      charge rather than being zeroed at a fixed edge, which is what stops two rollouts a minute apart from
+    ///      straddling that edge and moving two allowances. The same decay is what a leaky bucket always does: the
+    ///      bucket holds `DAILY_BUDGET` and drains at `DAILY_BUDGET / ONE_DAY`, so an interval of `elapsed`
+    ///      releases `DAILY_BUDGET * elapsed / ONE_DAY` on top of the room the bucket started with. The long-run
+    ///      rate is exactly `rolloutBpsPerDay` a day — which is what I32 says — and over twelve minutes the
+    ///      overshoot this admits is twelve minutes' worth, about 0.8 % of one allowance. The tumbling window it
+    ///      replaces admitted a *whole* second allowance across its edge, in two seconds.
+    function _allowanceOver(uint256 elapsed) private pure returns (uint256 allowance) {
+        return DAILY_BUDGET + (DAILY_BUDGET * elapsed) / uint256(Constants.ONE_DAY);
+    }
+
     /// @dev The last `Rollout` in `logs`.
     function _rolloutIn(Vm.Log[] memory logs) private view returns (uint256 movedAmps, uint256 placedAmps) {
         for (uint256 i = logs.length; i != 0; --i) {
@@ -683,6 +710,21 @@ contract VaultRolloutTest is PlacementFixture {
             return abi.decode(entry.data, (uint256, uint256));
         }
         revert("no Rollout");
+    }
+
+    /// @dev Every `Placement` in `logs` carrying `reason`, summed over the amount each one actually placed.
+    function _placedForReason(Vm.Log[] memory logs, bytes32 reason) private view returns (uint256 total) {
+        for (uint256 i; i < logs.length; ++i) {
+            Vm.Log memory entry = logs[i];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Placement.selector) continue;
+            (, uint256 amount, bytes32 logReason) = _placementFields(entry.data);
+            if (logReason == reason) total += amount;
+        }
+    }
+
+    /// @dev The three `Placement` fields {_placedForReason} needs, decoded in their own frame.
+    function _placementFields(bytes memory data) private pure returns (bool above, uint256 amount, bytes32 reason) {
+        (above,, amount,, reason,,) = abi.decode(data, (bool, uint8, uint256, int24, bytes32, int24, int24));
     }
 
     /// @dev The last `BountyPaid` in `logs`.
@@ -822,6 +864,168 @@ contract VaultRolloutTest is PlacementFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // Re-audit findings 10, 12 and 13
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit finding 10.** A bid ladder anchors at the reference, like every ask ladder, so no bid
+    ///         cell can straddle `sqrtPrice(P_ref / P_counter)` — the price `LadderPositionValuer` decomposes
+    ///         every position at (I7).
+    ///
+    /// @dev Bids used to anchor at `pool.tick`, which is the same anchor only while the pool sits at the
+    ///      reference. With the pool above it — a rate-limited `P_ref`, or `REF_DIVERGED` — the top bid cell can
+    ///      span the reference, the valuer writes its AMPS half off at zero (I5), and `A` falls by up to a third
+    ///      of the collateral being placed: the 2 bp R1 post-condition then reverts `deployBonded` and every
+    ///      governance bid on a valuation artefact. {VaultPlacementLib-_cells}' bid branch already takes
+    ///      `min(fromAnchor, fromTick)`, so the reference anchor can only pull the ladder *down*, never up
+    ///      through the tick.
+    function test_r10_theBidLadderAnchorsAtTheReferenceAndStaysBelowIt() public {
+        PoolId spoke = spokePools[0];
+        bondDeposit(address(stocks[0]), 20e18);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        // Put the pool ~1,500 ticks above the reference without moving the *market*: the divergence check is
+        // measured against `P_mkt`, which is untouched, so what is under test is the anchor and not the gauntlet.
+        // This is the shape a rate-limited `P_ref` produces after a fast rise -- and the shape `REF_DIVERGED`
+        // produces outright, since it pins the reference at NAV while the pool trades at a premium. Slot 0's high
+        // half is `pRefX18` (`docs/phase2-state-model.md` §1.1); 86% of it is `exp(-1500 / 10000)` to a tick.
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(0))));
+        uint256 lowered = ((word >> 128) * 86) / 100;
+        vm.store(address(vault), bytes32(uint256(0)), bytes32((lowered << 128) | (word & type(uint128).max)));
+        assertEq(vault.pRefX18(), lowered, "the reference now sits below the market");
+
+        int24 refTick = PriceLib.fairTick(vault.pRefX18(), STOCK_USD8[0], 18, TICK_SPACING);
+        assertGt(int256(tickOf(spoke)) - int256(refTick), int256(1000), "the pool is well above the reference");
+
+        vm.recordLogs();
+        uint256 placed = vault.deployBonded(constituentIds[0]);
+        assertGt(placed, 0, "the bonded collateral was placed -- R1 did not refuse it");
+
+        (bool seen, int24 anchor) = _lastBidAnchor(vm.getRecordedLogs(), spoke);
+        assertTrue(seen, "a bid ladder was laid");
+        assertEq(anchor, refTick, "and it anchored at the reference, not at the tick");
+
+        // Every cell this call laid lies below the reference, which is the property the anchor buys: a straddled
+        // bid is the one the valuer writes off at zero (I5) and the 2 bp R1 bound then reverts. The tolerance is
+        // one tick spacing -- `_cells` adds the spacing back before it floors onto the doubling grid, so that the
+        // bid side's rounding residue is the same size and shape as the ask side's (ruling AX) instead of a whole
+        // doubling stricter. Sixty ticks against a cell 6,900 wide is what the anchor is allowed to give away;
+        // 1,500 is what it takes back.
+        PlacementRecord[] memory records = ladderOf(spoke);
+        uint256 bids;
+        for (uint256 i; i < records.length; ++i) {
+            if (records[i].above || records[i].liquidity == 0) continue;
+            if (records[i].placedAt != uint32(block.timestamp)) continue;
+            assertLe(records[i].upperTick, refTick + TICK_SPACING, "every bid cell lies below the reference");
+            assertLt(records[i].upperTick, tickOf(spoke) - 1000, "and far below the tick it used to anchor at");
+            ++bids;
+        }
+        assertGt(bids, 0, "there were bid cells to check");
+    }
+
+    /// @notice **Re-audit finding 12.** The 24-hour window is rolling, not tumbling: there is no edge for two
+    ///         rollouts a minute apart to straddle, so they cannot move two days' allowance between them.
+    ///
+    /// @dev `moved` used to be zeroed outright the first time a rollout arrived after `windowStart + ONE_DAY`,
+    ///      and `windowStart` was re-stamped only then. A keeper who spent the allowance a second before that
+    ///      edge and asked again a second after it moved `2 x rolloutBpsPerDay` inside a rolling interval of
+    ///      about zero — 360 AMPS at the launch parameters, halving the time to drain the entry pools to
+    ///      `entryFloorBps`. `moved` now decays linearly over a day from the *last charge*, so the budget released
+    ///      between two rollouts is exactly the elapsed fraction of one day's allowance, whenever they happen.
+    function test_r12_theWindowDoesNotTumbleAtTheDayBoundary() public {
+        // A first rollout opens the window; under the old rule its edge is here plus a day.
+        // `block.timestamp` is loop-invariant to solc and is common-subexpression-eliminated across the warps
+        // below (hazard S in `docs/phase3-state-model.md` §12.3), so the clock is read through the cheatcode.
+        uint256 opened = vm.getBlockTimestamp();
+        assertGt(vault.rollout(constituentIds[0]), 0, "the window is open and charged");
+
+        // Almost a day later, spend nearly the whole allowance — still inside the old window.
+        uint256 step = Constants.PLACEMENT_COOLDOWN_SECONDS + 1;
+        warpBy(uint256(Constants.ONE_DAY) - step);
+        syncMarket();
+        _forceProposal((DAILY_BUDGET * 9) / 10);
+        uint256 second = vault.rollout(constituentIds[1]);
+        assertGt(second, 0, "the allowance had refilled by then");
+        assertLt(vm.getBlockTimestamp(), opened + uint256(Constants.ONE_DAY), "still inside the old window");
+
+        // Two minutes later the *old* window has tumbled and handed out a whole second allowance. It does not.
+        warpBy(2 * step);
+        syncMarket();
+        assertGe(vm.getBlockTimestamp(), opened + uint256(Constants.ONE_DAY), "past the old window's hard edge");
+        _forceProposal(DAILY_BUDGET);
+        vm.expectPartialRevert(RolloutLimitExceeded.selector);
+        vault.rollout(constituentIds[1]);
+
+        // What those two minutes actually released is the elapsed fraction of one day's allowance, and no more.
+        uint256 released = (DAILY_BUDGET * 2 * step) / uint256(Constants.ONE_DAY);
+        _forceProposal(released);
+        uint256 third = vault.rollout(constituentIds[1]);
+        assertLe(second + third, DAILY_BUDGET + released, "two rollouts across the old edge move one allowance");
+    }
+
+    /// @notice **Re-audit finding 12, second half.** A rollout the destination refuses charges the window with
+    ///         what the entry pools actually gave up, not with what the harvest lifted and the rollback put back.
+    ///
+    /// @dev With the live-cell budget saturated the harvest and the re-placement can cancel exactly, so charging
+    ///      `moved` burned the whole day's allowance with zero net movement — a permissionless call, costing only
+    ///      gas, that denied rollout for twenty-four hours.
+    function test_r12_theWindowIsChargedOnTheRealisedDrainNotOnTheHarvest() public {
+        vm.prank(TIMELOCK);
+        vault.setLadderShape(
+            Constants.LADDER_TILT_X18_DEFAULT,
+            Constants.LADDER_DOUBLINGS_MAX,
+            Constants.SEED_HALVINGS_DEFAULT,
+            Constants.BOND_BID_HALVINGS_DEFAULT
+        );
+        forceLiveCells(Constants.MAX_LIVE_CELLS);
+
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        uint256 moved = vault.rollout(constituentIds[0]);
+        assertGt(moved, 0, "the entry pools gave up inventory");
+
+        (uint256 movedAmps, uint256 placedAmps) = _rolloutIn(vm.getRecordedLogs());
+        assertLt(placedAmps, movedAmps, "and the destination could not take all of it");
+
+        // The rollback put the difference back where it came from, so the window is charged the net drain.
+        assertLt(_rolloutMoved24h(), movedAmps, "the window was not charged for the harvest the call undid");
+        assertGt(_rolloutMoved24h(), 0, "but it was charged for what really left");
+    }
+
+    /// @notice **Re-audit finding 13.** The entry-pool floor is measured over the inventory the harvest is
+    ///         willing to move, not over everything the ask cells hold.
+    ///
+    /// @dev `_harvestAsks` skips cells whose upper bound the high-water mark has crossed — AMPS the vault sold on
+    ///      the way up and bought back on the way down, which belongs to the buyback burn — while `_askInventory`
+    ///      counted them. The two are compared against each other, so the floor granted room the tradeable depth
+    ///      did not have and the quotable ask depth could sit below the governed floor while the check said it
+    ///      did not.
+    function test_r13_theEntryFloorCountsOnlyMovableInventory() public {
+        // Put the mark above the hub's whole ask ladder: every unfilled hub ask is buyback inventory now.
+        hook.setHighWaterTick(hubPool, _highestAskUpperIn(hubPool));
+
+        uint256 counted = _entryAskInventory();
+        uint256 movable = _movableEntryAskInventory();
+        assertLt(movable, counted, "the mark took the hub's asks out of the harvest's reach");
+
+        // A floor strictly between the two: satisfied by the old inflated count, breached by the real one.
+        uint16 floorBps = uint16(((movable + counted) / 2) * Constants.BPS / Constants.POL_SHARES);
+        assertGt(floorBps, 0, "the floor is expressible in bps of the POL tranche");
+        vm.prank(TIMELOCK);
+        vault.setRolloutParams(Constants.ROLLOUT_BPS_PER_DAY_DEFAULT, floorBps);
+
+        _forceProposal(1e18);
+        vm.expectPartialRevert(RolloutLimitExceeded.selector);
+        vault.rollout(constituentIds[0]);
+
+        // With the mark back at the live tick every ask cell is movable again, the same floor is clear, and the
+        // same proposal goes through: it is the mark that decides, and nothing else changed.
+        hook.setHighWaterTick(hubPool, tickOf(hubPool));
+        assertEq(_movableEntryAskInventory(), counted, "everything is movable again");
+        _forceProposal(1e18);
+        assertGt(vault.rollout(constituentIds[0]), 0, "and the rollout is allowed");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
 
@@ -849,6 +1053,52 @@ contract VaultRolloutTest is PlacementFixture {
     /// @dev The two entry pools' unfilled ask inventory.
     function _entryAskInventory() private view returns (uint256) {
         return _askInventoryOf(hubPool) + _askInventoryOf(wethPool);
+    }
+
+    /// @dev The same, minus the cells the high-water mark has crossed: what {VaultRolloutLib-_harvestAsks} will
+    ///      actually move, and therefore what the entry floor has to be measured over (re-audit finding 13).
+    function _movableAskInventoryOf(PoolId poolId) private view returns (uint256 inventory) {
+        int24 tick = tickOf(poolId);
+        int24 highWater = hook.highWaterTick(poolId);
+        PlacementRecord[] memory records = ladderOf(poolId);
+        for (uint256 i; i < records.length; ++i) {
+            if (!records[i].above || records[i].liquidity == 0 || records[i].lowerTick <= tick) continue;
+            if (records[i].upperTick <= highWater) continue;
+            inventory += askAmpsIn(records[i]);
+        }
+    }
+
+    /// @dev The two entry pools' movable ask inventory.
+    function _movableEntryAskInventory() private view returns (uint256) {
+        return _movableAskInventoryOf(hubPool) + _movableAskInventoryOf(wethPool);
+    }
+
+    /// @dev The top of a pool's ask ladder, so a test can put the high-water mark above every ask cell.
+    function _highestAskUpperIn(PoolId poolId) private view returns (int24 highest) {
+        PlacementRecord[] memory records = ladderOf(poolId);
+        for (uint256 i; i < records.length; ++i) {
+            if (records[i].above && records[i].upperTick > highest) highest = records[i].upperTick;
+        }
+    }
+
+    /// @dev The AMPS price the spoke `i` pool is trading at, 18 decimals, for re-seeding the rings after a pump.
+    function _spokeAmpsPriceUsd18(uint256 i) private view returns (uint256 priceUsd18) {
+        return
+            PriceLib.sqrtPriceX96ToAmpsPriceUsd18(PriceLib.tickToSqrtPriceX96(tickOf(spokePools[i])), STOCK_USD8[i], 18);
+    }
+
+    /// @dev The anchor of the last bid `Placement` in `logs` for `poolId`.
+    function _lastBidAnchor(Vm.Log[] memory logs, PoolId poolId) private view returns (bool seen, int24 anchor) {
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics.length < 2) continue;
+            if (entry.topics[0] != IAmpsVault.Placement.selector) continue;
+            if (entry.topics[1] != PoolId.unwrap(poolId)) continue;
+            (bool above,,, int24 anchorTick,,,) =
+                abi.decode(entry.data, (bool, uint8, uint256, int24, bytes32, int24, int24));
+            if (above) continue;
+            return (true, anchorTick);
+        }
     }
 
     /// @dev The USDG the PoolManager holds, i.e. everything the hub's bids and proceeds are made of.

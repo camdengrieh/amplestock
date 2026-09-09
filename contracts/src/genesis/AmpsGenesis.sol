@@ -59,7 +59,22 @@ contract AmpsGenesis is IAmpsGenesis {
     /// @dev The gas ceiling on the one optional read this contract makes of the vault's feed registry. Bounded for
     ///      the same reason `AmpsVault._gateRead` is: a pointer this contract does not own must not be able to
     ///      turn an optional cross-check into an out-of-gas.
-    uint256 private constant FEED_READ_GAS = 200_000;
+    ///
+    /// @dev **400,000, the same budget every other consumer gives the registry** (audit lead, 2026-09-09). It was
+    ///      200,000, half of `Constants.COMPOSITE_READ_GAS`, and `latestAnswerUsd18` is a composite read: an
+    ///      aggregator probe plus up to two `getRoundData` rounds behind the stateless jump rule plus the session
+    ///      arithmetic. Under-budgeting it here is not a liveness cap, it is a silent downgrade of `P0` — the
+    ///      launch reference of the whole system — to the price recorded at `createAuctions`, up to a whole
+    ///      bidding window earlier, on a read that would have succeeded for any other caller.
+    uint256 private constant FEED_READ_GAS = 400_000;
+
+    /// @dev The gas ceiling on the optional `onTokensReceived()` nudge into a freshly deployed auction. The
+    ///      auction comes from a factory this contract does not control, and the nudge is best-effort by
+    ///      construction — a factory that already recorded the tranche has no such function and the call fails
+    ///      harmlessly. Unbounded, it handed 63/64 of `createAuctions`'s frame to third-party code on a path that
+    ///      cannot be retried, since the leg's CREATE2 address is already taken by the time it runs (audit lead,
+    ///      2026-09-09). The real work is one storage write; four probe budgets is orders of magnitude more.
+    uint256 private constant NUDGE_GAS = 200_000;
 
     // -------------------------------------------------------------------------------------------------------------
     // Immutables
@@ -446,7 +461,7 @@ contract AmpsGenesis is IAmpsGenesis {
         // Some CCA revisions record the funding lazily and emit `TokensReceived` from a nudge rather than from the
         // transfer. The nudge is optional by construction: a factory that already recorded the tranche has no such
         // function and the call fails harmlessly, and the balance assertion below is what actually decides.
-        (bool ok,) = auction.call(abi.encodeWithSignature("onTokensReceived()"));
+        (bool ok,) = auction.call{gas: NUDGE_GAS}(abi.encodeWithSignature("onTokensReceived()"));
         ok;
 
         // `>=` for the reason {createAuctions} gives: the leg's CREATE2 address is derivable from the proposal's
@@ -491,6 +506,15 @@ contract AmpsGenesis is IAmpsGenesis {
 
         uint64 endBlock = leg.endBlock();
         if (block.number < endBlock) revert AuctionNotEnded(auction, endBlock);
+        // **And not before claiming opens either** (audit lead, 2026-09-09). `sweepUnsoldTokens` runs below, and
+        // whether an auction is willing to return its unsold tranche between `endBlock` and `claimBlock` is a
+        // property of bytecode this contract does not own and cannot re-run: `settle()` is one-shot, so a sweep
+        // that silently returned nothing in that window would strand the tranche for good. `claimBlock >=
+        // endBlock` is enforced at creation ({_createLeg}), so waiting for it costs an already-ended auction only
+        // the operator's patience and removes the question entirely. The error names the block to wait for, in the
+        // same shape the end-block refusal above does.
+        uint64 claimBlock = leg.claimBlock();
+        if (block.number < claimBlock) revert AuctionNotEnded(auction, claimBlock);
 
         // `isGraduated` and `clearingPrice` both read the latest checkpoint, which is only written when a bid
         // arrives. Forcing one here is what makes the end block itself checkpointed and the price final.

@@ -216,13 +216,13 @@ contract AmpsHookTest is HookTestFixture {
         assertEq(entry.tickSpacing, TICK_SPACING, "tick spacing");
         assertEq(entry.counterDecimals, 6, "USDG decimals");
         assertEq(entry.maxTickMovePerBlock, Constants.MAX_TICK_MOVE_PER_BLOCK_DEFAULT, "truncation cap");
-        assertEq(entry.uiMultiplierX18, uint64(Constants.WAD), "entry pools carry a unit multiplier");
+        assertEq(entry.uiMultiplierX9, uint64(Constants.WAD / 1e9), "entry pools carry a unit multiplier");
 
         HookPoolState memory spoke = hook.poolState(stockId);
         assertEq(uint8(spoke.poolClass), uint8(PoolClass.SPOKE), "class");
         assertEq(spoke.buyFeeBps, Constants.BUY_FEE_BPS_SPOKE_DEFAULT, "spoke buy fee");
         assertEq(spoke.constituentId, SPOKE_CONSTITUENT_ID, "constituent");
-        assertEq(spoke.uiMultiplierX18, uint64(1e18), "the probed multiplier");
+        assertEq(spoke.uiMultiplierX9, uint64(1e9), "the probed multiplier, as X9");
         assertEq(spoke.lastTick, _currentTick(stockId), "lastTick seeded at the opening tick");
         assertEq(spoke.fairTick, _currentTick(stockId), "fairTick seeded at the opening tick");
     }
@@ -320,7 +320,7 @@ contract AmpsHookTest is HookTestFixture {
         uint32 surgeArmedAt,
         uint16 captureFeeBps,
         uint32 captureArmedAt,
-        uint64 uiMultiplierX18,
+        uint64 uiMultiplierX9,
         uint64 varianceX12,
         uint32 lastCorporateCheck
     ) public pure {
@@ -329,7 +329,7 @@ contract AmpsHookTest is HookTestFixture {
             surgeArmedAt: surgeArmedAt,
             captureFeeBps: captureFeeBps,
             captureArmedAt: captureArmedAt,
-            uiMultiplierX18: uiMultiplierX18,
+            uiMultiplierX9: uiMultiplierX9,
             varianceX12: varianceX12,
             lastCorporateCheck: lastCorporateCheck
         });
@@ -339,7 +339,7 @@ contract AmpsHookTest is HookTestFixture {
         assertEq(out.surgeArmedAt, a.surgeArmedAt);
         assertEq(out.captureFeeBps, a.captureFeeBps);
         assertEq(out.captureArmedAt, a.captureArmedAt);
-        assertEq(out.uiMultiplierX18, a.uiMultiplierX18);
+        assertEq(out.uiMultiplierX9, a.uiMultiplierX9);
         assertEq(out.varianceX12, a.varianceX12);
         assertEq(out.lastCorporateCheck, a.lastCorporateCheck);
     }

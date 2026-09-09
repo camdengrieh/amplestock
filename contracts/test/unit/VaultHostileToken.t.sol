@@ -3,9 +3,12 @@ pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
+import {PoolClass} from "../../src/types/Types.sol";
 import {AmpsVaultFixture} from "../mocks/AmpsVaultFixture.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
 /// @notice Opens a delta on the PoolManager that nobody closes.
 ///
@@ -268,6 +271,72 @@ contract VaultHostileTokenTest is AmpsVaultFixture {
         uint256 gasBefore = gasleft();
         vault.checkpoint{gas: 30_000_000}();
         assertLt(gasBefore - gasleft(), 5_000_000, "the sweep's calls into the token are capped, not open-ended");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Re-audit finding 8 — the claims-only fallback's gas reserve
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit finding 8.** The unblockable claims-only fallback is affordable at a full constituent
+    ///         set: with the ERC-20 attempt burned by a hostile constituent, every one of 32 assets is still paid.
+    ///
+    /// @dev The reserve held back from the first attempt used to be a flat 700,000, whose own NatSpec claimed it
+    ///      covered every registerable asset. It did not: the fallback unlock does one ERC-6909 `transfer` per
+    ///      asset at ~27.5k cold, so it needs ~900k at 32 assets and ~1.8M at 66. The fallback is deliberately
+    ///      *not* `try`-wrapped — it moves balances the vault is known to hold and calls no token — so running out
+    ///      of gas inside it reverts the whole redemption, and the redemption is the one entry point nothing may
+    ///      stop (§7). The reserve now scales with the list it has to walk.
+    function test_r09_theClaimsFallbackIsAffordableAt32Assets() public {
+        _registerExtraConstituents(28);
+        assertEq(vault.assetCount(), 32, "a full constituent set plus the two entry counters");
+        _assertEveryAssetIsPaidAsAClaim();
+    }
+
+    /// @notice And at the registry's own ceiling: `MAX_CONSTITUENTS` plus the two entry counters.
+    function test_r09_theClaimsFallbackIsAffordableAtTheRegistryCeiling() public {
+        _registerExtraConstituents(62);
+        assertEq(vault.assetCount(), 66, "MAX_CONSTITUENTS + WETH + USDG");
+        _assertEveryAssetIsPaidAsAClaim();
+    }
+
+    /// @dev Registers `count` further constituents, each with a feed and a real bonded balance, so that every one
+    ///      of them is on the redemption's walk.
+    function _registerExtraConstituents(uint256 count) private {
+        for (uint256 i; i < count; ++i) {
+            MockStockToken extra = new MockStockToken("Extra", "EXTR");
+            registry.addConstituentAndPool(
+                address(extra),
+                address(uint160(0xFEED0000 + i)),
+                PoolId.wrap(keccak256(abi.encode("extra", i))),
+                PoolClass.SPOKE,
+                60,
+                0
+            );
+            feeds.setAnswer(address(extra), STOCK_USD8);
+            extra.mint(address(this), 1e18);
+            bondDeposit(address(extra), address(this), 1e18);
+        }
+    }
+
+    /// @dev The ERC-20 attempt is abandoned as a whole (a constituent opens a PoolManager delta of its own from
+    ///      inside `transfer`), so the claims-only unlock is what pays — and it must pay *everything*.
+    function _assertEveryAssetIsPaidAsAClaim() private {
+        stock.setTransferHook(address(opener), abi.encodeCall(DeltaOpener.open, ()));
+
+        vm.prank(ALICE);
+        (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata{gas: 30_000_000}(1e18, ALICE);
+
+        uint256 paid;
+        for (uint256 i; i < tokens.length; ++i) {
+            if (amounts[i] == 0) continue;
+            assertEq(
+                poolManager.balanceOf(ALICE, Currency.wrap(tokens[i]).toId()),
+                amounts[i],
+                "every asset was paid as a claim by the fallback"
+            );
+            ++paid;
+        }
+        assertGt(paid, 2, "and there really were assets with a payout to pay");
     }
 
     // -------------------------------------------------------------------------------------------------------------

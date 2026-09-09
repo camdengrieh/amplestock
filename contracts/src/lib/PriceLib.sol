@@ -102,12 +102,35 @@ library PriceLib {
         pure
         returns (uint160 sqrtPriceX96)
     {
+        sqrtPriceX96 = ampsPerCounterToSqrtPriceX96OrZero(pRefUsd18, counterPriceUsd8, counterDecimals);
+        if (sqrtPriceX96 == 0) revert PriceOutOfTickRange();
+    }
+
+    /// @notice {ampsPerCounterToSqrtPriceX96}, answering **zero** instead of reverting when the implied pool price
+    ///         lies outside `[TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE)`.
+    ///
+    /// @dev The two functions are one body: the reverting form is this one plus a `require`, so they can never
+    ///      disagree about where the domain ends. It exists for callers whose contract is "zero when the inputs
+    ///      are outside the range `PriceLib` accepts" and which must therefore not carry a latent revert of their
+    ///      own — `VaultNavLib._referenceSqrtPrice`, which the permissionless checkpoint and the realised index
+    ///      weight both go through (audit lead, 2026-09-09). Every *other* refusal `_rawPriceFraction` makes
+    ///      (`ZeroPrice`, `DecimalsOutOfRange`, `PriceOverflow`) still reverts here: those are malformed inputs a
+    ///      caller can and does screen for, not a price out of domain.
+    /// @param pRefUsd18 The AMPS reference price in USD, 18 decimals. Must be non-zero.
+    /// @param counterPriceUsd8 The counter asset's Chainlink USD answer, 8 decimals. Must be non-zero.
+    /// @param counterDecimals The counter asset's ERC-20 decimals.
+    /// @return sqrtPriceX96 The v4 Q64.96 sqrt price, or zero when it is out of the tick range.
+    function ampsPerCounterToSqrtPriceX96OrZero(uint256 pRefUsd18, uint256 counterPriceUsd8, uint8 counterDecimals)
+        internal
+        pure
+        returns (uint160 sqrtPriceX96)
+    {
         (uint256 numerator, uint256 denominator) = _rawPriceFraction(pRefUsd18, counterPriceUsd8, counterDecimals);
 
         // `q == floor(price)`. `price` can never exceed `(MAX_SQRT_PRICE / 2**96)**2 < 2**128`, so anything at or
         // above `2**128` is out of range by inspection and is rejected before it can overflow the Q64 window below.
         uint256 q = numerator / denominator;
-        if (q >= (uint256(1) << 128)) revert PriceOutOfTickRange();
+        if (q >= (uint256(1) << 128)) return 0;
 
         uint256 result;
         if (q < (uint256(1) << 64)) {
@@ -121,7 +144,7 @@ library PriceLib {
             result = Math.sqrt(ratioX64, Math.Rounding.Ceil) << 64;
         }
 
-        if (result < TickMath.MIN_SQRT_PRICE || result >= TickMath.MAX_SQRT_PRICE) revert PriceOutOfTickRange();
+        if (result < TickMath.MIN_SQRT_PRICE || result >= TickMath.MAX_SQRT_PRICE) return 0;
         sqrtPriceX96 = uint160(result);
     }
 

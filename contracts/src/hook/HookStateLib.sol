@@ -19,7 +19,7 @@ import {PoolClass, Session} from "../types/Types.sol";
 ///      [ 16.. 31] uint16 constituentId      [ 24.. 55] uint32 lastUpdate        [ 16.. 47] uint32 surgeArmedAt
 ///      [ 32.. 39] uint8  poolClass          [ 56.. 79] int24  fairTick          [ 48.. 63] uint16 captureFeeBps
 ///      [ 40.. 63] int24  tickSpacing        [ 80..103] int24  innerBandTicks    [ 64.. 95] uint32 captureArmedAt
-///      [ 64.. 87] int24  maxTickMovePerBlock[104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX18
+///      [ 64.. 87] int24  maxTickMovePerBlock[104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX9
 ///      [ 88.. 95] uint8  counterDecimals    [128..143] uint16 dynCapBps         [160..223] uint64 varianceX12
 ///      [ 96..119] int24  gridBaseTick       [144..151] uint8  session           [224..255] uint32 lastCorporateCheck
 ///      [120..127] bool   initialized        [152..159] uint8  gateFlags
@@ -47,6 +47,20 @@ library HookStateLib {
 
     /// @dev `gateFlags` bit 3: a `uiMultiplier()` step larger than `DIVIDEND_STEP_BPS_MAX` was observed.
     uint8 internal constant FLAG_CA_ARMED = 8;
+
+    /// @dev `gateFlags` bit 4: the standing dividend-capture toll was armed by a **downward** `uiMultiplier()`
+    ///      step, so the arbitrage it tolls runs the other way.
+    ///
+    /// @dev **Why the direction has to be stored rather than derived** (audit fix, 2026-09-09). The toll is
+    ///      asymmetric by design: it is charged only on the side that takes the mispricing out of the pool, and
+    ///      `IFeePolicy.FeeInput.captureDirectionTakesStock` is the field that says which side that is. A `+delta`
+    ///      step makes each raw stock token worth more, so the arbitrage takes stock out (`zeroForOne == true`); a
+    ///      `-delta` step — a reverse split, a restatement, a downward correction — makes it worth less, so the
+    ///      arbitrage brings stock *in* and takes AMPS out, and tolling `zeroForOne` then charges the losing side
+    ///      while the profitable one pays the pass-through 5 bp. The sign is a property of the *step*, not of the
+    ///      swap being quoted, and the swap quoting it runs up to `DIVIDEND_CAPTURE_HALF_LIFE * 8` seconds later —
+    ///      so it has to be recorded when the toll is armed. Bit 4 was the first free bit of `gateFlags`.
+    uint8 internal constant FLAG_STEP_DOWN = 16;
 
     uint256 private constant MASK_8 = 0xff;
     uint256 private constant MASK_16 = 0xffff;
@@ -100,12 +114,22 @@ library HookStateLib {
     ///      variance - and therefore a lower fee - on exactly the moves that should raise it. Saturation itself
     ///      is fee-neutral: `f_vol` is already pinned at `F_VOL_CAP_BPS` from `EWMA(d^2) ~ 20,000` ticks^2
     ///      (sigma ~ 141 ticks), three orders of magnitude below the ceiling.
+    ///
+    /// @dev **`uiMultiplierX9` is the second field whose unit is not the wire's, and for the opposite reason**
+    ///      (audit fix, 2026-09-09). `IStockToken.uiMultiplier()` is an 18-decimal cumulative display multiplier,
+    ///      and 64 bits hold only `type(uint64).max / 1e18` ~ **18.45x** of it. That is not a theoretical bound:
+    ///      a name at 4.0x crosses it on one 5:1 split, and once the store saturated every later reading clipped
+    ///      to the same value, `deltaBps` was permanently zero, and the detector below stopped arming the capture
+    ///      toll, the surge and the corporate-action flag for that constituent for good. Storing `m / 1e9` instead
+    ///      raises the ceiling to ~1.8e10x with nine decimals of resolution left - four orders of magnitude finer
+    ///      than the 1 bp the step test measures at - so the field now saturates only on a reading no honest
+    ///      issuer can produce, and {AmpsHook} treats *that* as a failed probe rather than as "nothing observed".
     struct Armed {
         uint16 surgeBps;
         uint32 surgeArmedAt;
         uint16 captureFeeBps;
         uint32 captureArmedAt;
-        uint64 uiMultiplierX18;
+        uint64 uiMultiplierX9;
         uint64 varianceX12;
         uint32 lastCorporateCheck;
     }
@@ -194,7 +218,7 @@ library HookStateLib {
     /// @return word The packed word.
     function packArmed(Armed memory a) internal pure returns (uint256 word) {
         word = uint256(a.surgeBps) | (uint256(a.surgeArmedAt) << 16) | (uint256(a.captureFeeBps) << 48)
-            | (uint256(a.captureArmedAt) << 64) | (uint256(a.uiMultiplierX18) << 96) | (uint256(a.varianceX12) << 160)
+            | (uint256(a.captureArmedAt) << 64) | (uint256(a.uiMultiplierX9) << 96) | (uint256(a.varianceX12) << 160)
             | (uint256(a.lastCorporateCheck) << 224);
     }
 
@@ -206,7 +230,7 @@ library HookStateLib {
         a.surgeArmedAt = uint32((word >> 16) & MASK_32);
         a.captureFeeBps = uint16((word >> 48) & MASK_16);
         a.captureArmedAt = uint32((word >> 64) & MASK_32);
-        a.uiMultiplierX18 = uint64((word >> 96) & MASK_64);
+        a.uiMultiplierX9 = uint64((word >> 96) & MASK_64);
         a.varianceX12 = uint64((word >> 160) & MASK_64);
         a.lastCorporateCheck = uint32((word >> 224) & MASK_32);
     }

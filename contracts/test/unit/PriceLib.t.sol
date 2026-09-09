@@ -258,6 +258,30 @@ contract PriceLibTest is Test {
         price.ampsPerCounterToSqrtPriceX96(1e57, 1e8, DEC18);
     }
 
+    /// @notice **Re-audit lead.** The `…OrZero` sibling answers zero on exactly the three inputs the reverting
+    ///         form refuses with `PriceOutOfTickRange`, and is identical to it everywhere else.
+    ///
+    /// @dev `VaultNavLib._referenceSqrtPrice` documents its own contract as "zero when the inputs are outside the
+    ///      range `PriceLib` accepts", and a latent revert of the permissionless checkpoint and of the realised
+    ///      index weight is not that. Every *other* refusal still reverts here: those are malformed inputs a
+    ///      caller can screen for, not a price out of domain.
+    function test_r16_theOrZeroFormAnswersZeroOutOfTheTickRange() public view {
+        assertEq(price.ampsPerCounterToSqrtPriceX96OrZero(1, 1e18, DEC6), 0, "below MIN_SQRT_PRICE");
+        assertEq(
+            price.ampsPerCounterToSqrtPriceX96OrZero(((uint256(1) << 128) - 1) * 1e18, 1e8, DEC18),
+            0,
+            "above MAX_SQRT_PRICE"
+        );
+        assertEq(price.ampsPerCounterToSqrtPriceX96OrZero(1e57, 1e8, DEC18), 0, "above the short circuit");
+
+        // And inside the domain the two forms are the same function.
+        assertEq(
+            price.ampsPerCounterToSqrtPriceX96OrZero(1e18, 180e8, DEC18),
+            price.ampsPerCounterToSqrtPriceX96(1e18, 180e8, DEC18),
+            "identical where the reverting form answers"
+        );
+    }
+
     function test_revert_sqrtPriceOutOfRange() public {
         vm.expectRevert(
             abi.encodeWithSelector(PriceLib.SqrtPriceOutOfRange.selector, uint160(TickMath.MIN_SQRT_PRICE - 1))

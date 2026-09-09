@@ -216,6 +216,28 @@ contract VaultGenesisTest is AmpsVaultFixture {
         vault.setPolicyPointer(bytes32("genesis"), replacement);
     }
 
+    /// @notice **Re-audit lead.** The `genesis` pointer latches at the **mint**, not at the placement.
+    ///
+    /// @dev `genesisMint()` mints half of `S0` to whatever address that slot holds, and `genesisPlace()` is what
+    ///      froze the wiring — so between the two steps, for the whole length of the auction's bidding window, the
+    ///      timelock could re-point `genesis` at another address and hand it the adapter's claim on the placement.
+    ///      `_genesisMinted` already recorded the moment that stopped being a policy choice; it just had no reader.
+    function test_r16_theGenesisPointerLatchesAtTheMintNotThePlacement() public {
+        vm.prank(TIMELOCK);
+        vault.genesisMint(genesisMintParams());
+        assertTrue(vault.genesisMinted(), "the mint has run");
+
+        address replacement = address(new MockStockToken("Replacement", "REPL"));
+        vm.prank(TIMELOCK);
+        vm.expectRevert(AlreadyInitialized.selector);
+        vault.setPolicyPointer(bytes32("genesis"), replacement);
+
+        // The pointers that are not wiring are unaffected: only the one the mint has already paid out is closed.
+        vm.prank(TIMELOCK);
+        vault.setPolicyPointer(bytes32("ladderPolicy"), replacement);
+        assertEq(vault.ladderPolicy(), replacement, "an upgradeable pointer still moves");
+    }
+
     // -------------------------------------------------------------------------------------------------------------
     // Step two — genesisPlace
     // -------------------------------------------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
+import {IMarketReference} from "../../src/interfaces/IMarketReference.sol";
 import {LadderLib} from "../../src/lib/LadderLib.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {Constants} from "../../src/types/Constants.sol";
@@ -984,6 +985,26 @@ contract VaultPlacementTest is PlacementFixture {
         hook.setResetHighWaterReverts(true);
         vm.prank(TIMELOCK);
         assertEq(vault.place(hubPool, false, SEED_USDG), SEED_USDG, "the seed bids still go in");
+    }
+
+    /// @notice **Re-audit lead.** A market reference that answers `highWaterTick` with something too short to
+    ///         decode degrades the buyback to "nothing counts as bought back" rather than bricking the compound.
+    ///
+    /// @dev The last typed `try` left on a pointer-upgradeable target in `VaultPlacementLib`. Solidity decodes a
+    ///      *successful* call's returndata in the caller's frame, so a short — or out-of-range — answer raised a
+    ///      `Panic` **past** the `catch` and took `compound`, `place` and every burnback with it: a governance
+    ///      pointer bricking placements instead of degrading them.
+    function test_r16_aMalformedHighWaterAnswerDegradesInsteadOfBrickingThePlacement() public {
+        vm.mockCall(address(hook), abi.encodeWithSelector(IMarketReference.highWaterTick.selector), hex"01");
+
+        vm.prank(KEEPER);
+        (, uint256 burned) = vault.compound(hubPool);
+        assertEq(burned, 0, "an unreadable mark means nothing counts as bought back");
+
+        // And a governance placement on the same pool still goes in.
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        vm.prank(TIMELOCK);
+        assertGt(vault.place(hubPool, false, 10e6), 0, "the placement path is unaffected");
     }
 
     // -------------------------------------------------------------------------------------------------------------

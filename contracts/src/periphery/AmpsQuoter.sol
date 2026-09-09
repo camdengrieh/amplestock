@@ -345,6 +345,14 @@ contract AmpsQuoter is IAmpsQuoter {
         view
         returns (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed)
     {
+        // **The router's own two preconditions, mirrored** (audit fix, 2026-09-09). `rotate` refuses `hop1 ==
+        // hop2` and a pair with no spoke leg, so a quote for either shape is a quote for a transaction that
+        // always reverts — the one thing this contract exists to stop a front end from publishing. Zeros
+        // throughout: there is no fee to report for a route that cannot be built, and `amountOut == 0` is already
+        // this function's "no route".
+        if (PoolId.unwrap(hop1) == PoolId.unwrap(hop2)) return (0, 0, 0, 0);
+        if (!_isSpoke(hop1) && !_isSpoke(hop2)) return (0, 0, 0, 0);
+
         bool refuse1;
         {
             bool okFee1;
@@ -793,10 +801,24 @@ contract AmpsQuoter is IAmpsQuoter {
         ampsFeeBps = uint16(ampsFeeBps);
         buyFeeBps = uint16(buyFeeBps);
 
-        uint256 base = ampsFeeBps;
-        if (ampsIn != 0 && credit != 0 && ampsFeeBps > buyFeeBps) {
-            uint256 consumed = credit < ampsIn ? credit : ampsIn;
-            base = buyFeeBps + FullMath.mulDivRoundingUp(ampsFeeBps - buyFeeBps, ampsIn - consumed, ampsIn);
+        // **`ampsIn == 0` is the hook's "fully covered" case, not its "no credit" one** (audit fix, 2026-09-09).
+        // `AmpsHook._quote` blends on `uncredited == amountIn - min(credit, amountIn)`, so a zero-sized
+        // pass-through sell leaves `uncredited == 0` and is priced at `buyFeeBps` — which is the answer the view
+        // surface is being asked for, "what would a pass-through sell cost", and not "what does a zero-sized one
+        // cost". Requiring `ampsIn != 0` here answered `ampsFeeBps` instead, so the quoter and the hook disagreed
+        // by up to 495 bp on the one call a front end makes to render a rotation's headline rate.
+        // **The condition is `uncredited == 0`, exactly as the hook's is** (audit fix, 2026-09-09).
+        // `AmpsHook._quote` blends on `uncredited = amountIn - min(credit, amountIn)` and prices a fully covered
+        // pass-through sell — the `ampsIn == 0` degenerate case included, which is "what would a pass-through sell
+        // cost" and not "what does a zero-sized one cost" — at `buyFeeBps`. Requiring `ampsIn != 0 && credit != 0`
+        // here answered `ampsFeeBps` for that case instead, so the quoter and the hook disagreed by up to 495 bp
+        // on the one call a front end makes to render a rotation's headline rate.
+        uint256 uncredited = ampsIn > credit ? ampsIn - credit : 0;
+        uint256 base = buyFeeBps;
+        if (uncredited != 0) {
+            base = ampsFeeBps > buyFeeBps
+                ? buyFeeBps + FullMath.mulDivRoundingUp(ampsFeeBps - buyFeeBps, uncredited, ampsIn)
+                : ampsFeeBps;
         }
 
         uint256 total = base + dynBps;
@@ -887,6 +909,17 @@ contract AmpsQuoter is IAmpsQuoter {
         cfg.constituentId = uint16(_word(data, 5));
         cfg.registered = _word(data, 6) != 0;
         cfg.gridBaseTick = int24(int256(_word(data, 7)));
+    }
+
+    /// @dev Whether a pool is a constituent's spoke, i.e. whether it can be a leg of a rotation at all. Mirrors
+    ///      `AmpsRouter._isSpoke`, through this contract's own bounded registry probe: an unreadable registry
+    ///      reads as "not a spoke", so a route the quoter cannot verify is quoted as no route rather than as one
+    ///      that might revert.
+    /// @param poolId The pool.
+    /// @return spoke Whether it carries a non-zero `constituentId`.
+    function _isSpoke(PoolId poolId) private view returns (bool spoke) {
+        (bool ok, PoolConfig memory cfg) = _poolConfig(poolId);
+        spoke = ok && cfg.registered && cfg.constituentId != 0;
     }
 
     /// @dev `IAmpsHook.poolState`, hand-decoded. Only the fields the quote renders are unpacked; the rest of the

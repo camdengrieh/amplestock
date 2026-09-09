@@ -77,8 +77,8 @@ slot 9-13  address oracleGate / feedRegistry / positionValuer /
            ladderPolicy / rolloutPolicy                          pointer-upgradeable (7 d); the last two are
                                                                  Phase 3, positionValuer is the zero-position stub
 slot 14  address standbyVault                          14-day timelock
-slot 15  uint128 rolloutMoved24h           [  0..127]  Phase 3
-         uint32  rolloutWindowStart        [128..159]
+slot 15  uint128 rolloutMoved24h           [  0..127]  Phase 3; decays linearly to zero over ONE_DAY
+         uint32  rolloutWindowStart        [128..159]   re-stamped on every charge (rolling, not tumbling)
 slot 16  address[] assets                              enumeration for the NAV sum and for redeemProRata
 slot 17  mapping(address => uint256) assetIndex        1-based; 0 means "not an asset"
 slot 18  mapping(PoolId => PlacementRecord[]) ladder   Phase 3, 2 slots per bucket
@@ -462,7 +462,12 @@ under `COMPOSITE_READ_GAS`, 400k). The bond shell probes the registry under the 
 and `bond()` could see different deficits depending on warm storage, so the budget is the one that makes the read
 succeed whenever it is readable at all. **The `k_w` under-weight preference is therefore live**: a name held below its
 target weight gets a wider discount, exactly as the formula says, and a registry that cannot answer still prices
-`deficit == 0`. The ABI and the bond bytecode do not change when it lands. A registry
+`deficit == 0`. **And "the vault cannot price this spoke" is a revert, not a zero** (re-audit finding 11,
+2026-09-09): `deficit = (target - current)/target`, so a reported weight of zero is the *largest* deficit the
+formula admits, and a dead feed, an absent position valuer or an out-of-range reference answering a clean `0`
+walked straight past the target-weight fail-safe and widened the discount to `dMax` for exactly the name nobody
+could price. Those three branches now revert `SpokeUnpriceable`, so the probe fails and the fail-safe stands; a
+literal `0` is reserved for the one case that means it, which is that the vault holds none of the name. The ABI and the bond bytecode do not change when it lands. A registry
 that cannot answer must never be able to close a bond market, which is why the read is a bounded probe and not a
 plain call.
 
@@ -566,11 +571,22 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
   bleed bound measures *both* sides live at the same instant (audit finding 10, 2026-09-08): comparing the stored
   checkpoint — unrefreshable, because `checkpoint()` is gated — against a live valuation made ordinary weekend drift
   of the 24/7 assets roll the whole evacuation back, and an unpriceable side now skips the bound and says so in
-  `MigrationBleedUnchecked` rather than vetoing the escape.
+  `MigrationBleedUnchecked` rather than vetoing the escape. It measures both sides at the same *basis* too
+  (re-audit finding 7, 2026-09-09): `navBefore` is taken **after** the `ACTION_UNWIND` that realises every position
+  into claims, so it is balances against balances. Taken before it, positions were valued at
+  `sqrtPrice(P_ref / P_counter)` (I7) while the standby's side was realised at whatever the pools cleared at, and a
+  pool a fraction of a percent below the reference — one front-running sell into a public, urgent, timelock-free
+  call — tripped the 50 bp bound and reverted the guardian's evacuation.
 * **A gate pointer that *reverts* is read as absent, not as a refusal.** The gate is the one pointer that can refuse
   every governance call; if a broken one refused, nobody could call `setPolicyPointer` to replace it and a contract
   holding no funds would have bricked the protocol. Failing open grants an attacker nothing they would not already
-  have with a `GREEN` gate.
+  have with a `GREEN` gate. **The guardian's protocol freeze is read first, and is exempt from that rule**
+  (re-audit finding 6, 2026-09-09): `protocolFreezeUntil()` is one `SLOAD` behind a getter (~2.6k) while `state(0)`
+  walks the calendar, the feeds, the market reference and the registry (330-390k against real aggregators), so
+  reading the expensive one first put the fail-open `return` between the caller and the freeze — and a gated
+  selector sent with a gas limit that starves the composite and nothing else proceeded while the freeze was live.
+  The refusal that cannot be starved therefore runs before the read that can; neither read's own semantics change,
+  and a gate that answers neither is still absent.
 
 **How the I14 enumeration test verifies it** (`test/unit/GuardSymmetry.t.sol`):
 

@@ -185,7 +185,16 @@ each auction through the factory, funds it, and emits
 **Single-auction mode**: with one leg disabled, that leg's tranche simply stays on the adapter and
 is returned to the vault as unsold at settlement.
 
-### `settle()` — permissionless, once, after every created leg's `endBlock`
+### `settle()` — permissionless, once, after every created leg's `claimBlock`
+
+**It waits for `claimBlock`, not for `endBlock`** (audit lead, 2026-09-09). Step 2 below calls
+`sweepUnsoldTokens()`, and whether an auction is willing to return its unsold tranche between the two blocks is a
+property of factory bytecode the protocol does not own; `settle()` is one-shot, so a sweep that silently returned
+nothing in that window would strand the tranche for good. `startBlock < endBlock <= claimBlock` is enforced at
+creation, so waiting costs an already-ended auction only the operator's patience. With
+`genesis.json`'s `claimDelayHours: 0` the two blocks coincide and nothing about the runbook changes; a non-zero
+delay moves step 5 of §5's table out by exactly that delay.
+
 
 1. `checkpoint()` each leg, so the end block is checkpointed and the clearing price is final;
 2. `sweepCurrency()` on each **graduated** leg, `sweepUnsoldTokens()` on every leg;
@@ -262,7 +271,7 @@ so if the pools are to open at `P0`, the whole of `05_Registry` has to run after
 | 2b | `05_Registry` / `10_TestnetPools` with `REGISTRY_FEEDS_ONLY=true` | step 1 | every feed installed, **no pool registered** |
 | 3 | `06a_GenesisAuction` | `vault.genesis` set; the WETH feed; no gate | `genesisMint` + two funded auctions |
 | 4 | bidding, ~72 h (2.59M blocks at 100 ms) | step 3 | bids |
-| 5 | `06b_GenesisSettle` | every `endBlock` passed; **no pool registered yet** | `settle()` → `genesisPlace` → `P_ref = P0` |
+| 5 | `06b_GenesisSettle` | every `claimBlock` passed (`endBlock` plus `claimDelayHours`, zero at launch); **no pool registered yet** | `settle()` → `genesisPlace` → `P_ref = P0` |
 | 6 | `05_Registry` / `10_TestnetPools` | `pRefX18() == P0`; no gate | 32 pools opened at `P0`, 30 bond markets, index weights |
 | 7 | TWAP warm-up | step 6 | the hub ring covers `twapWindow` |
 | 8 | `09_Phase3Wire` **pass 2** | steps 6-7 | the gate pointer, `GREEN` |

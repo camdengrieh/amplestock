@@ -7,6 +7,7 @@ import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {Constants} from "../types/Constants.sol";
 import {
+    AlreadyInitialized,
     GateNotHealthy,
     NavBleedExceeded,
     NotBonds,
@@ -1268,6 +1269,13 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // Every pointer this setter can write names a contract the vault *calls*. A codeless one is a typo, and
         // for the gate slot specifically it is the typo that used to brick this very function: see {_requireGate}.
         if (newPointer.code.length == 0) revert ZeroAddress();
+        // **The `genesis` pointer latches at the mint, not at the placement** (audit lead, 2026-09-09).
+        // {VaultNavLib-setPointer} refuses a second write once `genesisPlace()` has frozen the wiring, but
+        // `genesisMint()` runs first and mints half of `S0` to whatever address this slot holds — so between the
+        // two steps, for the whole length of the auction's bidding window, the timelock could re-point `genesis`
+        // at another address and hand it the adapter's claim on `genesisPlace`. `_genesisMinted` already recorded
+        // exactly the moment that stopped being a policy choice; it just had no reader. Now it has one.
+        if (slot == bytes32("genesis") && _genesisMinted) revert AlreadyInitialized();
         address previous = VaultNavLib.setPointer(slot, newPointer, _wiringFrozen);
         emit PolicyPointerChanged(slot, previous, newPointer);
     }
@@ -1314,14 +1322,31 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (standby == address(0) || standby != registered) revert NotStandbyVault(standby, registered);
         if (!VaultNavLib.migrationPredicate(_registry, address(this))) revert MigrationPredicateNotMet();
 
-        // **`navBefore` is measured live, at this instant** (audit fix, 2026-09-08). It used to be the stored
-        // `_navPerShareX18`, i.e. the last checkpoint — and `checkpoint()` is gate-gated, so in exactly the states
-        // that make a migration necessary it cannot be refreshed. The bleed bound then compared a stale NAV with a
-        // live one and tripped on ordinary drift of the 24/7 assets: a 2.5% ETH move over a weekend is five times
-        // the 0.5% bound, so the whole evacuation rolled back on a number that had nothing to do with the
-        // evacuation. Measured here, `navBefore` and `navAfter` are the same instant and the bound measures the
-        // migration alone. The dead `NAV_BEFORE` transient write — which NatSpec called the relaxed bound's
-        // channel and nothing ever read — is gone with it.
+        IPoolManager pm = IPoolManager(_POOL_MANAGER);
+
+        // Phase 3: unwind the ladder first. Liquidity left in v4 positions owned by a denylisted vault would be
+        // unreachable by the standby, and the removal itself cannot be blocked — the hook carries no
+        // `BEFORE_REMOVE_LIQUIDITY` bit (I18) and the released counter never leaves the PoolManager.
+        if (_poolKeys().length != 0) {
+            _setUnlockAction(VaultRedeemLib.ACTION_UNWIND);
+            pm.unlock(abi.encode(_AMPS, uint256(1), uint256(1)));
+            _setUnlockAction(0);
+        }
+
+        // **`navBefore` is measured after the unwind, not before it** (audit fix, 2026-09-08, corrected
+        // 2026-09-09). It was first the stored `_navPerShareX18`, i.e. the last checkpoint — and `checkpoint()` is
+        // gate-gated, so in exactly the states that make a migration necessary it cannot be refreshed; the bound
+        // then compared a stale NAV with a live one and tripped on ordinary weekend drift of the 24/7 assets.
+        // Measuring it live fixed the staleness but not the *basis*: with positions still open,
+        // `assetsUsd18Of(this)` values them at `sqrtPrice(P_ref / P_counter)` (I7), the counterfactual reference
+        // price, while `navAfter` on the standby is realised balances at whatever the pool actually cleared at.
+        // A pool sitting ~0.8% below the reference — one front-running sell, which is a cheap thing to arrange
+        // against a call whose whole point is that it is public and urgent — therefore tripped the 50 bp bound
+        // and reverted the guardian's evacuation in the incident it exists for.
+        //
+        // Taken here the two numbers are the same *kind* of number: the unwind above has realised every position
+        // into claims, so both sides are balances and the bound measures the migration and nothing else. The
+        // ordering is the whole fix; the unpriceable-skip below and `MigrationBleedUnchecked` are unchanged.
         //
         // The read is the external `assetsUsd18Of` so it can be `try`-wrapped: a vault the valuer or a feed cannot
         // price must still be evacuable, so an unpriceable *before* skips the bound and says so in an event rather
@@ -1338,17 +1363,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
             // it is explicitly *not* compared with `navAfter`, which is what the finding was about.
             navBefore = _navPerShareX18;
             emit MigrationBleedUnchecked(bytes32("navBefore"));
-        }
-
-        IPoolManager pm = IPoolManager(_POOL_MANAGER);
-
-        // Phase 3: unwind the ladder first. Liquidity left in v4 positions owned by a denylisted vault would be
-        // unreachable by the standby, and the removal itself cannot be blocked — the hook carries no
-        // `BEFORE_REMOVE_LIQUIDITY` bit (I18) and the released counter never leaves the PoolManager.
-        if (_poolKeys().length != 0) {
-            _setUnlockAction(VaultRedeemLib.ACTION_UNWIND);
-            pm.unlock(abi.encode(_AMPS, uint256(1), uint256(1)));
-            _setUnlockAction(0);
         }
 
         // Every claim moves PoolManager-internally: no ERC-20 transfer, so a denylist cannot stop the evacuation.
@@ -1609,6 +1623,20 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @param policy Which of the three refusal sets to apply: {POLICY_PLACEMENT}, {POLICY_MANAGEMENT} or
     ///        {POLICY_BONDS}.
     function _requireGate(uint8 policy) private view {
+        // **The freeze is read first, and it is the cheap read** (audit fix, 2026-09-09). `protocolFreezeUntil()`
+        // is one `SLOAD` behind a getter (~2.6k); `state(0)` walks the calendar, the feed registry, the market
+        // reference and the registry (330-390k against real aggregators). Reading the expensive one first meant
+        // the `return` that treats an unreadable gate as *absent* — which is load-bearing, because this contract
+        // is immutable and a broken pointer must never lock governance out of replacing it — sat between the
+        // caller and the guardian's freeze. A gated selector sent with a gas limit that starves `state()` and
+        // nothing else therefore proceeded while the protocol-wide freeze was live, and the freeze is the one
+        // refusal a guardian can raise with no timelock behind it. The refusal that cannot be starved now runs
+        // before the read that can be: the ordering is the fix, and neither read's own semantics change.
+        (bool frozenKnown, uint256 frozenUntil) = _gateRead(abi.encodeCall(IOracleGate.protocolFreezeUntil, ()));
+        if (frozenKnown && uint32(frozenUntil) > block.timestamp) {
+            revert GateNotHealthy(uint8(GateState.SCHEDULED_FREEZE), bytes32(0));
+        }
+
         (bool known, uint256 word) = _gateRead(abi.encodeCall(IOracleGate.state, (0)));
         if (!known || word > uint256(type(GateState).max)) return;
 
@@ -1619,11 +1647,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (!refuses && policy != POLICY_BONDS) refuses = gateState == GateState.WATCHDOG;
         if (!refuses && policy == POLICY_PLACEMENT) refuses = gateState == GateState.DEGRADED;
         if (refuses) revert GateNotHealthy(uint8(gateState), bytes32(0));
-
-        (known, word) = _gateRead(abi.encodeCall(IOracleGate.protocolFreezeUntil, ()));
-        if (known && uint32(word) > block.timestamp) {
-            revert GateNotHealthy(uint8(GateState.SCHEDULED_FREEZE), bytes32(0));
-        }
     }
 
     /// @dev One bounded `staticcall` on the gate pointer, answered only when a whole word came back. Unknown

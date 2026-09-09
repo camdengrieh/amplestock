@@ -439,9 +439,14 @@ contract GuardSymmetryTest is AmpsVaultFixture {
     }
 
     /// @notice Every *other* path is refused in that same world, which is what makes the exemption meaningful.
+    ///
+    /// @dev The world this breaks into is frozen *and* watchdogged, and since the re-audit fix of 2026-09-09
+    ///      `AmpsVault._requireGate` reads `protocolFreezeUntil()` before `state()` — so the refusal it reports is
+    ///      the freeze (`SCHEDULED_FREEZE`), not the watchdog. Which of the two is named is not the property under
+    ///      test; that a non-redemption path is refused at all is.
     function test_step3_everythingElseIsRefusedInThatWorld() public {
         _breakTheWorld();
-        vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.WATCHDOG), bytes32(0)));
+        vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.SCHEDULED_FREEZE), bytes32(0)));
         vault.checkpoint();
     }
 

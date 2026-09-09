@@ -3,7 +3,7 @@ pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {Constants} from "../../src/types/Constants.sol";
-import {NotGuardian, NotVault} from "../../src/types/Errors.sol";
+import {NavBleedExceeded, NotGuardian, NotVault} from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
 import {Phase3Fixture} from "../integration/Phase3Fixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -174,6 +174,51 @@ contract DenylistMigrationTest is Phase3Fixture {
             healthyPaid += amounts[i];
         }
         assertGt(healthyPaid, 0, "one paused constituent cost only itself");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Re-audit finding 7 — the bleed bound compares two measurements of the same kind
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit finding 7.** A pool trading below the reference no longer reverts the evacuation.
+    ///
+    /// @dev `navBefore` used to be taken with the ladder still open, so `assetsUsd18Of(this)` valued every
+    ///      position at `sqrtPrice(P_ref / P_counter)` — the counterfactual reference price (I7) — while
+    ///      `navAfter` on the standby is realised balances at whatever the pools actually cleared at. A pool a
+    ///      fraction of a percent below the reference therefore tripped the 50 bp bound, and a front-running sell
+    ///      into a call that is public, urgent and has no timelock behind it is a cheap thing to arrange. Taken
+    ///      after the `ACTION_UNWIND` — which realises every position into claims — both sides are balances, and
+    ///      the bound measures the migration and nothing else.
+    function test_r08_aPoolBelowTheReferenceDoesNotRollBackTheEvacuation() public {
+        // One large sell into the hub, and no checkpoint after it: the pool is now well below `P_ref`.
+        giveShares(BOB, 900e18);
+        int24 before = tickOf(hubPool);
+        sellAmps(hubPool, BOB, 900e18);
+        assertLt(tickOf(hubPool), before - 200, "the hub trades meaningfully below where the reference was set");
+
+        _denylistTheVault(0);
+        vm.prank(GUARDIAN);
+        vault.emergencyMigrate(STANDBY);
+
+        assertEq(amps.vault(), STANDBY, "the evacuation completed rather than reverting on a valuation basis");
+        assertEq(vault.liveCells(), 0, "and the ladder really was unwound");
+    }
+
+    /// @notice And the bound still binds on a real leak: a standby that receives 10% less than the vault held
+    ///         reverts, which is the property the fix must not cost.
+    function test_r08_theBoundStillBindsOnARealLeak() public {
+        _denylistTheVault(0);
+
+        // The standby is priced by the same walk over the same asset list, so short-changing it is what a bleed
+        // looks like. Ten percent is twenty times the 50 bp bound.
+        uint256 held = vault.assetsUsd18Of(address(vault));
+        vm.mockCall(
+            address(vault), abi.encodeWithSignature("assetsUsd18Of(address)", STANDBY), abi.encode((held * 90) / 100)
+        );
+
+        vm.prank(GUARDIAN);
+        vm.expectPartialRevert(NavBleedExceeded.selector);
+        vault.emergencyMigrate(STANDBY);
     }
 
     /// @dev Blocks the vault on spoke `i`'s token, which is what the issuer does in the incident this exists for.

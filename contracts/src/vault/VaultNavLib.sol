@@ -13,7 +13,14 @@ import {IPositionValuer} from "../interfaces/IPositionValuer.sol";
 import {IStockToken} from "../interfaces/IStockToken.sol";
 import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
-import {AlreadyInitialized, LengthMismatch, NotContract, ZeroAddress, ZeroAmount} from "../types/Errors.sol";
+import {
+    AlreadyInitialized,
+    LengthMismatch,
+    NotContract,
+    SpokeUnpriceable,
+    ZeroAddress,
+    ZeroAmount
+} from "../types/Errors.sol";
 import {ConstituentConfig, GateState, PoolConfig} from "../types/Types.sol";
 import {VaultRedeemLib} from "./VaultRedeemLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -168,9 +175,18 @@ library VaultNavLib {
     ///      position's `amount1` at the reference sqrt price (I7's counterfactual, never `slot0`, so a swap cannot
     ///      move a weight) plus the vault's idle and claim balances of that token.
     ///
-    /// @dev **Zero when unpriceable**, never a revert and never a guess: no registry, no such constituent, no
-    ///      usable answer, nothing held, or an `A` of zero all read as zero, which prices `deficit == 0` — the
-    ///      protocol-favourable direction, since a smaller deficit means a smaller discount and less AMPS issued.
+    /// @dev **Zero means "the vault holds none of it"; unpriceable is a revert** (audit fix, 2026-09-09). The
+    ///      NatSpec here used to claim that an unreadable answer "prices `deficit == 0`, the protocol-favourable
+    ///      direction". It is the arithmetic inverse: both consumers compute
+    ///      `deficit = (target - current) / target`, so a reported weight of zero is the **largest** deficit the
+    ///      formula admits — the bond discount widens to `dMax` and the rollout schedule doubles for exactly the
+    ///      name nobody can price. Both consumers already default to `targetWeightBps` (deficit zero) when the
+    ///      read *fails*, and a clean zero is what walked past that default. So the three unpriceable branches —
+    ///      no usable feed answer, no position valuer or reference price to decompose the ladder at, and a
+    ///      reference price outside `PriceLib`'s domain — revert {SpokeUnpriceable}, which makes
+    ///      `PoolRegistry.currentWeightBps`'s bounded `staticcall` fail and leaves its own fail-safe standing.
+    ///      An `A` of zero, an absent registry and an unknown constituent still answer zero: those are not
+    ///      failures to price a holding, they are the absence of one.
     ///
     /// @dev **The denominator is the last checkpoint's `A`, not a live walk.** Re-valuing every asset here would
     ///      cost ~150k gas per valued pool (about 5M at 32 pools), far beyond any probe budget a consumer can
@@ -196,19 +212,21 @@ library VaultNavLib {
         if (config.token == address(0)) return 0;
 
         uint256 answerUsd8 = answer(src.feedRegistry, config.token);
-        if (answerUsd8 == 0) return 0;
+        if (answerUsd8 == 0) revert SpokeUnpriceable(constituentId, bytes32("answer"));
+        // Without a valuer or a previous reference price the spoke's ladder cannot be decomposed at all, so a
+        // constituent whose whole holding sits in bid positions would report ~0 — the maximum deficit — for a
+        // reason that has nothing to do with how much of it the protocol holds.
+        if (src.positionValuer == address(0) || src.pRefPrevX18 == 0) {
+            revert SpokeUnpriceable(constituentId, bytes32("valuer"));
+        }
+        uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, config.token, config.decimals);
+        if (sqrtPriceRefX96 == 0) revert SpokeUnpriceable(constituentId, bytes32("refPrice"));
 
         uint256 balance = IPoolManager(src.poolManager).balanceOf(holder, Currency.wrap(config.token).toId())
             + _idleBalance(config.token, holder);
-
-        if (src.positionValuer != address(0) && src.pRefPrevX18 != 0) {
-            uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, config.token, config.decimals);
-            if (sqrtPriceRefX96 != 0) {
-                (, uint256 amount1) = IPositionValuer(src.positionValuer)
-                    .valuePool(IPoolRegistry(src.registry).poolIdOf(constituentId), sqrtPriceRefX96);
-                balance += amount1;
-            }
-        }
+        (, uint256 amount1) = IPositionValuer(src.positionValuer)
+            .valuePool(IPoolRegistry(src.registry).poolIdOf(constituentId), sqrtPriceRefX96);
+        balance += amount1;
         if (balance == 0) return 0;
 
         uint256 bps = FullMath.mulDiv(
@@ -843,7 +861,13 @@ library VaultNavLib {
         if (answerUsd8 == 0 || decimals > PriceLib.MAX_COUNTER_DECIMALS) return 0;
         if (src.pRefPrevX18 > type(uint256).max / (10 ** uint256(decimals))) return 0;
         if (answerUsd8 > type(uint256).max / 1e28) return 0;
-        return PriceLib.ampsPerCounterToSqrtPriceX96(src.pRefPrevX18, answerUsd8, decimals);
+        // **The last way this function could revert instead of answering zero** (audit lead, 2026-09-09). The two
+        // guards above cover `PriceOverflow`; `PriceOutOfTickRange` is the third refusal `PriceLib` makes, and it
+        // fires when the implied pool price falls outside `[MIN_SQRT_PRICE, MAX_SQRT_PRICE)` — arithmetically
+        // unreachable at launch decimals, but this function's stated contract is "zero when the inputs are outside
+        // the range `PriceLib` accepts", and a latent revert of the permissionless checkpoint and of the realised
+        // index weight is not that. `…OrZero` is the same body with that one refusal answered rather than thrown.
+        return PriceLib.ampsPerCounterToSqrtPriceX96OrZero(src.pRefPrevX18, answerUsd8, decimals);
     }
 
     /// @dev A bounded `decimals()` probe. Eighteen is the fallback: every Stock Token and WETH carry it, and an

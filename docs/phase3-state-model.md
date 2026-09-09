@@ -54,7 +54,7 @@ CONFIG _cfg                                DYNAMIC _dyn                        A
 [ 16.. 31] uint16 constituentId            [ 24.. 55] uint32 lastUpdate        [ 16.. 47] uint32 surgeArmedAt
 [ 32.. 39] uint8  poolClass                [ 56.. 79] int24  fairTick          [ 48.. 63] uint16 captureFeeBps
 [ 40.. 63] int24  tickSpacing              [ 80..103] int24  innerBandTicks    [ 64.. 95] uint32 captureArmedAt
-[ 64.. 87] int24  maxTickMovePerBlock      [104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX18
+[ 64.. 87] int24  maxTickMovePerBlock      [104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX9
 [ 88.. 95] uint8  counterDecimals          [128..143] uint16 dynCapBps         [160..223] uint64 varianceX18
 [ 96..119] int24  gridBaseTick             [144..151] uint8  session           [224..255] uint32 lastCorporateCheck
 [120..127] bool   initialized              [152..159] uint8  gateFlags
@@ -63,7 +63,13 @@ CONFIG _cfg                                DYNAMIC _dyn                        A
                                            [200..255] (free)
 ```
 
-`gateFlags`: bit0 degraded, bit1 corporateFreeze, bit2 refreshFailed, bit3 caArmed.
+`gateFlags`: bit0 degraded, bit1 corporateFreeze, bit2 refreshFailed, bit3 caArmed, bit4 stepDown.
+
+`uiMultiplierX9` is the token's 18-decimal `uiMultiplier()` divided by `1e9` (audit fix, 2026-09-09). The X18 form
+does not fit 64 bits — the ceiling is 18.45x, which one 5:1 split on a 4.0x name crosses — and a saturated store
+made every later reading identical, so `deltaBps` was permanently zero and the detector below stopped arming
+anything for that constituent. `stepDown` records the sign of the step the standing capture toll was armed by; the
+toll is charged on the side that takes the mispricing out of the pool, which for a `-Delta` step is the buy side.
 
 `beforeSwap` reads exactly these three words plus the pure fee policy, and nothing else. `f_vol` is pre-computed
 into `fVolBps` by `afterSwap` from the full-precision `varianceX18`, so `beforeSwap` needs no `k_vol` multiply.
@@ -99,7 +105,7 @@ _afterInitialize(sender, key, sqrtPriceX96, tick)
   write CONFIG from cfg; gridBaseTick = PriceLib.alignTick(tick, tickSpacing, true)
   _obs[id].initialize(uint32(block.timestamp), tick)
   _dyn: lastTick = fairTick = tick; full gate refresh (band, rail, dynCap, session)
-  _arm: uiMultiplierX18 = bounded staticcall uiMultiplier() (1e18 for WETH/USDG)
+  _arm: uiMultiplierX9 = bounded staticcall uiMultiplier() / 1e9 (1e9 for WETH/USDG)
 
 _beforeAddLiquidity(sender, ...)   require(sender == vault)       NotVault
 ```
@@ -188,8 +194,9 @@ and leaves the cached value in place. No path reverts, under any fuzzed downstre
 3. **EWMA variance**, `lambda = 0.98`, on the raw tick delta `d = tick - dyn.lastTick`:
    `varianceX18 = (LAMBDA_X18 * varianceX18 + (1e18 - LAMBDA_X18) * uint256(int256(d) * int256(d)) * 1e18) / 1e18`,
    saturating at `type(uint64).max`; then `fVolBps = min(K_VOL_X18 * varianceX18 / 1e36, F_VOL_CAP_BPS)`.
-4. **Rotation credit** — **pass-through buys only**, and nothing else:
-   `if (passThrough && !p.zeroForOne) { int128 out = delta.amount0(); if (out > 0)
+4. **Rotation credit** — **pass-through, exact-input buys only**, and nothing else (the exact-input test is the
+   one the *spend* side already makes, added on the earn side by a re-audit lead, 2026-09-09):
+   `if (passThrough && !p.zeroForOne && p.amountSpecified < 0) { int128 out = delta.amount0(); if (out > 0)
    tstore(slot(sender), tload(slot(sender)) + uint256(uint128(out))); }`. Credited from the **realised** delta,
    never the requested amount, and to the `sender` the PoolManager reports, so I26 holds by construction. An
    ordinary buy — including `AmpsRouter.buy`, which passes empty `hookData` — mints no credit at all, which is
@@ -207,23 +214,42 @@ and leaves the cached value in place. No path reverts, under any fuzzed downstre
    Substituting the widest band widened a healthy REGULAR spoke's rail from 800 ticks to 4,500, i.e. loosened the
    one circuit breaker in the system at the moment the same staleness dropped its anchor onto the pool's own TWAP.
 7. **Dividend-step detector** (spokes only, same interval): bounded `staticcall uiMultiplier()` capped at
-   `Constants.STOCK_TOKEN_PROBE_GAS`, with `prev = arm.uiMultiplierX18`:
+   `Constants.STOCK_TOKEN_PROBE_GAS`, with `cur = m / 1e9` and `prev = arm.uiMultiplierX9`:
    ```
-   deltaBps = |m - prev| * BPS / prev        both directions (audit finding 11, 2026-09-08): the size says
+   m / 1e9 > type(uint64).max                   -> refreshFailed = 1; nothing armed, nothing cleared, prev stands
+   deltaBps = |cur - prev| * BPS / prev      both directions (audit finding 11, 2026-09-08): the size says
                                              whether it is a dividend or a corporate action, the sign only says
                                              which way the arbitrage runs, and a step smaller than a standing
                                              capture fee never displaces it
    0 < deltaBps <= DIVIDEND_STEP_BPS_MAX (200)  -> captureFeeBps = deltaBps * DIVIDEND_CAPTURE_NUMERATOR_BPS / BPS
                                                    captureArmedAt = now;  half-life 300 s
+                                                   gateFlags.stepDown = (cur < prev)   with the toll, and only
+                                                   when the toll is actually (re-)armed
    deltaBps > 200                               -> gateFlags.caArmed = 1;  dynCapBps = DYN_CAP_ESCALATION_BPS
-   always                                       -> arm.uiMultiplierX18 = m
+   otherwise                                    -> arm.uiMultiplierX9 = cur
    ```
    A `+Delta` step makes each raw stock token worth more, so the arbitrage is to take stock **out** of the pool —
-   which, AMPS being currency0, is `zeroForOne == true` (a sell). The capture fee applies to that direction only
-   and leaves the arbitrageur 20% of the step.
+   which, AMPS being currency0, is `zeroForOne == true` (a sell). A `-Delta` step is the mirror image: the
+   arbitrage brings stock **in** and takes AMPS out, so the toll follows `gateFlags.stepDown` rather than being a
+   constant of the swap direction (audit finding 4, 2026-09-09). The capture fee applies to that one direction and
+   leaves the arbitrageur 20% of the step.
 8. `dyn.lastTick = tick; dyn.lastUpdate = now;` (one dirty SSTORE). Emit `RebalanceNeeded(id, tick, fairTick)`
-   when `abs(tick - fairTick) > innerBand / 2`.
-9. Return `(selector, int128(0))` — never a delta; no returns-delta bit exists.
+   when `abs(tick - fairTick) > innerBand / 2` — measured against the **refreshed** fair tick, because it is a
+   keeper signal and not a refusal.
+9. **The post-swap half of the rail check**, and the one deliberate revert. The swap is refused only when it
+   ended beyond the rail having increased the deviation **in both reference frames**: against `quotedFair` and
+   `quoted.railTicks`, captured *before* step 6's refresh — the frame it was sold in, which every quoter surface
+   reads — and against the fair tick and rail step 6 has just installed, the frame now in force. The error carries
+   `quotedFair`'s numbers, because that is the bound the trader was quoted (re-audit finding 1, 2026-09-09).
+   Judging on the refreshed frame alone reverted `BeyondRail` on a swap every quoter surface had reported
+   executable, and rolled the refresh back with it. Judging on the quoted frame alone *pins* a pool: the cached
+   fair tick advances only inside a successful `afterSwap`, so a pool that has reached its rail refuses the next
+   deviation-increasing swap, rolls back the observation that would have let its own reference catch up, and
+   refuses the one after that — measured on the hub, a one-directional market stalled 1,969 ticks above its
+   opening tick with a TWAP that had moved the whole 1,969 and a cached fair tick that had not moved at all, and
+   only a trade in the opposite direction could unstick it. The conjunction is two refusals and not a weakening of
+   either.
+10. Return `(selector, int128(0))` — never a delta; no returns-delta bit exists.
 
 ### 1.6 `IMarketReference` and the vault-only mutators
 
@@ -539,7 +565,8 @@ Permissionless, paid from `BountyPot`.
    ```
    creatorBps(t) = CREATOR_FEE_BPS * max(0, 1 - (t - genesis)/CREATOR_DECAY_SECONDS)   100 bp -> 0 over 30 d
    feeBps        = max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT, chargedBps)                   audit finding 4, 2026-09-08
-                   chargedBps = IAmpsHook.quoteFee(pool, sell).feePips / PIPS_PER_BPS   i.e. base + dyn right now
+                   chargedBps = IAmpsHook.chargedFeeBps(pool)                          re-audit finding 3, 2026-09-09
+                                = max over BOTH directions of base + dyn right now
 
    creatorCounter = counterFees * creatorBps(t) / feeBps    -> paid inside the same unlock, in kind
    counter        = counterFees - creatorCounter            -> ERC-6909 claim, then re-placed as bids (step 7)
@@ -555,7 +582,13 @@ Permissionless, paid from `BountyPot`.
    the pool collected `base + dyn` while the slice was still divided by `base`, inflating it up to 1.6× (GREEN), 3×
    (degraded) or 5× (the escalation cap). Flooring the divisor at `AMPS_FEE_BPS_DEFAULT` bounds the first and
    taking `max(..., chargedBps)` bounds the second, so the dynamic part enlarges the divisor by exactly what it
-   enlarged the collection and is never creator-eligible. Both bounds move the payout one way only — down — so the
+   enlarged the collection and is never creator-eligible. **`chargedBps` is the larger of the two directions**
+   (re-audit finding 3, 2026-09-09): the divisor is applied to each currency's fees, and the two currencies are
+   earned at two different rates — `fees0` at the sell rate, `fees1` at the buy rate — with a dynamic part that is
+   asymmetric by construction, so sampling the sell direction alone divided counter fees collected at up to 800 bp
+   (2,600 bp under escalation) by the 500 bp base. The maximum is taken inside the hook — `IAmpsHook.chargedFeeBps`
+   — because the rate a pool charges is the hook's own fact and because `VaultPlacementLib` has under 200 B of
+   EIP-170 headroom while `AmpsHook` has thousands. Both bounds move the payout one way only — down — so the
    creator is paid **at most `creatorBps(t)` of trade volume** in each currency, and what they do not take is
    burned. A hook that cannot be read leaves the launch-fee floor in charge.
 
@@ -573,7 +606,15 @@ Permissionless, paid from `BountyPot`.
 7. **Re-add the counter side** (`counterFees - creatorCounter`, plus whatever the buyback freed) as bids across
    grid cells strictly below `alignDown(slot0.tick)`, merging into existing records by `m`. It stays in the pool
    that earned it and is never moved to another pool: there is no cross-spoke relay, and no keeper job that
-   could perform one.
+   could perform one. Two conditions on the re-ladder (re-audit findings 2 and 5, 2026-09-09):
+   * it runs only when the remainder is worth at least `COMPOUND_PLACE_MIN_USD18` ($0.10) at the same feed
+     valuation `workValueUsd18` uses. Below it the counter stays an ERC-6909 claim — `A` values it (I5) and the
+     next compound rolls it in — because one wei of counter fee made `placed != 0`, which armed `SURGE_MAX_BPS`
+     and, with the cooldown, pinned a pool's dynamic fee near the cap for a few dollars a day;
+   * a bucket whose cell already holds **ask** liquidity is skipped and left unplaced. The bid ladder starts at
+     the cell immediately below the tick, which after any rise is a cell the price sold through as an ask, and
+     `PlacementRecord.above` is `_burnback`'s only record that a cell was ever sold as one. `_writeRecords`
+     therefore writes `above` only when a cell is *opened*, and `_executePlace` refuses the merge outright.
 8. **Three side effects, on three different facts** (audit finding 1, 2026-09-08). `burned != 0` used to gate the
    mark reset and the surge together, and it is satisfied by a *fee-only* burn — the AMPS side of one dust sell,
    which anybody can produce for the price of a swap — while the cooldown was written only when something had been
@@ -582,10 +623,13 @@ Permissionless, paid from `BountyPot`.
      withdraws no inventory and discards no window;
    * `armSurge(poolId, SURGE_MAX_BPS, "compound")` when `placed != 0`: the surge exists so a placement cannot be
      sandwiched at the pre-placement fee;
-   * `_lastPlacementAt[poolId] = now` when `placed != 0 || burned != 0`: the cooldown rate-limits the engine per
-     pool, and it is what bounds the repetition of both effects above to once a minute — the rate a legitimate
-     compound runs at. A call that collected nothing, bought nothing back and placed nothing takes none of the
-     three and costs the pool nothing.
+   * `_lastPlacementAt[poolId] = now` when `placed != 0 || boughtBack != 0`: the cooldown rate-limits the engine
+     per pool, and it is what bounds the repetition of both effects above to once a minute — the rate a legitimate
+     compound runs at. **A fee-only burn is not work** (re-audit finding 5, 2026-09-09): `burned` is satisfied by
+     the AMPS side of one dust sell, so gating the cooldown on it let a griefer take the shared 60-second lock —
+     which `place`, `rollout`, `deployBonded` and `withdrawRetiredBids` all honour — once a minute for dust.
+     `place` takes its own cooldown on the same fact. A call that collected nothing, bought nothing back and
+     placed nothing takes none of the three and costs the pool nothing.
 9. Divergence at exit; `_checkpoint()`; **R1**: `navAfter >= NAV_BEFORE * (BPS - 2) / BPS` else revert
    `NavBleedExceeded` (I11); `_lastPlacementAt[poolId] = now`; `BountyPot.pay(...)`; `_sweepClean()`; emit
    `Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`.
@@ -598,11 +642,17 @@ Permissionless, paid from `BountyPot`.
   after the move `>= entryFloorBps * polTranche / BPS`; every destination cell's `lowerTick >= tickOf(P_ref /
   P_stock)`, so a rolled-out ask is never placed below `P_ref`. Only **unfilled** ask cells move (`above == true`
   and `lowerTick > slot0.tick` in the source), so no counter-asset is touched. Both pools pay the full gauntlet.
-  The 24 h window is charged on what the harvest removed (`moved`) and the bounty is paid on what was placed; when
-  the destination places less than moved (the live-cell budget is full), the remainder is re-placed into the entry
-  pools it came from (`reason = "rollback"`) and the source cooldown is written once, after that re-placement
-  (re-audit finding 6: charging `placed` let a saturated budget drain the entry pools one full daily allowance per
-  minute). `latestAnswer` and `currentWeightBps` on this path are read under `COMPOSITE_READ_GAS` (400k): a failed
+  The 24 h window is **rolling**: `moved` decays linearly by `min(elapsed, ONE_DAY)/ONE_DAY` and `windowStart`
+  advances on every charge, so there is no hard edge for two rollouts a minute apart to straddle (re-audit finding
+  12, 2026-09-09; the tumbling form let `2 x rolloutBpsPerDay` leave the entry pools inside a rolling interval of
+  about zero). It is charged on the **realised drain** — `moved - returned`, after the destination placement's
+  rollback — and the bounty is paid on what was placed; when the destination places less than moved (the live-cell
+  budget is full), the remainder is re-placed into the entry pools it came from (`reason = "rollback"`) and the
+  source cooldown is written once, after that re-placement (charging `placed` let a saturated budget drain the
+  entry pools one full daily allowance per minute; charging the *harvest* let the same saturated budget burn a
+  whole day's allowance with zero net movement). `_askInventory` — the number the floor and the schedule are both
+  measured over — applies the same high-water clause `_harvestAsks` does, so the floor counts only movable depth
+  (re-audit finding 13). `latestAnswer` and `currentWeightBps` on this path are read under `COMPOSITE_READ_GAS` (400k): a failed
   read skips `_requireConverged` and drops the anchor to the live tick, so a tight cap would trade liveness for
   safety.
 * **`deployBonded(constituentId)`** — permissionless, bountied. Places the idle ERC-6909 claim of that
@@ -615,14 +665,26 @@ Permissionless, paid from `BountyPot`.
 * **`place(poolId, above, amount)`** — timelock, or the registry inside `addConstituent` for the `spokeSeedBps`
   seed ask (decision 11). Genesis placement runs through it. Every `place` first collects the fees accrued in the
   cells it will merge into and routes the AMPS side through the §3.6 split (`_collectAndSplit`), so a merge settles
-  principal only (re-audit lead), and it writes the pool cooldown only when something was placed (re-audit finding
-  12: a zero-work `rollout`/`deployBonded` could otherwise deny a real placement for 60 s).
+  principal only (re-audit lead), and it writes the pool cooldown only when the call did work — `placed != 0 ||
+  boughtBack != 0` (a zero-work `rollout`/`deployBonded` could otherwise deny a real placement for 60 s, and its
+  ask branch burns back exactly as `compound` does). **Both sides anchor at `tickOf(P_ref / P_counter)`**
+  (re-audit finding 10, 2026-09-09): bids used to anchor at `slot0.tick`, so with the pool 1,000-2,600 ticks above
+  the reference the top bid cell spanned the price the valuer decomposes every position at (I7) and `A` fell by up
+  to a third of the collateral being placed, which the 2 bp R1 bound then reverted. `_cells`' bid branch takes
+  `min(fromAnchor, fromTick)`, so the reference anchor can only pull a ladder down, never up through the tick. The
+  anchor rounds onto the tick spacing away from the side it anchors — **down for asks, up for bids** — so each side
+  carries the same bounded residue of at most `tickSpacing - 1` ticks (ruling AX). Rounding the bid anchor down
+  instead would cost a whole doubling at genesis, where the grid origin sits at or above the exact reference by
+  construction: the seed bids would open at `m = -2..-5` rather than the `m = -1..-4` of §3.3.
 
 ### 3.8 The gauntlet — every guard on every placement
 
 1. `locked` (transient reentrancy) and `_requirePlaceable()`.
 2. `IOracleGate.checkPlacement(poolId)` — refuses on `SCHEDULED_FREEZE`, `DIVERGED`, `WATCHDOG`, guardian freeze.
-   `REF_DIVERGED` is permitted but forces the NAV anchor (`P_ref == navPerShare`).
+   `REF_DIVERGED` is permitted but forces the NAV anchor (`P_ref == navPerShare`). The call is capped at
+   `COMPOSITE_READ_GAS` and its revert data is re-thrown verbatim (re-audit lead, 2026-09-09): the gate is a
+   governance pointer, so a looping implementation must not take the placement's whole frame with it — but a gate
+   refuses *by reverting*, so its answer cannot be degraded into "absent" the way a value read can.
 3. Divergence at **entry and exit**: `abs(slot0.tick - tickOf(P_mkt / P_i)) <= PLACEMENT_DIVERGENCE_TICKS` (800).
 4. Sidedness (I9, unconditional): asks strictly above `alignUp(slot0.tick)`, bids strictly below
    `alignDown(slot0.tick)`. Every proposed bucket is re-checked by the vault, never trusted from the policy.
@@ -1026,7 +1088,7 @@ property functions need no storage access. Run it over `src/hook/**`, `src/polic
 10. **The corporate-action flag has no path from hook to gate** — the Phase 2 `OracleGate` reads the token
     directly and holds a mock market reference. *Proposal:* redeploy `OracleGate` in Phase 3 (a swap already
     required for the market-reference move) so `_corporateAction` also consults
-    `IAmpsHook.poolState(poolId).uiMultiplierX18` against the token's live `uiMultiplier()`.
+    `IAmpsHook.poolState(poolId).uiMultiplierX9` against the token's live `uiMultiplier()` scaled by `1e9`.
 11. **`place`'s caller set is ambiguous**, and `addConstituent` must seed a new spoke. *Proposal:* `place` is
     **timelock-or-registry**; `compound`, `rollout` and `deployBonded` are the permissionless bountied paths;
     genesis placement runs through `place`.
@@ -1325,7 +1387,7 @@ The twelve-agent `solidity-auditor` review of `89e451d` (`docs/audits/amplestock
 | AC | **I12 is best-effort, not asserted.** The exit sweep probes balances through bounded staticcalls, absorbs per token, and emits `SweepResidue` instead of reverting; `AmpsVault._assertSweepZero` is gone and `AmpsBonds._issue` forwards collateral dust to the vault. A one-wei donation of a paused or denylisting Stock Token can no longer brick a redemption, a bond market, or any entry point (findings 1, 3). |
 | AD | **Redemption pays a refusing token as a claim.** `_payOut` tries `take`; a token that refuses the transfer leaves the redeemer an ERC-6909 claim (`pm.transfer`) they take once the issuer relents, and an unmovable idle wei is simply not paid. The floor is therefore unblockable by any single issuer (finding 2); §7's "no reference to a gate or a price" still holds — the calls are into the tokens themselves, bounded and best-effort. |
 | AE | **The buyback burn selects only fully round-tripped cells** (`upperTick <= highWater && tick <= lowerTick`), straddled cells are left alone, and every ask placement resets the mark (§3.5; findings 4 and the stale-mark lead). Decision 16's "AMPS bought back is burned" now means "burned once the cell is pure AMPS again"; partially bought-back inventory re-sells on the way up. |
-| AF | **A zero-work `compound` is inert**: no surge, no mark reset, no cooldown (§3.6 step 8; finding 5). |
+| AF | **A zero-work `compound` is inert**: no surge, no mark reset, no cooldown (§3.6 step 8; finding 5). *Widened by re-audit finding 5 (2026-09-09): the cooldown follows `placed != 0 \|\| boughtBack != 0`, so a fee-only burn is inert too, and step 7 places nothing below `COMPOUND_PLACE_MIN_USD18`.* |
 | AG | **The creator divisor is floored at `AMPS_FEE_BPS_DEFAULT`** so the slice is at most one fifth of AMPS-side fees whatever `ampsFeeBps` is set to; the dynamic-fee over-statement (≤ 1.6x under GREEN) is accepted and documented rather than tracked per swap, which would cost an SSTORE on every sell (finding 6). |
 | AH | **`checkpoint()`/`touch()` refuse before genesis** and `navPerShare` is 0 at zero supply, so the reference can never be written as `1e15` before the first pool opens (finding 7). |
 | AI | **`compound` re-ladders at the reference anchor** like every other ask placement (I32; finding 16). *Superseded by revision 6 ruling BG: `compound` places no asks at all, because the AMPS side of the fee is burned.* |
@@ -1340,10 +1402,10 @@ The twelve-agent `solidity-auditor` review of `89e451d` (`docs/audits/amplestock
 | AR | **The NAV numerator never reads a token with a typed call**: `totalAssetsUsd18`, `inventoryAmps`, `_placeLadder` and `deployBonded` use the bounded hand-decoded balance probe, unreadable ⇒ zero; `referenceOverridden`, `_poolPriceUsd18` and `answer` are bounded hand-decoded reads (finding 2; the `VaultNavLib` half of the typed-`try` lead). |
 | AS | **The checkpoint records `navUnconfirmed`** when any priced asset was `!fresh \|\| unconfirmed` (slot 21), `fresh` is false while an answer is held back, and the bond shell refuses to price against an unconfirmed NAV (`UnconfirmedNav`; `quote` reason `unconfirmedNav`) through a bounded probe that fails open (findings 7, 8). |
 | AT | **`_issue`'s dust forward is a bounded probe, a bounded transfer and a first-word decode**; codeless pointers read as absent throughout the bond shell's quote surface; the quote's overflow guard mirrors `mulDiv` (finding 4 and two leads). |
-| AU | **Rollout charges the window on `moved`, rolls the unplaced remainder back into the entry pools and writes the source cooldown once**; `place` takes no cooldown on zero work; `compound` arms the surge and resets the mark only on an AMPS-side event (findings 6, 11, 12). |
+| AU | **Rollout charges the window on `moved`, rolls the unplaced remainder back into the entry pools and writes the source cooldown once**; `place` takes no cooldown on zero work; `compound` arms the surge and resets the mark only on an AMPS-side event (findings 6, 11, 12). *Corrected by re-audit finding 12 (2026-09-09): the window is charged on the realised drain `moved - returned`, **after** the rollback, and it decays as a rolling day rather than tumbling at a hard edge.* |
 | AV | **The high-water mark is floored at the raw tick** and a failed reset on an ask placement reverts `HighWaterResetFailed` (finding 10 and its lead). |
 | AW | **Hook probe budgets**: `GATE_PROBE_GAS` = 1,000,000 with the measurement documented; `closedHours` reads under it; a spoke's `fairTick` falls back to its TWAP when the snapshot fails (finding 9). |
-| AX | **The placement anchor stays aligned down** (the lead "anchor aligns down while the grid ceils" is accepted): the grid origin is the opening tick, so the reference sits inside cell 0 by construction; aligning the anchor up would leave no protocol ask between `P_ref` and `2 x P_ref`, and snapping the origin up instead makes a straddled bid whose AMPS half `A` writes off (an R1 revert on the seed). §3.7's I32 uses the aligned-down `fairTick`; the residue is bounded to under one tick spacing on the first cell (`test_i32_theStraddleOfTheFirstAskCellIsBoundedByOneTickSpacing`). `PriceLib.fairTick(…, roundUp)` exists for a future ruling. |
+| AX | **The placement anchor rounds away from the side it anchors** — down for asks, up for bids (the lead "anchor aligns down while the grid ceils" is accepted): the grid origin is the opening tick, so the reference sits inside cell 0 by construction; aligning the *ask* anchor up would leave no protocol ask between `P_ref` and `2 x P_ref`, and snapping the origin up instead makes a straddled bid whose AMPS half `A` writes off (an R1 revert on the seed). §3.7's I32 uses the aligned-down `fairTick` on the ask side; the residue is bounded to under one tick spacing on the first cell (`test_i32_theStraddleOfTheFirstAskCellIsBoundedByOneTickSpacing`). **Amended 2026-09-09 (re-audit finding 10):** once bids anchor at the reference too, `PriceLib.fairTick(…, roundUp = true)` is what keeps their residue the same size and the same shape — aligning the bid anchor down is stricter by 0.9 % of one cell and moves the genesis seed bids a whole doubling, to `m = -2..-5`. |
 | AY | **The registry answers the realised index weight when it can** (`VaultNavLib.spokeWeightBps`, measured against the last checkpointed `A` so the read costs ~200k gas at any pool count, through a 2M-gas bounded probe with the target weight as fallback); both the rollout schedule and the bond shell read it under `COMPOSITE_READ_GAS`, so the deficit term is live in both (`docs/phase2-state-model.md` §5). `setStandbyVault` refuses a codeless target; `_requireWiringOpen` is gone; `reinstateConstituent` clears `retiredAt`; `_setMarketOpen` adopts the live `marketIdOf` (retiring with no `bonds` pointer now reverts `ZeroAddress`). |
 | AZ | **Accepted, not changed** (second-wave leads): the credit shared within one settlement contract (rotation-equivalent flow; superseded by plan revision 6's router-only pass-through); a fully crossed bid burned as a buyback (it holds bought-back AMPS); the migration's single-transaction fit at a full constituent set (part of the user-owned cap decision); the bid re-ladder's placement surge on a dust counter fee; `rollout`'s harvest realising accrued AMPS fees without the split (needs a public collect entry point; moot once revision 6 burns the AMPS side); the absorb residual where a token accepts the transfer and then refuses `balanceOf` inside `settle` (its own dust stays uncredited); the `Migrated` event not naming a failed hook leg; `_writeRecords` overwriting `record.above` on a side flip; the bounty's two-hop over-count. |
 

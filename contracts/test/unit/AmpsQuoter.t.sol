@@ -1037,6 +1037,65 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
         }
     }
 
+    // -------------------------------------------------------------------------------------------------------------
+    // Re-audit lead: the quoter must not price a route the router refuses
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit lead (demoted finding).** `quoteRotation` returns zeros for a same-pool route.
+    /// @dev `AmpsRouter.rotate` refuses `hop1 == hop2` (`SameHop`), so quoting it published a route that always
+    ///      reverted on execution -- the one failure a quoter exists to prevent. Zeros throughout, because there is
+    ///      no price to report for a route that cannot be built.
+    function test_r14_quoteRotationIsZeroForASamePoolRoute() public view {
+        (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed) =
+            quoter.quoteRotation(usdgPool, usdgPool, 1000e6);
+        assertEq(amountOut, 0, "no route");
+        assertEq(hop1FeePips, 0, "and no fee to report for it");
+        assertEq(hop2FeePips, 0, "on either leg");
+        assertEq(creditUsed, 0, "and no credit");
+    }
+
+    /// @notice And for a route with no constituent spoke on either leg, which `rotate` refuses as `NotARotation`.
+    /// @dev The two entry pools are the way in and the way out of the index, so a hop between them is not a
+    ///      rotation at any price: pricing it pass-through sold a 60 bp swap against protocol-owned liquidity.
+    function test_r14_quoteRotationIsZeroForARouteWithNoSpokeLeg() public {
+        // Demote the stock pool to an entry-class pool with no constituent: an entry-to-entry pair.
+        registry.setPool(
+            stockPool,
+            PoolConfig({
+                counter: STOCK_ADDRESS,
+                poolClass: PoolClass.ENTRY,
+                counterDecimals: 18,
+                tickSpacing: TICK_SPACING,
+                buyFeeBps: BUY_FEE_BPS,
+                constituentId: 0,
+                registered: true,
+                gridBaseTick: 0
+            })
+        );
+
+        (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed) =
+            quoter.quoteRotation(stockPool, usdgPool, STOCK_IN);
+        assertEq(amountOut, 0, "no route");
+        assertEq(hop1FeePips, 0, "and no fee to report for it");
+        assertEq(hop2FeePips, 0, "on either leg");
+        assertEq(creditUsed, 0, "and no credit");
+    }
+
+    /// @notice **Re-audit lead.** The blend at `ampsIn == 0` answers what the hook answers.
+    /// @dev The hook blends on `uncredited == amountIn - min(credit, amountIn)`, so a zero-sized pass-through sell
+    ///      is "fully covered" and prices at `buyFeeBps` -- which is the question the view surface is being asked,
+    ///      "what would a pass-through sell cost". The quoter required `ampsIn != 0 && credit != 0` and answered
+    ///      `ampsFeeBps` instead: a 495 bp disagreement on the headline rate of a rotation.
+    function test_r14_theZeroAmountBlendMatchesTheHook() public view {
+        (, uint24 zeroNoCredit,,) = quoter.quoteSellWithCredit(usdgPool, 0, 0);
+        (uint24 hookPips,,,) = hookStub.quoteFee(usdgPool, true, true, 0, true);
+        assertEq(zeroNoCredit, hookPips, "the quoter and the hook agree at zero");
+        assertEq(zeroNoCredit, BUY_FEE_PIPS, "which is the pass-through base");
+
+        (, uint24 zeroWithCredit,,) = quoter.quoteSellWithCredit(usdgPool, 0, 1e18);
+        assertEq(zeroWithCredit, BUY_FEE_PIPS, "and a credit does not change it");
+    }
+
     /// @notice The `F_MIN_BPS` floor: a fully credited sell in a 1 bp pool would price at 1 bp, and the hook's
     ///         clamp lifts it to 3.
     function test_blend_fMinFloor() public {

@@ -388,8 +388,19 @@ library VaultRedeemLib {
     ///      vault's `unlock` revert with `CurrencyNotSettled` at the end, after every per-asset `catch` has
     ///      already been passed. One constituent could therefore revert the whole payout. The ERC-20 attempt is
     ///      therefore itself a `try`, and its failure runs a second `unlock` that transfers every claim part and
-    ///      touches no token at all. `Constants.REDEEM_PAYOUT_RESERVE_GAS` is held back from the first attempt so
-    ///      that the second is always affordable, however much gas the first one burns.
+    ///      touches no token at all. A reserve is held back from the first attempt so that the second is always
+    ///      affordable, however much gas the first one burns.
+    ///
+    /// @dev **The reserve is sized per asset** (audit fix, 2026-09-09). It used to be a flat 700,000 whose own
+    ///      NatSpec claimed it covered "every asset the protocol can register", and it did not: the claims-only
+    ///      unlock does one ERC-6909 `transfer` per asset at ~27.5k cold, so it needs ~900k at 32 assets and
+    ///      ~1.8M at 66. The fallback therefore ran out of gas in precisely the case it exists for — a hostile
+    ///      constituent that burns the first attempt — and the *structurally ungated* redemption reverted, which
+    ///      is the one outcome the whole three-fallback design is built to make impossible. The reserve is now
+    ///      `REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS x tokens.length + REDEEM_PAYOUT_RESERVE_FIXED_GAS`, and when the
+    ///      frame cannot hold that plus a worthwhile attempt the ERC-20 leg is skipped outright rather than
+    ///      started and abandoned: an attempt that cannot finish costs the redeemer the whole difference and pays
+    ///      nobody, while the fallback pays every asset as a claim.
     ///
     ///      The third is the idle leg, which is paid **after** the unlock: an idle ERC-20 balance is dust by I12
     ///      (every deposit path settles straight into the PoolManager), it cannot be handed over as a claim
@@ -413,10 +424,11 @@ library VaultRedeemLib {
     ) public {
         uint256 slot = UNLOCK_ACTION;
         bytes memory data = abi.encode(tokens, fromClaims, to);
-        uint256 reserve = Constants.REDEEM_PAYOUT_RESERVE_GAS;
+        uint256 reserve =
+            Constants.REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS * tokens.length + Constants.REDEEM_PAYOUT_RESERVE_FIXED_GAS;
         bool paid;
 
-        if (gasleft() > reserve) {
+        if (gasleft() > reserve + Constants.REDEEM_PAYOUT_ATTEMPT_GAS) {
             uint256 action = ACTION_PAYOUT;
             assembly ("memory-safe") {
                 tstore(slot, action)
@@ -552,10 +564,21 @@ library VaultRedeemLib {
     ///      gross_j = floor(b_j x shares / supply) + released_j
     ///      net_j   = floor(gross_j x (BPS - redeemFeeBps) / BPS)
     ///      ```
-    ///      and the same shape for the vault's own AMPS inventory, which is burned rather than paid out so that
-    ///      `T` falls by more than `shares`. `released_j` is the position principal the unwind actually freed and
-    ///      is paid in full rather than pro-rated, because it *is* the pro-rata slice: it came out of a position
-    ///      by removing `floor(L x shares / supply)` of its liquidity.
+    ///      `released_j` is the position principal the unwind actually freed and is paid in full rather than
+    ///      pro-rated, because it *is* the pro-rata slice: it came out of a position by removing
+    ///      `floor(L x shares / supply)` of its liquidity.
+    ///
+    /// @dev **The vault's own AMPS inventory does not take `keepBps`, and the NatSpec used to say it did** (audit
+    ///      lead, 2026-09-09). The burn is
+    ///      ```
+    ///      inventoryBurned = floor(inventory x shares / supply) + releasedAmps
+    ///      ```
+    ///      with **no** `(BPS - redeemFeeBps)` factor: the whole pro-rata slice is burned rather than
+    ///      `keepBps` of it. That is deliberate and it is the protocol-favourable direction — the fee on a
+    ///      redemption is value the *remaining* holders keep, and inventory AMPS is worth zero in `A` by I5, so
+    ///      burning the larger number lowers `T` and raises NAV per share for them instead of leaving a retained
+    ///      slice in a place where it is not counted. `previewRedeem` computes the identical expression, so the
+    ///      preview and the payout still agree to the wei; only the sentence describing them was wrong.
     ///
     /// @dev Reads balances only: no oracle, no gate, no registry, no price.
     ///

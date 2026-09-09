@@ -55,6 +55,9 @@ interface IAmpsHook is IMarketReference {
     event SurgeArmed(PoolId indexed poolId, uint16 surgeBps, bytes32 reason);
 
     /// @notice Emitted when a `uiMultiplier()` step is detected on a constituent.
+    /// @dev Both multipliers are reported in the token's own 18-decimal form. The hook caches the previous one as
+    ///      X9 (see `HookPoolState.uiMultiplierX9`), so `previousMultiplierX18` is that value scaled back up and
+    ///      is therefore a multiple of `1e9`; `newMultiplierX18` is the raw reading, unscaled.
     /// @param poolId The pool.
     /// @param previousMultiplierX18 The cached multiplier.
     /// @param newMultiplierX18 The observed multiplier.
@@ -267,6 +270,23 @@ interface IAmpsHook is IMarketReference {
         external
         view
         returns (uint24 feePips, uint16 baseBps, uint16 dynBps, bool refuse);
+
+    /// @notice The largest total fee, in basis points, the hook is charging in `poolId` right now — the maximum
+    ///         of the two directions, base plus the clamped dynamic part, priced as an ordinary (non-pass-through)
+    ///         exact-input swap of size zero.
+    ///
+    /// @dev **Why the maximum, and why it lives here** (audit fix, 2026-09-09). `AmpsVault`'s creator slice
+    ///      divides a pool's collected fees back into the volume that produced them, with one divisor for both
+    ///      currencies — but the two currencies are earned at two different rates: the AMPS side at the sell rate,
+    ///      the counter side at the buy rate, and the dynamic part is asymmetric by construction, because it is
+    ///      what makes a deviation-increasing trade expensive. A divisor sampled from one direction and applied to
+    ///      the other paid the creator up to 4.33x `CREATOR_FEE_BPS` of that side's volume out of NAV. The larger
+    ///      of the two rates bounds both quotients from below, so it is the one number the vault needs — and the
+    ///      rate a pool is charging is the hook's own fact, so the hook is where the maximum is taken.
+    /// @dev Never reverts. An unknown pool answers zero, which every consumer reads as "no answer".
+    /// @param poolId The pool.
+    /// @return bps The larger of the two directions' total fee, in bps.
+    function chargedFeeBps(PoolId poolId) external view returns (uint16 bps);
 
     /// @notice The inner band half-width currently in force for a pool.
     /// @param poolId The pool.

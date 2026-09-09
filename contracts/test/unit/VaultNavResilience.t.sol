@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../../src/interfaces/IFeedRegistry.sol";
 import {IMarketReference} from "../../src/interfaces/IMarketReference.sol";
 import {IOracleGate} from "../../src/interfaces/IOracleGate.sol";
 import {Constants} from "../../src/types/Constants.sol";
+import {SpokeUnpriceable} from "../../src/types/Errors.sol";
 import {GateState} from "../../src/types/Types.sol";
 import {AmpsVaultFixture} from "../mocks/AmpsVaultFixture.sol";
 
@@ -313,10 +315,33 @@ contract VaultSpokeWeightTest is AmpsVaultFixture {
         assertEq(vault.spokeWeightBps(2), 0, "nothing held of the second name");
     }
 
-    /// @notice And an unpriceable name is zero rather than a revert or a guess, so a bond on it still prices.
-    function test_anUnpriceableSpokeIsZero() public {
+    /// @notice **Re-audit finding 11.** An *unpriceable* name reverts rather than answering a legal zero, because
+    ///         a successful zero is the **largest** deficit both consumers can read and not the smallest.
+    ///
+    /// @dev `deficit = (target - current) / target`, so `current == 0` prices `deficit == 1e18`: the bond discount
+    ///      widens to `dMax` and the rollout schedule doubles, for a name nobody can price. Both consumers already
+    ///      default to `targetWeightBps` — deficit zero — when the read *fails*, and a clean zero walked straight
+    ///      past that fail-safe. Reverting is what puts it back in charge, and the probe-level assertion below is
+    ///      the shape `PoolRegistry.currentWeightBps` and `AmpsBonds` actually make.
+    function test_r11_anUnpriceableSpokeRevertsRatherThanAnsweringZero() public {
         feeds.clearAnswer(address(stock));
-        assertEq(vault.spokeWeightBps(1), 0, "no answer, no weight");
+
+        vm.expectRevert(abi.encodeWithSelector(SpokeUnpriceable.selector, uint16(1), bytes32("answer")));
+        vault.spokeWeightBps(1);
+
+        (bool ok,) = address(vault).staticcall(abi.encodeCall(IAmpsVault.spokeWeightBps, (1)));
+        assertFalse(ok, "so a bounded probe of it fails, and the consumer's own target-weight default stands");
+    }
+
+    /// @notice The other unpriceable branch answers the same way, and names itself: with no position valuer the
+    ///         spoke's ladder cannot be decomposed at all, so a name whose whole holding sits in bid positions
+    ///         would report ~0 — the maximum deficit — for a reason that has nothing to do with the holding.
+    /// @dev §1.1 slot 11 is `positionValuer`; it is cleared directly because `setPolicyPointer` refuses a codeless
+    ///      replacement and there is no setter for "none".
+    function test_r11_anAbsentPositionValuerIsUnpriceableToo() public {
+        vm.store(address(vault), bytes32(uint256(11)), bytes32(uint256(0)));
+        vm.expectRevert(abi.encodeWithSelector(SpokeUnpriceable.selector, uint16(1), bytes32("valuer")));
+        vault.spokeWeightBps(1);
     }
 
     /// @notice An id nobody registered is zero too.

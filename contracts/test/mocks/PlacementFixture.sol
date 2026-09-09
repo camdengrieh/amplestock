@@ -385,6 +385,21 @@ abstract contract PlacementFixture is V4TestBase {
         vault.checkpoint();
     }
 
+    /// @notice TEST ONLY. Puts the vault's reference price exactly on the hub's live price, which is where a
+    ///         rate-limited `P_ref` arrives on its own once the market has stopped moving.
+    ///
+    /// @dev `checkpoint()` walks `P_ref` toward `P_mkt` at `refUpRateBps` per period, so a fixture that has just
+    ///      walked the hub a whole doubling with one swap would need days of warps to let the reference follow.
+    ///      Every test that uses this is testing something else — where `compound` lays its bids, what the
+    ///      buyback burns — and needs the market and the reference to agree, which is the ordinary state of the
+    ///      world. Slot 0's high half is `pRefX18` (`docs/phase2-state-model.md` §1.1), which `VaultLayout.t.sol`
+    ///      pins; `syncMarket()` has already put `P_mkt` on the same price, so the two agree after this rather
+    ///      than diverging.
+    function catchUpRef() internal {
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(0))));
+        vm.store(address(vault), bytes32(uint256(0)), bytes32((hubPriceUsd18() << 128) | (word & type(uint128).max)));
+    }
+
     /// @notice The AMPS price the hub is actually trading at right now, 18 decimals. Re-seeding every ring at
     ///         this keeps `P_mkt` in step with the pool a test has just moved, which is what an arbitraged market
     ///         and a live truncated TWAP would do between blocks.

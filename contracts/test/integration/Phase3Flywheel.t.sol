@@ -657,8 +657,9 @@ contract Phase3FlywheelTest is Phase3Fixture {
     function _creatorDivisorBps() private view returns (uint256 divisor) {
         divisor = hook.ampsFeeBps();
         if (divisor < Constants.AMPS_FEE_BPS_DEFAULT) divisor = Constants.AMPS_FEE_BPS_DEFAULT;
-        (uint24 chargedPips,,,) = hook.quoteFee(hubPool, true, true, 0, false);
-        uint256 chargedBps = uint256(chargedPips) / Constants.PIPS_PER_BPS;
+        // The larger of the two directions since re-audit finding 3: the divisor is applied to each currency's
+        // fees and the two currencies are earned at two different rates, so it is bounded below by the larger.
+        uint256 chargedBps = hook.chargedFeeBps(hubPool);
         if (chargedBps > divisor) divisor = chargedBps;
     }
 }
