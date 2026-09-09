@@ -83,7 +83,8 @@ The chain suite spawns anvil, stands the whole production system up through
 `test/chain/KeeperFixture.s.sol` (`AmpsVault`, `AmpsHook` mined to `0x38C0`, `OracleGate`, `PoolRegistry`,
 `BountyPot`, the four linked vault libraries, the three policies, six pools, four constituents) and drives the
 keeper against it: a fee accrual makes `compound` fire with the right bounty, a bonded deposit above the
-threshold makes `deployBonded` fire, a frozen or degraded gate stops everything, a diverged pool is refused,
+threshold makes `deployBonded` fire, a frozen gate stops everything, a degraded gate stops every placement
+and lets the watchdog restamp through, a diverged pool is refused,
 the cooldown is waited out, a stale checkpoint is refreshed, a tripped watchdog is healed by `touch`, a
 48-hour gap resumes with no duplicate send, and a synthetic spam campaign is blocked outright.
 
@@ -100,8 +101,8 @@ ETH/USD feed. So `chost` refuses an empty job on chain, the 3× gas cap binds, a
 real payout.
 
 The keeper reads that report directly where the node allows: `simulateBounty` runs the job through
-`eth_simulateV1` and decodes the `BountyPaid` it would emit, so it knows the exact payout and the exact binding
-constraint before it sends. Where the node has no `eth_simulateV1` — anvil does, Arbitrum Nitro does not
+`eth_simulateV1` and decodes the `BountyPaid` it would emit, so it knows the binding constraint and, to within
+the few hundred gas that separate the simulated block from the one the job lands in, the payout before it sends. Where the node has no `eth_simulateV1` — anvil does, Arbitrum Nitro does not
 guarantee it — it falls back to its own estimate, which for `compound` is a **lower bound** because the call
 does not return the counter-side fees. `amps_keeper_measured_*` against `amps_keeper_reported_*` is that gap,
 and the chain suite asserts the bound holds.
