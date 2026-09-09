@@ -2207,6 +2207,13 @@ export const ampsHookAbi = [
   {
     type: 'function',
     inputs: [{ name: 'poolId', internalType: 'PoolId', type: 'bytes32' }],
+    name: 'chargedFeeBps',
+    outputs: [{ name: 'bps', internalType: 'uint16', type: 'uint16' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [{ name: 'poolId', internalType: 'PoolId', type: 'bytes32' }],
     name: 'fairTick',
     outputs: [{ name: 'tick', internalType: 'int24', type: 'int24' }],
     stateMutability: 'view',
@@ -2349,7 +2356,7 @@ export const ampsHookAbi = [
           { name: 'buyFeeBps', internalType: 'uint16', type: 'uint16' },
           { name: 'tickSpacing', internalType: 'int24', type: 'int24' },
           { name: 'maxTickMovePerBlock', internalType: 'int24', type: 'int24' },
-          { name: 'uiMultiplierX18', internalType: 'uint64', type: 'uint64' },
+          { name: 'uiMultiplierX9', internalType: 'uint64', type: 'uint64' },
           { name: 'varianceX18', internalType: 'uint64', type: 'uint64' },
           { name: 'lastSwapAt', internalType: 'uint32', type: 'uint32' },
           { name: 'surgeBps', internalType: 'uint16', type: 'uint16' },
@@ -5050,6 +5057,7 @@ export const ampsVaultAbi = [
     ],
     name: 'VestingMinted',
   },
+  { type: 'error', inputs: [], name: 'AlreadyInitialized' },
   {
     type: 'error',
     inputs: [
