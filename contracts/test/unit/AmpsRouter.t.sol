@@ -206,6 +206,46 @@ contract AmpsRouterTest is HookTestFixture {
         router.rotate(usdgId, usdgId, USDG_IN, 0, address(this), false, type(uint256).max);
     }
 
+    /// @notice **Audit lead: requested, not realised, input settled.** An exact-input swap runs with the price
+    ///         limit open, so the pool can still fill less than the whole amount once it runs out of liquidity —
+    ///         and settling the *requested* amount then over-pays the PoolManager, which reverts the whole call
+    ///         with v4's `CurrencyNotSettled` instead of the `SlippageExceeded` a caller can read. The realised
+    ///         delta is what is settled, and the unspent remainder is swept back to the caller.
+    function test_lead_anOversizedBuySettlesTheRealisedInputAndSweepsTheRest() public {
+        // The rail is not what this test is about, and an over-filling swap ends at the price limit by
+        // construction: widen it to the tick domain so the swap is bounded by the pool's own depth.
+        policy.setRailOverride(887_272);
+        _refreshGate(usdgKey);
+
+        uint256 oversized = 5_000_000e6; // several times the AMPS the seeded range holds
+        usdg.approve(address(router), type(uint256).max);
+        uint256 before = usdg.balanceOf(address(this));
+
+        uint256 out = router.buy(usdgId, oversized, 0, address(this), type(uint256).max);
+        assertGt(out, 0, "the swap executed rather than reverting on the settlement");
+
+        uint256 spent = before - usdg.balanceOf(address(this));
+        assertGt(spent, 0, "something was paid in");
+        assertLt(spent, oversized, "but only what the pool actually consumed");
+        assertEq(usdg.balanceOf(address(router)), 0, "and the router kept none of the remainder");
+    }
+
+    /// @notice The same on the sell side: an oversized AMPS sell settles what the pool took.
+    function test_lead_anOversizedSellSettlesTheRealisedInput() public {
+        policy.setRailOverride(887_272);
+        _refreshGate(usdgKey);
+
+        uint256 oversized = 5_000_000e18;
+        amps.approve(address(router), type(uint256).max);
+        uint256 before = amps.balanceOf(address(this));
+
+        uint256 out = router.sell(usdgId, oversized, 0, address(this), false, type(uint256).max);
+        assertGt(out, 0, "the swap executed");
+        uint256 spent = before - amps.balanceOf(address(this));
+        assertLt(spent, oversized, "and only the realised AMPS was settled");
+        assertEq(amps.balanceOf(address(router)), 0, "the router kept nothing");
+    }
+
     /// @notice A pool the registry does not know cannot be traded, on any entry point.
     function test_everyEntryPointRefusesAnUnregisteredPool() public {
         PoolId ghost = PoolId.wrap(keccak256("no such pool"));

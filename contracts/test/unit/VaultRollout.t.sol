@@ -378,6 +378,123 @@ contract VaultRolloutTest is PlacementFixture {
         assertSweepClean("withdrawRetiredBids");
     }
 
+    /// @notice **Audit finding 5.** A harvest's realised fees are fees, not principal. `modifyLiquidity` returns
+    ///         `principal + feesAccrued` in one delta, and this path used to keep only the sum — so a retired
+    ///         spoke's accrued fees were minted as plain vault claims, skipping the creator's slice and the
+    ///         mandatory AMPS-side burn that every other realisation pays.
+    ///
+    /// @dev The bid cells earn their AMPS-side fees from sells that walk the price down into them, which is
+    ///      exactly what this test does before retiring the name.
+    function test_f05_aRetiredBidWithdrawalRoutesItsAccruedFeesThroughTheSplit() public {
+        bondDeposit(address(stocks[0]), 20e18);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        assertGt(vault.deployBonded(constituentIds[0]), 0, "the spoke has bids");
+
+        // A sell into the spoke pays its fee in AMPS, to the bid cells the price walks into. It is deliberately
+        // small: there is no liquidity between the tick and the top bid cell, so any sell reaches the bids, and
+        // the AMPS it leaves in them is written off by the valuer (I5) — i.e. it is a real NAV move, and a large
+        // one would trip the R1 bleed bound for a reason that has nothing to do with the fee split under test.
+        giveShares(BOB, 20e18);
+        sellAmps(spokePools[0], 2e18);
+        syncMarket();
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        vm.prank(TIMELOCK);
+        registry.retireConstituent(constituentIds[0]);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        uint256 creatorBefore = amps.balanceOf(CREATOR);
+        uint256 supplyBefore = amps.totalSupply();
+        uint256 creatorClaimBefore = poolManager.balanceOf(CREATOR, uint256(uint160(address(stocks[0]))));
+
+        vm.prank(TIMELOCK);
+        registry.withdrawRetiredBids(constituentIds[0]);
+
+        assertGt(supplyBefore - amps.totalSupply(), 0, "the AMPS-side fees were burned, not banked as inventory");
+        assertGt(amps.balanceOf(CREATOR) - creatorBefore, 0, "and the creator took their slice of them");
+        // The counter side of the same removal is principal, which stays with the vault as claims; whatever fee
+        // share the creator is owed of it arrives as a claim of their own and never as an in-kind transfer.
+        assertGe(
+            poolManager.balanceOf(CREATOR, uint256(uint160(address(stocks[0])))),
+            creatorClaimBefore,
+            "the counter-side slice is a claim"
+        );
+        assertSweepClean("retired-bid fee split");
+    }
+
+    /// @notice **Audit finding 15.** A cell the buyback owns is not rollout's to move. Every unfilled ask cell
+    ///         satisfies the second half of §3.5's predicate by construction, so a cell whose upper bound the mark
+    ///         had crossed — AMPS the vault sold on the way up and bought back on the way down — was eligible for
+    ///         the harvest, and a rollout ordered before the next `compound` moved it into a spoke's **ask** ladder
+    ///         to be sold a second time instead of burned. Rollout is permissionless, so that ordering is
+    ///         anybody's to choose.
+    function test_f15_aRolloutLeavesABoughtBackCellForTheBurn() public {
+        // The hub's whole ask ladder is under the mark: every cell of it is bought-back inventory.
+        int24 highest;
+        PlacementRecord[] memory hubRecords = ladderOf(hubPool);
+        for (uint256 i; i < hubRecords.length; ++i) {
+            if (hubRecords[i].above && hubRecords[i].upperTick > highest) highest = hubRecords[i].upperTick;
+        }
+        hook.setHighWaterTick(hubPool, highest);
+
+        uint256 hubBefore = _askInventoryOf(hubPool);
+        uint256 wethBefore = _askInventoryOf(wethPool);
+
+        vm.prank(KEEPER);
+        uint256 moved = vault.rollout(constituentIds[0]);
+        assertGt(moved, 0, "the rollout still ran");
+
+        assertEq(_askInventoryOf(hubPool), hubBefore, "and took nothing out of the hub's marked cells");
+        assertLt(_askInventoryOf(wethPool), wethBefore, "everything it moved came from the unmarked pool");
+
+        // And the inventory it left alone is burned by the next `compound`, which is where it was always going.
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        syncMarket();
+        uint256 supplyBefore = amps.totalSupply();
+        vm.prank(KEEPER);
+        (, uint256 burned) = vault.compound(hubPool);
+        assertGt(burned, 0, "the compound burned the cells the rollout preserved");
+        assertEq(supplyBefore - amps.totalSupply(), burned, "and the supply agrees");
+    }
+
+    /// @notice **Audit finding 7.** The EIP-150 reserve compounds with the hops. `rollout` reaches `payBounty`
+    ///         through two live `DELEGATECALL` frames, and correcting for a single 63/64 reserve overstated the
+    ///         gas by about `txGasLimit / 64` — a term the *caller* chooses, so a keeper could inflate the pot's
+    ///         own 3x gas cap simply by sending the job with a large gas limit. With the two-hop correction the
+    ///         reported figure is the job's, and sending the same job with ten times the gas limit does not change
+    ///         it.
+    function test_f07_theTwoHopGasAllowanceIsIndependentOfTheCallersGasLimit() public {
+        vm.prank(TIMELOCK);
+        pot.setChipBps(Constants.CHIP_BPS_MAX);
+
+        uint256 snapshot = vm.snapshotState();
+        uint256 reportedSmall = _rolloutReportedGas(8_000_000);
+        vm.revertToState(snapshot);
+        uint256 reportedBig = _rolloutReportedGas(40_000_000);
+
+        assertGt(reportedSmall, 0, "the job was measured at all");
+        // A single reserve on a two-hop path leaves `limit / 64` of the caller's choosing in the figure: at a 40M
+        // limit that is ~625k gas against ~125k at 8M, a difference several times the tolerance below.
+        assertApproxEqRel(reportedBig, reportedSmall, 0.05e18, "the same job, whatever the caller's gas limit");
+    }
+
+    /// @dev One rollout sent with `gasLimit`, and the gas figure the vault handed the pot, recovered from the
+    ///      payment the 3x cap produced. Mirrors `VaultCompound.t.sol`'s single-hop version.
+    function _rolloutReportedGas(uint256 gasLimit) private returns (uint256 reportedGas) {
+        vm.recordLogs();
+        vm.prank(KEEPER);
+        this.rolloutWithGas{gas: gasLimit}(constituentIds[0]);
+
+        (, uint256 paidUsd18,,) = _bountyIn(vm.getRecordedLogs());
+        uint256 usdPerGas = (Constants.KEEPER_BASEFEE_FLOOR_WEI * WETH_USD8) / 1e8;
+        reportedGas = paidUsd18 / Constants.KEEPER_GAS_CAP_MULTIPLE / usdPerGas;
+    }
+
+    /// @notice External wrapper so a rollout can be sent with an explicit gas limit.
+    function rolloutWithGas(uint16 constituentId) external returns (uint256 moved) {
+        moved = vault.rollout(constituentId);
+    }
+
     // -------------------------------------------------------------------------------------------------------------
     // deployBonded
     // -------------------------------------------------------------------------------------------------------------

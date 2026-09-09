@@ -9,6 +9,7 @@ import {
     AmpsResidual,
     DeadlineExpired,
     NativeTransferFailed,
+    NotARotation,
     NotPoolManager,
     NotWrappedNative,
     Reentrancy,
@@ -237,6 +238,10 @@ contract AmpsRouter is IAmpsRouter, IUnlockCallback {
 
         PoolKey memory key1 = _poolKey(hop1);
         PoolKey memory key2 = _poolKey(hop2);
+        // **At least one leg must be a constituent's spoke** (audit fix, 2026-09-08). See {NotARotation}: the two
+        // entry pools are the way in and the way out of the index, so a hop between them is not a rotation at any
+        // price, and pricing it pass-through sold a 60 bp USDG/WETH swap against protocol-owned liquidity.
+        if (!_isSpoke(hop1) && !_isSpoke(hop2)) revert NotARotation(PoolId.unwrap(hop1), PoolId.unwrap(hop2));
         if (unwrap && Currency.unwrap(key2.currency1) != weth) {
             revert NotWrappedNative(Currency.unwrap(key2.currency1));
         }
@@ -297,7 +302,12 @@ contract AmpsRouter is IAmpsRouter, IUnlockCallback {
         BalanceDelta delta = _swap(key, false, amountIn, "");
         uint256 ampsOut = _positive(delta.amount0());
 
-        _settle(key.currency1, amountIn);
+        // **The realised input, not the requested one** (audit fix, 2026-09-08). An exact-input swap runs with the
+        // price limit open, so the pool can still fill less than the whole amount — it runs out of liquidity, or
+        // the hook's rail stops the tick — and settling the *requested* amount then over-pays the PoolManager,
+        // which reverts the whole call with v4's `CurrencyNotSettled` instead of the `SlippageExceeded` the caller
+        // can read. The unspent remainder stays here and is swept back to the caller by the entry point.
+        _settle(key.currency1, _owed(delta.amount1()));
         IPoolManager(poolManager).take(key.currency0, to, ampsOut);
         result = abi.encode(ampsOut);
     }
@@ -310,7 +320,8 @@ contract AmpsRouter is IAmpsRouter, IUnlockCallback {
         BalanceDelta delta = _swap(key, true, ampsIn, "");
         uint256 amountOut = _positive(delta.amount1());
 
-        _settle(key.currency0, ampsIn);
+        // The realised AMPS in, for the reason {_buyAction} gives.
+        _settle(key.currency0, _owed(delta.amount0()));
         IPoolManager(poolManager).take(key.currency1, to, amountOut);
         result = abi.encode(amountOut);
     }
@@ -343,7 +354,9 @@ contract AmpsRouter is IAmpsRouter, IUnlockCallback {
         int256 residual = PoolStateLib.currencyDelta(IExttload(poolManager), address(this), key1.currency0);
         if (residual != 0) revert AmpsResidual(residual);
 
-        _settle(key1.currency1, amountIn);
+        // The realised input of hop 1, for the reason {_buyAction} gives; hop 2's input is `ampsThrough`, which is
+        // already hop 1's realised output, and the AMPS legs are asserted to net to zero above.
+        _settle(key1.currency1, _owed(hop1.amount1()));
         IPoolManager(poolManager).take(key2.currency1, to, amountOut);
         result = abi.encode(amountOut, ampsThrough);
     }
@@ -489,6 +502,18 @@ contract AmpsRouter is IAmpsRouter, IUnlockCallback {
     ///      there is nothing to take.
     function _positive(int128 amount) private pure returns (uint256 value) {
         value = amount > 0 ? uint256(uint128(amount)) : 0;
+    }
+
+    /// @dev The negative half of a realised delta, as an unsigned amount: what the swap actually consumed and
+    ///      therefore what has to be settled. Zero when the pool took nothing.
+    function _owed(int128 amount) private pure returns (uint256 value) {
+        value = amount < 0 ? uint256(uint128(-amount)) : 0;
+    }
+
+    /// @dev Whether a pool is a constituent's spoke rather than one of the two entry pools. Read from the registry,
+    ///      which is the one authority on the index's membership; an entry pool's `constituentId` is zero.
+    function _isSpoke(PoolId poolId) private view returns (bool spoke) {
+        spoke = IPoolRegistry(registry).poolConfig(poolId).constituentId != 0;
     }
 }
 

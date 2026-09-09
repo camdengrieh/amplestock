@@ -163,8 +163,19 @@ contract AmpsGenesis is IAmpsGenesis {
                 || (ethOn && ethSpec.shares != Constants.AUCTION_ETH_SHARES)
         ) revert InvalidTranche(usdgSpec.shares, ethSpec.shares);
 
+        // **`>=`, and the surplus goes home** (audit fix, 2026-09-08). This address is derivable from the
+        // deployment long before genesis and holds a known balance in a known window, so `held != AUCTION_SHARES`
+        // meant one wei sent between `genesisMint` and this call stranded half of `S0` in an ownerless adapter
+        // with no other exit and halved NAV/share for good. The tranche is still exact — the legs below are funded
+        // from it to the wei — and anything above it is a donation, which goes back to the vault as inventory,
+        // where every other stray balance in this protocol goes.
         uint256 held = IERC20(_AMPS).balanceOf(address(this));
-        if (held != Constants.AUCTION_SHARES) revert TrancheNotFunded(held, Constants.AUCTION_SHARES);
+        if (held < Constants.AUCTION_SHARES) revert TrancheNotFunded(held, Constants.AUCTION_SHARES);
+        uint256 surplus = held - Constants.AUCTION_SHARES;
+        if (surplus != 0) {
+            IERC20(_AMPS).safeTransfer(_VAULT, surplus);
+            emit TrancheSurplusSwept(surplus);
+        }
 
         if (ethUsdX18_ == 0) revert EthUsdMismatch(0, 0);
         _requireEthUsdAgrees(ethUsdX18_);
@@ -438,8 +449,12 @@ contract AmpsGenesis is IAmpsGenesis {
         (bool ok,) = auction.call(abi.encodeWithSignature("onTokensReceived()"));
         ok;
 
+        // `>=` for the reason {createAuctions} gives: the leg's CREATE2 address is derivable from the proposal's
+        // own salt, so a pre-donation of one wei must not be able to force the whole launch to be re-proposed. A
+        // leg holding more than its tranche sells only what its schedule issues and returns the rest through
+        // `sweepUnsoldTokens` at settlement, which is the same path the unsold part of the tranche takes.
         held = IERC20(_AMPS).balanceOf(auction);
-        if (held != spec.shares) revert AuctionNotFunded(auction, held, spec.shares);
+        if (held < spec.shares) revert AuctionNotFunded(auction, held, spec.shares);
     }
 
     /// @dev Deploys one auction through the factory, trying the v2 name before the pre-v2 one.
@@ -495,9 +510,19 @@ contract AmpsGenesis is IAmpsGenesis {
     function _launchPrice(bool usdgGraduated, bool ethGraduated) private returns (uint256 p0) {
         // Refresh the ETH/USD price from the vault's feed registry when it can be read. The value recorded at
         // creation is up to the whole bidding window old, and the ETH leg's clearing price is quoted in ETH.
-        uint256 ethUsd = _feedEthUsdX18();
-        if (ethUsd == 0) ethUsd = _ethUsdX18;
-        else _ethUsdX18 = ethUsd;
+        // The refresh is taken only when the registry calls the answer **fresh** (audit fix, 2026-09-08). `P0` is
+        // the protocol's launch reference and, on an ETH-only graduation, the ETH/USD answer *is* `P0` up to the
+        // clearing price — so adopting a stale one would set the reference of the whole system off a price nobody
+        // vouches for. An unusable answer falls back to the price recorded at `createAuctions`, which was itself
+        // cross-checked against the registry then, and says so; it does not revert, because a `settle()` that
+        // reverts strands the raise inside one-shot auction sweeps for ever.
+        (uint256 ethUsd, bool fresh) = _feedEthUsdX18();
+        if (ethUsd == 0 || !fresh) {
+            emit EthUsdNotRefreshed(ethUsd, _ethUsdX18);
+            ethUsd = _ethUsdX18;
+        } else {
+            _ethUsdX18 = ethUsd;
+        }
 
         uint256 usdgPrice;
         uint256 ethPrice;
@@ -593,8 +618,11 @@ contract AmpsGenesis is IAmpsGenesis {
     ///      cross-check is a guard against a fat-fingered proposal, not a dependency.
     /// @param supplied The proposal's price.
     function _requireEthUsdAgrees(uint256 supplied) private view {
-        uint256 feedPrice = _feedEthUsdX18();
-        if (feedPrice == 0) return;
+        // An answer the registry does not call fresh is no answer for this purpose: the cross-check exists to
+        // catch a fat-fingered proposal, and comparing against a price the registry itself will not stand behind
+        // can only turn a correct proposal into a revert. Skipping is what "cannot be read" has always done here.
+        (uint256 feedPrice, bool fresh) = _feedEthUsdX18();
+        if (feedPrice == 0 || !fresh) return;
         uint256 gap = supplied > feedPrice ? supplied - feedPrice : feedPrice - supplied;
         if (FullMath.mulDiv(gap, Constants.BPS, feedPrice) > IAmpsVault(_VAULT).refDivergenceBps()) {
             revert EthUsdMismatch(supplied, feedPrice);
@@ -605,16 +633,23 @@ contract AmpsGenesis is IAmpsGenesis {
     /// @dev A bounded, hand-decoded `staticcall` rather than a typed `try`, for the reason `AmpsVault._gateRead`
     ///      gives: a `try` fails open only for a target that *reverts*, not for one that is codeless, answers
     ///      short or burns the gas it is given, and this read must never be able to stop a launch.
+    /// @dev The freshness word is read and returned rather than discarded: `latestAnswerUsd18` reports an answer
+    ///      it does not consider actionable — aged past its session-scaled bound, or held behind an unconfirmed
+    ///      jump — and both callers here have to know, because one of them sets `P0`.
     /// @return price18 The price, or zero.
-    function _feedEthUsdX18() private view returns (uint256 price18) {
+    /// @return fresh Whether the registry considers it actionable. False whenever `price18` is zero.
+    function _feedEthUsdX18() private view returns (uint256 price18, bool fresh) {
         address feeds = IAmpsVault(_VAULT).feedRegistry();
-        if (feeds == address(0) || feeds.code.length == 0) return 0;
+        if (feeds == address(0) || feeds.code.length == 0) return (0, false);
         (bool ok, bytes memory returndata) =
             feeds.staticcall{gas: FEED_READ_GAS}(abi.encodeCall(IFeedRegistry.latestAnswerUsd18, (_WETH9)));
-        if (!ok || returndata.length < 96) return 0;
+        if (!ok || returndata.length < 96) return (0, false);
+        uint256 freshWord;
         assembly ("memory-safe") {
             price18 := mload(add(returndata, 0x20))
+            freshWord := mload(add(returndata, 0x60))
         }
+        fresh = price18 != 0 && freshWord != 0;
     }
 }
 

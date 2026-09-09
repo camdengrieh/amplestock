@@ -214,6 +214,31 @@ contract PlacementHookStub is BaseHook, IMarketReference {
         ampsFeeBps = value;
     }
 
+    /// @notice The dynamic component {quoteFee} reports on top of {ampsFeeBps}, in bps: a surge, in other words.
+    /// @dev The creator's divisor is bounded below by the rate the pool is actually charging, so this is what a
+    ///      test moves to prove the dynamic part is never creator-eligible (audit finding 4).
+    uint16 public dynBps;
+
+    /// @notice Sets {dynBps}.
+    function setDynBps(uint16 value) external {
+        dynBps = value;
+    }
+
+    /// @notice `IAmpsHook.quoteFee`, in the one shape `VaultPlacementLib` asks for: what a sell is charged right
+    ///         now, base plus the clamped dynamic part.
+    /// @dev The real hook's answer depends on the pool's whole cached state; this reports exactly the two numbers
+    ///      the vault's creator-slice divisor reads, which is all of it the placement path touches.
+    function quoteFee(PoolId, bool, bool, uint256, bool)
+        external
+        view
+        returns (uint24 feePips, uint16 baseBps, uint16 dynamicBps, bool refuse)
+    {
+        baseBps = ampsFeeBps;
+        dynamicBps = dynBps;
+        feePips = (uint24(baseBps) + uint24(dynamicBps)) * 100;
+        refuse = false;
+    }
+
     /// @notice Sets a pool's buy fee, in bps.
     function setBuyFeeBps(PoolId poolId, uint16 value) external {
         _obs[poolId].buyFeeBps = value;

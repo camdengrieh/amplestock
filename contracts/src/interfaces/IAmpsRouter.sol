@@ -153,6 +153,14 @@ interface IAmpsRouter {
     /// @dev The two hops must be different pools. Buying AMPS in a pool and selling it straight back into the same
     ///      pool is a round trip that moves the tick out and back, not a rotation, and pricing it at two
     ///      pass-through fees would make the pool's liquidity pay for the caller's own noise.
+    ///
+    /// @dev **At least one hop must be a constituent's spoke, and one pool takes one pass-through hop per
+    ///      transaction** (audit fix, 2026-09-08). `rotate(hub, wethPool)` is a USDG/WETH trade against
+    ///      protocol-owned liquidity, not a move through the index, and reverts `NotARotation`. And `rotate(A, B)`
+    ///      followed by `rotate(B, A)` in one transaction is the round trip the paragraph above refuses, rebuilt
+    ///      out of two calls: `AmpsHook` counts the pass-through hops it has priced per pool per transaction, so
+    ///      the second call's hops pay `ampsFeeBps`. Neither bound touches an honest rotation, which visits each
+    ///      pool once.
     /// @param hop1 The pool bought through; its counter asset is the input.
     /// @param hop2 The pool sold through; its counter asset is the output.
     /// @param amountIn Hop 1's input, in its raw units. Pass `msg.value == amountIn` to wrap ether, legal only

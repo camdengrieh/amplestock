@@ -162,7 +162,7 @@ interface IOracleGate {
     /// @return cap 300 GREEN, 1,000 degraded, 2,000 during band escalation.
     function dynCapBps(PoolId poolId) external view returns (uint16 cap);
 
-    /// @notice Reverting form of {isPlacementAllowed}, for the vault's `_requireHealthy`.
+    /// @notice Reverting form of {isPlacementAllowed}, for the vault's `_requirePlaceable`.
     /// @param poolId The pool.
     /// @return anchorAtNav Whether the caller must anchor at NAV.
     function checkPlacement(PoolId poolId) external view returns (bool anchorAtNav);

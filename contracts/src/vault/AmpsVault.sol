@@ -59,15 +59,19 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 ///      transaction, is not a gate (section 7).
 ///
 /// @dev **Two deliberate deviations from a literal reading of section 7**, both documented in the Phase 2 report:
-///        1. There are two gate policies, not one. `_requireHealthy` refuses `DEGRADED`, `DIVERGED`,
-///           `SCHEDULED_FREEZE` and `WATCHDOG` — the four states section 7 step 2 forces — and passes `GREEN` and
-///           `REF_DIVERGED`. {depositBonded} and {mintVesting} instead take `_requireBondsHealthy`, which refuses
-///           only `DIVERGED` and `SCHEDULED_FREEZE`: bond markets stay open 24/7 through stale feeds and closed
-///           sessions and price the haircut instead (the plan's Decision 10 and section 2's own table), so the
-///           management policy would be stricter than the design rather than safer.
-///        2. {emergencyMigrate} is not `_requireHealthy`-gated. It is gated by the on-chain denylist predicate,
+///        1. There are **three** gate policies, not one. `_requirePlaceable` — every placement, `compound`,
+///           `rollout`, `deployBonded` and `withdrawRetiredBids` — refuses `DEGRADED`, `DIVERGED`,
+///           `SCHEDULED_FREEZE` and `WATCHDOG`, the four states section 7 step 2 forces, and passes `GREEN` and
+///           `REF_DIVERGED`. `_requireManageable` — the governed setters, `checkpoint`, `touch`,
+///           `initializePool`, both genesis steps and `setStandbyVault` — refuses `DIVERGED`, `SCHEDULED_FREEZE`
+///           and `WATCHDOG` but **not** `DEGRADED`, because the trading calendar reports `DEGRADED` every weekend
+///           and every holiday and governance must not be seasonal (see {_requireManageable}).
+///           {depositBonded} and {mintVesting} take `_requireBondsHealthy`, which refuses only `DIVERGED` and
+///           `SCHEDULED_FREEZE`: bond markets stay open 24/7 through stale feeds and closed sessions and price the
+///           haircut instead (the plan's Decision 10 and section 2's own table).
+///        2. {emergencyMigrate} is gated by none of them. It is gated by the on-chain denylist predicate,
 ///           which is strictly narrower, and the incident it exists for (an issuer denylisting the vault while
-///           pausing its oracle) is precisely a state in which `_requireHealthy` would refuse. Gating it would
+///           pausing its oracle) is precisely a state in which every one of them would refuse. Gating it would
 ///           brick the evacuation path of an immutable contract.
 ///        3. A gate pointer the vault **cannot read** is treated as absent rather than as a refusal — and "cannot
 ///           read" is meant in full: a pointer that reverts, that has no code, that answers short, that answers
@@ -95,10 +99,6 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      of the number is a second thing that can drift.
     uint256 private constant UNLOCK_ACTION = VaultRedeemLib.UNLOCK_ACTION;
 
-    /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`. NAV/share captured at entry for the R1 post-condition,
-    ///      used by the relaxed migration bleed bound. Declared once, in {VaultRedeemLib}.
-    uint256 private constant NAV_BEFORE = VaultRedeemLib.NAV_BEFORE;
-
     /// @dev The gas ceiling on each of the three calls this contract makes to the oracle gate pointer: `state(0)`,
     ///      `protocolFreezeUntil()` and `poke()`. See {_requireGate} for why they are bounded low-level calls at
     ///      all rather than typed `try`s.
@@ -112,6 +112,16 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      silently stop refusing. 1,500,000 is far above the honest cost and far below a block, and by EIP-150
     ///      the caller keeps a 1/64th of its remaining gas whatever the callee does with the rest.
     uint256 private constant GATE_READ_GAS = 1_500_000;
+
+    /// @dev {_requireGate}'s three refusal sets. Placement is section 7 step 2's four states; management drops
+    ///      `DEGRADED` from them; bonds drops `WATCHDOG` as well. See {_requirePlaceable}, {_requireManageable}
+    ///      and {_requireBondsHealthy}, and `test/unit/GuardSymmetry.t.sol`, which classifies every selector by
+    ///      which of the three it takes.
+    uint8 private constant POLICY_PLACEMENT = 0;
+    /// @dev See {POLICY_PLACEMENT}.
+    uint8 private constant POLICY_MANAGEMENT = 1;
+    /// @dev See {POLICY_PLACEMENT}.
+    uint8 private constant POLICY_BONDS = 2;
 
     /// @dev The unlock action set lives in {VaultRedeemLib}, which is the one library both the placement path and
     ///      the ungated redemption path may reference, so the discriminators have exactly one home. `ACTION_SETTLE`
@@ -881,7 +891,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc IAmpsVault
-    /// @dev The gate is poked *before* `_requireHealthy`, so a checkpoint is exactly what clears a layer-A watchdog
+    /// @dev The gate is poked *before* the gate check, so a checkpoint is exactly what clears a layer-A watchdog
     ///      whose cause has passed.
     ///
     /// @dev **Refuses before {genesis}, and must.** With no supply, `_navPerShare` is `1e18 / VIRTUAL_SHARES` —
@@ -893,7 +903,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function checkpoint() external locked returns (Checkpoint memory snapshot) {
         if (!_initialized) revert NotInitialized();
         _poke();
-        _requireHealthy();
+        _requireManageable();
         snapshot = _checkpoint();
         _sweepClean();
     }
@@ -906,7 +916,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function touch() external locked {
         if (!_initialized) revert NotInitialized();
         _poke();
-        _requireHealthy();
+        _requireManageable();
         _sweepClean();
     }
 
@@ -983,7 +993,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      NAV over an `A` of zero, so the two halves of the old `genesis()` are separated by the whole bidding
     ///      window.
     function genesisMint(GenesisMintParams calldata params) external locked onlyTimelock {
-        _requireHealthy();
+        _requireManageable();
         if (_genesisMinted) revert GenesisAlreadyDone();
         _genesisMinted = true;
         _creator = params.creator;
@@ -1008,7 +1018,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      reference is then seeded at `max(p0X18, navPerShare)` — the floor keeps I24 true by construction even
     ///      if a proposal ever passed a `p0X18` below the backing it just delivered.
     function genesisPlace(GenesisPlaceParams calldata params) external locked {
-        _requireHealthy();
+        _requireManageable();
         if (msg.sender != _genesis && msg.sender != _TIMELOCK) revert NotTimelock(msg.sender);
         if (!_genesisMinted) revert GenesisNotMinted();
         if (_initialized) revert GenesisAlreadyDone();
@@ -1042,7 +1052,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external locked returns (PoolId poolId) {
-        _requireHealthy();
+        _requireManageable();
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
 
         // §12 ruling C: every pool opens exactly on a spacing-aligned tick, which is what makes it open on its
@@ -1073,7 +1083,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      membership and the inventory bound inside, and R1 plus `sweepClean` in {_afterPlacement}.
     function place(PoolId poolId, bool above, uint256 amount) external locked returns (uint256 placed) {
         if (msg.sender != _TIMELOCK && msg.sender != _registry) revert NotTimelock(msg.sender);
-        _requireHealthy();
+        _requirePlaceable();
         uint256 navBefore = _previewNav();
         placed = VaultPlacementLib.place(
             ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, above, amount, bytes32("place"), true
@@ -1085,7 +1095,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev Permissionless and bountied. See {VaultPlacementLib-compound} for the step-by-step of §3.6.
     function compound(PoolId poolId) external locked returns (uint256 ampsFees, uint256 burned) {
         uint256 gasStart = gasleft();
-        _requireHealthy();
+        _requirePlaceable();
         uint256 navBefore = _previewNav();
         (ampsFees, burned) =
             VaultPlacementLib.compound(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, gasStart);
@@ -1096,7 +1106,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev Permissionless and bountied. `amountAmps == 0` from the schedule is a no-op, not a revert.
     function rollout(uint16 constituentId) external locked returns (uint256 moved) {
         uint256 gasStart = gasleft();
-        _requireHealthy();
+        _requirePlaceable();
         uint256 navBefore = _previewNav();
         moved = VaultRolloutLib.rollout(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
@@ -1107,7 +1117,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      be used to drain the bounty pot a wei at a time (§10 ruling 15).
     function deployBonded(uint16 constituentId) external locked returns (uint256 placed) {
         uint256 gasStart = gasleft();
-        _requireHealthy();
+        _requirePlaceable();
         uint256 navBefore = _previewNav();
         placed = VaultRolloutLib.deployBonded(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
@@ -1118,9 +1128,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      legitimate caller and a wrong caller is not a gate refusal.
     function withdrawRetiredBids(uint16 constituentId) external locked returns (uint256 amountMoved) {
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
-        _requireHealthy();
+        _requirePlaceable();
         uint256 navBefore = _previewNav();
-        amountMoved = VaultRolloutLib.withdrawRetiredBids(ladderAt, _lastPlacementAt, _POOL_MANAGER, constituentId);
+        amountMoved =
+            VaultRolloutLib.withdrawRetiredBids(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
         _afterPlacement(navBefore);
     }
 
@@ -1239,11 +1250,21 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     /// @dev The single pointer setter. Four slots are **set-once** and refuse once {genesis} has frozen the wiring
-    ///      (`registry`, `bonds`, `bountyPot`); `marketReference` is set-once before genesis and may be
-    ///      re-pointed afterwards exactly once more, to `AmpsHook`, under the 7-day timelock. The remaining slots
-    ///      are freely pointer-upgradeable and none of them can move a fund.
+    ///      (`registry`, `bonds`, `bountyPot`, `genesis`). Every other slot — `marketReference` included — is
+    ///      freely re-pointable by the timelock under the 7-day delay, and none of them can move a fund.
+    ///
+    /// @dev **`marketReference` carries no set-once latch, and deliberately so** (audit disposition, 2026-09-08).
+    ///      The NatSpec here used to promise "set-once, then exactly once more", which the code never enforced.
+    ///      The promise, not the code, was wrong: the market reference is `AmpsHook`, whose address *is* its
+    ///      permission set and is therefore mined against one exact creation-code hash. A hook that has to be
+    ///      redeployed — a fixed bug, a dependency bump, a re-mine — is a new address, and a vault that could not
+    ///      be re-pointed at it would be a vault with no observation source, no high-water mark and no surge for
+    ///      good. What the pointer can actually do is bounded elsewhere: every read of it is a gas-capped,
+    ///      hand-decoded probe whose failure degrades rather than reverts, a wrong answer cannot mint, move or
+    ///      spend anything, and the write itself is a 7-day timelock operation. So the latch is not added and the
+    ///      claim is corrected.
     function setPolicyPointer(bytes32 slot, address newPointer) external locked onlyTimelock {
-        _requireHealthy();
+        _requireManageable();
         // Every pointer this setter can write names a contract the vault *calls*. A codeless one is a typo, and
         // for the gate slot specifically it is the typo that used to brick this very function: see {_requireGate}.
         if (newPointer.code.length == 0) revert ZeroAddress();
@@ -1258,7 +1279,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      there is unrecoverable — the roles are `onlyVault`, so nobody can hand them back. The check is the
     ///      same one {setPolicyPointer} already makes for every pointer the vault calls.
     function setStandbyVault(address standby) external locked onlyTimelock {
-        _requireHealthy();
+        _requireManageable();
         if (standby.code.length == 0) revert ZeroAddress();
         _standbyVault = standby;
         emit StandbyVaultRegistered(standby);
@@ -1266,7 +1287,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @inheritdoc IAmpsVault
     function setCreator(address newCreator) external locked {
-        _requireHealthy();
+        _requireManageable();
         address previous = _creator;
         if (msg.sender != previous) revert NotCreator(msg.sender);
         if (newCreator == address(0)) revert ZeroAddress();
@@ -1279,7 +1300,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc IAmpsVault
-    /// @dev Not `_requireHealthy`-gated on purpose: the incident this exists for is an issuer denylisting the vault
+    /// @dev Deliberately not gate-gated: the incident this exists for is an issuer denylisting the vault
     ///      while pausing its oracle, which is exactly a state in which the gate refuses. The predicate below is a
     ///      strictly narrower on-chain gate, and the guardian cannot migrate without it.
     /// @dev **Nothing on this path asserts a clean sweep, and nothing on it may.** The migration exists for a token
@@ -1293,10 +1314,30 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (standby == address(0) || standby != registered) revert NotStandbyVault(standby, registered);
         if (!VaultNavLib.migrationPredicate(_registry, address(this))) revert MigrationPredicateNotMet();
 
-        uint256 navBefore = _navPerShareX18;
-        uint256 navSlot = NAV_BEFORE;
-        assembly ("memory-safe") {
-            tstore(navSlot, navBefore)
+        // **`navBefore` is measured live, at this instant** (audit fix, 2026-09-08). It used to be the stored
+        // `_navPerShareX18`, i.e. the last checkpoint — and `checkpoint()` is gate-gated, so in exactly the states
+        // that make a migration necessary it cannot be refreshed. The bleed bound then compared a stale NAV with a
+        // live one and tripped on ordinary drift of the 24/7 assets: a 2.5% ETH move over a weekend is five times
+        // the 0.5% bound, so the whole evacuation rolled back on a number that had nothing to do with the
+        // evacuation. Measured here, `navBefore` and `navAfter` are the same instant and the bound measures the
+        // migration alone. The dead `NAV_BEFORE` transient write — which NatSpec called the relaxed bound's
+        // channel and nothing ever read — is gone with it.
+        //
+        // The read is the external `assetsUsd18Of` so it can be `try`-wrapped: a vault the valuer or a feed cannot
+        // price must still be evacuable, so an unpriceable *before* skips the bound and says so in an event rather
+        // than reverting. That is the same rule the `navAfter` leg has always applied on its own side.
+        uint256 navBefore;
+        bool bounded;
+        try this.assetsUsd18Of(address(this)) returns (uint256 assetsBefore) {
+            navBefore = _navPerShare(assetsBefore);
+            bounded = navBefore != 0;
+        } catch {}
+        if (!bounded) {
+            // Unpriceable at this instant, so there is nothing to bound against — but the last checkpoint is still
+            // the best number anyone has, and `Migrated` is the only disclosure of it. Reporting it costs nothing:
+            // it is explicitly *not* compared with `navAfter`, which is what the finding was about.
+            navBefore = _navPerShareX18;
+            emit MigrationBleedUnchecked(bytes32("navBefore"));
         }
 
         IPoolManager pm = IPoolManager(_POOL_MANAGER);
@@ -1323,13 +1364,15 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         uint256 navAfter;
         try this.assetsUsd18Of(standby) returns (uint256 assetsAfter) {
             navAfter = _navPerShare(assetsAfter);
-            uint256 floor = FullMath.mulDiv(navBefore, Constants.BPS - Constants.MIGRATION_BLEED_BPS_MAX, Constants.BPS);
-            if (navAfter < floor) revert NavBleedExceeded(navBefore, navAfter, Constants.MIGRATION_BLEED_BPS_MAX);
-        } catch {}
-
-        assembly ("memory-safe") {
-            tstore(navSlot, 0)
+            if (bounded) {
+                uint256 floor =
+                    FullMath.mulDiv(navBefore, Constants.BPS - Constants.MIGRATION_BLEED_BPS_MAX, Constants.BPS);
+                if (navAfter < floor) revert NavBleedExceeded(navBefore, navAfter, Constants.MIGRATION_BLEED_BPS_MAX);
+            }
+        } catch {
+            emit MigrationBleedUnchecked(bytes32("navAfter"));
         }
+
         emit Migrated(standby, navBefore, navAfter);
     }
 
@@ -1498,12 +1541,37 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     // Internals — gate, assets, migration predicate
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev The management policy, taken by every external state-changing function except {redeemProRata}, the two
-    ///      `AmpsBonds` entry points and {emergencyMigrate}: `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and
-    ///      `WATCHDOG` refuse — exactly the four states section 7 step 2 forces — while `GREEN` and `REF_DIVERGED`
-    ///      pass, because section 2's table keeps placements alive under `REF_DIVERGED`, anchored at NAV.
-    function _requireHealthy() private view {
-        _requireGate(false);
+    /// @dev The **placement** policy, taken by `place`, `compound`, `rollout`, `deployBonded` and
+    ///      `withdrawRetiredBids`: `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG` refuse — exactly the
+    ///      four states section 7 step 2 forces — while `GREEN` and `REF_DIVERGED` pass, because section 2's table
+    ///      keeps placements alive under `REF_DIVERGED`, anchored at NAV.
+    function _requirePlaceable() private view {
+        _requireGate(POLICY_PLACEMENT);
+    }
+
+    /// @dev The **management** policy, taken by every governed setter, `checkpoint`, `touch`, `initializePool`,
+    ///      both genesis steps and `setStandbyVault`: `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG` refuse, and
+    ///      `DEGRADED` does not.
+    ///
+    /// @dev **Why `DEGRADED` had to come out of this set** (audit fix, 2026-09-08). `OracleGate.state(0)` reports
+    ///      `DEGRADED` whenever an equity feed is stale beyond its session-scaled bound *or the session is simply
+    ///      closed* — which is every weekend, every holiday and every night. Applying the placement policy to
+    ///      management meant that for roughly 48 hours a week, plus holidays, the timelock could not change a
+    ///      parameter, could not register a standby vault, could not open a pool, could not run either genesis
+    ///      step, and — the one that matters most — could not call `setPolicyPointer`, which is the only way to
+    ///      replace a gate that is wrong but readable. Nobody could `checkpoint()` or `touch()` either, so the
+    ///      calendar could freeze governance and NAV upkeep together with no on-chain remedy for either the
+    ///      timelock or the guardian.
+    ///
+    ///      Nothing about `DEGRADED` argues for refusing governance. It says "a price is not currently actionable",
+    ///      which is a reason to stop *committing inventory at that price* — the placement policy, unchanged — not
+    ///      a reason to stop the contract's owners from operating it. The three states that still refuse are the
+    ///      ones that mean the protocol's own state is untrustworthy or deliberately halted: layer E's divergence
+    ///      breaker, a corporate-action or guardian freeze, and layer A's watchdog. A guardian protocol freeze
+    ///      refuses both policies, as it always has, and `checkpoint()` recomputing NAV off stale answers is
+    ///      exactly what slot 21's `navUnconfirmed` flag is for — the bond shell refuses such a NAV on its own.
+    function _requireManageable() private view {
+        _requireGate(POLICY_MANAGEMENT);
     }
 
     /// @dev The bond policy, taken only by {depositBonded} and {mintVesting}: `DIVERGED` and `SCHEDULED_FREEZE`
@@ -1516,7 +1584,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      `IOracleGate.checkBond` enforces on the `AmpsBonds` side. This check mirrors it as defence in depth: a
     ///      buggy or replaced bonds shell still cannot deposit or mint through a closed market.
     function _requireBondsHealthy() private view {
-        _requireGate(true);
+        _requireGate(POLICY_BONDS);
     }
 
     /// @dev The two policies over one gate read. A gate that cannot be read is treated as **absent** rather than as
@@ -1538,15 +1606,18 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      which is exactly the shape `OracleGate._read` uses on its own dependencies. `setPolicyPointer` also
     ///      refuses a codeless replacement outright, so reaching this state at all takes a self-destructed gate.
     ///
-    /// @param bondsPath Whether to apply the bond policy instead of the management policy.
-    function _requireGate(bool bondsPath) private view {
+    /// @param policy Which of the three refusal sets to apply: {POLICY_PLACEMENT}, {POLICY_MANAGEMENT} or
+    ///        {POLICY_BONDS}.
+    function _requireGate(uint8 policy) private view {
         (bool known, uint256 word) = _gateRead(abi.encodeCall(IOracleGate.state, (0)));
         if (!known || word > uint256(type(GateState).max)) return;
 
         GateState gateState = GateState(uint8(word));
-        bool refuses = bondsPath
-            ? (gateState == GateState.DIVERGED || gateState == GateState.SCHEDULED_FREEZE)
-            : (gateState != GateState.GREEN && gateState != GateState.REF_DIVERGED);
+        // The three sets, widest first. `DIVERGED` and `SCHEDULED_FREEZE` refuse everything; `WATCHDOG` refuses
+        // everything but a bond; `DEGRADED` refuses a placement alone.
+        bool refuses = gateState == GateState.DIVERGED || gateState == GateState.SCHEDULED_FREEZE;
+        if (!refuses && policy != POLICY_BONDS) refuses = gateState == GateState.WATCHDOG;
+        if (!refuses && policy == POLICY_PLACEMENT) refuses = gateState == GateState.DEGRADED;
         if (refuses) revert GateNotHealthy(uint8(gateState), bytes32(0));
 
         (known, word) = _gateRead(abi.encodeCall(IOracleGate.protocolFreezeUntil, ()));
@@ -1604,7 +1675,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         private
         returns (uint256 accepted)
     {
-        _requireHealthy();
+        _requireManageable();
         if (value < min || value > max) revert OutOfBand(name, value, min, max);
         emit VaultParameterChanged(name, previous, value);
         return value;

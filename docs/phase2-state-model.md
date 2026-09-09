@@ -339,7 +339,7 @@ redeem  (structurally ungated)
     emit Redeem, Burn("redeemInventory"); sweepClean (per token: sync + capped transfer outside any unlock, then
                                                           a try-wrapped per-token unlock for settle + mint;
                                                           `SweepResidue` instead of a revert)
-    -- no _requireHealthy, no gate, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
+    -- no gate read, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
        as an ERC-6909 claim the redeemer takes later, so one issuer can never block the floor (audit fixes 2, 3)
 
 checkpoint  (permissionless, unpaid)
@@ -507,7 +507,7 @@ asset list and, in Phase 3, with the positions the valuer decomposes), independe
 
 ## 7. The structurally ungated surface
 
-Exactly two external state-changing functions are exempt from `_requireHealthy`:
+Exactly two external state-changing functions are exempt from every gate policy:
 
 | Function | Why |
 |---|---|
@@ -526,28 +526,47 @@ any unlock, so a token that re-enters the PoolManager hits `ManagerLocked` inste
 the vault's own unlock, and the payout falls back to a claims-only unlock if the ERC-20 unlock fails for any reason.
 A third party can degrade a redemption; nothing can revert it (audit fixes 2, 3; re-audit findings 1, 3, 5).
 
-### 7.1 The vault has two gate policies, not one
+### 7.1 The vault has three gate policies, not one
 
-`AmpsVault` reads the gate through one helper with two policies, and the difference is load-bearing:
+`AmpsVault` reads the gate through one helper with three policies, and the differences are load-bearing:
 
 | Policy | Taken by | Refuses | Passes |
 |---|---|---|---|
-| `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requirePlaceable` (placement) | `place`, `compound`, `rollout`, `deployBonded`, `withdrawRetiredBids` | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requireManageable` (management) | every governed setter, `checkpoint`, `touch`, `initializePool`, both genesis steps, `setStandbyVault`, `setCreator` | `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `DEGRADED`, `REF_DIVERGED` |
 | `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
-| either policy, gate pointer **reverts, is codeless or answers malformed** | every gated selector | nothing | everything (fail-open through a bounded hand-decoded read; `setPolicyPointer` refuses a codeless target — audit fix 18) |
+| any policy, gate pointer **reverts, is codeless or answers malformed** | every gated selector | nothing | everything (fail-open through a bounded hand-decoded read; `setPolicyPointer` refuses a codeless target — audit fix 18) |
 
 The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
-`h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
+`h_session`, not close a market, so applying the placement policy to the two bond entry points would be *stricter
 than the design* rather than safer: it would shut every bond market every weekend. It mirrors `IOracleGate.checkBond`
 exactly, which makes the vault defence in depth behind the shell — a buggy or replaced `AmpsBonds` still cannot
 deposit or mint through a market the gate has closed — rather than a second, disagreeing gate.
 
+**Why `DEGRADED` came out of the management set (audit finding 9, 2026-09-08).** `OracleGate.state(0)` reports
+`DEGRADED` whenever an equity feed is stale beyond its session-scaled bound *or the session is simply closed* —
+which is every weekend, every holiday and every night. Applying the placement policy to management therefore meant
+that for roughly 48 hours a week, plus holidays, the timelock could not change a parameter, register a standby,
+open a pool, run either genesis step or — the one that matters most — call `setPolicyPointer`, which is the only way
+to replace a gate that is wrong but readable; and nobody could `checkpoint()` or `touch()` either, so the calendar
+froze governance and NAV upkeep together with no on-chain remedy for the timelock or the guardian. Nothing about
+`DEGRADED` argues for refusing governance: it says a price is not currently actionable, which is a reason to stop
+committing inventory at that price — the placement policy, unchanged — not a reason to stop the contract's owners
+from operating it. The three states that still refuse management are the ones that mean the protocol's own state is
+untrustworthy or deliberately halted: layer E's divergence breaker, a corporate-action or guardian freeze, and layer
+A's watchdog. A guardian protocol freeze still refuses all three policies, and a `checkpoint()` taken against stale
+answers is exactly what slot 21's `navUnconfirmed` flag exists to mark — the bond shell refuses such a NAV itself.
+
 Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
-* **`emergencyMigrate` is not `_requireHealthy`-gated.** It is gated by the on-chain denylist predicate, which is
+* **`emergencyMigrate` is gated by none of the three.** It is gated by the on-chain denylist predicate, which is
   strictly narrower. The incident it exists for — an issuer denylisting the vault while pausing its oracle — is
-  precisely a state in which `_requireHealthy` refuses, so gating it would brick the evacuation path of an immutable
-  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`).
+  precisely a state in which every one of them refuses, so gating it would brick the evacuation path of an immutable
+  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`). Its 0.5% NAV
+  bleed bound measures *both* sides live at the same instant (audit finding 10, 2026-09-08): comparing the stored
+  checkpoint — unrefreshable, because `checkpoint()` is gated — against a live valuation made ordinary weekend drift
+  of the 24/7 assets roll the whole evacuation back, and an unpriceable side now skips the bound and says so in
+  `MigrationBleedUnchecked` rather than vetoing the escape.
 * **A gate pointer that *reverts* is read as absent, not as a refusal.** The gate is the one pointer that can refuse
   every governance call; if a broken one refused, nobody could call `setPolicyPointer` to replace it and a contract
   holding no funds would have bricked the protocol. Failing open grants an attacker nothing they would not already
@@ -619,7 +638,7 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
 ## 9.1 Bootstrap ordering: the gate and the first pool are circular
 
-`AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireHealthy`, and
+`AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireManageable`, and
 `OracleGate._referenceIntegrity` reports `WATCHDOG` whenever the hub pool is unregistered *or* its observation ring
 covers less than `twapWindow`. A freshly initialised hook pool has no observations at all, so with the gate already
 wired **no pool can be registered and neither genesis step can run**: all three revert with

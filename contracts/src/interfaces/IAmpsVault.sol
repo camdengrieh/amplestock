@@ -45,7 +45,7 @@ import {Checkpoint, GateState} from "../types/Types.sol";
 ///      the bytecode is {mintVesting}, callable only by `AmpsBonds` (I10). There is no NAV mint, no
 ///      `mintInKind`, no `mintWithUSDG`, and the vault never mints AMPS for its own inventory or to defend a price.
 ///
-/// @dev **`redeemProRata` is structurally ungated.** It contains no `_requireHealthy`, no guardian read, no pause
+/// @dev **`redeemProRata` is structurally ungated.** It contains no gate read, no guardian read, no pause
 ///      flag, no oracle read and no gate reference of any kind — not merely "is not paused", but *cannot be*
 ///      paused (I14, I23). It succeeds with every feed dead, the watchdog tripped, the guardian frozen and the
 ///      timelock hostile. Only chain-level censorship remains, and that is disclosed rather than mitigated.
@@ -257,10 +257,20 @@ interface IAmpsVault {
     event StandbyVaultRegistered(address indexed standby);
 
     /// @notice Emitted when `emergencyMigrate` completes.
+    /// @dev `navPerShareBefore` is measured live at the call's first statement, at the same instant `navAfter`
+    ///      will be, so the pair is comparable and the bleed bound measures the migration rather than the market.
     /// @param newVault The vault that now owns everything.
     /// @param navPerShareBefore NAV/share before the migration.
     /// @param navPerShareAfter NAV/share after it.
     event Migrated(address indexed newVault, uint256 navPerShareBefore, uint256 navPerShareAfter);
+
+    /// @notice Emitted by `emergencyMigrate` when the 0.5% bleed bound could not be applied because one side of it
+    ///         could not be priced. The evacuation still completes: a vault whose assets no feed or valuer can
+    ///         value is exactly the incident the migration exists for, so an unpriceable NAV must not be able to
+    ///         veto it — but it is never silent.
+    /// @param side `"navBefore"` when the vault could not be valued at entry, `"navAfter"` when the standby could
+    ///        not be valued at the end.
+    event MigrationBleedUnchecked(bytes32 side);
 
     /// @notice Emitted when the creator address is reassigned. Only the current creator may do this.
     /// @param previousCreator The old address.
@@ -942,8 +952,11 @@ interface IAmpsVault {
     ///          {genesisPlace} sets the `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
     ///        - **Pointer-upgradeable policies**, replaceable at any time under the same 7-day delay:
     ///          `bytes32("oracleGate")`, `bytes32("feedRegistry")`, `bytes32("positionValuer")`,
-    ///          `bytes32("ladderPolicy")` and `bytes32("rolloutPolicy")`. `bytes32("marketReference")` sits between
-    ///          the two: set-once before genesis to the Phase 2 mock, and re-pointed to `AmpsHook` afterwards.
+    ///          `bytes32("ladderPolicy")`, `bytes32("rolloutPolicy")` and `bytes32("marketReference")`. The last of
+    ///          those carries **no** set-once or write-once-more latch: `AmpsHook`'s address is its permission set
+    ///          and is mined against one creation-code hash, so a redeployed hook is a new address and a vault that
+    ///          could not be re-pointed at it would lose its observation source for good. Every read of the
+    ///          pointer is a bounded, hand-decoded probe that degrades on failure, and it can move no funds.
     ///
     ///      Any other slot name reverts with {UnknownPointerSlot}, and `address(0)` is refused for every slot.
     ///

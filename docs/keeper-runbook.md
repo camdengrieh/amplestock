@@ -24,7 +24,7 @@ Five calls on `AmpsVault`, one on `AmpsGenesis` that runs once in the protocol's
 | Settle genesis | `AmpsGenesis.settle()` | **no** | once, in the first block after both auctions' `endBlock`, while `AmpsGenesis.settled()` is false |
 
 **Settle genesis is unpaid and one-shot**: it sweeps both legs, wraps the ETH and calls `AmpsVault.genesisPlace` in
-the same transaction. It takes `_requireHealthy`, so it fails while the vault's gate pointer is set and the hub pool
+the same transaction. It takes `_requireManageable` (through `genesisPlace`), so it fails while the vault's gate pointer is set and the hub pool
 does not exist yet — the gate pointer must stay unset until settlement (`docs/genesis-cca.md` §5). After it
 succeeds the job retires itself; the keeper's five ordinary jobs only start once the launch is placed.
 
@@ -52,7 +52,7 @@ Two stages. Screening is free (`view` reads only); qualification costs one `eth_
 | # | Check | Refusal reason | Source |
 |---|---|---|---|
 | 1 | `OracleGate.protocolFreezeUntil() <= now` | `protocol-frozen` | guardian freeze, auto-expires within 7 d |
-| 2 | `OracleGate.state(0) == GREEN` | `gate-not-green` / `gate-ref-diverged` | the vault's own `_requireHealthy` |
+| 2 | `OracleGate.state(0) == GREEN` | `gate-not-green` / `gate-ref-diverged` | the vault's own `_requirePlaceable` |
 | 3 | `OracleGate.isPlacementAllowed(poolId).allowed` | `placement-refused` | §3.8 step 2 |
 | 4 | `abs(slot0.tick - fairTick) <= 800` | `diverged` | §3.8 step 3, `PLACEMENT_DIVERGENCE_TICKS` |
 | 5 | `now >= lastPlacementAt + 60` | `cooldown` (carries `readyAt`) | §3.8 step 6 |
@@ -296,7 +296,7 @@ enumerate it. Logs are one JSON object per line on stdout.
 
 ## 6. What to do in each gate state
 
-`OracleGate.state(0)` is what `AmpsVault._requireHealthy` reads; `stateByPool(poolId)` is what a placement
+`OracleGate.state(0)` is what the vault's gate policies (`_requirePlaceable`, `_requireManageable`) read; `stateByPool(poolId)` is what a placement
 reads. `amps_keeper_gate_state` carries the ordinal.
 
 | State | Ordinal | What it means | The keeper | The operator |

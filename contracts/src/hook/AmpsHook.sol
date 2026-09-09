@@ -92,6 +92,19 @@ contract AmpsHook is BaseHook, IAmpsHook {
     ///      contract in one `unlock`, with the second hop selling precisely what the first hop bought.
     uint256 private constant ROTATION_CREDIT_SLOT = 0x28ef4cf38086db5318537797461c68e4f15873dbd0e73f3e45f6b1f32032b976;
 
+    /// @dev Domain separator of the EIP-1153 slots counting how many router pass-through hops this transaction has
+    ///      already been priced in one pool: `Constants.PASS_THROUGH_TOUCHED_SLOT`. See {_claimPassThrough}.
+    ///
+    /// @dev **What it closes** (audit fix, 2026-09-08). `AmpsRouter.rotate` refuses `hop1 == hop2`, so one call
+    ///      cannot buy and sell in the same pool — but two calls can: `rotate(A, B)` followed by `rotate(B, A)` in
+    ///      one transaction is exactly the round trip that refusal exists to stop, rebuilt out of four
+    ///      pass-through hops at 5-30 bp apiece where four AMPS fees at 500 bp are due. That lowers the
+    ///      profitability threshold of a sandwich against the vault's own ladders by about fifty-fold, which is a
+    ///      change of kind and not of degree. A pool priced pass-through once in a transaction therefore pays
+    ///      `ampsFeeBps` on every later hop of that transaction, so the closing leg of a round trip is priced as
+    ///      the exit it is while an honest rotation — one hop per pool — is untouched.
+    uint256 private constant PASS_THROUGH_TOUCHED_SLOT = uint256(Constants.PASS_THROUGH_TOUCHED_SLOT);
+
     /// @dev Gas ceiling on the gate snapshot. Generous — but finite, so a gate that loops cannot take the swap
     ///      with it. The budget only binds when the gate is genuinely that expensive: a normal refresh forwards
     ///      what it forwards and costs what it costs, and this number never adds gas to a swap.
@@ -385,7 +398,9 @@ contract AmpsHook is BaseHook, IAmpsHook {
         SwapCtx memory ctx;
         ctx.sell = params.zeroForOne;
         ctx.exactInput = params.amountSpecified < 0;
-        ctx.passThrough = _isPassThrough(sender, hookData);
+        // The claim is what makes the exemption once-per-pool-per-transaction; see {_claimPassThrough}. It runs
+        // only when the hop is the router's flagged rotation hop, so an ordinary swap writes nothing.
+        ctx.passThrough = _isPassThrough(sender, hookData) && _claimPassThrough(id);
         if (ctx.exactInput) ctx.amountIn = uint256(-params.amountSpecified);
 
         // Hashed once, on the only path that can spend a credit, and reused by the write below. A hop that is not
@@ -449,6 +464,15 @@ contract AmpsHook is BaseHook, IAmpsHook {
         HookStateLib.Dynamic memory d = HookStateLib.unpackDynamic(_dyn[id]);
         HookStateLib.Armed memory a = HookStateLib.unpackArmed(_arm[id]);
 
+        // **The rail this swap was quoted against, captured before anything below can move it** (audit fix,
+        // 2026-09-08). The gate refresh in step 6 installs a new band and rail, and the post-swap check in step 9
+        // used to read them: at a session close the first swap after the cache expired was priced in `beforeSwap`
+        // against the 800-tick REGULAR rail and then judged against the 2,310-4,500-tick CLOSED one, so one swap
+        // could push a spoke several times further from fair than the bound in force when it was quoted — and at
+        // the open the mirror image refused swaps that had been quoted as executable. A swap is judged against
+        // the rail it was sold at; the new rail binds the next swap, which is what `beforeSwap` will quote it at.
+        Effective memory quoted = _effective(c, d);
+
         (, int24 tick,,) = PoolStateLib.slot0(poolManager, id);
         int24 previousTick = d.lastTick;
 
@@ -461,7 +485,14 @@ contract AmpsHook is BaseHook, IAmpsHook {
         // 4. The rotation credit, from the realised delta and never the requested amount (I26), to the buyer and
         //    no one else — and only when the buy was the protocol router's rotation hop (I26, revision 6). An
         //    ordinary buy pays `ampsFeeBps` and earns nothing, so there is nothing for it to leave behind.
-        if (!params.zeroForOne && _isPassThrough(sender, hookData)) _credit(sender, delta);
+        // `_passThroughHops(id) <= 1` is "no *earlier* flagged hop has been priced in this pool": this swap's own
+        // `beforeSwap` claimed the pool and left the counter at 1, and no other hop can run between the two halves
+        // of one swap. A second flagged hop on the same pool reads 2 here, was priced at `ampsFeeBps` for exactly
+        // that reason, and must earn no credit either. Zero is the degenerate case of a callback driven without
+        // its `beforeSwap`, which the PoolManager never produces for a pool carrying the flag.
+        if (!params.zeroForOne && _isPassThrough(sender, hookData) && _passThroughHops(id) <= 1) {
+            _credit(sender, delta);
+        }
 
         // 5. Surge and capture are decayed at quote time; this only clears them once they are worth nothing.
         _clearDecayed(a);
@@ -493,8 +524,7 @@ contract AmpsHook is BaseHook, IAmpsHook {
         // 9. The post-swap half of the rail check: refuse a swap that ended beyond the rail having increased the
         //    deviation. The state written above is rolled back with it.
         if (devAfter > _deviation(previousTick, d.fairTick)) {
-            int24 rail = _effective(c, d).railTicks;
-            if (devAfter > rail) revert BeyondRail(PoolId.unwrap(id), devAfter, rail);
+            if (devAfter > quoted.railTicks) revert BeyondRail(PoolId.unwrap(id), devAfter, quoted.railTicks);
         }
 
         return (BaseHook.afterSwap.selector, int128(0));
@@ -659,7 +689,14 @@ contract AmpsHook is BaseHook, IAmpsHook {
     {
         bool stale = d.gateRefreshedAt == 0 || _elapsed(d.gateRefreshedAt) > Constants.GATE_CACHE_MAX_AGE;
         if (stale) {
-            e.bandTicks = Constants.INNER_BAND_MAX_TICKS;
+            // **The narrow band, not the wide one** (audit fix, 2026-09-08). "Conservative" is not one direction
+            // for all four fields: for the dynamic cap and the frozen floor it means *more* fee, and for the band
+            // and the rail it means a *tighter* refusal. Substituting `INNER_BAND_MAX_TICKS` widened the rail from
+            // 800 ticks to 4,500 in a healthy REGULAR spoke, so the one circuit breaker in the system loosened by
+            // 5.6x at the exact moment its anchor became self-referential — the same staleness drops the fair tick
+            // back onto the pool's own TWAP. The regular band is what a healthy pool is bounded by, so it is what
+            // an unreadable gate falls back to; a real widening has to be published by a gate that can be read.
+            e.bandTicks = Constants.INNER_BAND_REGULAR_TICKS;
             e.railTicks = _defaultRail(c.poolClass, e.bandTicks);
             e.dynCapBps = Constants.DYN_CAP_DEGRADED_BPS;
             e.frozen = true;
@@ -925,8 +962,18 @@ contract AmpsHook is BaseHook, IAmpsHook {
         uint256 current = _toUint64(m);
         a.uiMultiplierX18 = uint64(current);
 
+        // **A step is a step in either direction** (audit fix, 2026-09-08). The size of the move is what says
+        // whether it is a dividend (a toll, so the arbitrage cannot take the whole step out of the pool for free)
+        // or a corporate action (a freeze); the *sign* says only which way the arbitrage runs, and `FeeInput`
+        // already carries that separately as `captureDirectionTakesStock`. Measuring `current > previous` alone
+        // meant a reverse split, a negative restatement or any downward `uiMultiplier()` step of any size armed
+        // nothing at all — no capture fee, no surge, no `caArmed` — and, worse, satisfied the small-step branch
+        // below, so it could *clear* a corporate-action flag that was standing over exactly that event.
         uint256 deltaBps;
-        if (previous != 0 && current > previous) deltaBps = ((current - previous) * Constants.BPS) / previous;
+        if (previous != 0) {
+            uint256 diff = current > previous ? current - previous : previous - current;
+            deltaBps = (diff * Constants.BPS) / previous;
+        }
 
         if (
             deltaBps <= Constants.DIVIDEND_STEP_BPS_MAX && HookStateLib.hasFlag(d.gateFlags, HookStateLib.FLAG_CA_ARMED)
@@ -937,8 +984,18 @@ contract AmpsHook is BaseHook, IAmpsHook {
 
         if (deltaBps <= Constants.DIVIDEND_STEP_BPS_MAX) {
             uint16 captureFeeBps = uint16((deltaBps * Constants.DIVIDEND_CAPTURE_NUMERATOR_BPS) / Constants.BPS);
-            a.captureFeeBps = captureFeeBps;
-            a.captureArmedAt = uint32(block.timestamp);
+            // **A smaller step never displaces a toll that is still armed** (the second half of the same fix). The
+            // capture fee is 80% of the step it was armed for, so a 1 bp step quotes 0 bp — and writing that over
+            // a standing 160 bp toll inside its own decay window handed the arbitrage the rest of the dividend for
+            // nothing, for the price of a one-basis-point `uiMultiplier()` nudge by the issuer. A step at least as
+            // large as the standing toll's own replaces it and re-arms the clock; a smaller one leaves both the
+            // fee and its original timestamp alone, so the toll still decays and still expires on schedule
+            // ({_clearDecayed} zeroes it after eight half-lives) and cannot be renewed by dust.
+            bool expired = _elapsed(a.captureArmedAt) >= Constants.DIVIDEND_CAPTURE_HALF_LIFE * DECAY_HORIZON;
+            if (captureFeeBps >= a.captureFeeBps || expired) {
+                a.captureFeeBps = captureFeeBps;
+                a.captureArmedAt = uint32(block.timestamp);
+            }
             _armSurgeMemory(id, a, Constants.SURGE_MAX_BPS, "multiplierStep");
             emit MultiplierStepDetected(id, previous, m, captureFeeBps);
         } else {
@@ -1105,6 +1162,37 @@ contract AmpsHook is BaseHook, IAmpsHook {
         }
         if (flag != Constants.ROUTER_ROTATE) return false;
         passThrough = sender == router && sender != address(0);
+    }
+
+    /// @dev Claims this pool's one pass-through hop for the transaction: true when no flagged hop had been priced
+    ///      in this pool yet, false once one has. The counter is bumped either way, so a third hop cannot read the
+    ///      second's answer, and {_passThroughHops} can tell `afterSwap` which hop it is finishing.
+    ///
+    /// @dev Only reached on a hop that already satisfies {_isPassThrough}, so an ordinary swap pays nothing for
+    ///      this — not the keccak, and not the transient write. The view surface ({quoteFee},
+    ///      `AmpsQuoter.quoteRotation`) models the *first* hop, because that is the shape `AmpsRouter.rotate`
+    ///      builds; a caller who submits two rotations over one pool in one transaction is quoted the first and
+    ///      charged `ampsFeeBps` on the second, which is the direction a quote may be wrong in.
+    /// @param id The pool.
+    /// @return first Whether this is the transaction's first pass-through hop in that pool.
+    function _claimPassThrough(PoolId id) private returns (bool first) {
+        uint256 slot = _touchedSlot(id);
+        uint256 hops = _tload(slot);
+        uint256 next = hops + 1;
+        assembly ("memory-safe") {
+            tstore(slot, next)
+        }
+        first = hops == 0;
+    }
+
+    /// @dev How many pass-through hops this transaction has been priced in `id`.
+    function _passThroughHops(PoolId id) private view returns (uint256 hops) {
+        hops = _tload(_touchedSlot(id));
+    }
+
+    /// @dev The transient slot counting one pool's pass-through hops: `keccak256(PASS_THROUGH_TOUCHED_SLOT, id)`.
+    function _touchedSlot(PoolId id) private pure returns (uint256 slot) {
+        slot = uint256(keccak256(abi.encode(PASS_THROUGH_TOUCHED_SLOT, PoolId.unwrap(id))));
     }
 
     /// @dev The transient slot holding one account's rotation credit: `keccak256(ROTATION_CREDIT_SLOT, sender)`.

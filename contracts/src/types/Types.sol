@@ -438,7 +438,7 @@ struct Checkpoint {
 ///      [232..255] (free)
 ///
 ///      slot +1
-///      [  0..127] uint128 amount        AMPS wei (ask) or counter raw units (bid) committed at placement
+///      [  0..127] uint128 amount        AMPS wei (ask) or counter raw units (bid) the cell still holds
 ///      [128..191] uint64  tiltX18       the `ladderTilt` in force at placement
 ///      [192..215] int24   anchorTick    the anchor the ladder was measured from
 ///      [216..255] (free)
@@ -450,7 +450,12 @@ struct Checkpoint {
 /// @param buckets The ladder's bucket count at placement time.
 /// @param above True for an ask bucket, false for a bid bucket.
 /// @param placedAt Placement timestamp.
-/// @param amount The token amount committed at placement.
+/// @param amount The token amount the cell holds: what placements committed into it, less what removals took out.
+///        Pro-rated on a partial removal and zeroed on a whole one (the buyback burn, a retired-bid withdrawal, a
+///        pro-rata redemption), so it describes the cell's live inventory rather than its lifetime gross — which
+///        is what it used to do, and what made every off-chain reader over-report the ladder (audit fix,
+///        2026-09-08). It is a disclosure field: the liquidity is authoritative, and `amount` is what makes a
+///        ladder auditable cell by cell against `ILadderPolicy`'s own weight vector.
 /// @param tiltX18 The tilt in force at placement.
 /// @param anchorTick The ladder anchor.
 struct PlacementRecord {
@@ -507,7 +512,7 @@ struct GridCell {
 ///      the lock, which is what lets the gauntlet run entirely on values captured at entry.
 ///
 /// @dev **The gauntlet the vault runs around this** (§3.8, and it is the vault's job, never the policy's): the
-///      transient lock and `_requireHealthy`; `IOracleGate.checkPlacement`; divergence at entry *and* exit;
+///      transient lock and `_requirePlaceable`; `IOracleGate.checkPlacement`; divergence at entry *and* exit;
 ///      sidedness (I9 — asks strictly above `alignUp(currentTick)`, bids strictly below `alignDown(currentTick)`);
 ///      grid membership (I39) and `sum(amounts) <= amount`; the 60-second cooldown; the R1 revert; `armSurge`
 ///      after; `_sweepClean` at exit. Every bucket a policy proposes is re-checked here, never trusted.

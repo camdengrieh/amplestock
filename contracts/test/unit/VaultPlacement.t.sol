@@ -450,14 +450,76 @@ contract VaultPlacementTest is PlacementFixture {
         vault.place(spokePools[0], false, 1e18);
     }
 
-    /// @notice The surge is armed after every placement, so it cannot be sandwiched at the pre-placement fee
-    ///         (gauntlet step 8).
-    function test_surgeIsArmedAfterEveryPlacement() public {
+    /// @notice The surge is armed after every **ask** placement, so an ask cannot be sandwiched at the
+    ///         pre-placement fee (gauntlet step 8) — and after no bid placement at all.
+    ///
+    /// @dev **Audit finding 2.** Arming for any committed cell handed `compound`'s step-7 bid re-ladder, reachable
+    ///      with one wei of counter fee, the power to arm `SURGE_MAX_BPS`: the exact hole step 8's own gating was
+    ///      written to close. A bid is laid *below* the tick out of value the pool already holds, cannot be
+    ///      sandwiched the way an ask can, and is not a burn candidate, so it touches neither the surge nor the
+    ///      mark. `compound` arms one surge of its own for the bids it lays, under its own cooldown.
+    function test_f02_theSurgeAndTheMarkAreTheAskSidesAlone() public {
         assertEq(hook.surgeArmedCount(hubPool), 0, "nothing armed yet");
+        uint32 resets = hook.highWaterResetCount(hubPool);
+
         vm.prank(TIMELOCK);
         vault.place(hubPool, true, 100e18);
-        assertEq(hook.surgeArmedCount(hubPool), 1, "armed once");
+        assertEq(hook.surgeArmedCount(hubPool), 1, "the ask armed once");
         assertEq(hook.lastSurgeReason(hubPool), bytes32("place"), "with the placement's reason");
+        assertEq(hook.highWaterResetCount(hubPool) - resets, 1, "and reset the mark, as every ask must");
+
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+        uint32 armedAfterAsk = hook.surgeArmedCount(hubPool);
+        uint32 resetsAfterAsk = hook.highWaterResetCount(hubPool);
+
+        vm.prank(TIMELOCK);
+        assertGt(vault.place(hubPool, false, SEED_USDG), 0, "the bid ladder went in");
+        assertEq(hook.surgeArmedCount(hubPool), armedAfterAsk, "and armed no surge");
+        assertEq(hook.highWaterResetCount(hubPool), resetsAfterAsk, "and moved no mark");
+    }
+
+    /// @notice **Audit finding 2, the ordering half.** An ask placement settles the pending buyback *before* it
+    ///         resets the high-water mark, so the window is consumed rather than discarded.
+    ///
+    /// @dev The reset is what stops an ask from being burned as inventory it never was; but it also erases the
+    ///      record that the price crossed a cell on the way up, and a permissionless `rollout` or `deployBonded`
+    ///      landing before the next `compound` therefore left the AMPS the vault had bought back in the ladder to
+    ///      be sold a second time (I33). `compound` settles the window at its own step 4; every other ask
+    ///      placement settles it here, so the rule is the same everywhere: burn back, then place, then reset.
+    function test_f02_anAskPlacementSettlesTheBuybackBeforeItResetsTheMark() public {
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, ENTRY_ASK_AMPS);
+        warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
+
+        // The mark crossed the whole ladder while the price came back below it: every ask cell above the tick now
+        // holds AMPS the vault bought back.
+        PlacementRecord[] memory before = ladderOf(hubPool);
+        int24 highest;
+        int24 lowestAsk = type(int24).max;
+        for (uint256 i; i < before.length; ++i) {
+            if (!before[i].above || before[i].liquidity == 0) continue;
+            if (before[i].upperTick > highest) highest = before[i].upperTick;
+            if (before[i].lowerTick < lowestAsk) lowestAsk = before[i].lowerTick;
+        }
+        hook.setHighWaterTick(hubPool, highest);
+        assertLe(tickOf(hubPool), lowestAsk, "the price sits at or below the whole ask ladder");
+
+        uint256 supplyBefore = amps.totalSupply();
+        uint32 resets = hook.highWaterResetCount(hubPool);
+
+        vm.prank(TIMELOCK);
+        vault.place(hubPool, true, 50e18);
+
+        assertLt(amps.totalSupply(), supplyBefore, "the pending buyback was burned by this very call");
+        assertEq(hook.highWaterResetCount(hubPool) - resets, 1, "and only then was the window reset");
+        assertEq(hook.highWaterTick(hubPool), tickOf(hubPool), "at the live tick");
+
+        // Nothing the placement itself laid is left under the new mark, which is the other half of the rule.
+        PlacementRecord[] memory after_ = ladderOf(hubPool);
+        for (uint256 i; i < after_.length; ++i) {
+            if (!after_[i].above || after_[i].liquidity == 0) continue;
+            assertGt(after_[i].upperTick, hook.highWaterTick(hubPool), "no fresh ask sits under the mark");
+        }
     }
 
     /// @notice The ladder policy is propose-only: the vault asks it for a weight vector and re-derives everything
@@ -472,6 +534,51 @@ contract VaultPlacementTest is PlacementFixture {
         for (uint256 k; k < records.length; ++k) {
             assertEq(records[k].amount, ENTRY_ASK_CELLS[k], "and with LadderLib's own weights");
         }
+    }
+
+    /// @notice **Audit lead: the weight sum outside the `try`.** The sum was computed in *this* frame, in checked
+    ///         arithmetic, so a policy vector whose elements overflow reverted the whole placement — the one thing
+    ///         the `try` exists to prevent — and a pointer-upgradeable policy could therefore brick `compound`,
+    ///         `rollout` and every genesis ladder. An overflow is simply a vector that does not sum to `WAD`.
+    function test_lead_aLadderPolicyWhoseWeightsOverflowIsIgnoredNotFatal() public {
+        uint256[] memory overflowing = new uint256[](10);
+        overflowing[0] = type(uint256).max;
+        overflowing[1] = 2;
+        vm.mockCall(
+            address(ladderPolicy), abi.encodeWithSelector(ladderPolicy.weights.selector), abi.encode(overflowing)
+        );
+
+        vm.prank(TIMELOCK);
+        uint256 placed = vault.place(hubPool, true, ENTRY_ASK_AMPS);
+        assertEq(placed, ENTRY_ASK_AMPS, "the placement went through");
+
+        PlacementRecord[] memory records = ladderOf(hubPool);
+        for (uint256 k; k < records.length; ++k) {
+            assertEq(records[k].amount, ENTRY_ASK_CELLS[k], "with LadderLib's own weights");
+        }
+    }
+
+    /// @notice **Audit lead: the cell budget charged for cells that never opened.** `++live` ran before the
+    ///         placement, so a bucket whose amount could not buy one unit of liquidity over its range consumed a
+    ///         budget slot it never used: on the strict governance path that became a `CellBudgetExceeded` with
+    ///         real headroom left, and on the bountied paths a caller could walk a ladder's dust cells to pin the
+    ///         count. The budget is spent on cells that actually opened.
+    function test_lead_aCellThatBuysNoLiquidityDoesNotSpendTheBudget() public {
+        // A vector with a dust weight in the first cell and the rest in the last: the first cell's share cannot
+        // buy one unit of liquidity over a whole doubling, the last cell's obviously can.
+        uint256[] memory vector = new uint256[](10);
+        vector[0] = 1;
+        vector[9] = Constants.WAD - 1;
+        vm.mockCall(address(ladderPolicy), abi.encodeWithSelector(ladderPolicy.weights.selector), abi.encode(vector));
+
+        // One slot of headroom: enough for the cell that really opens, and not for a wasted one.
+        forceLiveCells(Constants.MAX_LIVE_CELLS - 1);
+
+        vm.prank(TIMELOCK);
+        uint256 placed = vault.place(hubPool, true, ENTRY_ASK_AMPS);
+        assertGt(placed, 0, "the cell that could hold liquidity was placed");
+        assertEq(vault.liveCells(), Constants.MAX_LIVE_CELLS, "and exactly one cell opened, not two");
+        assertEq(countLiveCells(), 1, "which is the one the ladder really holds");
     }
 
     /// @notice A policy whose weights do not sum to 1e18 is ignored for the same reason.
@@ -803,14 +910,20 @@ contract VaultPlacementTest is PlacementFixture {
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);
 
         uint256 creatorBefore = amps.balanceOf(CREATOR);
-        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
+        // The counter slice is an ERC-6909 claim since audit finding 8: no third-party token code may run inside
+        // the vault's own unlock, so the creator is handed the claim rather than the token.
+        uint256 creatorUsdgBefore = poolManager.balanceOf(CREATOR, uint256(uint160(address(usdg))));
         uint256 supplyBefore = amps.totalSupply();
 
         vm.prank(TIMELOCK);
         vault.place(hubPool, true, 10e18);
 
         assertGt(amps.balanceOf(CREATOR) - creatorBefore, 0, "the creator's AMPS slice was paid");
-        assertGt(usdg.balanceOf(CREATOR) - creatorUsdgBefore, 0, "and the counter slice with it");
+        assertGt(
+            poolManager.balanceOf(CREATOR, uint256(uint160(address(usdg)))) - creatorUsdgBefore,
+            0,
+            "and the counter slice with it, as a claim"
+        );
         assertLt(amps.totalSupply(), supplyBefore, "and every wei of the AMPS-side remainder was burned");
         assertSweepClean("place into a cell with accrued fees");
     }

@@ -200,12 +200,19 @@ and leaves the cached value in place. No path reverts, under any fuzzed downstre
    `OracleGate`; `dynCapBps` from `OracleGate.dynCapBps(id)`; `innerBand`/`outerRail` from the fee policy;
    `fairTick` = for a spoke `PriceLib.fairTick(pMkt, stockAnswerUsd8, decimals, tickSpacing)` with `pMkt` from
    `_obs[hubPoolId].twap30m()`, for an entry pool its own `_obs[id].twap30m()`. When the cache is older than
-   `GATE_CACHE_MAX_AGE` (900 s), `beforeSwap` substitutes the **most conservative** values: widest band for the
-   class, `DYN_CAP_DEGRADED_BPS`, `FROZEN_FEE_FLOOR_BPS` on the dynamic part.
+   `GATE_CACHE_MAX_AGE` (900 s), `beforeSwap` substitutes the **most conservative** values — and conservative is
+   not one direction for all of them (audit finding 13, 2026-09-08): `INNER_BAND_REGULAR_TICKS` for the band and
+   the rail that follows from it, because for a refusal bound conservative means *tighter*; and
+   `DYN_CAP_DEGRADED_BPS` with `FROZEN_FEE_FLOOR_BPS` on the dynamic part, because for a fee it means *more*.
+   Substituting the widest band widened a healthy REGULAR spoke's rail from 800 ticks to 4,500, i.e. loosened the
+   one circuit breaker in the system at the moment the same staleness dropped its anchor onto the pool's own TWAP.
 7. **Dividend-step detector** (spokes only, same interval): bounded `staticcall uiMultiplier()` capped at
    `Constants.STOCK_TOKEN_PROBE_GAS`, with `prev = arm.uiMultiplierX18`:
    ```
-   deltaBps = m > prev ? (m - prev) * BPS / prev : 0
+   deltaBps = |m - prev| * BPS / prev        both directions (audit finding 11, 2026-09-08): the size says
+                                             whether it is a dividend or a corporate action, the sign only says
+                                             which way the arbitrage runs, and a step smaller than a standing
+                                             capture fee never displaces it
    0 < deltaBps <= DIVIDEND_STEP_BPS_MAX (200)  -> captureFeeBps = deltaBps * DIVIDEND_CAPTURE_NUMERATOR_BPS / BPS
                                                    captureArmedAt = now;  half-life 300 s
    deltaBps > 200                               -> gateFlags.caArmed = 1;  dynCapBps = DYN_CAP_ESCALATION_BPS
@@ -382,7 +389,7 @@ several kilobytes. Two options:
 functions may take `storage` pointers (ABI-encoded as slot numbers), so signatures read
 `placeLadder(mapping(PoolId => PlacementRecordStorage[]) storage ladder, mapping(PoolId => uint32) storage
 cooldown, PlaceParams memory p) public returns (Placed memory)`. The vault's five externals become 6-10-line
-forwarders: lock, `_requireHealthy`, capture `NAV_BEFORE`, call the library, re-check R1, `_sweepClean`. Budget:
+forwarders: lock, `_requirePlaceable`, capture `NAV_BEFORE`, call the library, re-check R1, `_sweepClean`. Budget:
 forwarders ~150 B each plus ~400 B of new `unlockCallback` branches exceeds 811 B, so **`redeemProRata`'s position
 removal moves out too, into a second minimal library `VaultRedeemLib`** (decision 6). `forge build --sizes` is a
 hard CI gate at 24,576 B. The I14 bytecode proof must follow the link: CI analyses the vault **and every linked
@@ -466,6 +473,9 @@ it, the AMPS in it is inventory the vault **bought back** and must burn (I33). T
 both must hold (audit fix 4, 2026-09-07):
 
 ```
+record.above                    : it is an ask (audit finding 15, 2026-09-08): only what was *sold* as an ask
+                                  can have been bought back, and a bid the price has fallen through holds the
+                                  counter side of a real trade
 record.upperTick <= highWater   : the mark crossed the whole cell (it was fully sold)
 pool.tick        <= record.lowerTick : the price is back at or below its floor (it is pure AMPS again)
                                   -> remove all L; burn all of it; liquidity = 0; the counter fees it
@@ -476,7 +486,10 @@ anything else                   : leave the cell alone
 A straddled cell (`lower < tick < upper`) is **never** touched: removing it whole and re-laying its counter half a
 cell lower is what let every bid cell — which satisfies `upperTick <= highWater` from the moment it is placed,
 because bids sit below the tick and the mark is at the tick — be liquidated by the next `compound` after a one-tick
-move, ratcheting the bid ladder a doubling lower each time (audit finding 4). Partially bought-back inventory stays
+move, ratcheting the bid ladder a doubling lower each time (audit finding 4). A **fully** crossed bid is not a
+buyback either (audit finding 15, 2026-09-08): it satisfies both geometric clauses once the price falls under it,
+and burning it re-prices a real trade's proceeds — NAV-dilutive whenever the fill happened above NAV/share, and
+enough to breach R1 when valued at the checkpoint's reference — so the predicate takes asks only. Partially bought-back inventory stays
 in place and re-sells on the way up, which is the symmetric-proceeds design of decision 16; only a full round trip
 retires supply. The `tick == lower` case is pure `amount0` in v4 terms and burns.
 
@@ -487,7 +500,16 @@ satisfy `upperTick <= highWater` off a stale excursion:
 Revision 6 deleted the re-ladder step that used to sit between the split and the reset — the AMPS side of the fee
 is burned instead of being re-offered — so `compound` no longer places asks at all and cannot re-sell AMPS it has
 just bought back. A `compound` that collected nothing, burned nothing and placed nothing resets no mark, arms no
-surge and takes no cooldown (audit fix 5; the AMPS-side gate is now exactly `burned != 0`, §3.6 step 8).
+surge and takes no cooldown (§3.6 step 8).
+
+**Every ask placement settles the buyback before it resets the mark (audit finding 2, 2026-09-08).** The reset is
+what stops a fresh ask from being burned as inventory it never was, but it also *discards* the window, so a
+`place`, a `rollout` or a `deployBonded` landing before the next `compound` erased the record that the price had
+crossed a cell on the way up and left the AMPS the vault bought back in the ladder to be sold twice. `place`
+therefore runs the burn of §3.5 itself when it is placing asks, in the order `burn back -> place -> reset`, which
+is the order `compound` already used. And the surge is the ask side's alone: arming it for any committed cell let
+`compound`'s step-7 bid re-ladder — one wei of counter fee — arm `SURGE_MAX_BPS`, which is the hole step 8's own
+gating exists to close.
 
 **The mark is floored at the raw tick (re-audit finding 10).** `highWaterTick` is a *truncated* tick, which lags the
 pool by up to `maxTickMovePerBlock` per block after a fast move; a reset that wrote the lagging truncated tick under
@@ -504,7 +526,7 @@ the best-effort behaviour because a bid is never a burn candidate under the firs
 
 Permissionless, paid from `BountyPot`.
 
-1. `locked`; `_requireHealthy()`; `gate.checkPlacement(poolId)`; 60 s cooldown on `_lastPlacementAt[poolId]`;
+1. `locked`; `_requirePlaceable()`; `gate.checkPlacement(poolId)`; 60 s cooldown on `_lastPlacementAt[poolId]`;
    `NAV_BEFORE = previewNavPerShareX18()`.
 2. Divergence at entry: `abs(slot0.tick - tickOf(P_mkt / P_i)) <= PLACEMENT_DIVERGENCE_TICKS` (800).
 3. One `unlock`, `ACTION_COMPOUND`: `modifyLiquidity(lower, upper, 0, salt 0)` per record realises `feesAccrued`;
@@ -516,7 +538,8 @@ Permissionless, paid from `BountyPot`.
    burned in full; what is left of the counter side is placed back into the pool that earned it.
    ```
    creatorBps(t) = CREATOR_FEE_BPS * max(0, 1 - (t - genesis)/CREATOR_DECAY_SECONDS)   100 bp -> 0 over 30 d
-   feeBps        = ampsFeeBps                                                          the divisor floor is gone
+   feeBps        = max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT, chargedBps)                   audit finding 4, 2026-09-08
+                   chargedBps = IAmpsHook.quoteFee(pool, sell).feePips / PIPS_PER_BPS   i.e. base + dyn right now
 
    creatorCounter = counterFees * creatorBps(t) / feeBps    -> paid inside the same unlock, in kind
    counter        = counterFees - creatorCounter            -> ERC-6909 claim, then re-placed as bids (step 7)
@@ -524,17 +547,25 @@ Permissionless, paid from `BountyPot`.
    creatorAmps    = ampsFees   * creatorBps(t) / feeBps     -> IERC20(amps).safeTransfer(creator, …)
    burnCut        = ampsFees   - creatorAmps                -> Amps.burn, all of it
    ```
-   `creatorBps(t) <= ampsFeeBps` is structural: the schedule starts at 100 bp and the fee's band floor is 100 bp,
-   so the slice can never exceed the fee, and the divisor floor `max(fee, AMPS_FEE_BPS_DEFAULT)` that ruling AG
-   introduced is removed with the thing it was protecting against. The creator is paid **`creatorBps(t)` of trade
-   volume**, in each currency, which is what the directive asked for: `fees × creatorBps/feeBps` is
-   `volume × feeBps × creatorBps/feeBps`. `ampsFees` was collected at `base + dyn`, so the realised slice
-   over-states the schedule by at most `(base + dynCap)/base` under `GREEN` (1.6×); that is accepted and
-   documented rather than tracked per swap, which would cost an SSTORE on every swap.
+   `creatorBps(t) <= feeBps` is structural: the schedule starts at 100 bp and the fee's band floor is 100 bp, so
+   the slice can never exceed one currency's fees. **The divisor is not the live base fee alone** (audit finding 4,
+   2026-09-08). Fees accrue continuously and are divided at collect time, so both directions of that mismatch paid
+   the creator out of the unconditional burn: a governed *cut* multiplied the creator's share of every in-flight wei
+   by `oldFee/newFee` — 5× at the band floor, i.e. 100% of both currencies — and a raised *dynamic* component meant
+   the pool collected `base + dyn` while the slice was still divided by `base`, inflating it up to 1.6× (GREEN), 3×
+   (degraded) or 5× (the escalation cap). Flooring the divisor at `AMPS_FEE_BPS_DEFAULT` bounds the first and
+   taking `max(..., chargedBps)` bounds the second, so the dynamic part enlarges the divisor by exactly what it
+   enlarged the collection and is never creator-eligible. Both bounds move the payout one way only — down — so the
+   creator is paid **at most `creatorBps(t)` of trade volume** in each currency, and what they do not take is
+   burned. A hook that cannot be read leaves the launch-fee floor in charge.
 
-   Counter-asset payments are **best-effort**: a bounded ERC-20 transfer with an ERC-6909-claim fallback, so a
-   paused or denylisting Stock Token can never block a compound. Creator payouts remain the only transfer of
-   protocol-held AMPS to a non-pool address (I31).
+   Counter-asset payments are **ERC-6909 claims, always** (audit finding 8, 2026-09-08): the whole positive delta
+   is minted as claims and the creator's slice moves by `pm.transfer`, so no third-party token code runs inside the
+   vault's own unlock. A `take` to the creator — even gas-bounded, even `try`-wrapped — could be made to open a
+   PoolManager delta from inside the unlock and fail it with `CurrencyNotSettled` beyond the reach of the `catch`,
+   which would have handed any issuer a veto over the fee engine and the buyback burn for the 30-day window. The
+   AMPS side stays a plain transfer: it is the protocol's own token and it runs after the unlock has closed.
+   Creator payouts remain the only transfer of protocol-held AMPS to a non-pool address (I31).
 6. **There is no step 6.** Re-laddering the fee AMPS as asks above the reference is gone: the AMPS side is burned
    instead. That is what turns I10 from an inequality into an equality — ask inventory is the genesis POL tranche
    less sales and rollout moves, and nothing adds to it — and it removes the one path on which `compound` could
@@ -543,14 +574,18 @@ Permissionless, paid from `BountyPot`.
    grid cells strictly below `alignDown(slot0.tick)`, merging into existing records by `m`. It stays in the pool
    that earned it and is never moved to another pool: there is no cross-spoke relay, and no keeper job that
    could perform one.
-8. Only on an **AMPS-side event**, which since revision 6 is exactly `burned != 0`: `resetHighWater(poolId)` and
-   `armSurge(poolId, SURGE_MAX_BPS, "compound")`; the cooldown follows what was actually placed. The condition is
-   `burned` and not `counterFees` because both side effects protect AMPS-side facts, and the counter side is
-   whatever a *buyer* paid the ladder — one wei of it, which anyone can produce for the price of a dust swap,
-   would otherwise arm `SURGE_MAX_BPS` on the pool and erase the mark the next compound needs to recognise its own
-   bought-back inventory (audit fix 5; re-audit finding 11). Since the fee burn takes the whole AMPS-side
-   remainder and the buyback burn is the other half of the same condition, `burned == 0` means no AMPS moved at
-   all.
+8. **Three side effects, on three different facts** (audit finding 1, 2026-09-08). `burned != 0` used to gate the
+   mark reset and the surge together, and it is satisfied by a *fee-only* burn — the AMPS side of one dust sell,
+   which anybody can produce for the price of a swap — while the cooldown was written only when something had been
+   placed. So each now follows the fact it is about:
+   * `resetHighWater(poolId)` when `boughtBack != 0`: the mark is the buyback's own bookkeeping, and a fee burn
+     withdraws no inventory and discards no window;
+   * `armSurge(poolId, SURGE_MAX_BPS, "compound")` when `placed != 0`: the surge exists so a placement cannot be
+     sandwiched at the pre-placement fee;
+   * `_lastPlacementAt[poolId] = now` when `placed != 0 || burned != 0`: the cooldown rate-limits the engine per
+     pool, and it is what bounds the repetition of both effects above to once a minute — the rate a legitimate
+     compound runs at. A call that collected nothing, bought nothing back and placed nothing takes none of the
+     three and costs the pool nothing.
 9. Divergence at exit; `_checkpoint()`; **R1**: `navAfter >= NAV_BEFORE * (BPS - 2) / BPS` else revert
    `NavBleedExceeded` (I11); `_lastPlacementAt[poolId] = now`; `BountyPot.pay(...)`; `_sweepClean()`; emit
    `Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned)`.
@@ -585,7 +620,7 @@ Permissionless, paid from `BountyPot`.
 
 ### 3.8 The gauntlet — every guard on every placement
 
-1. `locked` (transient reentrancy) and `_requireHealthy()`.
+1. `locked` (transient reentrancy) and `_requirePlaceable()`.
 2. `IOracleGate.checkPlacement(poolId)` — refuses on `SCHEDULED_FREEZE`, `DIVERGED`, `WATCHDOG`, guardian freeze.
    `REF_DIVERGED` is permitted but forces the NAV anchor (`P_ref == navPerShare`).
 3. Divergence at **entry and exit**: `abs(slot0.tick - tickOf(P_mkt / P_i)) <= PLACEMENT_DIVERGENCE_TICKS` (800).
@@ -881,7 +916,7 @@ Events: `Bought(poolId, payer, to, amountIn, ampsOut)`, `Sold(poolId, payer, to,
 | `unit/PoolStateLib.t.sol` | every read differentially tested against `StateLibrary` (test-only import allowed) on a live local pool, incl. non-zero salts and negative ticks |
 | `unit/LadderPositionValuer.t.sol` | decomposition below/inside/above the range; rounding always down; empty pool returns zeros; `totalLiquidity`; I7 (`slot0` +/-50% moves `A` by <= dust) |
 | `unit/VaultPlacement.t.sol` | genesis ladders to the wei (3.3); sidedness (I9); grid membership (I39); merge-by-cell; cooldown; divergence at entry and exit; R1 revert on a manipulated tick |
-| `unit/VaultCompound.t.sol` | the two-currency split to the wei — creator in kind out of each, AMPS remainder burned in full, counter side re-placed as bids in the same pool; no ask is placed by `compound` at all; `creatorBps(t) == 0` after day 30 (I31); buyback burn in all three tick positions (I33); the surge and the mark gated on `burned != 0`; high-water reset ordering |
+| `unit/VaultCompound.t.sol` | the two-currency split to the wei — creator in kind out of each, AMPS remainder burned in full, counter side re-placed as bids in the same pool; no ask is placed by `compound` at all; `creatorBps(t) == 0` after day 30 (I31); buyback burn in all three tick positions (I33); the surge on a placement, the mark on a buyback and the cooldown on either (finding 1); high-water reset ordering |
 | `unit/VaultRollout.t.sol` | `rolloutBpsPerDay` and `entryFloorBps` never breached; no ask below `P_ref` (I32); retirement returns unfilled asks; `withdrawRetiredBids` |
 | `unit/AmpsQuoter.t.sol` | never reverts with every dependency reverting, singly and together; degraded bitfield; rotation quote matches a real two-hop swap to the wei |
 | `integration/Phase3Flywheel.t.sol` | ladder consumed bottom-up with per-bucket proceeds matching `LadderLib`; pump-then-dump round trip ends with `totalSupply` lower and `A == seed + fees` |
@@ -1274,7 +1309,7 @@ changes; the vault's storage layout is untouched and every ABI change is an **ap
 
 | # | Ruling |
 |---|---|
-| W | **The keeper bounty is measured, not flat, and `chost` can now fire.** `VaultPlacementLib` and `VaultRolloutLib` passed `WORK_VALUE_USD18 = GAS_ALLOWANCE_USD18 = 1e18` to `BountyPot.pay`, which made two of the pot's four guards dead letters (`docs/keeper-runbook.md` §3.1, §3.2): the dust guard refuses on `workValueUsd18 < chostUsd18` and `1e18 < 1e18` is false at the launch `chost` of $1, so an *empty* `compound()` was paid the full tip; and `3 × $1 = $3` sits far above the `$0.05 + 2% × $1 = $0.07` a job could earn, so the gas cap never bound. Both inputs are now derived inside the call. **Work value:** `compound` — `(ampsFees + boughtBack) × P_ref` plus the counter-side *fees* at their feed price (freed burn-back inventory is excluded: it is value the vault already owned); `rollout` — `moved × P_ref`; `deployBonded` — the collateral placed, at the same feed price the deploy threshold was tested against. **Gas allowance:** `gasleft()` is captured as the first statement of the vault forwarder and the delta is taken in `VaultPlacementLib.payBounty`, plus `Constants.KEEPER_GAS_OVERHEAD` (80,000) for the intrinsic cost, the calldata and the payment itself, **minus `gasleft() / 63`** and clamped to `Constants.KEEPER_GAS_MAX` (8M). The correction is EIP-150 and it is not cosmetic: every message call forwards at most 63/64 of the caller's remaining gas, so the naive delta across the vault's delegatecall into the library charges the job for 1/64 of the *transaction's gas limit* as well as for the gas it spent — 16.8M under Foundry's 2^30 default, eight times a real `compound`, and on chain a lever a keeper could pull to inflate the pot's own 3x ceiling simply by sending the job with a large gas limit. `available = gasleft() * 64 / 63`, so adding `gasleft() / 63` back recovers the true consumption exactly for `compound` and to within one further 64th for the two-hop `rollout`/`deployBonded` paths; `KEEPER_GAS_MAX` is the belt that bounds every shape of it. `test_theGasAllowanceMeasuresTheJobNotTheCallersGasLimit` reconstructs the figure the pot was handed out of the payment the cap produced and holds it against what the call really burned. It is priced at `block.basefee` clamped into `[KEEPER_BASEFEE_FLOOR_WEI, KEEPER_BASEFEE_CAP_WEI]` = [0.01 gwei, 1 gwei] and at the ETH/USD answer the feed registry already holds for the `AMPS/WETH` entry pool's counter. **No new governance parameter, no new pointer and no new oracle**: it is the same feed `A` values the vault's WETH bids with, which is why the alternative (a governed `gasPriceUsd18`) was not taken — it would have added a vault storage slot, a setter, a band and a selector-gate entry to reach a number the protocol already reads. `IBountyPot` and `BountyPot` are unchanged; the pot's own note already said "the basefee cap lives in the caller". An ETH price the registry cannot answer leaves the allowance at zero, so the cap binds at zero and the job is unpaid but still done — I21's degradation, not a stop. At the launch shape this makes the **gas cap the binding constraint on an ordinary job**. Measured in `VaultCompoundTest` at the floor basefee and $2,500 ETH: an empty `compound` reports `workValueUsd18 == 0` and is paid `0` with `reason == "chost"`; a `compound` after one buy and one sell reports $18.51 of work (1.59 AMPS of fees plus 16.67 AMPS bought back, at `P_ref`, plus the USDG-side fees) and 2,682,720 gas, so the allowance is $0.0671 and the 3x ceiling $0.2012 — which is what it pays, because tip + chip is $0.4201 at the launch 2% chip and $1.9007 at the 10% band ceiling. With `dailyCeilingUsd18` governed to $0.02 the same job pays exactly $0.02 and the window is then exhausted (`reason == "dailyCeiling"` on the next quote). All four guards therefore bind on the same fixture, and none of them could before. |
+| W | **The keeper bounty is measured, not flat, and `chost` can now fire.** `VaultPlacementLib` and `VaultRolloutLib` passed `WORK_VALUE_USD18 = GAS_ALLOWANCE_USD18 = 1e18` to `BountyPot.pay`, which made two of the pot's four guards dead letters (`docs/keeper-runbook.md` §3.1, §3.2): the dust guard refuses on `workValueUsd18 < chostUsd18` and `1e18 < 1e18` is false at the launch `chost` of $1, so an *empty* `compound()` was paid the full tip; and `3 × $1 = $3` sits far above the `$0.05 + 2% × $1 = $0.07` a job could earn, so the gas cap never bound. Both inputs are now derived inside the call. **Work value:** `compound` — `(ampsFees + boughtBack) × P_ref` plus the counter-side *fees* at their feed price (freed burn-back inventory is excluded: it is value the vault already owned); `rollout` — `moved × P_ref`; `deployBonded` — the collateral placed, at the same feed price the deploy threshold was tested against. **Gas allowance:** `gasleft()` is captured as the first statement of the vault forwarder and the delta is taken in `VaultPlacementLib.payBounty`, plus `Constants.KEEPER_GAS_OVERHEAD` (80,000) for the intrinsic cost, the calldata and the payment itself, **minus `gasleft() / 63`** and clamped to `Constants.KEEPER_GAS_MAX` (8M). The correction is EIP-150 and it is not cosmetic: every message call forwards at most 63/64 of the caller's remaining gas, so the naive delta across the vault's delegatecall into the library charges the job for 1/64 of the *transaction's gas limit* as well as for the gas it spent — 16.8M under Foundry's 2^30 default, eight times a real `compound`, and on chain a lever a keeper could pull to inflate the pot's own 3x ceiling simply by sending the job with a large gas limit. `available = gasleft() * 64 / 63`, so adding `gasleft() / 63` back recovers the true consumption exactly for `compound`; the reserve compounds with the hops, so the two-hop `rollout`/`deployBonded`/`withdrawRetiredBids` paths add back `gasleft() * 127 / 3969` instead — `remaining × (64^h - 63^h)/63^h` — which is exact for them as well and removes the caller-chosen `txGasLimit/64` term the single reserve left behind (audit finding 7, 2026-09-08); `KEEPER_GAS_MAX` is the belt that bounds every shape of it. `test_theGasAllowanceMeasuresTheJobNotTheCallersGasLimit` reconstructs the figure the pot was handed out of the payment the cap produced and holds it against what the call really burned. It is priced at `block.basefee` clamped into `[KEEPER_BASEFEE_FLOOR_WEI, KEEPER_BASEFEE_CAP_WEI]` = [0.01 gwei, 1 gwei] and at the ETH/USD answer the feed registry already holds for the `AMPS/WETH` entry pool's counter. **No new governance parameter, no new pointer and no new oracle**: it is the same feed `A` values the vault's WETH bids with, which is why the alternative (a governed `gasPriceUsd18`) was not taken — it would have added a vault storage slot, a setter, a band and a selector-gate entry to reach a number the protocol already reads. `IBountyPot` and `BountyPot` are unchanged; the pot's own note already said "the basefee cap lives in the caller". An ETH price the registry cannot answer leaves the allowance at zero, so the cap binds at zero and the job is unpaid but still done — I21's degradation, not a stop. At the launch shape this makes the **gas cap the binding constraint on an ordinary job**. Measured in `VaultCompoundTest` at the floor basefee and $2,500 ETH: an empty `compound` reports `workValueUsd18 == 0` and is paid `0` with `reason == "chost"`; a `compound` after one buy and one sell reports $18.51 of work (1.59 AMPS of fees plus 16.67 AMPS bought back, at `P_ref`, plus the USDG-side fees) and 2,682,720 gas, so the allowance is $0.0671 and the 3x ceiling $0.2012 — which is what it pays, because tip + chip is $0.4201 at the launch 2% chip and $1.9007 at the 10% band ceiling. With `dailyCeilingUsd18` governed to $0.02 the same job pays exactly $0.02 and the window is then exhausted (`reason == "dailyCeiling"` on the next quote). All four guards therefore bind on the same fixture, and none of them could before. |
 | X | **`VaultPlacementLib.payBounty` and `ampsValueUsd18` are `public` library functions**, called by `VaultRolloutLib` the way `place` already is. `DELEGATECALL` preserves both the vault's storage and `msg.sender`, so the keeper is still the payee; nothing new is linked and `script/config/libraries.json` is unchanged. `AmpsVault.compound`, `rollout` and `deployBonded` each gained one `gasleft()` and one argument — no second call site, which is what keeps the change inside the vault's EIP-170 margin. |
 | Y | **Views and events the apps had to work around.** All additions, all append-only, none of them a new mutating selector, so the I14 tables and `scripts/selector-gate.py` are untouched: `AmpsVault.lastPlacementAt(PoolId)` (the keeper's screening step 5, previously approximated from the newest `placedAt` in `ladderAt`); `Placement` gains `reason`, `lowerTick` and `upperTick` (the indexer classified placements from the transaction's four-byte selector and rebuilt ranges from `ModifyLiquidity`); a new `Rollout(constituentId, poolId, movedAmps, placedAmps)`; `PoolRegistry.PoolRegistered` gains `tickSpacing`, `counterDecimals` and `buyFeeBps`, and a new `PoolGridSet(poolId, gridBaseTick)` is emitted beside `PoolOpened` — the grid origin does not exist when `PoolRegistered` fires (the record must be written before the vault opens the pool), and it is a separate event rather than a field on `PoolOpened` because `script/05_Registry.s.sol` filters that event by a hardcoded topic, so the three together are what is log-complete; `AmpsBonds.Bond` gains `vestSeconds`; `AmpsVault.VestingMinted` gains `reason` (`bytes32("bond")`), which is what tells a bond's mint from the team's vest without cross-referencing `Bond` — the team's 5% is minted in `genesisMint` and reported by `GenesisMinted` (revision 7; it was `genesis`/`Genesis`); `redeemProRata` now emits `Burn(shares, "redeem")` for the redeemer's own burn alongside `Burn(inventoryBurned, "redeemInventory")`, so "sum the `Burn` events" is the supply reduction (the emit reads no gate, price or pointer, so the I14 exemption and its storage-access proof stand); `IAmpsQuoter.PoolQuote` gains a trailing `int24 tickSpacing`, which is the last field a router needed beyond `quoteAll()` to build a `PathKey`; `LadderPositionValuer.amountsOf(poolId)` and `referenceSqrtPriceX96(poolId)` publish per-pool POL depth in tokens at the same reference, decomposition and rounding `A` uses. **Every appended event field changes that event's `topic0`**, so `packages/abis` must be regenerated and the indexer's handlers re-pointed; nothing was reordered or removed. |
 | Z | **`AmpsBonds.unvestedOf(address)` is per owner, and there is deliberately no nullary `unvested()`.** Vesting is linear from each position's own `start` over its own frozen `vestSeconds` (I38), positions live in per-owner arrays with no global enumeration, and an aggregate maintained on the way in would have to be corrected again at each position's vest end — a scheduled write an immutable contract has nowhere to put and nobody to pay for. `AmpsBondsLens.unvested(bonds, owners)` and `unvestedOf(bonds, marketId, owners)` are the exact totals over an owner set the indexer and the dApp both already hold; `Amps.balanceOf(bonds)` stays the honest upper bound for a caller with no list. |

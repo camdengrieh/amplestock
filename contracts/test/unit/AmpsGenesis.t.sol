@@ -102,6 +102,61 @@ contract AmpsGenesisTest is AmpsVaultFixture {
         adapter.createAuctions(_spec(true, 0), _spec(false, 0), ETH_USD_X18);
     }
 
+    /// @notice **Audit finding 12.** One wei of AMPS sent to this address between `genesisMint` and
+    ///         `createAuctions` used to strand half of `S0` for ever: the tranche check was `held != AUCTION_SHARES`
+    ///         on a balance any AMPS holder can raise, the adapter is ownerless and has no other exit, and NAV/share
+    ///         would have halved. The check is `>=`, the tranche is still funded to the wei, and the donation goes
+    ///         back to the vault as inventory.
+    function test_f12_aOneWeiDonationDoesNotBrickCreateAuctions() public {
+        _mint();
+
+        // Anybody with AMPS can do this; the team vesting wallet releases linearly from genesis.
+        uint256 donation = 1;
+        vm.prank(address(vault));
+        amps.transfer(address(this), donation);
+        amps.transfer(address(adapter), donation);
+        assertEq(amps.balanceOf(address(adapter)), Constants.AUCTION_SHARES + donation, "the tranche plus dust");
+
+        uint256 vaultBefore = amps.balanceOf(address(vault));
+        vm.expectEmit(true, true, true, true, address(adapter));
+        emit IAmpsGenesis.TrancheSurplusSwept(donation);
+        _create();
+
+        assertEq(amps.balanceOf(address(vault)) - vaultBefore, donation, "the donation went back to the vault");
+        assertEq(
+            amps.balanceOf(adapter.usdgAuction()), Constants.AUCTION_USDG_SHARES, "and the USDG leg is exact anyway"
+        );
+        assertEq(amps.balanceOf(adapter.ethAuction()), Constants.AUCTION_ETH_SHARES, "as is the ETH leg");
+        assertEq(amps.balanceOf(address(adapter)), 0, "with nothing left here");
+    }
+
+    /// @notice And a donation to a *leg's* address — derivable from the proposal's own salt, so equally cheap to
+    ///         make — no longer forces the whole launch to be re-proposed either.
+    function test_f12_aPreDonatedLegIsStillFunded() public {
+        _mint();
+
+        // The leg's address is CREATE2 from the factory, the proposal's salt and the init code, so it is knowable
+        // before the launch runs: learn it by running the creation once and rolling the state back, which is
+        // exactly the information an attacker reads off the proposal.
+        uint256 snapshot = vm.snapshotState();
+        _create();
+        address predicted = adapter.usdgAuction();
+        vm.revertToState(snapshot);
+        assertEq(adapter.usdgAuction(), address(0), "the state really did roll back");
+
+        // Over-fund it past its own tranche, which is the shape a factory that *pulls* the tranche produces once
+        // a donation has arrived first — and the shape `held != spec.shares` reverted on, forcing the whole launch
+        // to be re-proposed with a new salt. The adapter tops up only what is missing, so an under-funded address
+        // is unchanged; an over-funded one is now simply accepted.
+        vm.prank(address(vault));
+        amps.transfer(predicted, Constants.AUCTION_USDG_SHARES + 1);
+
+        _create();
+        assertEq(adapter.usdgAuction(), predicted, "the leg landed where the salt said it would");
+        assertGe(amps.balanceOf(predicted), Constants.AUCTION_USDG_SHARES, "and is funded for its whole tranche");
+        assertTrue(MockCCA(payable(predicted)).funded(), "so the funding handshake still completed");
+    }
+
     /// @notice The floor is $1.00 per AMPS in each currency, computed here rather than taken from the proposal.
     function test_create_floorsAreOneDollarPerAmps() public {
         _mint();

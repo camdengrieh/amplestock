@@ -404,11 +404,57 @@ contract AmpsHookObservationsTest is HookTestFixture {
         }
     }
 
-    function test_aMultiplierThatFallsIsIgnored() public {
+    /// @notice **Audit finding 11.** A step is a step in either direction. `deltaBps` was computed only when the
+    ///         multiplier *rose*, so a reverse split, a negative restatement or any downward `uiMultiplier()` move
+    ///         of any size armed nothing at all — no capture fee, no surge, no corporate-action flag — and, worse,
+    ///         satisfied the small-step branch, so it could *clear* a flag standing over exactly that event.
+    ///
+    /// @dev A 50% fall is far past `DIVIDEND_STEP_BPS_MAX`, so it is a corporate action and raises `caArmed`,
+    ///      exactly as the 10:1 split above does. The sign says only which way the arbitrage runs, and `FeeInput`
+    ///      carries that separately as `captureDirectionTakesStock`.
+    function test_f11_aMultiplierThatFallsFarIsACorporateActionToo() public {
         stock.setUIMultiplier(0.5e18);
         _refreshGate(stockKey);
-        assertEq(hook.poolState(stockId).captureFeeBps, 0, "nothing armed");
-        assertEq(hook.poolState(stockId).uiMultiplierX18, 0.5e18, "but the cache follows");
+
+        assertTrue(HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_CA_ARMED), "caArmed");
+        assertEq(hook.poolState(stockId).dynCapBps, Constants.DYN_CAP_ESCALATION_BPS, "escalation cap");
+        assertEq(hook.poolState(stockId).uiMultiplierX18, 0.5e18, "and the cache is exactly what was read");
+    }
+
+    /// @notice And a downward step small enough to be a dividend arms the capture fee, at the same 80% of the step
+    ///         an upward one does.
+    function test_f11_aSmallDownwardStepArmsTheCaptureFee() public {
+        stock.setUIMultiplier(0.995e18); // -50 bp
+        _refreshGate(stockKey);
+
+        assertEq(hook.poolState(stockId).captureFeeBps, 40, "0.8 x 50 bp, whichever way the step went");
+        assertEq(hook.poolState(stockId).captureArmedAt, uint32(block.timestamp), "armed now");
+        assertEq(hook.poolState(stockId).gateFlags & 8, 0, "and it is not a corporate action");
+        assertEq(hook.poolState(stockId).uiMultiplierX18, 0.995e18, "the cache is what was read");
+    }
+
+    /// @notice **The second half of finding 11.** A one-basis-point step cannot erase a standing toll. The capture
+    ///         fee is 80% of the step it was armed for, so a 1 bp step quotes 0 bp — and writing that over an armed
+    ///         160 bp fee inside its own decay window handed the dividend arbitrage the rest of the step for the
+    ///         price of a dust `uiMultiplier()` nudge by the issuer.
+    function test_f11_aOneBasisPointStepDoesNotEraseAnArmedCaptureFee() public {
+        stock.setUIMultiplier(1.02e18); // exactly DIVIDEND_STEP_BPS_MAX: 160 bp of capture fee
+        _refreshGate(stockKey);
+        assertEq(hook.poolState(stockId).captureFeeBps, 160, "the toll is armed");
+        uint32 armedAt = hook.poolState(stockId).captureArmedAt;
+
+        // +1 bp on top: `0.8 x 1 bp` rounds to zero, which is what used to be written over the 160.
+        stock.setUIMultiplier(1.020102e18);
+        _refreshGate(stockKey);
+        assertEq(hook.poolState(stockId).captureFeeBps, 160, "the standing toll survives a smaller step");
+        assertEq(hook.poolState(stockId).captureArmedAt, armedAt, "with its original clock, so it still expires");
+        assertEq(hook.poolState(stockId).uiMultiplierX18, 1.020102e18, "and the cache is exactly what was read");
+
+        // A step at least as large as the standing toll's own does replace it, clock included.
+        stock.setUIMultiplier(1.04050404e18); // exactly another 200 bp
+        _refreshGate(stockKey);
+        assertEq(hook.poolState(stockId).captureFeeBps, 160, "a step of the same size re-arms the same fee");
+        assertEq(hook.poolState(stockId).captureArmedAt, uint32(block.timestamp), "with a fresh clock");
     }
 
     function test_anUnreadableMultiplierIsAFlagAndNotARevert() public {

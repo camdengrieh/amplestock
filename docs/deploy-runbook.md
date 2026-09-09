@@ -7,7 +7,7 @@ component list suggests. Four facts drive everything below.
    `__$…$__` placeholders and cannot be deployed at all, so the library addresses are the first thing the
    deployment fixes (`docs/phase2-state-model.md` §10.1, `docs/phase3-state-model.md` §12 ruling A).
 2. **The gate and the first pool are circular, and revision 7 adds a second circle.**
-   `AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireHealthy`, and `OracleGate`
+   `AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireManageable`, and `OracleGate`
    reports `WATCHDOG` while the hub pool is unregistered *or* its observation ring covers less than `twapWindow`.
    A freshly initialised pool has no observations, so with the gate already wired **no pool can be registered and
    neither genesis step can run** (`docs/phase2-state-model.md` §9.1). On top of that, `PoolRegistry` opens each

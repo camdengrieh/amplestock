@@ -553,6 +553,16 @@ library Constants {
     ///      `beforeSwap` by an exact-input sell, blended and rounded up.
     bytes32 internal constant ROTATION_CREDIT_SLOT = keccak256("amplestocks.hook.ROTATION_CREDIT");
 
+    /// @notice Base of the EIP-1153 slots recording which pools a router pass-through hop has already been priced
+    ///         in this transaction: `keccak256(PASS_THROUGH_TOUCHED_SLOT, poolId)`.
+    /// @dev **One pass-through hop per pool per transaction** (audit fix, 2026-09-08). `rotate` refuses `hop1 ==
+    ///      hop2`, but two `rotate` calls in one transaction — `rotate(A, B)` then `rotate(B, A)` — reconstruct
+    ///      the round trip that refusal exists to stop, and would pay four pass-through fees instead of four AMPS
+    ///      fees. A pool already priced pass-through in this transaction therefore pays `ampsFeeBps` on every
+    ///      later hop, so the second leg of a round trip is priced as the exit it is. Transient storage is zero
+    ///      at the start of every transaction by EVM rule, so the bound is per transaction by construction.
+    bytes32 internal constant PASS_THROUGH_TOUCHED_SLOT = keccak256("amplestocks.hook.PASS_THROUGH_TOUCHED");
+
     /// @notice The `hookData` flag the protocol router puts on both hops of a rotation, and the only thing that
     ///         makes a swap hop *pass-through*: `keccak256("amplestocks.router.ROTATE")`.
     /// @dev A hop is pass-through iff `sender == AmpsHook.router()` **and** `hookData` is exactly these 32 bytes.

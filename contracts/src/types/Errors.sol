@@ -127,7 +127,7 @@ error UnknownMarket(uint16 marketId);
 // Gate and safety
 // -------------------------------------------------------------------------------------------------------------
 
-/// @notice The oracle gate refused this path. Thrown by `_requireHealthy` in every state-changing vault and bonds
+/// @notice The oracle gate refused this path. Thrown by the vault's three gate policies in every state-changing
 ///         function except `redeemProRata` and `claim` (invariant I14).
 /// @param state The `GateState` ordinal that refused, so the dApp can explain which layer tripped.
 /// @param poolId The pool the refusal applies to, or `bytes32(0)` for a protocol-wide refusal.
@@ -284,6 +284,17 @@ error DeadlineExpired(uint256 deadline, uint256 timestamp);
 ///         it at two pass-through fees would make the pool pay for the caller's own noise.
 /// @param poolId The pool named twice, as `PoolId.unwrap`.
 error SameHop(bytes32 poolId);
+
+/// @notice `AmpsRouter.rotate` was asked to rotate between two pools neither of which is a constituent's spoke.
+///
+/// @dev The pass-through fee is the price of *moving through* the index: in at one pool, out at another, with the
+///      AMPS leg netting to zero. A `rotate(hub, wethPool)` does none of that — it is a USDG/WETH swap against
+///      protocol-owned liquidity, priced at 60 bp where the design charges the AMPS fee on both legs, and both
+///      entry pools take their fair tick from their own TWAP so the deviation term is structurally zero. At least
+///      one leg must therefore be a spoke, which is the only shape "rotate between two constituents" can have.
+/// @param hop1 The first hop, as `PoolId.unwrap`.
+/// @param hop2 The second hop, as `PoolId.unwrap`.
+error NotARotation(bytes32 hop1, bytes32 hop2);
 
 /// @notice A rotation's two hops did not net to zero AMPS inside the unlock. Asserted before anything is settled,
 ///         so a router that ever held AMPS across a `rotate` reverts rather than banking it.

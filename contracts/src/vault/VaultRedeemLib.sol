@@ -74,7 +74,12 @@ library VaultRedeemLib {
     /// @dev `keccak256("amplestocks.vault.UNLOCK_ACTION")`: the discriminator `unlockCallback` dispatches on.
     uint256 internal constant UNLOCK_ACTION = 0x291441d399a16c9ae9ccf88b6ae5184884515a8004caafbe978b06287b215855;
 
-    /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`: NAV/share captured at entry for the R1 post-condition.
+    /// @dev `keccak256("amplestocks.vault.NAV_BEFORE")`. **Reserved, and written by nothing.** It was the channel
+    ///      NatSpec claimed carried NAV/share into the migration's relaxed bleed bound, but nothing ever read it
+    ///      and `AmpsVault.emergencyMigrate` now measures both sides of that bound live in one frame (audit fix,
+    ///      2026-09-08). The number stays declared so the slot is accounted for — `test/unit/VaultPlacement.t.sol`
+    ///      asserts it does not collide with the staging buffer — and so a future transient value cannot be
+    ///      derived onto it by accident.
     uint256 internal constant NAV_BEFORE = 0x6f2a9a8b4cb99f4e46ead1f9b636e99fbe475b6e810215ed22b447ae90ae3975;
 
     /// @dev Pull an ERC-20 from a payer straight into the PoolManager and mint the claim.
@@ -727,6 +732,13 @@ library VaultRedeemLib {
                 );
 
                 record.liquidity = live - removed;
+                // **`record.amount` is deliberately *not* pro-rated here** (audit lead, 2026-09-08). Every other
+                // removal decrements it, but this one runs on the structurally ungated redemption floor, once per
+                // live cell, and the field lives in the record's *second* slot: writing it costs a cold `SLOAD`
+                // plus a dirty `SSTORE` per cell, which measured +2.5M gas at the 512-cell budget and pushed
+                // `redeemProRata` past the one-transaction bound `test_e_gasPerLiveCellFitsTheRedemptionBudget`
+                // asserts. The disclosure is worth less than the floor's headroom, so the field reads as "placed,
+                // less what the placement engine removed" and a redemption is the one thing it does not follow.
                 if (live == removed) ++closed;
                 principal0 += int256(callerDelta.amount0()) - int256(feesAccrued.amount0());
                 principal1 += int256(callerDelta.amount1()) - int256(feesAccrued.amount1());

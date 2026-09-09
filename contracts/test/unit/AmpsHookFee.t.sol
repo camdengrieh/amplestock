@@ -196,19 +196,89 @@ contract AmpsHookFeeTest is HookTestFixture {
         );
     }
 
-    /// @notice Past `GATE_CACHE_MAX_AGE` the cached view is not trusted: widest band, degraded cap, frozen floor.
-    function test_aStaleGateCacheSubstitutesTheMostConservativeValues() public {
+    /// @notice Past `GATE_CACHE_MAX_AGE` the cached view is not trusted: the **narrow** band, the degraded cap and
+    ///         the frozen floor.
+    ///
+    /// @dev **Audit finding 13.** "Conservative" is not one direction for all four fields. For the dynamic cap and
+    ///      the frozen floor it means *more* fee; for the band and the rail it means a *tighter* refusal. The
+    ///      substitute used to take `INNER_BAND_MAX_TICKS`, which widened a healthy REGULAR spoke's rail from 800
+    ///      ticks to 4,500 — so the one circuit breaker in the system loosened 5.6x at the exact moment its anchor
+    ///      became self-referential, because the same staleness drops the fair tick back onto the pool's own TWAP.
+    function test_f13_aStaleGateCacheSubstitutesTheNarrowRailAndTheDegradedCap() public {
         policy.setDynOverride(0);
+        int24 healthyRail = hook.outerRailTicks(stockId);
         vm.warp(block.timestamp + Constants.GATE_CACHE_MAX_AGE + 1);
 
         (,, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.FROZEN_FEE_FLOOR_BPS, "the frozen floor applies while the cache is stale");
-        assertEq(hook.innerBandTicks(stockId), Constants.INNER_BAND_MAX_TICKS, "widest band for the class");
-        assertEq(hook.outerRailTicks(stockId), Constants.INNER_BAND_MAX_TICKS * 3, "and the rail that follows");
+        assertEq(hook.innerBandTicks(stockId), Constants.INNER_BAND_REGULAR_TICKS, "the regular band, not the widest");
+        assertEq(hook.outerRailTicks(stockId), Constants.OUTER_RAIL_MIN_TICKS, "and the rail that follows from it");
+        assertEq(hook.outerRailTicks(stockId), healthyRail, "which is the rail a healthy REGULAR spoke is bounded by");
+        assertLt(
+            hook.outerRailTicks(stockId),
+            Constants.INNER_BAND_MAX_TICKS * Constants.OUTER_RAIL_BAND_MULTIPLE,
+            "the substitute no longer widens the one circuit breaker in the system"
+        );
 
         policy.setDynOverride(type(uint16).max - 1);
         (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
-        assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "and the degraded cap");
+        assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "and the degraded cap still applies");
+    }
+
+    /// @notice **Audit finding 6.** A swap is judged against the rail it was **quoted** against. The gate refresh
+    ///         runs inside the same `afterSwap` as the post-swap rail check, so at a session close the first swap
+    ///         after the cache interval was priced in `beforeSwap` against the narrow REGULAR rail and then judged
+    ///         against the wide CLOSED one — letting one swap push a spoke several times further from fair than the
+    ///         bound in force when it was quoted (and, at the open, refusing swaps that had quoted as executable).
+    function test_f06_theSwapIsJudgedAgainstTheRailItWasQuotedAgainst() public {
+        // A cached rail of 800 ticks, with the pool 795 ticks from fair: inside the rail, and one boundary from
+        // being outside it.
+        policy.setRailOverride(800);
+        _setFairTick(stockId, _currentTick(stockId) - 795);
+        assertEq(hook.outerRailTicks(stockId), 800, "the rail this swap will be quoted against");
+
+        // The gate now publishes a much wider rail, but nothing has read it yet: the refresh that picks it up is
+        // the one inside the very `afterSwap` that judges the swap below.
+        policy.setRailOverride(5000);
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        (,,, bool refuse) = hook.quoteFee(stockId, false, true, 50e18, false);
+        assertFalse(refuse, "the swap starts inside the rail, so `beforeSwap` allows it");
+
+        (int24 devAfter, int24 railJudged) = _railFromRefusedBuy(50e18);
+        assertEq(railJudged, 800, "and it is judged against that same 800-tick rail");
+        assertGt(devAfter, 800, "having ended beyond it");
+        assertEq(hook.outerRailTicks(stockId), 800, "and the whole swap rolled back, refresh included");
+    }
+
+    /// @notice The buy really does refuse, and the `BeyondRail` payload the PoolManager re-throws is decoded here so
+    ///         the *rail* it was measured against can be asserted rather than assumed.
+    function _railFromRefusedBuy(uint256 amountIn) private returns (int24 devAfter, int24 rail) {
+        try this.buyForRevert(stockKey, amountIn) {
+            revert("the swap should have been refused");
+        } catch (bytes memory wrapped) {
+            bytes memory reason = _wrappedReason(wrapped);
+            assertEq(bytes4(reason), BeyondRail.selector, "refused for the rail and nothing else");
+            (, devAfter, rail) = abi.decode(_body(reason), (bytes32, int24, int24));
+        }
+    }
+
+    /// @notice External wrapper so a refused swap can be caught and its payload read.
+    function buyForRevert(PoolKey memory key, uint256 amountIn) external {
+        require(msg.sender == address(this), "self-call only");
+        _buyRaw(key, amountIn);
+    }
+
+    /// @dev The `reason` member of an ERC-7751 `WrappedError`, which is how the PoolManager re-throws a hook revert.
+    function _wrappedReason(bytes memory wrapped) private pure returns (bytes memory reason) {
+        (,, reason,) = abi.decode(_body(wrapped), (address, bytes4, bytes, bytes));
+    }
+
+    /// @dev ABI-encoded call or revert data with its four-byte selector removed.
+    function _body(bytes memory data) private pure returns (bytes memory stripped) {
+        stripped = new bytes(data.length - 4);
+        for (uint256 i; i < stripped.length; ++i) {
+            stripped[i] = data[i + 4];
+        }
     }
 
     // -----------------------------------------------------------------------------------------------------------

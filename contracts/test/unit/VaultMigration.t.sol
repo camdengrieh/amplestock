@@ -2,10 +2,12 @@
 pragma solidity 0.8.30;
 
 import {IAmpsVault} from "../../src/interfaces/IAmpsVault.sol";
-import {PoolClass} from "../../src/types/Types.sol";
+import {NavBleedExceeded} from "../../src/types/Errors.sol";
+import {GateState, PoolClass} from "../../src/types/Types.sol";
 import {AmpsVaultFixture, MockVaultRole} from "../mocks/AmpsVaultFixture.sol";
 import {MockNonCanonicalToken} from "../mocks/MockNonCanonicalToken.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @notice A hook-shaped contract with no `setVault(address)` at all: an older deployment, or one whose flag-mined
 ///         address predates the handover. Its call must be ignored, not fatal.
@@ -173,8 +175,80 @@ contract VaultMigrationTest is AmpsVaultFixture {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // The bleed bound (audit finding 10)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Audit finding 10.** The 0.5% bleed bound compares two measurements of the *same instant*. It used
+    ///         to compare the stored checkpoint against a live valuation — and `checkpoint()` is gate-gated, so in
+    ///         exactly the states that make a migration necessary the stored number cannot be refreshed. Ordinary
+    ///         drift of the 24/7 assets over a weekend therefore rolled the whole evacuation back on a number that
+    ///         had nothing to do with the evacuation.
+    function test_f10_aWeekendPriceMoveDoesNotRollBackTheEvacuation() public {
+        // A 10% ETH move, twenty times the bound, with the gate refusing every `checkpoint()` that could take it
+        // into the stored NAV. This is a weekend, not an incident.
+        stock.pause();
+        stock2.pause();
+        feeds.setAnswer(address(weth), WETH_USD8 * 90 / 100);
+        gate.setDefaultState(GateState.WATCHDOG);
+
+        uint256 stored = vault.navPerShareX18();
+        uint256 live = vault.previewNavPerShareX18();
+        assertLt(live, stored * 995 / 1000, "the live NAV is far below the stale checkpoint: 20x the bound");
+
+        vm.recordLogs();
+        vm.prank(GUARDIAN);
+        vault.emergencyMigrate(STANDBY);
+
+        assertEq(amps.vault(), STANDBY, "the evacuation completed");
+        (uint256 navBefore, uint256 navAfter) = _migratedIn(vm.getRecordedLogs());
+        assertEq(navBefore, live, "and `navBefore` is the live measurement, not the stale checkpoint");
+        assertApproxEqRel(navAfter, navBefore, 0.005e18, "which the standby's own valuation then matches");
+    }
+
+    /// @notice And the bound still binds when both sides *can* be priced: a standby that receives less than the
+    ///         vault held reverts, which is the property the fix must not cost.
+    function test_f10_theBoundStillBindsOnARealBleed() public {
+        stock.pause();
+        stock2.pause();
+
+        // The standby is priced by the same walk over the same asset list, so short-changing it is what a bleed
+        // looks like: intercept the second leg of the evacuation and swallow the WETH.
+        vm.mockCall(address(vault), abi.encodeWithSignature("assetsUsd18Of(address)", STANDBY), abi.encode(uint256(1)));
+
+        vm.prank(GUARDIAN);
+        vm.expectPartialRevert(NavBleedExceeded.selector);
+        vault.emergencyMigrate(STANDBY);
+    }
+
+    /// @notice A vault the valuer cannot price still evacuates, and says so rather than silently skipping the
+    ///         bound: the incident this path exists for is precisely one in which nothing can be valued.
+    function test_f10_anUnpriceableVaultEvacuatesAndAnnouncesTheSkippedBound() public {
+        stock.pause();
+        stock2.pause();
+        vm.mockCallRevert(
+            address(vault), abi.encodeWithSignature("assetsUsd18Of(address)", address(vault)), bytes("no price")
+        );
+
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit IAmpsVault.MigrationBleedUnchecked(bytes32("navBefore"));
+        vm.prank(GUARDIAN);
+        vault.emergencyMigrate(STANDBY);
+        assertEq(amps.vault(), STANDBY, "the evacuation still completed");
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------------------------------
+
+    /// @dev The last `Migrated` in `logs`.
+    function _migratedIn(Vm.Log[] memory logs) private view returns (uint256 navBefore, uint256 navAfter) {
+        for (uint256 i = logs.length; i != 0; --i) {
+            Vm.Log memory entry = logs[i - 1];
+            if (entry.emitter != address(vault) || entry.topics[0] != IAmpsVault.Migrated.selector) continue;
+            return abi.decode(entry.data, (uint256, uint256));
+        }
+        revert("no Migrated");
+    }
 
     /// @dev Registers a {MockNonCanonicalToken} as a third constituent and gives the vault a wei of it, so the
     ///      predicate's probe has a balance to move.

@@ -100,6 +100,20 @@ interface IAmpsGenesis {
     /// @param toleranceBps The vault's `refDivergenceBps` at settlement.
     event ClearingPricesDiverged(uint256 usdgP0X18, uint256 ethP0X18, uint16 toleranceBps);
 
+    /// @notice Emitted by {createAuctions} when the adapter held more AMPS than the tranche it is selling and the
+    ///         surplus was returned to the vault. A donation, in other words: anybody can send AMPS to a known
+    ///         address, and the tranche check is `>=` for exactly that reason.
+    /// @param amount The AMPS wei swept back to the vault.
+    event TrancheSurplusSwept(uint256 amount);
+
+    /// @notice Emitted by {settle} when the ETH/USD answer could not be refreshed — no feed, or an answer the feed
+    ///         registry does not call fresh — so `P0` was derived from the price the proposal carried instead.
+    /// @dev Disclosure, not a failure: a settlement that reverted here would strand the whole raise inside
+    ///      auctions whose sweeps are one-shot and `fundsRecipient`-only.
+    /// @param stalePrice The unusable answer, 18 decimals; zero when there was none at all.
+    /// @param usedPrice The price used instead: the one recorded at {createAuctions}, 18 decimals.
+    event EthUsdNotRefreshed(uint256 stalePrice, uint256 usedPrice);
+
     /// @notice {createAuctions} has already run. There is no reset.
     error AuctionsAlreadyCreated();
 
@@ -140,11 +154,18 @@ interface IAmpsGenesis {
 
     /// @notice The adapter does not hold the tranche {createAuctions} is being asked to sell, i.e.
     ///         `AmpsVault.genesisMint` has not run or minted somewhere else.
+    /// @dev Thrown on `held < required`, never on `held != required`: this address is derivable long before
+    ///      genesis and anybody may send AMPS to it, so an exact-equality check let one wei strand half of `S0`
+    ///      for ever in an ownerless adapter with no other exit. The surplus goes back to the vault instead
+    ///      ({TrancheSurplusSwept}).
     /// @param held AMPS wei held.
     /// @param required AMPS wei needed.
     error TrancheNotFunded(uint256 held, uint256 required);
 
     /// @notice An auction did not end up holding the tranche it was funded with.
+    /// @dev Thrown on `held < required` for the reason {TrancheNotFunded} gives: the leg's address is derivable
+    ///      from the proposal's own salt, so a pre-donation must not be able to force a re-proposal. A leg that
+    ///      holds *more* than its tranche returns the excess through its own unsold-token sweep at settlement.
     /// @param auction The auction.
     /// @param held Token wei it holds.
     /// @param required Token wei it should hold.

@@ -166,7 +166,10 @@ where the money goes.
 Each leg is either its whole constant or disabled (`shares == 0`); a "half tranche" is not a launch
 parameter. What the adapter validates, and a proposal therefore cannot get wrong:
 
-* the tranche is on the adapter (`genesisMint` has run) and equals `AUCTION_SHARES`;
+* the tranche is on the adapter (`genesisMint` has run) and is **at least** `AUCTION_SHARES` — anything above it
+  is a donation to a derivable address and is swept back to the vault as inventory (`TrancheSurplusSwept`), because
+  an exact-equality check let one wei strand half of `S0` in an ownerless adapter for ever (audit finding 12,
+  2026-09-08); the same `>=` applies to each leg's own funding check, whose address the proposal's salt reveals;
 * the floor, which it computes rather than reads;
 * `ethUsdX18` against the vault's `FeedRegistry` answer for WETH, inside the vault's
   `refDivergenceBps` — skipped entirely when no feed is readable, because this is a fat-finger guard
@@ -293,7 +296,7 @@ after the checkpoint rather than before it.
 
 **What the gate must not be.** Steps 3, 5 and 6 all run with `vault.oracleGate() == address(0)`.
 `OracleGate` reports `WATCHDOG` while the hub pool is unregistered or its ring is short, and
-`initializePool`, `genesisMint` and `genesisPlace` all take `_requireHealthy`, so a gate pointed too
+`initializePool`, `genesisMint` and `genesisPlace` all take `_requireManageable`, so a gate pointed too
 early makes the launch unreachable. An absent gate is exactly as permissive as a `GREEN` one.
 A consequence worth stating in the keeper runbook: because `settle()` is permissionless and gated,
 **the gate pointer must not be set between step 3 and step 5**, or a third party's `settle()` will

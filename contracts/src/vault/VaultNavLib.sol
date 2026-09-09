@@ -419,9 +419,11 @@ library VaultNavLib {
 
     /// @notice The pointer set, written by slot. Backs `AmpsVault.setPolicyPointer`.
     /// @dev The slot numbers are `docs/phase2-state-model.md` §1.1's, pinned field-for-field by
-    ///      `test/unit/VaultLayout.t.sol`. Five pointers are **set-once** and refuse once `genesis()` has frozen
-    ///      the wiring; `marketReference` is set-once before genesis and may be re-pointed afterwards exactly once
-    ///      more, to `AmpsHook`; the rest are freely pointer-upgradeable and none of them can move a fund.
+    ///      `test/unit/VaultLayout.t.sol`. Four pointers are **set-once** and refuse once `genesis()` has frozen
+    ///      the wiring (`registry`, `bonds`, `bountyPot`, `genesis`); the rest — `marketReference` included — are
+    ///      freely pointer-upgradeable by the timelock and none of them can move a fund. See
+    ///      `AmpsVault.setPolicyPointer` for why `marketReference` carries no latch, which is a decision and not an
+    ///      omission (audit disposition, 2026-09-08).
     /// @param name The pointer's short-string name.
     /// @param newPointer The replacement.
     /// @param wiringFrozen Whether `genesisPlace()` has run.
