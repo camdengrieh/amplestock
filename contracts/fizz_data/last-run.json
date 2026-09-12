@@ -1,0 +1,3253 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-12T12:25:48.553Z",
+  "projectRoot": ".",
+  "suiteDir": "test/fizz",
+  "metaDir": "fizz_data",
+  "contracts": [
+    {
+      "name": "AmpsBonds",
+      "sourcePath": "src/bonds/AmpsBonds.sol",
+      "sourceHash": "sha256:8e07307f1c6cb24f212655c6959df337da5863d6ad47e997803409f370a6f572",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "vault_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "registry_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "policy_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "addCollateral",
+          "inputs": [
+            {
+              "name": "collateral",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "class_",
+              "type": "enum",
+              "internalType": "CollateralClass"
+            },
+            {
+              "name": "dBaseBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "dMinBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "dMaxBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "capBpsPerEpoch",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "open",
+              "type": "bool",
+              "internalType": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "addCollateral(address,CollateralClass,uint16,uint16,uint16,uint16,bool)"
+        },
+        {
+          "name": "bond",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "amountIn",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "minAmpsOut",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "bond(uint16,uint256,uint256,address)"
+        },
+        {
+          "name": "claim",
+          "inputs": [
+            {
+              "name": "positionId",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "claim(uint256,address)"
+        },
+        {
+          "name": "claimAll",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "claimAll(address)"
+        },
+        {
+          "name": "removeCollateral",
+          "inputs": [
+            {
+              "name": "collateral",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "removeCollateral(address)"
+        },
+        {
+          "name": "setCapBpsPerEpoch",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "capBpsPerEpoch",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setCapBpsPerEpoch(uint16,uint16)"
+        },
+        {
+          "name": "setCoefficients",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "kWeightX18",
+              "type": "uint64",
+              "internalType": "uint64"
+            },
+            {
+              "name": "kFillX18",
+              "type": "uint64",
+              "internalType": "uint64"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setCoefficients(uint16,uint64,uint64)"
+        },
+        {
+          "name": "setDailyCapBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setDailyCapBps(uint16)"
+        },
+        {
+          "name": "setDiscountParams",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "dBaseBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "dMinBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "dMaxBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setDiscountParams(uint16,uint16,uint16,uint16)"
+        },
+        {
+          "name": "setEpochSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setEpochSeconds(uint32)"
+        },
+        {
+          "name": "setMarketOpen",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "open",
+              "type": "bool",
+              "internalType": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setMarketOpen(uint16,bool)"
+        },
+        {
+          "name": "setMinAccretionBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setMinAccretionBps(uint16)"
+        },
+        {
+          "name": "setPolicy",
+          "inputs": [
+            {
+              "name": "newPolicy",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setPolicy(address)"
+        },
+        {
+          "name": "setVault",
+          "inputs": [
+            {
+              "name": "newVault",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setVault(address)"
+        },
+        {
+          "name": "setVestSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setVestSeconds(uint32)"
+        }
+      ]
+    },
+    {
+      "name": "AmpsHook",
+      "sourcePath": "src/hook/AmpsHook.sol",
+      "sourceHash": "sha256:d027a5c71f102390885ec3b9387f0ebd5a38460846ca1755b6cb858f61df7368",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "poolManager_",
+            "type": "contract",
+            "internalType": "IPoolManager"
+          },
+          {
+            "name": "amps_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "vault_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "registry_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "afterAddLiquidity",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "ModifyLiquidityParams"
+            },
+            {
+              "name": "delta0",
+              "type": "int256",
+              "internalType": "BalanceDelta"
+            },
+            {
+              "name": "delta1",
+              "type": "int256",
+              "internalType": "BalanceDelta"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "afterAddLiquidity(address,PoolKey,ModifyLiquidityParams,BalanceDelta,BalanceDelta,bytes)"
+        },
+        {
+          "name": "afterDonate",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "amount0",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "amount1",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "afterDonate(address,PoolKey,uint256,uint256,bytes)"
+        },
+        {
+          "name": "afterInitialize",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "sqrtPriceX96",
+              "type": "uint160",
+              "internalType": "uint160"
+            },
+            {
+              "name": "tick",
+              "type": "int24",
+              "internalType": "int24"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "afterInitialize(address,PoolKey,uint160,int24)"
+        },
+        {
+          "name": "afterRemoveLiquidity",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "ModifyLiquidityParams"
+            },
+            {
+              "name": "delta0",
+              "type": "int256",
+              "internalType": "BalanceDelta"
+            },
+            {
+              "name": "delta1",
+              "type": "int256",
+              "internalType": "BalanceDelta"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "afterRemoveLiquidity(address,PoolKey,ModifyLiquidityParams,BalanceDelta,BalanceDelta,bytes)"
+        },
+        {
+          "name": "afterSwap",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "SwapParams"
+            },
+            {
+              "name": "delta",
+              "type": "int256",
+              "internalType": "BalanceDelta"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "afterSwap(address,PoolKey,SwapParams,BalanceDelta,bytes)"
+        },
+        {
+          "name": "armSurge",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "surgeBps_",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "reason",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "armSurge(PoolId,uint16,bytes32)"
+        },
+        {
+          "name": "beforeAddLiquidity",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "ModifyLiquidityParams"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "beforeAddLiquidity(address,PoolKey,ModifyLiquidityParams,bytes)"
+        },
+        {
+          "name": "beforeDonate",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "amount0",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "amount1",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "beforeDonate(address,PoolKey,uint256,uint256,bytes)"
+        },
+        {
+          "name": "beforeInitialize",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "sqrtPriceX96",
+              "type": "uint160",
+              "internalType": "uint160"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "beforeInitialize(address,PoolKey,uint160)"
+        },
+        {
+          "name": "beforeRemoveLiquidity",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "ModifyLiquidityParams"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "beforeRemoveLiquidity(address,PoolKey,ModifyLiquidityParams,bytes)"
+        },
+        {
+          "name": "beforeSwap",
+          "inputs": [
+            {
+              "name": "sender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "SwapParams"
+            },
+            {
+              "name": "hookData",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "beforeSwap(address,PoolKey,SwapParams,bytes)"
+        },
+        {
+          "name": "resetHighWater",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "resetHighWater(PoolId)"
+        },
+        {
+          "name": "setAmpsFeeBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setAmpsFeeBps(uint16)"
+        },
+        {
+          "name": "setBuyFeeBps",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setBuyFeeBps(PoolId,uint16)"
+        },
+        {
+          "name": "setFeePolicy",
+          "inputs": [
+            {
+              "name": "newPolicy",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setFeePolicy(address)"
+        },
+        {
+          "name": "setGateCacheSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setGateCacheSeconds(uint32)"
+        },
+        {
+          "name": "setMaxTickMovePerBlock",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "value",
+              "type": "int24",
+              "internalType": "int24"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setMaxTickMovePerBlock(PoolId,int24)"
+        },
+        {
+          "name": "setRouter",
+          "inputs": [
+            {
+              "name": "newRouter",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setRouter(address)"
+        },
+        {
+          "name": "setVault",
+          "inputs": [
+            {
+              "name": "newVault",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setVault(address)"
+        }
+      ]
+    },
+    {
+      "name": "BountyPot",
+      "sourcePath": "src/keeper/BountyPot.sol",
+      "sourceHash": "sha256:6fb7f723f550f5114bc6b706e911f53139c1c0c7528ee7ea41a4a530370b33cf",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "token_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "vault_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "fund",
+          "inputs": [
+            {
+              "name": "amountRaw",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "fund(uint256)"
+        },
+        {
+          "name": "pay",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "workValueUsd18",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "gasCostUsd18",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "pay(address,uint256,uint256)"
+        },
+        {
+          "name": "setChipBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setChipBps(uint16)"
+        },
+        {
+          "name": "setChostUsd18",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setChostUsd18(uint256)"
+        },
+        {
+          "name": "setDailyCeilingUsd18",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setDailyCeilingUsd18(uint256)"
+        },
+        {
+          "name": "setGasCapMultiple",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setGasCapMultiple(uint16)"
+        },
+        {
+          "name": "setTipUsd18",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setTipUsd18(uint256)"
+        },
+        {
+          "name": "setVault",
+          "inputs": [
+            {
+              "name": "newVault",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setVault(address)"
+        },
+        {
+          "name": "sweep",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "amountRaw",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "sweep(address,uint256)"
+        }
+      ]
+    },
+    {
+      "name": "FeedRegistry",
+      "sourcePath": "src/oracle/FeedRegistry.sol",
+      "sourceHash": "sha256:913d47ddc7bf618268f22bdb5ba2b8032f3cd4650d4044cb97ffa350f1090624",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "oracleGate_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "configureFeed",
+          "inputs": [
+            {
+              "name": "token",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "heartbeat",
+              "type": "uint32",
+              "internalType": "uint32"
+            },
+            {
+              "name": "thresholdBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "minAnswerUsd8",
+              "type": "uint128",
+              "internalType": "uint128"
+            },
+            {
+              "name": "maxAnswerUsd8",
+              "type": "uint128",
+              "internalType": "uint128"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "configureFeed(address,uint32,uint16,uint128,uint128)"
+        },
+        {
+          "name": "refresh",
+          "inputs": [
+            {
+              "name": "token",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "refresh(address)"
+        },
+        {
+          "name": "refreshMany",
+          "inputs": [
+            {
+              "name": "tokens",
+              "type": "array",
+              "internalType": "address[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "refreshMany(address[])"
+        },
+        {
+          "name": "setConfirmSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setConfirmSeconds(uint32)"
+        },
+        {
+          "name": "setFeed",
+          "inputs": [
+            {
+              "name": "token",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "aggregator",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "config",
+              "type": "tuple",
+              "internalType": "FeedConfig"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setFeed(address,address,FeedConfig)"
+        },
+        {
+          "name": "setFreshnessMultiplier",
+          "inputs": [
+            {
+              "name": "session",
+              "type": "enum",
+              "internalType": "Session"
+            },
+            {
+              "name": "multiplier",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setFreshnessMultiplier(Session,uint16)"
+        },
+        {
+          "name": "setOracleGate",
+          "inputs": [
+            {
+              "name": "gate",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setOracleGate(address)"
+        },
+        {
+          "name": "setStandardProxies",
+          "inputs": [
+            {
+              "name": "aggregators",
+              "type": "array",
+              "internalType": "address[]"
+            },
+            {
+              "name": "standard",
+              "type": "array",
+              "internalType": "bool[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setStandardProxies(address[],bool[])"
+        },
+        {
+          "name": "setStandardProxy",
+          "inputs": [
+            {
+              "name": "aggregator",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "standard",
+              "type": "bool",
+              "internalType": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setStandardProxy(address,bool)"
+        }
+      ]
+    },
+    {
+      "name": "OracleGate",
+      "sourcePath": "src/oracle/OracleGate.sol",
+      "sourceHash": "sha256:7357ff03e1ead7b23ba1ea8f351f86f0352c293174599c386f6366da9da48551",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "guardian_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "feedRegistry_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "registry_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "marketReference_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "freezeConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "until",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "freezeConstituent(uint16,uint32)"
+        },
+        {
+          "name": "freezeProtocol",
+          "inputs": [
+            {
+              "name": "until",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "freezeProtocol(uint32)"
+        },
+        {
+          "name": "poke",
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "poke()"
+        },
+        {
+          "name": "pokeConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "pokeConstituent(uint16)"
+        },
+        {
+          "name": "pokePool",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "pokePool(PoolId)"
+        },
+        {
+          "name": "pokePools",
+          "inputs": [
+            {
+              "name": "poolIds",
+              "type": "array",
+              "internalType": "PoolId[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "pokePools(PoolId[])"
+        },
+        {
+          "name": "setCorporateActionWindow",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setCorporateActionWindow(uint32)"
+        },
+        {
+          "name": "setDivergenceBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setDivergenceBps(uint16)"
+        },
+        {
+          "name": "setDivergenceSustainSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setDivergenceSustainSeconds(uint32)"
+        },
+        {
+          "name": "setDstTable",
+          "inputs": [
+            {
+              "name": "starts",
+              "type": "array",
+              "internalType": "uint32[]"
+            },
+            {
+              "name": "ends",
+              "type": "array",
+              "internalType": "uint32[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setDstTable(uint32[],uint32[])"
+        },
+        {
+          "name": "setFeedRegistry",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setFeedRegistry(address)"
+        },
+        {
+          "name": "setGapSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setGapSeconds(uint32)"
+        },
+        {
+          "name": "setGraceSeconds",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setGraceSeconds(uint32)"
+        },
+        {
+          "name": "setHSessionBps",
+          "inputs": [
+            {
+              "name": "session",
+              "type": "enum",
+              "internalType": "Session"
+            },
+            {
+              "name": "bps",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setHSessionBps(Session,uint16)"
+        },
+        {
+          "name": "setHolidayBitmap",
+          "inputs": [
+            {
+              "name": "year",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "bitmap",
+              "type": "uint256[2]",
+              "internalType": "uint256[2]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setHolidayBitmap(uint16,uint256[2])"
+        },
+        {
+          "name": "setMarketReference",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setMarketReference(address)"
+        },
+        {
+          "name": "setRefDivergenceBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setRefDivergenceBps(uint16)"
+        },
+        {
+          "name": "setRegistry",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setRegistry(address)"
+        },
+        {
+          "name": "unfreezeConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "unfreezeConstituent(uint16)"
+        },
+        {
+          "name": "unfreezeProtocol",
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "unfreezeProtocol()"
+        }
+      ]
+    },
+    {
+      "name": "AmpsRouter",
+      "sourcePath": "src/periphery/AmpsRouter.sol",
+      "sourceHash": "sha256:9357fa15f00721c3dabe40c631b0bcf462a1b9ab20eb1aa849c14b0921583cda",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "poolManager_",
+            "type": "contract",
+            "internalType": "IPoolManager"
+          },
+          {
+            "name": "amps_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "registry_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "weth_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "buy",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "amountIn",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "minAmpsOut",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "deadline",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "payable",
+          "tier": "primary",
+          "signature": "buy(PoolId,uint256,uint256,address,uint256)"
+        },
+        {
+          "name": "rotate",
+          "inputs": [
+            {
+              "name": "hop1",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "hop2",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "amountIn",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "minOut",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "unwrap",
+              "type": "bool",
+              "internalType": "bool"
+            },
+            {
+              "name": "deadline",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "payable",
+          "tier": "primary",
+          "signature": "rotate(PoolId,PoolId,uint256,uint256,address,bool,uint256)"
+        },
+        {
+          "name": "sell",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "ampsIn",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "minOut",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "unwrap",
+              "type": "bool",
+              "internalType": "bool"
+            },
+            {
+              "name": "deadline",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "sell(PoolId,uint256,uint256,address,bool,uint256)"
+        },
+        {
+          "name": "unlockCallback",
+          "inputs": [
+            {
+              "name": "data",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "unlockCallback(bytes)"
+        }
+      ]
+    },
+    {
+      "name": "PoolRegistry",
+      "sourcePath": "src/registry/PoolRegistry.sol",
+      "sourceHash": "sha256:018a0fad42e21cf9173c3d420e4244c9dbaddfbe8b54e66a1fc736d4e927e020",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "vault_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "hook_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "amps_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "weth9_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "usdg_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "addConstituent",
+          "inputs": [
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "IPoolRegistry.AddConstituentParams"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "addConstituent(IPoolRegistry.AddConstituentParams)"
+        },
+        {
+          "name": "reconfigureConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "IPoolRegistry.ReconfigureParams"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "reconfigureConstituent(uint16,IPoolRegistry.ReconfigureParams)"
+        },
+        {
+          "name": "registerEntryPool",
+          "inputs": [
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "counterDecimals",
+              "type": "uint8",
+              "internalType": "uint8"
+            },
+            {
+              "name": "buyFeeBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "feed",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "registerEntryPool(PoolKey,uint8,uint16,address)"
+        },
+        {
+          "name": "reinstateConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "rolloutWeightBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "reinstateConstituent(uint16,uint16)"
+        },
+        {
+          "name": "retireConstituent",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "retireConstituent(uint16)"
+        },
+        {
+          "name": "setIndexWeights",
+          "inputs": [
+            {
+              "name": "ids",
+              "type": "array",
+              "internalType": "uint16[]"
+            },
+            {
+              "name": "weightsBps",
+              "type": "array",
+              "internalType": "uint16[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setIndexWeights(uint16[],uint16[])"
+        },
+        {
+          "name": "setVault",
+          "inputs": [
+            {
+              "name": "newVault",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setVault(address)"
+        },
+        {
+          "name": "withdrawRetiredBids",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "withdrawRetiredBids(uint16)"
+        }
+      ]
+    },
+    {
+      "name": "Amps",
+      "sourcePath": "src/token/Amps.sol",
+      "sourceHash": "sha256:bc385d98ce9c93358a34bc580836ea289a78487e418488aea132b54a5377deb7",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "vault_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "approve",
+          "inputs": [
+            {
+              "name": "spender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "approve(address,uint256)"
+        },
+        {
+          "name": "burn",
+          "inputs": [
+            {
+              "name": "from",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "amount",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "burn(address,uint256)"
+        },
+        {
+          "name": "mint",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "amount",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "mint(address,uint256)"
+        },
+        {
+          "name": "permit",
+          "inputs": [
+            {
+              "name": "owner",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "spender",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "deadline",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "v",
+              "type": "uint8",
+              "internalType": "uint8"
+            },
+            {
+              "name": "r",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "s",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"
+        },
+        {
+          "name": "setVault",
+          "inputs": [
+            {
+              "name": "newVault",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setVault(address)"
+        },
+        {
+          "name": "transfer",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "transfer(address,uint256)"
+        },
+        {
+          "name": "transferFrom",
+          "inputs": [
+            {
+              "name": "from",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "transferFrom(address,address,uint256)"
+        }
+      ]
+    },
+    {
+      "name": "AmpsVault",
+      "sourcePath": "src/vault/AmpsVault.sol",
+      "sourceHash": "sha256:764cfe8fefe86f2f44ceac13ff5e983a9fc769afe395e7fb703c21b90f344de8",
+      "constructor": {
+        "inputs": [
+          {
+            "name": "amps_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "poolManager_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timelock_",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "guardian_",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "nonpayable"
+      },
+      "functions": [
+        {
+          "name": "checkpoint",
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "checkpoint()"
+        },
+        {
+          "name": "compound",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "compound(PoolId)"
+        },
+        {
+          "name": "deployBonded",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "deployBonded(uint16)"
+        },
+        {
+          "name": "depositBonded",
+          "inputs": [
+            {
+              "name": "marketId",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "collateral",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "from",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "amount",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "depositBonded(uint16,address,address,uint256)"
+        },
+        {
+          "name": "emergencyMigrate",
+          "inputs": [
+            {
+              "name": "standby",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "emergencyMigrate(address)"
+        },
+        {
+          "name": "genesisMint",
+          "inputs": [
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "IAmpsVault.GenesisMintParams"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "genesisMint(IAmpsVault.GenesisMintParams)"
+        },
+        {
+          "name": "genesisPlace",
+          "inputs": [
+            {
+              "name": "params",
+              "type": "tuple",
+              "internalType": "IAmpsVault.GenesisPlaceParams"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "genesisPlace(IAmpsVault.GenesisPlaceParams)"
+        },
+        {
+          "name": "initializePool",
+          "inputs": [
+            {
+              "name": "key",
+              "type": "tuple",
+              "internalType": "PoolKey"
+            },
+            {
+              "name": "sqrtPriceX96",
+              "type": "uint160",
+              "internalType": "uint160"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "initializePool(PoolKey,uint160)"
+        },
+        {
+          "name": "mintVesting",
+          "inputs": [
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            },
+            {
+              "name": "amount",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "mintVesting(address,uint256)"
+        },
+        {
+          "name": "place",
+          "inputs": [
+            {
+              "name": "poolId",
+              "type": "bytes32",
+              "internalType": "PoolId"
+            },
+            {
+              "name": "above",
+              "type": "bool",
+              "internalType": "bool"
+            },
+            {
+              "name": "amount",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "place(PoolId,bool,uint256)"
+        },
+        {
+          "name": "redeemProRata",
+          "inputs": [
+            {
+              "name": "shares",
+              "type": "uint256",
+              "internalType": "uint256"
+            },
+            {
+              "name": "to",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "redeemProRata(uint256,address)"
+        },
+        {
+          "name": "rollout",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "rollout(uint16)"
+        },
+        {
+          "name": "setCreator",
+          "inputs": [
+            {
+              "name": "newCreator",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setCreator(address)"
+        },
+        {
+          "name": "setDeployThresholdUsd18",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setDeployThresholdUsd18(uint256)"
+        },
+        {
+          "name": "setLadderShape",
+          "inputs": [
+            {
+              "name": "tiltX18",
+              "type": "uint64",
+              "internalType": "uint64"
+            },
+            {
+              "name": "doublings",
+              "type": "uint8",
+              "internalType": "uint8"
+            },
+            {
+              "name": "seedHalvings_",
+              "type": "uint8",
+              "internalType": "uint8"
+            },
+            {
+              "name": "bondBidHalvings_",
+              "type": "uint8",
+              "internalType": "uint8"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setLadderShape(uint64,uint8,uint8,uint8)"
+        },
+        {
+          "name": "setPolicyPointer",
+          "inputs": [
+            {
+              "name": "slot",
+              "type": "bytes32",
+              "internalType": "bytes32"
+            },
+            {
+              "name": "newPointer",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setPolicyPointer(bytes32,address)"
+        },
+        {
+          "name": "setRedeemFeeBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setRedeemFeeBps(uint16)"
+        },
+        {
+          "name": "setRefDivergenceBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setRefDivergenceBps(uint16)"
+        },
+        {
+          "name": "setRefUpRateBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setRefUpRateBps(uint16)"
+        },
+        {
+          "name": "setRolloutParams",
+          "inputs": [
+            {
+              "name": "bpsPerDay",
+              "type": "uint16",
+              "internalType": "uint16"
+            },
+            {
+              "name": "floorBps",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "setRolloutParams(uint16,uint16)"
+        },
+        {
+          "name": "setSpokeSeedBps",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setSpokeSeedBps(uint16)"
+        },
+        {
+          "name": "setStandbyVault",
+          "inputs": [
+            {
+              "name": "standby",
+              "type": "address",
+              "internalType": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setStandbyVault(address)"
+        },
+        {
+          "name": "setTwapWindow",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint32",
+              "internalType": "uint32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "setTwapWindow(uint32)"
+        },
+        {
+          "name": "touch",
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "touch()"
+        },
+        {
+          "name": "unlockCallback",
+          "inputs": [
+            {
+              "name": "data",
+              "type": "bytes",
+              "internalType": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "primary",
+          "signature": "unlockCallback(bytes)"
+        },
+        {
+          "name": "withdrawRetiredBids",
+          "inputs": [
+            {
+              "name": "constituentId",
+              "type": "uint16",
+              "internalType": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "tier": "secondary",
+          "signature": "withdrawRetiredBids(uint16)"
+        }
+      ]
+    }
+  ],
+  "handlers": {
+    "AdversaryHandler.sol": "sha256:779ed91f987c104ae29fff2dd23e41755e7f1a3da3460450c9bec3be305a9e79",
+    "AmpsBondsHandler.sol": "sha256:3484bd418a34e73279e82fd9d181ec81378de0b9772fcde76831b3ae83e68e43",
+    "AmpsHandler.sol": "sha256:d8436706e6fbb621a05bb8caa0f2a9c2e3048ca85bf0728fbdb3ec5774b5bfad",
+    "AmpsHookHandler.sol": "sha256:a0fb7a3101a6b30a46e183da99d52f2296bfea91527c84b81ae916c7677bf84c",
+    "AmpsRouterHandler.sol": "sha256:45e762d353b2c3287eeba9b2d9c8346d107fcd50f94de2d48d13583b5565d823",
+    "AmpsVaultHandler.sol": "sha256:9786d064ec9c8717262ff90d561f9dd12146c83bdfba12982b7e7762ae5cdd5d",
+    "BountyPotHandler.sol": "sha256:02f2402376182af72bd343cb8625f07e710d3b225d61c353aa10008ad6da6e3e",
+    "FeedRegistryHandler.sol": "sha256:35423d3b9473a18ee15de2d5aca2aa70e2aa88d9dc22e55af6cbbc7c5ac5a98c",
+    "Handlers.sol": "sha256:20da95af83c080d11029e11aef289af18e970d6d89f4f1e7f581f0aebc601f5c",
+    "OracleGateHandler.sol": "sha256:142a8fd5ee193a7d20489ef6747c24fb846f93a22609cd1984f7c19029b4b099",
+    "PoolRegistryHandler.sol": "sha256:34833a842ddabe16f16f4687572f0c93b12607b37a5db53f9ce4e9d3844c0cad"
+  },
+  "properties": [
+    {
+      "id": "GL-01",
+      "checkbox": "x",
+      "functionName": "property_ampsClosureSumsToSupply",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-02",
+      "checkbox": "x",
+      "functionName": "property_supplyUnderGenesisPlusIssuance",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-03",
+      "checkbox": "x",
+      "functionName": "property_supplyLedgerCloses",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-04",
+      "checkbox": "x",
+      "functionName": "property_shareTokenRolesIntact",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-05",
+      "checkbox": "x",
+      "functionName": "property_bondShellCoversItsBook",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-06",
+      "checkbox": "x",
+      "functionName": "property_perMarketIssuanceLedger",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-07",
+      "checkbox": "x",
+      "functionName": "property_epochIssuanceContained",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-08",
+      "checkbox": "x",
+      "functionName": "property_bondCapsBindCumulatively",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-09",
+      "checkbox": "x",
+      "functionName": "property_vestingBookIsConsistent",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-10",
+      "checkbox": "x",
+      "functionName": "property_positionFieldsImmutable",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-11",
+      "checkbox": "x",
+      "functionName": "property_claimableIsMonotoneAndOwnerOnly",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-12",
+      "checkbox": "x",
+      "functionName": "property_positionCountMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-13",
+      "checkbox": "x",
+      "functionName": "property_totalIssuedMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-14",
+      "checkbox": "x",
+      "functionName": "property_everyVestedPositionIsClaimable",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-15",
+      "checkbox": "x",
+      "functionName": "property_positionArrayGriefingBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-16",
+      "checkbox": "x",
+      "functionName": "property_closedMarketHasNotIssued",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-17",
+      "checkbox": "x",
+      "functionName": "property_marketAttributionAgrees",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-18",
+      "checkbox": "x",
+      "functionName": "property_navPerShareIdentity",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-19",
+      "checkbox": "x",
+      "functionName": "property_assetsDecomposeIntoA",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-20",
+      "checkbox": "x",
+      "functionName": "property_assetRegistryWellFormed",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-21",
+      "checkbox": "x",
+      "functionName": "property_inventoryAmpsDecomposes",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-22",
+      "checkbox": "x",
+      "functionName": "property_redemptionIsCovered",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-23",
+      "checkbox": "x",
+      "functionName": "property_poolManagerCoversClaims",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-24",
+      "checkbox": "x",
+      "functionName": "property_zeroStateSafety",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-25",
+      "checkbox": "x",
+      "functionName": "property_noShareInflationGrief",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-26",
+      "checkbox": "x",
+      "functionName": "property_disclosureNeverReverts",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-27",
+      "checkbox": "x",
+      "functionName": "property_theFloorIsAlwaysOpen",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-28",
+      "checkbox": "x",
+      "functionName": "property_redemptionIsNotSplittableForProfit",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-29",
+      "checkbox": "x",
+      "functionName": "property_previewRedeemIsMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-30",
+      "checkbox": "x",
+      "functionName": "property_noFreeRoundTripOnTheQuoter",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-31",
+      "checkbox": "-",
+      "functionName": "property_cumulativeKeeperBleedBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-32",
+      "checkbox": "x",
+      "functionName": null,
+      "file": null
+    },
+    {
+      "id": "GL-33",
+      "checkbox": "x",
+      "functionName": "property_referencePriceFloorsAtNav",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-34",
+      "checkbox": "x",
+      "functionName": "property_governedScalarsInBand",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-35",
+      "checkbox": "x",
+      "functionName": "property_creatorBpsIsMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-36",
+      "checkbox": "x",
+      "functionName": "property_creatorSliceIsBoundedCumulatively",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-37",
+      "checkbox": "x",
+      "functionName": "property_rotationCreditIsTransactionScoped",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-38",
+      "checkbox": "x",
+      "functionName": "property_hookHoldsAndMovesNothing",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-39",
+      "checkbox": "x",
+      "functionName": "property_routerHoldsNothing",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-40",
+      "checkbox": "x",
+      "functionName": "property_liveCellCounterIsHonest",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-41",
+      "checkbox": "x",
+      "functionName": "property_recordedLiquidityMatchesPoolManager",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-42",
+      "checkbox": "x",
+      "functionName": "property_everyRecordIsOneCanonicalCell",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-43",
+      "checkbox": "x",
+      "functionName": "property_ladderSidednessHolds",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-44",
+      "checkbox": "x",
+      "functionName": "property_ladderLengthMonotoneAndBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-45",
+      "checkbox": "x",
+      "functionName": "property_lastPlacementAtMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-46",
+      "checkbox": "x",
+      "functionName": "property_checkpointStampsMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-47",
+      "checkbox": "x",
+      "functionName": "property_highWaterRisesOnly",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-48",
+      "checkbox": "x",
+      "functionName": "property_observationCoverageMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-49",
+      "checkbox": "x",
+      "functionName": "property_rolloutDrainIsBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-50",
+      "checkbox": "x",
+      "functionName": "property_activeSetIsConsistent",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-51",
+      "checkbox": "x",
+      "functionName": "property_retiredIffStamped",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-52",
+      "checkbox": "x",
+      "functionName": "property_retiredNamesAreExitOnly",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-53",
+      "checkbox": "x",
+      "functionName": "property_weightVectorNormalises",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-54",
+      "checkbox": "x",
+      "functionName": "property_populationCountersBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-55",
+      "checkbox": "x",
+      "functionName": "property_pendingImpliesALatch",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-56",
+      "checkbox": "x",
+      "functionName": "property_freezeOutranksEveryLayer",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-57",
+      "checkbox": "x",
+      "functionName": "property_freezesAreBoundedAndExpire",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-58",
+      "checkbox": "x",
+      "functionName": "property_watchdogStampMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-59",
+      "checkbox": "x",
+      "functionName": "property_launchLatchesHold",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-60",
+      "checkbox": "x",
+      "functionName": "property_theBountyPotIsBounded",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-61",
+      "checkbox": "x",
+      "functionName": "property_noStuckTransientLock",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-62",
+      "checkbox": "x",
+      "functionName": "property_narrowTypesDoNotBrick",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-63",
+      "checkbox": "x",
+      "functionName": "property_noPrivilegeEscalation",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-64",
+      "checkbox": "x",
+      "functionName": "property_priceLibUsdRawRoundTrip",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-65",
+      "checkbox": "x",
+      "functionName": "property_priceLibSqrtRoundTrip",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-66",
+      "checkbox": "x",
+      "functionName": "property_tickRoundTripAndAlign",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-67",
+      "checkbox": "x",
+      "functionName": "property_ladderAmountLiquidityRoundTrip",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-68",
+      "checkbox": "x",
+      "functionName": "property_ladderSplitIsExact",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-69",
+      "checkbox": "x",
+      "functionName": "property_hookStatePackRoundTrip",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-70",
+      "checkbox": "x",
+      "functionName": "property_priceLibDirections",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-71",
+      "checkbox": "x",
+      "functionName": "property_qFloorImplementationsAgree",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-72",
+      "checkbox": "x",
+      "functionName": "property_ladderGeometryIsContiguous",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-73",
+      "checkbox": "x",
+      "functionName": "property_discountIsBandedAndMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-74",
+      "checkbox": "x",
+      "functionName": "property_zeroInputsAreSafe",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-75",
+      "checkbox": "x",
+      "functionName": "property_hookFeeIsWithinI16",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-76",
+      "checkbox": "x",
+      "functionName": "property_blendedBaseNeverRoundsDown",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-77",
+      "checkbox": "x",
+      "functionName": "property_quoterAgreesWithTheHook",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-78",
+      "checkbox": "x",
+      "functionName": "property_priceImpactIsMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-79",
+      "checkbox": "x",
+      "functionName": "property_bondQuoteIsMonotone",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-80",
+      "checkbox": "x",
+      "functionName": "property_retiredBidsNeverOverReturn",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "GL-81",
+      "checkbox": "x",
+      "functionName": "property_valuerNeverOverstatesAPool",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-01",
+      "checkbox": "x",
+      "functionName": "property_mintAttribution",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-02",
+      "checkbox": "x",
+      "functionName": "property_bondAppendsOnePosition",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-03",
+      "checkbox": "x",
+      "functionName": "property_bondMintsIntoCustody",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-04",
+      "checkbox": "x",
+      "functionName": "property_bondDepositConservation",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-05",
+      "checkbox": "x",
+      "functionName": "property_bondIsAccretive",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-06",
+      "checkbox": "x",
+      "functionName": "property_bondWithinCapacityOnOffer",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-07",
+      "checkbox": "x",
+      "functionName": "property_quoteMatchesBond",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-08",
+      "checkbox": "x",
+      "functionName": "property_bondSurplusReachesHolders",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-09",
+      "checkbox": "x",
+      "functionName": "property_claimMovesOnlyTheShellsAmps",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-10",
+      "checkbox": "x",
+      "functionName": "property_redemptionBurnIsExact",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-11",
+      "checkbox": "x",
+      "functionName": "property_previewIsThePayout",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-12",
+      "checkbox": "x",
+      "functionName": "property_onlyTheCallersOwnPosition",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-13",
+      "checkbox": "x",
+      "functionName": "property_redemptionIsAccretive",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-14",
+      "checkbox": "x",
+      "functionName": "property_redemptionPaysAtMostProRata",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-15",
+      "checkbox": "x",
+      "functionName": "property_redemptionKeepsLadderGeometry",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-16",
+      "checkbox": "x",
+      "functionName": "property_fullRedemptionNeverReverts",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-17",
+      "checkbox": "x",
+      "functionName": "property_placementBleedBound",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-18",
+      "checkbox": "x",
+      "functionName": "property_placementConservesInventoryAndShape",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-19",
+      "checkbox": "x",
+      "functionName": "property_sidednessAtPlacement",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-20",
+      "checkbox": "x",
+      "functionName": "property_placementDivergenceBand",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-21",
+      "checkbox": "x",
+      "functionName": "property_zeroWorkTakesNothing",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-22",
+      "checkbox": "x",
+      "functionName": "property_aboveChangesOnlyWhenEmpty",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-23",
+      "checkbox": "x",
+      "functionName": "property_burnbackBurnsOnlyCrossedAsks",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-24",
+      "checkbox": "x",
+      "functionName": "property_compoundBurnIsExact",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-25",
+      "checkbox": "x",
+      "functionName": "property_creatorSlicePerCompound",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-26",
+      "checkbox": "x",
+      "functionName": "property_checkpointIsStamped",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-27",
+      "checkbox": "x",
+      "functionName": "property_sweepCleanHolds",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-28",
+      "checkbox": "-",
+      "functionName": null,
+      "file": null
+    },
+    {
+      "id": "SP-29",
+      "checkbox": "x",
+      "functionName": "property_potChargesWhatItTransfers",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-30",
+      "checkbox": "x",
+      "functionName": "property_potMovementsDoNotMoveA",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-31",
+      "checkbox": "x",
+      "functionName": "property_emptyPotDoesNotRevertKeepers",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-32",
+      "checkbox": "x",
+      "functionName": "property_counterAssetConservation",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-33",
+      "checkbox": "x",
+      "functionName": "property_tradeAttribution",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-34",
+      "checkbox": "x",
+      "functionName": "property_swapNeverTakesMoreThanTheLadderHeld",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-35",
+      "checkbox": "x",
+      "functionName": "property_swapDoesNotMoveSupply",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-36",
+      "checkbox": "x",
+      "functionName": "property_honestTradingNeverReverts",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-37",
+      "checkbox": "x",
+      "functionName": "property_quoteExactInMatchesTheSwap",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-38",
+      "checkbox": "x",
+      "functionName": "property_quoteRotationMatchesTheRotation",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-39",
+      "checkbox": "x",
+      "functionName": "property_rotationFeeSchedule",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-40",
+      "checkbox": "x",
+      "functionName": "property_rotationExemptionNotForSale",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-41",
+      "checkbox": "x",
+      "functionName": "property_atomicWashPaysTheAmpsFee",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-42",
+      "checkbox": "x",
+      "functionName": "property_buySellRoundTripNoProfit",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-43",
+      "checkbox": "x",
+      "functionName": "property_sellBuyRoundTripNoProfit",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-44",
+      "checkbox": "x",
+      "functionName": "property_rotateThereAndBackNoProfit",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-45",
+      "checkbox": "x",
+      "functionName": "property_buyRedeemRoundTripNoProfit",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-46",
+      "checkbox": "x",
+      "functionName": "property_repeatedCycleExtractsNothing",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-47",
+      "checkbox": "x",
+      "functionName": "property_bondClaimRedeemCycle",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-48",
+      "checkbox": "-",
+      "functionName": null,
+      "file": null
+    },
+    {
+      "id": "SP-49",
+      "checkbox": "x",
+      "functionName": "property_noFreeAmpsFromTruncation",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-50",
+      "checkbox": "x",
+      "functionName": "property_statusMovesOnLegalEdgesOnly",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-51",
+      "checkbox": "x",
+      "functionName": "property_activeCountDelta",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-52",
+      "checkbox": "x",
+      "functionName": "property_retireStampsAndZeroes",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-53",
+      "checkbox": "x",
+      "functionName": "property_registryCallIsIsolated",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-54",
+      "checkbox": "x",
+      "functionName": "property_divergenceTimerLatches",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-55",
+      "checkbox": "x",
+      "functionName": "property_acceptedAnswerAdvancesTheRound",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-56",
+      "checkbox": "x",
+      "functionName": "property_latchClearsPending",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-57",
+      "checkbox": "x",
+      "functionName": "property_refreshThenBondUsesTheHeldAnswer",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-58",
+      "checkbox": "x",
+      "functionName": "property_governedSetterIsValueNeutral",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-59",
+      "checkbox": "x",
+      "functionName": "property_donationBricksNothing",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-60",
+      "checkbox": "x",
+      "functionName": "property_fullAmountOpsStayReenterable",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-61",
+      "checkbox": "x",
+      "functionName": "property_neutralErc20OpsAreNeutral",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-62",
+      "checkbox": "x",
+      "functionName": "property_transferAccountingIsExact",
+      "file": "test/fizz/Properties.sol"
+    },
+    {
+      "id": "SP-63",
+      "checkbox": "x",
+      "functionName": "property_toParameterCreditsTo",
+      "file": "test/fizz/Properties.sol"
+    }
+  ]
+}
