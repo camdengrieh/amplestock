@@ -384,6 +384,17 @@ export function resolveDocFigures(input: DocsResolveInput): Record<FigureId, Fig
     cfgSpokeSeedAmps: value(`${formatAmount(launchParameters.supply.perSpokeSeedWei, 18)} AMPS`),
     cfgNavAtFloor: value(`$${launchParameters.auction.navPerShareAtFloorUsd.toFixed(2)}`),
     cfgPremiumAtFloor: value(formatBps(launchParameters.auction.premiumAtFloorBps)),
+    cfgGraduationPerLeg: value(`$${launchParameters.auction.terms.graduationUsdPerLeg.toLocaleString('en-US')}`),
+    cfgNavAtGraduation: value(`$${launchParameters.auction.graduationMinimum.navPerShareUsd.toFixed(2)}`),
+    cfgPremiumAtGraduation: value(formatBps(launchParameters.auction.graduationMinimum.premiumBps)),
+    cfgAuctionStartDelay: value(`${launchParameters.auction.terms.startDelayHours} hours`),
+    cfgAuctionDuration: value(`${launchParameters.auction.terms.durationHours} hours`),
+    cfgAuctionClaimDelay: value(`${launchParameters.auction.terms.claimDelayHours} hours`),
+    cfgAuctionTickSpacing: value(formatBps(launchParameters.auction.terms.tickSpacingBps)),
+    cfgAuctionValidationHook: value(
+      launchParameters.auction.terms.validationHook === 'none' ? 'None' : launchParameters.auction.terms.validationHook,
+    ),
+    cfgFallbackLaunchPrice: value(`$${launchParameters.fallbackSeed.launchPriceUsd.toFixed(2)} per AMPS`),
     cfgFallbackSeed: value(
       `$${launchParameters.fallbackSeed.totalUsd.toLocaleString('en-US')} (${formatAmount(launchParameters.fallbackSeed.usdgRaw, 6)} USDG + ${formatAmount(launchParameters.fallbackSeed.wethWei, 18)} WETH)`,
     ),

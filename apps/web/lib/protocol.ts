@@ -128,8 +128,24 @@ export const H_SESSION_BPS_DEFAULT: readonly number[] = [0, 50, 150, 300]
 export const GRID_CELLS = 24
 export const GRID_MIN_M = -8
 export const MAX_LIVE_CELLS = 512
-export const MAX_CONSTITUENTS = 64
+/**
+ * `PoolRegistry.MAX_CONSTITUENTS` — 34, not a round number.
+ *
+ * Revision 8 lowers it to what the redemption gas budget proves: `MAX_LIVE_CELLS` is 512 and a
+ * fully laddered pool costs 14 live cells, so 512 / 14 = 36 pools, less the two entry pools.
+ */
+export const MAX_CONSTITUENTS = 34
 export const CHECKPOINT_MAX_AGE = 1_800
+
+/**
+ * `Constants.REDEEM_BURN_STREAM_SECONDS` — 24 hours.
+ *
+ * The AMPS a redemption releases out of the vault's own cells is not burned in that transaction and
+ * not burned in one step at the next checkpoint either: it is burned on a **linear stream** over
+ * this window, settled by every checkpoint and by every redemption. The window restarts whenever a
+ * redemption adds to the queue, so `burnStreamStart()` is the clock, not the first redemption ever.
+ */
+export const REDEEM_BURN_STREAM_SECONDS = 24 * 3_600
 export const PLACEMENT_COOLDOWN_SECONDS = 60
 export const TWAP_WINDOW_DEFAULT = 1_800
 

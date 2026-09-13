@@ -11,8 +11,13 @@
  * watchdog tripped, the guardian frozen and the timelock hostile. Chain-level censorship is the
  * only thing left, and `/risk` says so.
  *
- * The released inventory AMPS is burned too, so `T` falls by more than `shares`: the redemption is
- * accretive to everyone who stays.
+ * **The released inventory AMPS is not burned in the same transaction** (revision 8). It is
+ * released out of the cells the unwind crosses, left idle, and burned on a **24-hour linear
+ * stream** (`REDEEM_BURN_STREAM_SECONDS`) that every checkpoint and every redemption settles. So
+ * total supply falls by exactly `shares` at the redemption, and then continuously over the day that
+ * follows it as the stream drains. The stream is a supply policy, not an accrual: it is smoothed
+ * precisely so that the burn cannot be timed, and adding to the queue restarts the window rather
+ * than stacking a second one.
  *
  * The authority for the numbers a user sees is `AmpsVault.previewRedeem`, which reads balances
  * only and never reverts for a live vault. Everything here formats that answer; it does not
@@ -39,8 +44,11 @@ export interface RedeemPreview {
   shares: bigint
   redeemFeeBps: number
   lines: readonly RedeemLine[]
-  /** Additional AMPS burned from released POL inventory — why `T` falls by more than `shares`. */
-  inventoryBurned: bigint
+  /**
+   * AMPS released from the POL inventory the unwind crossed, queued for the 24-hour burn stream.
+   * Not burned in this transaction, and it leaves the supply over the day that follows it.
+   */
+  inventoryReleased: bigint
 }
 
 /**
@@ -59,7 +67,7 @@ export function grossFromNet(net: bigint, redeemFeeBps: number): bigint {
 export function buildRedeemPreview(params: {
   shares: bigint
   redeemFeeBps: number
-  inventoryBurned: bigint
+  inventoryReleased: bigint
   tokens: readonly Address[]
   amounts: readonly bigint[]
   meta: (token: Address) => {symbol: string; decimals: number}
@@ -77,7 +85,7 @@ export function buildRedeemPreview(params: {
     shares: params.shares,
     redeemFeeBps: params.redeemFeeBps,
     lines,
-    inventoryBurned: params.inventoryBurned,
+    inventoryReleased: params.inventoryReleased,
   }
 }
 

@@ -288,14 +288,32 @@ export const redemption = onchainTable(
     owner: t.hex().notNull(),
     to: t.hex().notNull(),
     shares: t.bigint().notNull(),
-    /** The vault's own AMPS (ERC-20 plus claim) burned alongside, ruling F. */
-    inventoryBurned: t.bigint().notNull(),
+    /**
+     * The vault's own AMPS released out of the cells the unwind crossed, **not** burned in this
+     * transaction (revision 8). It drains to the sink on a 24-hour linear stream that every
+     * checkpoint and every redemption settles, so total supply falls by exactly `shares` here and
+     * by this amount over the day that follows.
+     */
+    inventoryReleased: t.bigint().notNull(),
     feeBps: t.integer().notNull(),
     /** NAV/share in force at the redemption block. */
     navPerShareX18: t.bigint().notNull(),
-    /** `shares * nav * (BPS - feeBps) / BPS`, 18-decimal USD. Disclosure only. */
+    /** `shares * nav`, 18-decimal USD, before the fee. Disclosure only. */
     grossUsd18: t.bigint().notNull(),
     feeUsd18: t.bigint().notNull(),
+    /**
+     * The `redeem-gap` check (SP-14), recorded whether or not it breached.
+     *
+     * `expectedUsd18` is what the NAV basis says the redeemer is owed — `shares * nav * (1 - fee)`.
+     * `realisedUsd18` is what `previewRedeem(shares)` at `blockNumber - 1` actually pays out,
+     * valued at the indexed feed answers. `gapBps` is the divergence between them. A redemption
+     * whose assets the indexer cannot price leaves `gapPriced` false and `gapBps` zero — an
+     * unpriceable payout is not a zero gap, and nothing reads it as one.
+     */
+    expectedUsd18: t.bigint().notNull(),
+    realisedUsd18: t.bigint().notNull(),
+    gapBps: t.integer().notNull(),
+    gapPriced: t.boolean().notNull(),
   }),
   (table) => ({byOwner: index().on(table.owner), byBlock: index().on(table.blockNumber)}),
 )
@@ -1281,7 +1299,14 @@ export const alert = onchainTable(
     id: t.text().primaryKey(),
     blockNumber: t.bigint().notNull(),
     timestamp: t.bigint().notNull(),
-    /** `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action` | `sweep-residue`. */
+    /**
+     * `denylist` | `reconciliation` | `gate` | `nav-bleed` | `corporate-action` | `sweep-residue` |
+     * `genesis` | `redeem-gap` | `nav-drift`.
+     *
+     * The last two are revision 8's monitoring of the two accepted fuzz leads: `redeem-gap` for
+     * SP-14's slack between the NAV basis and the realised pro-rata payout, `nav-drift` for L-1's
+     * convergence step. `docs/indexer.md` §5 carries the table.
+     */
     kind: t.text().notNull(),
     severity: t.text().notNull(),
     subject: t.text().notNull(),

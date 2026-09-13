@@ -30,4 +30,14 @@ export const E2E = {
 } as const
 
 export const RPC_URL = 'http://127.0.0.1:8545'
+
+/**
+ * The indexer the smoke run pretends exists.
+ *
+ * Nothing listens on it. `harness.ts` fulfils `/api/genesis` from a fixture and lets every other
+ * route fail, which is deliberate: the run then exercises **both** states in one pass — the two
+ * auction panels render indexed rows, and every other indexer-backed panel renders the degraded
+ * treatment it is supposed to render when the indexer cannot answer.
+ */
+export const INDEXER_URL = 'http://127.0.0.1:3112'
 export const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11'

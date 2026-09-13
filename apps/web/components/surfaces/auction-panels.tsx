@@ -4,8 +4,10 @@
 import * as React from 'react'
 
 import {FieldRow, Stat, StatGrid} from '@/components/common/stat'
+import {IndexerUnavailable} from '@/components/common/states'
 import {Value} from '@/components/common/value'
 import {RowGroup, SectionHead} from '@/components/ledger/primitives'
+import {PoweredByUniswap} from '@/components/ledger/powered-by-uniswap'
 import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {Badge} from '@/components/ui/badge'
 import {Button} from '@/components/ui/button'
@@ -13,6 +15,7 @@ import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/c
 import {TxButton, TxError, TxSuccess, type TxPhase} from '@/components/common/tx'
 import type {AuctionState, BidRow} from '@/hooks/use-auction'
 import type {GenesisState} from '@/hooks/use-genesis'
+import type {AuctionBidRow, AuctionCheckpointRow} from '@/lib/indexer/types'
 import {
   AUCTION_MPS,
   BID_STATUS_LABEL,
@@ -298,6 +301,187 @@ export function AuctionExplainer() {
         ))}
       </div>
     </section>
+  )
+}
+
+/**
+ * The clearing price over the bidding window, as an inline sparkline.
+ *
+ * The auction's own `clearingPrice()` is one number: whatever the last checkpoint wrote.
+ * `checkpoint()` is a write rather than a view, so between two checkpoints there is no on-chain
+ * record of the price at all — this series exists only because the indexer keeps every
+ * `CheckpointUpdated` and `ClearingPriceUpdated` log. It is therefore **history**, not a live
+ * figure: the headline above stays a chain read and this panel never overrides it.
+ *
+ * No charting library. One series, one axis, drawn as an SVG path in the Ledger's own hairlines,
+ * which is a shape that survives a build with no network.
+ */
+export function ClearingPriceHistory({
+  auction,
+  checkpoints,
+  unavailable,
+  configured = true,
+  reason,
+}: {
+  auction: AuctionState
+  checkpoints?: readonly AuctionCheckpointRow[]
+  unavailable?: boolean
+  /** False when no indexer is configured for this deployment at all. */
+  configured?: boolean
+  reason?: string
+}) {
+  if (unavailable || !configured || !checkpoints || checkpoints.length === 0) {
+    return (
+      <IndexerUnavailable
+        what={`The ${auction.key.toUpperCase()} leg’s clearing-price history`}
+        {...(reason ? {reason} : {})}
+      />
+    )
+  }
+
+  const priceAt = (row: AuctionCheckpointRow): number | undefined => {
+    if (auction.currencyDecimals === undefined) return undefined
+    const x18 = q96PriceToWholeX18({
+      priceQ96: BigInt(row.clearingPriceQ96),
+      tokenDecimals: auction.tokenDecimals,
+      currencyDecimals: auction.currencyDecimals,
+    })
+    return Number(x18) / 1e18
+  }
+  const values = checkpoints.map(priceAt).filter((v): v is number => v !== undefined)
+  if (values.length === 0) {
+    return (
+      <IndexerUnavailable
+        what={`The ${auction.key.toUpperCase()} leg’s clearing-price history`}
+        reason="the auction currency’s decimals could not be read, so a Q96 price cannot be scaled"
+      />
+    )
+  }
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const span = max - min || 1
+  const path = values
+    .map((v, i) => {
+      const x = (i / Math.max(values.length - 1, 1)) * 100
+      const y = 30 - ((v - min) / span) * 28
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`
+    })
+    .join(' ')
+  const symbol = auction.currencySymbol ?? ''
+  const digits = symbol === 'USDG' ? 4 : 8
+  return (
+    <div className="space-y-3" data-testid={`clearing-history-${auction.key}`}>
+      <svg
+        viewBox="0 0 100 32"
+        preserveAspectRatio="none"
+        className="h-24 w-full border-b border-rule text-ink"
+        role="img"
+        aria-label={`Clearing price over the bidding window, ${symbol} per AMPS`}
+      >
+        <path d={path} fill="none" stroke="currentColor" strokeWidth="0.5" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <div className="ledger-label flex justify-between">
+        <span>
+          {min.toFixed(digits)} {symbol}
+        </span>
+        <span>
+          {values.length} checkpoint{values.length === 1 ? '' : 's'}
+        </span>
+        <span>
+          {max.toFixed(digits)} {symbol}
+        </span>
+      </div>
+      <p className="max-w-[88ch] text-[13px] leading-[1.55] text-dim">
+        Non-decreasing by construction: the clearing price rises only as far as resting demand supports and never
+        falls. Every point is a block somebody paid to advance the auction to, which is why the line is a series of
+        steps rather than a continuous curve.
+      </p>
+    </div>
+  )
+}
+
+/**
+ * The public bid book: every bid the indexer has seen in this leg, not only the reader's own.
+ *
+ * The reader's own bids are on the table above and come straight off `BidSubmitted` logs, which
+ * works with no indexer at all. This is the other side of that — what everybody else committed,
+ * and at what maximum — and it is genuinely public information: the auction emits it and anyone can
+ * read it. It is disclosure only, and no figure here is used to price anything.
+ *
+ * `amountQ96` is stored as the auction stores it, so it is shifted down by 2^96 for display and
+ * nowhere else.
+ */
+export function PublicBidBook({
+  auction,
+  bids,
+  unavailable,
+  configured = true,
+  reason,
+  limit = 12,
+}: {
+  auction: AuctionState
+  bids?: readonly AuctionBidRow[]
+  unavailable?: boolean
+  configured?: boolean
+  reason?: string
+  limit?: number
+}) {
+  if (unavailable || !configured || bids === undefined) {
+    return <IndexerUnavailable what={`The ${auction.key.toUpperCase()} leg’s public bid book`} {...(reason ? {reason} : {})} />
+  }
+  if (bids.length === 0) {
+    return (
+      <p className="text-sm text-dim" data-testid={`bid-book-${auction.key}`}>
+        The indexer has seen no bids in this leg yet. That is a statement about the index, not about the auction.
+      </p>
+    )
+  }
+  const decimals = auction.currencyDecimals
+  const rows = bids.slice(0, limit)
+  return (
+    <Table data-testid={`bid-book-${auction.key}`}>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Bid</TableHead>
+          <TableHead>Bidder</TableHead>
+          <TableHead align="right">Maximum</TableHead>
+          <TableHead align="right">Committed</TableHead>
+          <TableHead align="right">Block</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((bid) => (
+          <TableRow key={`${bid.auction}-${bid.bidId}`}>
+            <TableCell>#{bid.bidId}</TableCell>
+            <TableCell className="font-mono text-[12px] text-dim" title={bid.owner}>
+              {shortAddress(bid.owner)}
+            </TableCell>
+            <TableCell align="right">
+              <Value unavailable={decimals === undefined}>
+                {decimals !== undefined
+                  ? formatQ96Price({
+                      priceQ96: BigInt(bid.maxPriceQ96),
+                      tokenDecimals: auction.tokenDecimals,
+                      currencyDecimals: decimals,
+                      symbol: auction.currencySymbol ?? '',
+                    })
+                  : null}
+              </Value>
+            </TableCell>
+            <TableCell align="right">
+              <Value unavailable={decimals === undefined}>
+                {decimals !== undefined
+                  ? `${formatAmount(BigInt(bid.amountQ96) >> 96n, decimals)} ${auction.currencySymbol ?? ''}`
+                  : null}
+              </Value>
+            </TableCell>
+            <TableCell align="right" className="text-dim">
+              {bid.submittedBlock}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -695,6 +879,9 @@ export function SettlementPanel({
           </Value>
         </FieldRow>
       </RowGroup>
+
+      {/* The auctions this panel settles are not ours; the footer says whose they are. */}
+      <PoweredByUniswap className="mt-6" data-testid="powered-by-uniswap-settlement" />
     </section>
   )
 }

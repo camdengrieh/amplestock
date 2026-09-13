@@ -112,3 +112,53 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
 export function reconcileSeverity(result: ReconcileResult): 'warning' | 'critical' {
   return result.breachedFields.some((f) => f === 'nav' || f === 'pRef') ? 'critical' : 'warning'
 }
+
+/**
+ * The `redeem-gap` verdict (SP-14), as a pure function.
+ *
+ * `expectedUsd18` is the NAV basis net of the fee; `realisedUsd18` is what `previewRedeem` pays,
+ * valued at the indexed feed answers. Only a **shortfall** counts: the vault rounds every position
+ * slice down in its own favour, so the realised payout is expected to sit a hair under the basis,
+ * and a payout that came out *above* it is a valuation artefact of the indexer's own feed snapshot
+ * rather than something a redeemer can complain about. Thresholds are the accepted ones: `warning`
+ * over 10 bp, `critical` over 25 bp, which is the ceiling the fuzz lead's slack was accepted at.
+ */
+export function redeemGapSeverity(gapBps: number): 'warning' | 'critical' | undefined {
+  if (gapBps > REDEEM_GAP_CRITICAL_BPS) return 'critical'
+  if (gapBps > REDEEM_GAP_WARNING_BPS) return 'warning'
+  return undefined
+}
+
+export const REDEEM_GAP_WARNING_BPS = 10
+export const REDEEM_GAP_CRITICAL_BPS = 25
+
+/**
+ * The shortfall of a realised payout against the NAV basis, in bps. Zero when the payout met or
+ * beat the basis — an overshoot is not a gap.
+ */
+export function redeemGapBps(expectedUsd18: bigint, realisedUsd18: bigint): number {
+  if (expectedUsd18 <= 0n || realisedUsd18 >= expectedUsd18) return 0
+  return Number(((expectedUsd18 - realisedUsd18) * 10_000n) / expectedUsd18)
+}
+
+/** NAV/share fell by more than this between two checkpoints: the `nav-drift` trigger (L-1). */
+export const NAV_DRIFT_BPS = 1
+
+/**
+ * Whether a checkpoint is a `nav-drift`: NAV/share below the previous one by more than 1 bp, with
+ * nothing between the two that is allowed to move it.
+ *
+ * The "nothing between" half is the whole test. A `Bond`, `Redeem`, `Placement`, `Compound` or
+ * `Swap` moves the assets; a feed `AnswerUpdated` moves their price. A fall with none of those is
+ * the convergence step L-1 described, and it is the only case worth a page.
+ */
+export function isNavDrift(params: {
+  previousNavX18: bigint
+  navX18: bigint
+  movedSincePrevious: boolean
+}): boolean {
+  if (params.movedSincePrevious) return false
+  if (params.previousNavX18 <= 0n || params.navX18 >= params.previousNavX18) return false
+  const fallBps = Number(((params.previousNavX18 - params.navX18) * 10_000n) / params.previousNavX18)
+  return fallBps > NAV_DRIFT_BPS
+}

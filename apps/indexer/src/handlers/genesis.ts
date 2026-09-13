@@ -33,7 +33,7 @@ import schema from 'ponder:schema'
 import {jsonRecord} from '../lib/json'
 import {premiumBps} from '../lib/math'
 import {SINGLETON} from '../lib/ids'
-import {raiseAlert} from '../lib/store'
+import {getState, raiseAlert, setState} from '../lib/store'
 
 const ZERO = '0x0000000000000000000000000000000000000000' as const
 
@@ -251,7 +251,7 @@ function registerLeg(source: 'GenesisAuctionUsdg' | 'GenesisAuctionEth', leg: 'u
 
   ponder.on(`${source}:CheckpointUpdated`, async ({event, context}) => {
     await context.db.insert(schema.auctionCheckpoint).values({
-      id: `${event.block.number.toString().padStart(12, '0')}-${event.log.logIndex.toString().padStart(6, '0')}`,
+      id: checkpointKey(event.block.number, event.log.logIndex),
       auction: event.log.address,
       leg,
       blockNumber: event.block.number,
@@ -261,8 +261,49 @@ function registerLeg(source: 'GenesisAuctionUsdg' | 'GenesisAuctionEth', leg: 'u
       clearingPriceQ96: event.args.clearingPriceQ96,
       cumulativeMps: BigInt(event.args.cumulativeMps),
     })
+    // Remembered so a price-only `ClearingPriceUpdated` row inherits it rather than claiming zero.
+    await setState(context.db, cumulativeMpsKey(leg), BigInt(event.args.cumulativeMps), event.block.number)
+  })
+
+  /**
+   * `ClearingPriceUpdated` — the same series, from the other side.
+   *
+   * The auction writes a full checkpoint only when somebody pays for one, but it emits this
+   * whenever the clearing price itself moves, which is strictly more often. Subscribing to both is
+   * what makes the price series *dense* rather than one point per paid checkpoint: without it the
+   * dApp's clearing-price panel draws a straight line across every window nobody checkpointed.
+   *
+   * It carries no `cumulativeMps` — issuance is a property of the schedule and of the block, not of
+   * the price — so a row written from this log inherits the last issuance figure the leg recorded
+   * rather than claiming zero, and a `CheckpointUpdated` in the same block wins: it is the complete
+   * record, and `insert` would otherwise collide on the id.
+   */
+  ponder.on(`${source}:ClearingPriceUpdated`, async ({event, context}) => {
+    const id = checkpointKey(event.block.number, event.log.logIndex)
+    const cumulativeMps = (await getState(context.db, cumulativeMpsKey(leg))) ?? 0n
+    await context.db
+      .insert(schema.auctionCheckpoint)
+      .values({
+        id,
+        auction: event.log.address,
+        leg,
+        blockNumber: event.block.number,
+        timestamp: event.block.timestamp,
+        txHash: event.transaction.hash,
+        logIndex: event.log.logIndex,
+        clearingPriceQ96: event.args.clearingPriceQ96,
+        cumulativeMps,
+      })
+      .onConflictDoUpdate(() => ({clearingPriceQ96: event.args.clearingPriceQ96}))
   })
 }
+
+/** `"<block>-<logIndex>"`, zero-padded so the id sorts in block order as text. */
+const checkpointKey = (blockNumber: bigint, logIndex: number) =>
+  `${blockNumber.toString().padStart(12, '0')}-${logIndex.toString().padStart(6, '0')}`
+
+/** The last issuance figure a leg recorded, so a price-only log does not claim zero. */
+const cumulativeMpsKey = (leg: 'usdg' | 'eth') => `auction.${leg}.cumulativeMps`
 
 registerLeg('GenesisAuctionUsdg', 'usdg')
 registerLeg('GenesisAuctionEth', 'eth')

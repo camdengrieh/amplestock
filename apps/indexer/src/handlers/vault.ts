@@ -34,14 +34,26 @@ import {jsonRecord} from '../lib/json'
 import {
   STATE,
   getState,
+  markNavMoved,
   raiseAlert,
   setState,
   updateFlywheelDay,
   updateSummary,
+  type Db,
 } from '../lib/store'
+import {
+  REDEEM_GAP_CRITICAL_BPS,
+  REDEEM_GAP_WARNING_BPS,
+  isNavDrift,
+  redeemGapBps,
+  redeemGapSeverity,
+} from '../lib/reconcile'
+import {ampsVaultAbi} from '@amplestocks/abis'
+import {erc20Abi} from '../abi/external'
+import {to18, usd8ToUsd18} from '../lib/math'
 import {settleAccretion} from './bonds'
 import {launchPremiumBps, updateGenesis} from './genesis'
-import {reconcileAgain, runReconciliation, sampleShares} from './reconcile'
+import {read, reconcileAgain, runReconciliation, sampleShares, type JobContext} from './reconcile'
 
 const PREV_NAV = 'vault.navPerSharePrevX18'
 const PLACEMENT_LIQ = (tx: string, pool: string) => `placement.liquidity.${tx}.${pool}`
@@ -158,17 +170,24 @@ ponder.on('AmpsVault:NavCheckpoint', async ({event, context}) => {
   })
 
   // Seed the event-derived supply from the first checkpoint the indexer sees, so an indexer started
-  // mid-life has a starting point; after that it moves only on `VestingMinted`, `Burn` and `Redeem`
-  // and never on a chain read, which is what makes the supply pair a real two-sided check.
+  // mid-life has a starting point; after that it moves only on `VestingMinted` and `Burn` and never
+  // on a chain read, which is what makes the supply pair a real two-sided check.
   if ((await getState(context.db, STATE.supplyEvented)) === undefined) {
     await setState(context.db, STATE.supplyEvented, event.args.totalSupply, event.block.number)
   }
+
+  // L-1, made visible. NAV/share falling with nothing between the two checkpoints that is allowed
+  // to move it is the convergence step the fuzz lead described; the accepted disposition was to
+  // document it and watch for it, which is this. Raised before the state is advanced, because the
+  // predicate is about the *previous* checkpoint and what happened since.
+  await checkNavDrift(context, event, previous)
 
   await setState(context.db, PREV_NAV, previous, event.block.number)
   await setState(context.db, STATE.navPerShareX18, event.args.navPerShareX18, event.block.number)
   await setState(context.db, STATE.totalAssetsUsd18, event.args.totalAssetsUsd18, event.block.number)
   await setState(context.db, STATE.totalSupply, event.args.totalSupply, event.block.number)
   await setState(context.db, STATE.lastCheckpointBlock, event.block.number, event.block.number)
+  await setState(context.db, STATE.navMoved, 0n, event.block.number)
 
   await updateSummary(context.db, event.block.number, event.block.timestamp, (row) => ({
     navPerShareX18: event.args.navPerShareX18,
@@ -232,6 +251,10 @@ ponder.on('AmpsVault:Redeem', async ({event, context}) => {
   const nav = (await getState(context.db, STATE.navPerShareX18)) ?? 0n
   const grossUsd18 = (event.args.shares * nav) / 10n ** 18n
   const feeUsd18 = (grossUsd18 * BigInt(event.args.feeBps)) / 10_000n
+  const expectedUsd18 = grossUsd18 - feeUsd18
+
+  // SP-14: what the redeemer was owed on the NAV basis, against what the vault actually pays.
+  const gap = await measureRedeemGap(context as unknown as JobContext, event, expectedUsd18)
 
   await context.db.insert(schema.redemption).values({
     id: eventId(event.block.number, event.log.logIndex),
@@ -241,17 +264,50 @@ ponder.on('AmpsVault:Redeem', async ({event, context}) => {
     owner: event.args.owner,
     to: event.args.to,
     shares: event.args.shares,
-    inventoryBurned: event.args.inventoryBurned,
+    // Released, not burned: revision 8 queues the vault's own slice for the next checkpoint.
+    inventoryReleased: event.args.inventoryReleased,
     feeBps: event.args.feeBps,
     navPerShareX18: nav,
     grossUsd18,
     feeUsd18,
+    expectedUsd18,
+    realisedUsd18: gap.realisedUsd18,
+    gapBps: gap.gapBps,
+    gapPriced: gap.priced,
   })
 
-  // The supply is *not* moved here. `redeemProRata` now emits `Burn(shares, "redeem")` for the
-  // redeemer's own shares beside `Burn(inventoryBurned, "redeemInventory")` for the vault's slice,
-  // and both are real burns the `Burn` handler already subtracts; doing it again here would
-  // double-count the exit.
+  const severity = gap.priced ? redeemGapSeverity(gap.gapBps) : undefined
+  if (severity !== undefined) {
+    await raiseAlert(context.db, event.log.logIndex, {
+      kind: 'redeem-gap',
+      severity,
+      subject: event.args.owner,
+      message:
+        `a redemption of ${event.args.shares} shares paid ${gap.gapBps} bp under its NAV basis ` +
+        `(warning above ${REDEEM_GAP_WARNING_BPS} bp, critical above ${REDEEM_GAP_CRITICAL_BPS} bp)`,
+      blockNumber: event.block.number,
+      timestamp: event.block.timestamp,
+      detail: jsonRecord({
+        owner: event.args.owner,
+        to: event.args.to,
+        shares: event.args.shares,
+        feeBps: event.args.feeBps,
+        navPerShareX18: nav,
+        expectedUsd18,
+        realisedUsd18: gap.realisedUsd18,
+        gapBps: gap.gapBps,
+        previewedAtBlock: event.block.number - 1n,
+        txHash: event.transaction.hash,
+      }),
+    })
+  }
+
+  // The supply is *not* moved here. `redeemProRata` emits `Burn(shares, "redeem")` for the
+  // redeemer's own shares, which the `Burn` handler already subtracts; doing it again here would
+  // double-count the exit. The vault's released inventory is **not** burned in this transaction at
+  // all — it drains on a 24-hour linear stream, and every settlement of that stream arrives as its
+  // own `Burn(amount, "redeemInventory")`, which the same handler picks up whenever it happens.
+  await markNavMoved(context.db, event.block.number)
   await updateSummary(context.db, event.block.number, event.block.timestamp, (row) => ({
     redeemedSharesTotal: row.redeemedSharesTotal + event.args.shares,
   }))
@@ -259,6 +315,116 @@ ponder.on('AmpsVault:Redeem', async ({event, context}) => {
     redeemedShares: row.redeemedShares + event.args.shares,
   }))
 })
+
+/**
+ * The `redeem-gap` measurement (SP-14).
+ *
+ * `Redeem` carries no per-asset payouts, so the realised side has to come from
+ * `previewRedeem(shares)` — read at **`blockNumber - 1`**, because at the redemption's own block
+ * the shares are burned and the positions unwound, and the preview would then describe a vault the
+ * redeemer never had a claim on. The amounts are valued at the answers the indexer has already
+ * accepted for each token, which is the same valuation every other USD figure in this index uses.
+ *
+ * A token the index cannot price makes the whole comparison meaningless rather than smaller, so the
+ * result is marked unpriced and no alert is raised: an unpriceable payout is not a zero gap.
+ */
+async function measureRedeemGap(
+  context: JobContext,
+  event: {args: {shares: bigint}; block: {number: bigint}},
+  expectedUsd18: bigint,
+): Promise<{realisedUsd18: bigint; gapBps: number; priced: boolean}> {
+  const vault = (context.contracts.AmpsVault?.address as `0x${string}` | undefined) ?? undefined
+  if (vault === undefined || expectedUsd18 <= 0n) return {realisedUsd18: 0n, gapBps: 0, priced: false}
+
+  const preview = await read<readonly [readonly `0x${string}`[], readonly bigint[], bigint]>(
+    context,
+    vault,
+    ampsVaultAbi,
+    'previewRedeem',
+    [event.args.shares],
+    event.block.number - 1n,
+  )
+  if (preview === undefined) return {realisedUsd18: 0n, gapBps: 0, priced: false}
+
+  const [tokens, amounts] = preview
+  let realisedUsd18 = 0n
+  for (const [i, token] of tokens.entries()) {
+    const amount = amounts[i] ?? 0n
+    if (amount === 0n) continue
+    const priced = await valueTokenUsd18(context, token, amount)
+    if (priced === undefined) return {realisedUsd18: 0n, gapBps: 0, priced: false}
+    realisedUsd18 += priced
+  }
+
+  return {realisedUsd18, gapBps: redeemGapBps(expectedUsd18, realisedUsd18), priced: true}
+}
+
+/**
+ * One payout leg in 18-decimal USD, at the answer the protocol last accepted for that token.
+ *
+ * The decimals come from the `constituent` row where there is one and from a cached `decimals()`
+ * read otherwise — the vault also pays out WETH and USDG, which are collateral rather than
+ * constituents and have no row. The cache is a module-level map because a redemption can touch
+ * every asset the vault holds and the answer never changes for a given token.
+ */
+const DECIMALS_CACHE = new Map<string, number>()
+
+async function valueTokenUsd18(
+  context: JobContext,
+  token: `0x${string}`,
+  amount: bigint,
+): Promise<bigint | undefined> {
+  const id = token.toLowerCase() as `0x${string}`
+  const feed = await context.db.find(schema.feed, {id})
+  if (feed === null || feed.answerUsd8 <= 0n) return undefined
+
+  let decimals = DECIMALS_CACHE.get(id)
+  if (decimals === undefined) {
+    const index = await context.db.find(schema.tokenIndex, {id})
+    const constituent =
+      index === null ? null : await context.db.find(schema.constituent, {id: index.constituentId.toString()})
+    const read18 =
+      constituent?.decimals ?? (await read<number>(context, token, erc20Abi, 'decimals'))
+    if (read18 === undefined) return undefined
+    decimals = Number(read18)
+    DECIMALS_CACHE.set(id, decimals)
+  }
+
+  return (to18(amount, decimals) * usd8ToUsd18(feed.answerUsd8)) / 10n ** 18n
+}
+
+/**
+ * `nav-drift` (L-1): NAV/share fell with nothing between the two checkpoints allowed to move it.
+ *
+ * `STATE.navMoved` is set by every `Bond`, `Redeem`, `Placement`, `Compound`, pool `Swap` and feed
+ * `AnswerUpdated`, and cleared by each checkpoint. If it is clear and NAV/share is more than 1 bp
+ * down, the only thing left that can have moved the number is the vault's own convergence step —
+ * which is the accepted lead, and the reason this alert exists rather than a fix.
+ */
+async function checkNavDrift(
+  context: {db: Db},
+  event: {args: {navPerShareX18: bigint}; block: {number: bigint; timestamp: bigint}; log: {logIndex: number}},
+  previousNavX18: bigint,
+): Promise<void> {
+  const moved = ((await getState(context.db, STATE.navMoved)) ?? 0n) !== 0n
+  if (!isNavDrift({previousNavX18, navX18: event.args.navPerShareX18, movedSincePrevious: moved})) return
+
+  await raiseAlert(context.db, event.log.logIndex, {
+    kind: 'nav-drift',
+    severity: 'warning',
+    subject: event.block.number.toString(),
+    message:
+      `NAV/share fell from ${previousNavX18} to ${event.args.navPerShareX18} with no bond, ` +
+      'redemption, placement, compound, swap or feed update between the two checkpoints',
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    detail: jsonRecord({
+      previousNavPerShareX18: previousNavX18,
+      navPerShareX18: event.args.navPerShareX18,
+      changeBps: changeBps(previousNavX18, event.args.navPerShareX18),
+    }),
+  })
+}
 
 ponder.on('AmpsVault:Burn', async ({event, context}) => {
   const reason = decodeBytes32String(event.args.reason)
@@ -328,6 +494,8 @@ ponder.on('AmpsVault:BondedDeposit', async ({event, context}) => {
 // -------------------------------------------------------------------------------------------------
 
 ponder.on('AmpsVault:Placement', async ({event, context}) => {
+  // A placement moves the assets, so a NAV fall after it is not the `nav-drift` case.
+  await markNavMoved(context.db, event.block.number)
   const id = poolKey(event.args.poolId)
   const liqKey = PLACEMENT_LIQ(event.transaction.hash, id)
   const liquidity = (await getState(context.db, liqKey)) ?? 0n
@@ -432,6 +600,7 @@ ponder.on('AmpsVault:Rollout', async ({event, context}) => {
  * `Burn` handler indexes both with their reasons.
  */
 ponder.on('AmpsVault:Compound', async ({event, context}) => {
+  await markNavMoved(context.db, event.block.number)
   const id = poolKey(event.args.poolId)
   const navAfter = (await getState(context.db, STATE.navPerShareX18)) ?? 0n
   const navBefore = (await getState(context.db, PREV_NAV)) ?? navAfter

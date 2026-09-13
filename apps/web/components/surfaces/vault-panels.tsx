@@ -12,6 +12,7 @@ import {Badge} from '@/components/ui/badge'
 import {Button} from '@/components/ui/button'
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
 import {NOTES} from '@/lib/copy'
+import {REDEEM_BURN_STREAM_SECONDS} from '@/lib/protocol'
 import {
   formatAmount,
   formatBps,
@@ -133,20 +134,38 @@ export function CheckpointBar({
 /**
  * Disclosure 01 — Supply. Three buckets, not four: revision 6 removes staking, so there is no
  * staked balance to subtract and no xAMPS to name.
+ *
+ * The fourth row is not a share class at all. `pendingInventoryBurn()` is protocol-owned AMPS a
+ * redemption has already released out of the vault's own ladder cells and that is on its way to the
+ * sink on a 24-hour linear stream — still in `totalSupply`, still inventory, and already spoken
+ * for. It is shown here because a reader comparing supply across two days is owed the difference
+ * between "nothing burned" and "the burn is in flight".
  */
 export function SupplyBreakdown({
   totalSupply,
   inventory,
   vesting,
+  pendingInventoryBurn,
+  burnStreamStart,
+  now,
 }: {
   totalSupply?: bigint
   inventory?: bigint
   vesting?: bigint
+  /** `AmpsVault.pendingInventoryBurn()` — released by redemptions, still owed to the sink. */
+  pendingInventoryBurn?: bigint
+  /** `AmpsVault.burnStreamStart()` — the timestamp the current stream started at. Zero if idle. */
+  burnStreamStart?: number
+  /** Wall clock, in seconds, so the stream's progress is a fact rather than a render artefact. */
+  now?: number
 }) {
   const circulating =
     totalSupply !== undefined && inventory !== undefined && vesting !== undefined
       ? totalSupply - inventory - vesting
       : undefined
+  const streaming = pendingInventoryBurn !== undefined && pendingInventoryBurn > 0n
+  const startedAt = burnStreamStart !== undefined && burnStreamStart > 0 ? burnStreamStart : undefined
+  const burnsBy = startedAt === undefined ? undefined : startedAt + REDEEM_BURN_STREAM_SECONDS
   return (
     <div data-testid="supply-breakdown">
       <FieldRow label="Total supply" hint="Bonded AMPS counts from purchase, not from claim.">
@@ -165,6 +184,33 @@ export function SupplyBreakdown({
       >
         <Value unavailable={inventory === undefined}>
           {inventory !== undefined ? formatAmount(inventory, 18) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Released by redemptions, not yet burned"
+        hint="pendingInventoryBurn(): protocol-owned AMPS a redemption released out of the vault's own cells. It is burned on a 24-hour linear stream rather than in one step, and every checkpoint and every redemption settles whatever has accrued. Still counted in total supply until it goes."
+      >
+        <Value unavailable={pendingInventoryBurn === undefined}>
+          {pendingInventoryBurn !== undefined ? formatAmount(pendingInventoryBurn, 18) : null}
+        </Value>
+      </FieldRow>
+      <FieldRow
+        label="Burn stream"
+        hint="The window restarts whenever another redemption adds to the queue, so this is the clock the 24 hours are counted from rather than the first redemption ever."
+      >
+        <Value
+          unavailable={pendingInventoryBurn === undefined || (streaming && startedAt === undefined)}
+          reason="The vault could not be read"
+        >
+          {pendingInventoryBurn === undefined
+            ? null
+            : !streaming
+              ? 'Nothing queued'
+              : startedAt === undefined
+                ? null
+                : `Started ${formatTimestamp(startedAt)}${
+                    now !== undefined && now > startedAt ? ` · ${formatDuration(now - startedAt)} ago` : ''
+                  } · fully burned by ${formatTimestamp(burnsBy as number)}`}
         </Value>
       </FieldRow>
       <FieldRow

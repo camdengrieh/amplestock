@@ -27,7 +27,7 @@ import {ponder} from 'ponder:registry'
 import schema from 'ponder:schema'
 
 import {stockTokenAbi} from '../abi/external'
-import {CONSTITUENT_STATUS} from '../lib/constants'
+import {CONSTITUENT_STATUS, MAX_CONSTITUENTS} from '../lib/constants'
 import {jobId} from '../lib/ids'
 import {changeBps} from '../lib/math'
 import type {Db} from '../lib/store'
@@ -79,8 +79,9 @@ ponder.on('constituentPoll:block', async ({event, context}) => {
   const blockNumber = event.block.number
   const timestamp = event.block.timestamp
 
-  // `MAX_CONSTITUENTS` is 64 and ids are 1-based and dense, so a bounded walk is the whole set.
-  for (let i = 1; i <= 64; i++) {
+  // `MAX_CONSTITUENTS` is 34 — what the redemption gas budget proves (512 live cells / 14 per pool,
+  // less the two entry pools) — and ids are 1-based and dense, so a bounded walk is the whole set.
+  for (let i = 1; i <= MAX_CONSTITUENTS; i++) {
     const id = i.toString()
     const row = await context.db.find(schema.constituent, {id})
     if (row === null) continue

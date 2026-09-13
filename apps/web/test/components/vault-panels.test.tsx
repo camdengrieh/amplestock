@@ -54,6 +54,36 @@ describe('SupplyBreakdown', () => {
     const {container} = render(<SupplyBreakdown totalSupply={100n * WAD} />)
     expect(container.querySelectorAll('[data-unavailable="true"]').length).toBeGreaterThan(0)
   })
+
+  it('shows the released inventory as a burn in flight, with the stream it is on', () => {
+    // `pendingInventoryBurn()` is not a share class: it is protocol-owned AMPS a redemption has
+    // already released and that leaves the supply over the next 24 hours.
+    render(
+      <SupplyBreakdown
+        totalSupply={100n * WAD}
+        inventory={40n * WAD}
+        vesting={10n * WAD}
+        pendingInventoryBurn={3n * WAD}
+        burnStreamStart={1_800_000_000}
+        now={1_800_003_600}
+      />,
+    )
+    expect(screen.getByText('3')).toBeInTheDocument()
+    expect(screen.getByText(/Started .* ago · fully burned by/)).toBeInTheDocument()
+  })
+
+  it('says the stream is idle rather than printing a start that does not exist', () => {
+    render(
+      <SupplyBreakdown
+        totalSupply={100n * WAD}
+        inventory={40n * WAD}
+        vesting={10n * WAD}
+        pendingInventoryBurn={0n}
+        burnStreamStart={0}
+      />,
+    )
+    expect(screen.getByText('Nothing queued')).toBeInTheDocument()
+  })
 })
 
 describe('GateStatusTable', () => {

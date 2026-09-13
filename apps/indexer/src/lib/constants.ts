@@ -44,6 +44,15 @@ export const POSITION_SALT = '0x000000000000000000000000000000000000000000000000
 /** `Constants.MAX_LIVE_CELLS` (§12 ruling E). */
 export const MAX_LIVE_CELLS = 512
 
+/**
+ * `PoolRegistry.MAX_CONSTITUENTS` — 34 as of revision 8.
+ *
+ * Decision 4 set the cap to what the redemption gas budget proves rather than to a round number:
+ * `MAX_LIVE_CELLS / 14` cells per fully laddered pool is 36 pools, less the two entry pools. The
+ * constituent poll walks 1..this, because ids are 1-based and dense.
+ */
+export const MAX_CONSTITUENTS = 34
+
 /** `GateState`, in ordinal order. */
 export const GATE_STATES = [
   'GREEN',

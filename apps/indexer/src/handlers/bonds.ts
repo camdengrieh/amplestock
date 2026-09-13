@@ -25,6 +25,7 @@ import {changeBps, clampInt} from '../lib/math'
 import {
   STATE,
   getState,
+  markNavMoved,
   setState,
   updateFlywheelDay,
   updateSummary,
@@ -186,6 +187,8 @@ ponder.on('AmpsBonds:EpochRolled', async ({event, context}) => {
 })
 
 ponder.on('AmpsBonds:Bond', async ({event, context}) => {
+  // A bond adds collateral and mints against it, so the next checkpoint's NAV move is explained.
+  await markNavMoved(context.db, event.block.number)
   const marketId = event.args.marketId
   const navBefore = (await getState(context.db, STATE.navPerShareX18)) ?? 0n
   const supply = (await getState(context.db, STATE.totalSupply)) ?? 0n

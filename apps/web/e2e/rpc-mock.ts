@@ -191,6 +191,9 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     previewNavPerShareX18: [WAD],
     totalAssetsUsd18: [5_000n * WAD],
     inventoryAmps: [4_750n * WAD],
+    // Released by an earlier redemption and draining to the sink on the 24-hour stream.
+    pendingInventoryBurn: [12n * WAD],
+    burnStreamStart: [1_799_996_400n],
     redeemFeeBps: [250],
     REDEEM_FEE_BPS_MAX: [500],
     CREATOR_FEE_BPS: [100],
@@ -392,7 +395,9 @@ const FIXTURES: Record<string, Record<string, unknown>> = {
     BUY_FEE_BPS_ENTRY_MAX: [100],
     BUY_FEE_BPS_SPOKE_MIN: [1],
     BUY_FEE_BPS_SPOKE_MAX: [50],
-    MAX_CONSTITUENTS: [64],
+    // Revision 8: what the redemption gas budget proves — 512 live cells / 14 per pool, less the
+    // two entry pools.
+    MAX_CONSTITUENTS: [34],
     // The realised weight, next to the registry's target. They differ on purpose: the rollout
     // moves inventory on a daily cap, so the two are never the same figure.
     currentWeightBps: [4_200],

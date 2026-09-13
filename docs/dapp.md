@@ -164,12 +164,17 @@ Stock → AMPS → stock, exact input, one transaction, **through `AmpsRouter` a
 ### Redeem
 `app/(gated)/redeem` → `components/surfaces/redeem.tsx`
 
-- **Reads**: `AmpsVault.previewRedeem(shares)` → `(tokens, amounts, inventoryBurned)`;
+- **Reads**: `AmpsVault.previewRedeem(shares)` → `(tokens, amounts, inventoryReleased)`;
   `AmpsVault.checkpointData()`; `AmpsVault.redeemFeeBps()`; `Amps.totalSupply()`.
 - **Writes**: `AmpsVault.redeemProRata(shares, to)`.
 - One line per asset, with the fee broken out rather than folded invisibly into the payout, and the
-  released inventory AMPS burned alongside disclosed — which is why total supply falls by more than
-  the amount redeemed. The surface says plainly that it pays assets, not cash.
+  released inventory AMPS disclosed as **released rather than burned here**: revision 8 takes it out
+  of the cells the unwind crosses and then burns it on a **24-hour linear stream**
+  (`REDEEM_BURN_STREAM_SECONDS`) that every checkpoint and every redemption settles. So total supply
+  falls by exactly the amount redeemed in this transaction, and by the released amount continuously
+  over the day that follows. The stream exists so the burn cannot be timed, and adding to the queue
+  restarts the window rather than stacking a second one. The surface says plainly that it pays
+  assets, not cash.
 
 ### (removed) Stake
 
@@ -185,7 +190,8 @@ report. `lib/surfaces.ts` carries the absence as a comment rather than leaving i
 The disclosure page.
 
 - **Reads (chain)**: `AmpsVault.checkpointData` (NAV/share, `P_ref`, `P_mkt`, timestamp),
-  `previewNavPerShareX18`, `totalAssetsUsd18`, `inventoryAmps`, `redeemFeeBps`,
+  `previewNavPerShareX18`, `totalAssetsUsd18`, `inventoryAmps`, `pendingInventoryBurn`,
+  `burnStreamStart`, `redeemFeeBps`,
   `REDEEM_FEE_BPS_MAX`, `creatorBpsAt(now)`, `CREATOR_FEE_BPS`, `CREATOR_DECAY_SECONDS`,
   `genesisTimestamp`, `liveCells`, `initialized`, `positionValuer`, `lastPlacementAt(poolId)`;
   `LadderPositionValuer.amountsOf(poolId)` per pool; `Amps.totalSupply` and
@@ -202,6 +208,13 @@ The disclosure page.
   to thirty-two assets with different decimals and are labelled as such rather than printed as
   quantities. Burn history is broken out by reason: `buyback`, `compound`, `redeem`,
   `redeemInventory`.
+- **The supply panel carries a fourth row that is not a share class.**
+  `pendingInventoryBurn()` is protocol-owned AMPS a redemption has already released out of the
+  vault's own ladder cells and that is on its way to the sink on a 24-hour linear stream — still in
+  `totalSupply`, still inventory, and already spoken for. It is shown beside a "Burn stream" row
+  built from `burnStreamStart()`: when the current window opened, and when the queue will be fully
+  burned if nothing adds to it. A reader comparing supply across two days is owed the difference
+  between "nothing burned" and "the burn is in flight".
 - **Per-pool POL depth is published from the chain.** `LadderPositionValuer.amountsOf` decomposes
   the vault's grid cells at the same reference price the vault values `A` at, so the counter column
   is to the wei the term NAV credits that pool with, and the AMPS column is the unfilled ask
@@ -229,12 +242,33 @@ with every figure resolved live.
 - **Reads (the adapter)**: `AmpsGenesis` through `contract('genesis')` and `hooks/use-genesis.ts` —
   `phase()`, `settled()`, `p0X18()`, `raisedUsdg()`, `raisedWeth()`, `raisedUsd18()`,
   `unsoldAmps()`, `ethUsdX18()`, `floorUsdgQ96()`, `floorEthQ96()`, `usdgAuction()`, `ethAuction()`,
-  `vault()`. Plus `AmpsVault.S0()`, `checkpointData().pRefX18`, `initialized()`, `liveCells()` and
+  `vault()`. Plus `checkpointData().pRefX18`, `initialized()`, `liveCells()` and
   `PoolRegistry.poolCount()` for what the launch got to.
+- **Reads (the indexer)**: `/api/genesis` through `hooks/use-genesis-index.ts` — the per-leg
+  clearing-price series from `auction_checkpoint` and the **public** bid book from `auction_bid`.
+  History and disclosure only: every live figure stays a chain read, and an unreachable indexer
+  costs exactly those two panels, which render `IndexerUnavailable` rather than zero.
 - **Writes**: `AmpsGenesis.settle()` — permissionless, unpaid, one-shot. Enabled only when
   `phase() == Ended` and `settled()` is false; otherwise the button carries the reason the state
   refuses it (`lib/genesis.ts`'s `settleBlockedReason`) rather than being disabled in silence. Also
-  the auctions' own `bid`, `exitBid` and `claimTokens`.
+  the auctions' own `submitBid`, `exitBid`, `exitPartiallyFilledBid` and `claimTokens`, an ERC-20
+  `approve` for the USDG leg, and `checkpoint()`.
+- **The USDG leg needs an allowance; the ETH leg does not.** `submitBid` pulls the currency out of
+  the bidder's own wallet — no router, no Permit2 — so the surface reads
+  `allowance(owner, auction)` and offers an `approve` **for the typed amount only**. An unbounded
+  allowance to a contract that is finished in 72 hours is a standing risk bought for one saved
+  transaction, and the app does not make that trade for a reader. The ETH leg sends native ether as
+  the call's value and has no approval control at all.
+- **`checkpoint()` is offered, not just explained.** Every auction figure is "as of the last
+  checkpoint" because the clearing price is computed lazily and only written when somebody pays for
+  it. The headline prints that block and a *Refresh price* button beside it sends the call, which is
+  permissionless, moves no bid and pays nothing out.
+- **Attribution is a first-class element, not a footnote.** `components/ledger/powered-by-uniswap.tsx`
+  renders "Powered by Uniswap Continuous Clearing Auction v2.1.0 · MIT" with links to the source and
+  to Uniswap's docs, in the surface heading, in the settlement panel's footer and in the
+  `/docs/auction` header; `AUCTION_COPY` carries the same statement as an explainer item. It is
+  **text only** — no Uniswap wordmark or logo asset is shipped, because the licence covers the code
+  and not the marks. `NOTICES.md` carries the same credit.
 - **The Settlement panel reads the adapter, and adds nothing up client-side.** Each auction knows its
   own clearing price in its own currency; `AmpsGenesis` is the only contract that converts them to
   18-decimal USD, *measures* the factory's protocol fee rather than predicting it, chooses which
@@ -249,8 +283,9 @@ with every figure resolved live.
   auctions themselves rather than through Amplestocks, and the UI says that instead of showing a
   launch. `p0X18()` is zero both before settlement and for ever after an aborted one, so the panel
   decides from the phase and never from the number.
-- The fallback is named on the page: if nothing graduates, the AMPS returns to the vault and the
-  timelock opens it at $1.00 out of the founders' seed, which is a governed call with a 7-day delay.
+- The fallback is named on the page: if nothing graduates, the AMPS returns to the vault as inventory
+  and the timelock opens it at $1.00 out of the founders' seed, which is a governed call with a
+  7-day delay. The same $20,000 divides the same `S0`, so the premium on that path is zero.
 
 ### Governance
 `app/(gated)/governance` → `components/surfaces/governance.tsx`

@@ -230,6 +230,11 @@ export function VaultSurface() {
             {...(supply.data !== undefined ? {totalSupply: supply.data as bigint} : {})}
             {...(snapshot.inventoryAmps !== undefined ? {inventory: snapshot.inventoryAmps} : {})}
             {...(vesting.data !== undefined ? {vesting: vesting.data as bigint} : {})}
+            {...(snapshot.pendingInventoryBurn !== undefined
+              ? {pendingInventoryBurn: snapshot.pendingInventoryBurn}
+              : {})}
+            {...(snapshot.burnStreamStart !== undefined ? {burnStreamStart: snapshot.burnStreamStart} : {})}
+            now={now}
           />
         </Disclosure>
 
