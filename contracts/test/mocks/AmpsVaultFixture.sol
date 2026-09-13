@@ -10,6 +10,7 @@ import {ZeroPositionValuer} from "../../src/valuer/ZeroPositionValuer.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
 import {MockFeedRegistry} from "./MockFeedRegistry.sol";
+import {MockGenesisHolder} from "./MockGenesisHolder.sol";
 import {MockMarketReference} from "./MockMarketReference.sol";
 import {MockOracleGate} from "./MockOracleGate.sol";
 import {MockPoolRegistry} from "./MockPoolRegistry.sol";
@@ -52,12 +53,22 @@ contract MockVaultRole {
 ///         the address the vault was constructed against, the shared registry/gate/feed/market mocks, three assets
 ///         (WETH, USDG and one Stock Token) and the launch seed.
 ///
-/// @dev The launch vector this fixture reproduces exactly: `S0` = 5,000 AMPS, 250 to the team vesting wallet and
-///      4,750 retained as POL, against $2,500 of WETH (1 WETH at $2,500) and $2,500 of USDG (2,500 USDG at $1).
-///      `A` is therefore $5,000 and NAV/share is `(5000e18 + 1) * 1e18 / (5000e18 + 1e3)` = 999999999999999999 —
-///      $1.00 to the last wei the `VIRTUAL_SHARES` guard can round off.
+/// @dev The launch vector this fixture reproduces exactly: `S0` = 20,000 AMPS, 1,000 to the team vesting wallet,
+///      10,000 to the genesis adapter (standing for the auction tranche, which is in `totalSupply` whoever holds
+///      it — decision 14 is fully diluted) and 9,000 retained as POL, against $10,000 of WETH (4 WETH at $2,500)
+///      and $10,000 of USDG (10,000 USDG at $1). `A` is therefore $20,000 and NAV/share is
+///      `(20000e18 + 1) * 1e18 / (20000e18 + 1e3)` = 999999999999999999 — $1.00 to the last wei the
+///      `VIRTUAL_SHARES` guard can round off.
+///
+/// @dev **The seed is scaled with `S0`, not kept at $5,000.** Revision 7 quadrupled the supply, and a fixture that
+///      kept the old $5,000 seed would launch at NAV/share = $0.25 and move every tick, every ladder cell and
+///      every redemption vector in the suite for a reason that has nothing to do with what those tests assert.
+///      The fixture therefore runs the *fallback* genesis path (the timelock's founders' seed) at a seed sized so
+///      that NAV/share is still $1.00; `AmpsGenesis.t.sol` and `VaultGenesis.t.sol` are where the auction path and
+///      the `raised / S0` arithmetic are exercised.
 abstract contract AmpsVaultFixture is V4TestBase {
-    /// @dev The governance timelock: the only address that may call a `set*` or `genesis`.
+    /// @dev The governance timelock: the only address that may call a `set*`, `genesisMint` or the fallback
+    ///      `genesisPlace`.
     address internal constant TIMELOCK = address(0x7100E10C);
     /// @dev The guardian Safe: freezes and the predicate-gated migration.
     address internal constant GUARDIAN = address(0x6DA4D1A0);
@@ -78,10 +89,19 @@ abstract contract AmpsVaultFixture is V4TestBase {
     uint128 internal constant USDG_USD8 = 1e8;
     /// @dev The Stock Token at $100, 18 decimals.
     uint128 internal constant STOCK_USD8 = 100e8;
-    /// @dev The founders' WETH seed: 1 WETH == $2,500.
-    uint256 internal constant SEED_WETH = 1e18;
-    /// @dev The founders' USDG seed: 2,500 USDG == $2,500.
-    uint256 internal constant SEED_USDG = 2500e6;
+    /// @dev The founders' WETH seed: 4 WETH == $10,000.
+    uint256 internal constant SEED_WETH = 4e18;
+    /// @dev The founders' USDG seed: 10,000 USDG == $10,000.
+    uint256 internal constant SEED_USDG = 10_000e6;
+
+    /// @dev The `p0X18` this fixture asks {IAmpsVault-genesisPlace} for. `genesisPlace` floors the launch
+    ///      reference at NAV/share, so the smallest legal value asks for exactly that floor and `P_ref` starts at
+    ///      NAV — which is what genesis did before revision 7, and what every vector below this line was written
+    ///      against. It matters at the last wei: `VIRTUAL_SHARES` puts NAV/share one wei under $1.00 even with a
+    ///      seed worth exactly `S0` dollars, so asking for a flat `1e18` here would open a one-wei premium and
+    ///      every "the reference is NAV" assertion in the suite would be off by that wei. A launch that really
+    ///      does clear above NAV is `test/unit/VaultGenesis.t.sol`'s subject.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     Amps internal amps;
     AmpsVault internal vault;
@@ -90,6 +110,14 @@ abstract contract AmpsVaultFixture is V4TestBase {
     MockFeedRegistry internal feeds;
     MockMarketReference internal marketRef;
     ZeroPositionValuer internal valuer;
+
+    /// @dev Stands in for the `AmpsGenesis` adapter: the vault's `genesis` pointer and the auction tranche's
+    ///      holder. See {MockGenesisHolder} for why the fixtures do not deploy the real adapter. Zero in a suite
+    ///      that overrides {deployGenesisAdapter} to put the real one there.
+    MockGenesisHolder internal genesisHolder;
+
+    /// @dev Whatever the vault's `genesis` pointer holds, whether that is {genesisHolder} or a real `AmpsGenesis`.
+    address internal genesisPointer;
 
     MockERC20 internal weth;
     MockERC20 internal usdg;
@@ -107,7 +135,7 @@ abstract contract AmpsVaultFixture is V4TestBase {
     PoolId internal wethPool;
     PoolId internal spokePool;
 
-    /// @notice Deploys the whole Phase 2 world and wires every pointer, without running {genesis}.
+    /// @notice Deploys the whole Phase 2 world and wires every pointer, without running genesis.
     function deployVaultWorld() internal {
         deployV4();
 
@@ -156,9 +184,11 @@ abstract contract AmpsVaultFixture is V4TestBase {
         bondsRole = new MockVaultRole(address(vault));
         potRole = new MockVaultRole(address(vault));
         BONDS = address(bondsRole);
+        genesisPointer = deployGenesisAdapter();
 
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
+        vault.setPolicyPointer(bytes32("genesis"), genesisPointer);
         vault.setPolicyPointer(bytes32("bonds"), address(bondsRole));
         vault.setPolicyPointer(bytes32("bountyPot"), address(potRole));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));
@@ -172,7 +202,17 @@ abstract contract AmpsVaultFixture is V4TestBase {
         vm.label(address(stock), "MSTK");
     }
 
-    /// @notice Runs {genesis} with the confirmed launch parameters, funding and approving the timelock first.
+    /// @notice Whatever the vault's `genesis` pointer is wired to. A {MockGenesisHolder} by default, because
+    ///         every suite below this fixture is about the *vault*; `unit/AmpsGenesis.t.sol` overrides it to put
+    ///         the real adapter and a mock CCA factory there instead.
+    /// @return adapter The address the pointer is set to.
+    function deployGenesisAdapter() internal virtual returns (address adapter) {
+        genesisHolder = new MockGenesisHolder();
+        return address(genesisHolder);
+    }
+
+    /// @notice Runs both genesis steps with the confirmed launch parameters, funding and approving the timelock
+    ///         first. The placement is the fallback (founders' seed) path, called by the timelock.
     function runGenesis() internal {
         weth.mint(TIMELOCK, SEED_WETH);
         usdg.mint(TIMELOCK, SEED_USDG);
@@ -180,28 +220,36 @@ abstract contract AmpsVaultFixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         weth.approve(address(vault), type(uint256).max);
         usdg.approve(address(vault), type(uint256).max);
-        vault.genesis(genesisParams());
+        vault.genesisMint(genesisMintParams());
+        vault.genesisPlace(genesisPlaceParams());
         vm.stopPrank();
     }
 
-    /// @notice The launch genesis arguments.
-    /// @return params The arguments {genesis} is called with.
-    function genesisParams() internal view returns (IAmpsVault.GenesisParams memory params) {
-        address[] memory seedTokens = new address[](2);
-        uint256[] memory seedAmounts = new uint256[](2);
-        seedTokens[0] = address(weth);
-        seedAmounts[0] = SEED_WETH;
-        seedTokens[1] = address(usdg);
-        seedAmounts[1] = SEED_USDG;
-
-        params = IAmpsVault.GenesisParams({
+    /// @notice The step-one arguments.
+    /// @return params The arguments `genesisMint` is called with.
+    function genesisMintParams() internal view returns (IAmpsVault.GenesisMintParams memory params) {
+        params = IAmpsVault.GenesisMintParams({
             teamVestingWallet: TEAM_WALLET,
             creator: CREATOR,
+            genesis: genesisPointer,
             teamShares: Constants.TEAM_SHARES,
-            polShares: Constants.POL_SHARES,
-            seedTokens: seedTokens,
-            seedAmounts: seedAmounts
+            auctionShares: Constants.AUCTION_SHARES,
+            polShares: Constants.POL_SHARES
         });
+    }
+
+    /// @notice The step-two arguments: the founders' seed at the $1.00 fallback price.
+    /// @return params The arguments `genesisPlace` is called with.
+    function genesisPlaceParams() internal view returns (IAmpsVault.GenesisPlaceParams memory params) {
+        address[] memory tokens = new address[](2);
+        uint256[] memory amounts = new uint256[](2);
+        tokens[0] = address(weth);
+        amounts[0] = SEED_WETH;
+        tokens[1] = address(usdg);
+        amounts[1] = SEED_USDG;
+
+        params =
+            IAmpsVault.GenesisPlaceParams({p0X18: GENESIS_P0_AT_NAV, tokens: tokens, amounts: amounts, unsoldAmps: 0});
     }
 
     // -------------------------------------------------------------------------------------------------------------

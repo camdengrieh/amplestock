@@ -16,6 +16,14 @@ contract PriceLibHarness {
         return PriceLib.ampsPerCounterToSqrtPriceX96(pRefUsd18, counterPriceUsd8, counterDecimals);
     }
 
+    function ampsPerCounterToSqrtPriceX96OrZero(uint256 pRefUsd18, uint256 counterPriceUsd8, uint8 counterDecimals)
+        external
+        pure
+        returns (uint160)
+    {
+        return PriceLib.ampsPerCounterToSqrtPriceX96OrZero(pRefUsd18, counterPriceUsd8, counterDecimals);
+    }
+
     function sqrtPriceX96ToAmpsPriceUsd18(uint160 sqrtPriceX96, uint256 counterPriceUsd8, uint8 counterDecimals)
         external
         pure

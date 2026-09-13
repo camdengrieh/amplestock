@@ -10,20 +10,30 @@ import {Alert, AlertDescription, AlertTitle} from '@/components/ui/alert'
 import {Badge} from '@/components/ui/badge'
 import {Button} from '@/components/ui/button'
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow} from '@/components/ui/table'
+import {TxButton, TxError, TxSuccess, type TxPhase} from '@/components/common/tx'
 import type {AuctionState, BidRow} from '@/hooks/use-auction'
+import type {GenesisState} from '@/hooks/use-genesis'
 import {
   AUCTION_MPS,
   BID_STATUS_LABEL,
   BID_STATUS_NOTE,
   PHASE_LABEL,
   formatQ96Price,
-  genesisPremiumBps,
-  launchNavPerShareX18,
   q96PriceToWholeX18,
   secondsToBlock,
   toUsd18,
 } from '@/lib/auction'
+import {
+  GENESIS_PHASE_LABEL,
+  GENESIS_PHASE_NOTE,
+  floorQ96ToWholeX18,
+  launchNavPerShareX18,
+  launchPremiumBps,
+  raisedLegsUsd18,
+} from '@/lib/genesis'
 import {AUCTION_COPY} from '@/lib/copy'
+import type {SurfacedError} from '@/lib/errors'
+import {shortAddress} from '@/lib/format'
 import {formatAmount, formatBps, formatDuration, formatPercent, formatPremiumBps, formatUsd18} from '@/lib/format'
 
 export interface UsdRate {
@@ -428,84 +438,273 @@ export function MyBidsTable({
 }
 
 /**
- * Settlement: what the auction decided, and what it means for the protocol that follows it.
+ * Settlement: what the launch decided, read from the adapter that decided it.
  *
- * Every figure is arithmetic on two numbers the auctions publish. The genesis premium in particular
- * is not a judgement: the auction sells only the entry-pool tranche, so NAV per share divides the
- * raised currency by the whole supply while a buyer paid the clearing price for one share, and the
- * ratio between them is exactly the ratio of total supply to tokens sold.
+ * `AmpsGenesis` is the only contract that knows the answer. Each auction knows its own clearing
+ * price in its own currency; the adapter converts them to 18-decimal USD, **measures** the factory's
+ * protocol fee rather than predicting it, chooses which leg's price becomes `P0` — the USDG leg
+ * whenever it graduated, because it is the only one denominated in the unit `P_ref` is quoted in —
+ * and hands the proceeds, the unsold AMPS and `P0` to `AmpsVault.genesisPlace` in one transaction.
+ * So nothing here is added up client-side: every figure is a read of the adapter or of the vault.
+ *
+ * Three states the panel must not blur into one another:
+ *
+ * - **`Ended`** — every leg has closed and nobody has settled. `settle()` is offered here, and only
+ *   here. It is permissionless and one-shot.
+ * - **`Settled`** — the launch is live. `P0`, NAV/share and the premium are facts, and the premium
+ *   is a disclosure: `P0 / NAV − 1`, never presented as a discount, and NAV/share is never quoted
+ *   as the auction price.
+ * - **`Aborted`** — no leg graduated, so nothing was sold. Bidders refund through the auctions
+ *   themselves. There is no launch to show and the panel says so instead of showing one.
  */
 export function SettlementPanel({
+  genesis,
   auctions,
-  usdgRate,
-  ampsTotalSupply,
+  usdgDecimals,
+  genesisSupply,
+  pRefX18,
+  liveCells,
+  poolCount,
+  vaultInitialized,
+  settle,
 }: {
+  genesis: GenesisState
   auctions: readonly AuctionState[]
-  usdgRate: UsdRate
-  ampsTotalSupply?: bigint
+  usdgDecimals?: number
+  /**
+   * `AmpsVault.S0()` — the whole genesis supply, and the denominator of NAV per share at launch.
+   *
+   * Not `Amps.totalSupply()`: that grows with every bond, so dividing the auction's raise by it
+   * would make the launch NAV drift downwards for ever after. `S0` is in the bytecode and never
+   * moves, so this figure is as true a year later as it was in the settlement block.
+   */
+  genesisSupply?: bigint
+  /** `AmpsVault.checkpointData().pRefX18` — `max(P0, NAV)`, so it should equal `P0` at launch. */
+  pRefX18?: bigint
+  liveCells?: number
+  poolCount?: number
+  vaultInitialized?: boolean
+  settle?: SettleAction
 }) {
-  const settled = auctions.filter((a) => a.phase === 'ended' || a.phase === 'claimable')
-  if (settled.length === 0 || settled.length !== auctions.length) return null
+  // Nothing to settle and nothing settled: the panel is for the end of the auction, not the middle
+  // of it. `Created` and `Bidding` are the headline's business.
+  if (genesis.address === undefined && auctions.every((a) => a.phase !== 'ended' && a.phase !== 'claimable')) {
+    return null
+  }
+  const phase = genesis.phase
+  if (phase === 'created' || phase === 'bidding') return null
 
-  const tokensSold = auctions.reduce<bigint | undefined>(
-    (sum, a) => (sum === undefined || a.totalCleared === undefined ? undefined : sum + a.totalCleared),
-    0n,
-  )
+  const aborted = phase === 'aborted'
+  const settled = phase === 'settled'
 
-  // Only the USDG auction can be valued in dollars: there is no ETH/USD feed in the reference book.
-  const usdgAuction = auctions.find((a) => a.key === 'usdg')
-  const raisedUsd18 =
-    usdgAuction?.currencyRaised !== undefined && usdgAuction.currencyDecimals !== undefined
-      ? toUsd18({
-          priceX18: (usdgAuction.currencyRaised * 10n ** 18n) / 10n ** BigInt(usdgAuction.currencyDecimals),
-          answer: usdgRate.answer,
-          answerDecimals: usdgRate.answerDecimals,
-        })
-      : undefined
-
-  const navX18 =
-    raisedUsd18 !== undefined && ampsTotalSupply !== undefined
-      ? launchNavPerShareX18({raisedUsd18, tokensSold: ampsTotalSupply})
-      : undefined
-  const premiumBps =
-    ampsTotalSupply !== undefined && tokensSold !== undefined
-      ? genesisPremiumBps({totalSupply: ampsTotalSupply, tokensSold})
-      : undefined
+  // NAV per share at launch: the adapter's raise over `S0`, which is what the vault's own `Genesis`
+  // log records. It is deliberately *not* the vault's live checkpoint — that number moves with
+  // every fee, bond and burn, and "NAV per share at launch" is a fact about one block.
+  const navX18 = launchNavPerShareX18({
+    ...(genesis.raisedUsd18 !== undefined ? {raisedUsd18: genesis.raisedUsd18} : {}),
+    ...(genesisSupply !== undefined ? {totalSupply: genesisSupply} : {}),
+  })
+  const premiumBps = launchPremiumBps({
+    ...(genesis.p0X18 !== undefined ? {p0X18: genesis.p0X18} : {}),
+    ...(navX18 !== undefined ? {navPerShareX18: navX18} : {}),
+  })
+  const legs = raisedLegsUsd18({
+    ...(genesis.raisedUsdg !== undefined ? {raisedUsdg: genesis.raisedUsdg} : {}),
+    ...(usdgDecimals !== undefined ? {usdgDecimals} : {}),
+    ...(genesis.raisedWeth !== undefined ? {raisedWeth: genesis.raisedWeth} : {}),
+    ...(genesis.ethUsdX18 !== undefined ? {ethUsdX18: genesis.ethUsdX18} : {}),
+  })
+  const refMatchesP0 =
+    pRefX18 !== undefined && genesis.p0X18 !== undefined && genesis.p0X18 > 0n ? pRefX18 === genesis.p0X18 : undefined
 
   return (
     <section data-testid="auction-settlement">
       <SectionHead
         title="Settlement"
-        note="Both auctions have ended. The final clearing price becomes the launch reference price, and the currency raised becomes the entry pools’ bid liquidity — the first depth under AMPS, placed by the vault as a ladder."
-        aside="Both legs closed"
+        note="The two auctions do not open the protocol; the genesis adapter does. It sweeps both legs, wraps the ETH, measures what actually arrived, derives P0 from the clearing price and calls AmpsVault.genesisPlace — which takes the proceeds as backing, takes the unsold AMPS back as inventory and seeds the reference price. One transaction, and anybody may send it."
+        aside={phase ? GENESIS_PHASE_LABEL[phase] : 'Adapter not configured'}
       />
-      <StatGrid className="mt-7">
-        <Stat
-          label="Tokens sold"
-          value={tokensSold !== undefined ? `${formatAmount(tokensSold, 18)} AMPS` : undefined}
-          unavailable={tokensSold === undefined}
-          hint="Across both auctions. The rest of the supply is protocol inventory and the team tranche."
-        />
-        <Stat
-          label="Raised, in USD"
-          value={raisedUsd18 !== undefined ? formatUsd18(raisedUsd18) : undefined}
-          unavailable={raisedUsd18 === undefined}
-          reason="Only the USDG leg has a price feed on this chain; the ETH leg is shown in ether"
-          hint="The USDG leg, converted through its Chainlink answer. The ETH leg is not converted."
-        />
-        <Stat
-          label="NAV per share at launch"
-          value={navX18 !== undefined ? formatUsd18(navX18, 4) : undefined}
-          unavailable={navX18 === undefined}
-          hint="Raised divided by total supply. Arithmetic on the vault’s own balances, not a price."
-        />
-        <Stat
-          label="Genesis premium"
-          value={premiumBps !== undefined ? formatPremiumBps(premiumBps) : undefined}
-          unavailable={premiumBps === undefined}
-          hint="Total supply over tokens sold, less one. The auction sold the entry-pool tranche, not the whole supply, so a buyer’s price exceeds NAV per share by exactly this ratio."
-        />
-      </StatGrid>
+
+      {phase ? (
+        <Alert
+          variant={aborted ? 'warning' : settled ? 'default' : 'info'}
+          className="mt-7"
+          data-testid="genesis-phase-note"
+        >
+          <AlertTitle>{GENESIS_PHASE_LABEL[phase]}</AlertTitle>
+          <AlertDescription>
+            <p>{GENESIS_PHASE_NOTE[phase]}</p>
+          </AlertDescription>
+        </Alert>
+      ) : genesis.unavailable ? (
+        <Alert variant="warning" className="mt-7" data-testid="genesis-phase-note">
+          <AlertTitle>The genesis adapter did not answer</AlertTitle>
+          <AlertDescription>
+            <p>
+              An address is configured for <code className="font-mono">AmpsGenesis</code> but{' '}
+              <code className="font-mono">phase()</code> could not be read. Nothing below is settlement state, and
+              nothing on this page should be read as saying the launch has or has not happened.
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {aborted ? null : (
+        <StatGrid className="mt-7">
+          <Stat
+            label="Launch reference price P₀"
+            value={genesis.p0X18 !== undefined && genesis.p0X18 > 0n ? formatUsd18(genesis.p0X18, 6) : undefined}
+            unavailable={genesis.p0X18 === undefined || genesis.p0X18 === 0n}
+            reason="P₀ is written by settle(); it is zero until then and zero for ever if no leg graduated"
+            hint="The clearing price, in 18-decimal USD per AMPS. All 32 pools were opened at it rather than at a price chosen in advance."
+          />
+          <Stat
+            label="Raised"
+            value={genesis.raisedUsd18 !== undefined ? formatUsd18(genesis.raisedUsd18) : undefined}
+            unavailable={genesis.raisedUsd18 === undefined}
+            hint="Both legs, net of the factory's protocol fee, priced in USD by the adapter. This is the A the vault started with."
+          />
+          <Stat
+            label="NAV per share at launch"
+            value={navX18 !== undefined ? formatUsd18(navX18, 4) : undefined}
+            unavailable={navX18 === undefined}
+            hint="The raise divided by S₀, the whole genesis supply — inventory included, which is what fully diluted means. It is a fact about the settlement block and does not move afterwards; the vault's live NAV is on the Vault surface."
+          />
+          <Stat
+            label="Launch premium"
+            value={premiumBps !== undefined ? formatPremiumBps(premiumBps) : undefined}
+            unavailable={premiumBps === undefined}
+            hint="P₀ over NAV per share, less one. The vault keeps 45% of the supply as inventory backed by nothing until it sells, so a buyer's price exceeds NAV by exactly that. Disclosed, never smoothed: it shrinks as the ask ladders fill at or above P₀."
+          />
+        </StatGrid>
+      )}
+
+      <div className="mt-11 grid gap-x-14 gap-y-11 lg:grid-cols-2">
+        <RowGroup label="What settlement moved" data-testid="genesis-proceeds">
+          <FieldRow label="USDG swept" hint="From the USDG leg, net of the protocol fee. Taken at par: P₀ needs no oracle to come out of this leg.">
+            <Value unavailable={genesis.raisedUsdg === undefined || usdgDecimals === undefined}>
+              {genesis.raisedUsdg !== undefined && usdgDecimals !== undefined
+                ? `${formatAmount(genesis.raisedUsdg, usdgDecimals)} USDG${legs.usdg !== undefined ? ` · ${formatUsd18(legs.usdg)}` : ''}`
+                : null}
+            </Value>
+          </FieldRow>
+          <FieldRow label="WETH swept" hint="The ETH leg's proceeds, wrapped into WETH9 inside settle() so the vault never holds native ether.">
+            <Value unavailable={genesis.raisedWeth === undefined}>
+              {genesis.raisedWeth !== undefined
+                ? `${formatAmount(genesis.raisedWeth, 18)} WETH${legs.weth !== undefined ? ` · ${formatUsd18(legs.weth)}` : ''}`
+                : null}
+            </Value>
+          </FieldRow>
+          <FieldRow
+            label="Unsold AMPS returned"
+            hint="The part of the auction tranche that never cleared. It is pulled back as the vault's own inventory — neither minted nor counted in A, because every AMPS leg is valued at zero."
+          >
+            <Value unavailable={genesis.unsoldAmps === undefined}>
+              {genesis.unsoldAmps !== undefined ? `${formatAmount(genesis.unsoldAmps, 18)} AMPS` : null}
+            </Value>
+          </FieldRow>
+          <FieldRow label="ETH/USD the adapter used" hint="Refreshed from the vault's feed registry at settlement where that read succeeded, otherwise the price recorded at creation.">
+            <Value unavailable={genesis.ethUsdX18 === undefined || genesis.ethUsdX18 === 0n}>
+              {genesis.ethUsdX18 !== undefined && genesis.ethUsdX18 > 0n ? formatUsd18(genesis.ethUsdX18, 2) : null}
+            </Value>
+          </FieldRow>
+        </RowGroup>
+
+        <RowGroup label="Where the launch got to" data-testid="genesis-placement">
+          <FieldRow label="Vault opened" hint="AmpsVault.initialized() — set by genesisPlace, one-way. Before it, nothing can be checkpointed, bonded or redeemed.">
+            <Value unavailable={vaultInitialized === undefined}>
+              {vaultInitialized === undefined ? null : vaultInitialized ? 'Yes' : 'Not yet'}
+            </Value>
+          </FieldRow>
+          <FieldRow
+            label="Reference price seeded at P₀"
+            hint="genesisPlace writes P_ref = max(P0, NAV/share) after the checkpoint, so the two agree unless the NAV floor bound it."
+          >
+            <Value unavailable={refMatchesP0 === undefined}>
+              {refMatchesP0 === undefined
+                ? null
+                : refMatchesP0
+                  ? `Yes · ${pRefX18 !== undefined ? formatUsd18(pRefX18, 6) : ''}`
+                  : `P_ref ${pRefX18 !== undefined ? formatUsd18(pRefX18, 6) : ''} — floored at NAV`}
+            </Value>
+          </FieldRow>
+          <FieldRow label="Pools opened at P₀" hint="Registration runs after settlement, and PoolRegistry anchors every pool at the vault's pRefX18().">
+            <Value unavailable={poolCount === undefined}>{poolCount === undefined ? null : String(poolCount)}</Value>
+          </FieldRow>
+          <FieldRow
+            label="Ladder cells placed"
+            hint="AmpsVault.liveCells(): ten ask cells in each of the 32 pools plus four seed bids in each entry pool once both placement phases have run."
+          >
+            <Value unavailable={liveCells === undefined}>{liveCells === undefined ? null : String(liveCells)}</Value>
+          </FieldRow>
+        </RowGroup>
+      </div>
+
+      {settle ? (
+        <div className="mt-11" data-testid="genesis-settle">
+          <SectionHead
+            title="Settle genesis"
+            note="Permissionless and one-shot. It checkpoints both auctions, sweeps the currency from every graduated leg and the unsold tokens from every leg, wraps the ether, derives P₀ and calls AmpsVault.genesisPlace — all in the transaction you send. There is no reward for sending it and no way to send it twice."
+            aside={settle.blockedReason ? 'Not callable' : 'Callable now'}
+          />
+          <div className="mt-6 max-w-[46rem] space-y-6">
+            <TxButton
+              phase={settle.phase}
+              label="Settle genesis"
+              {...(settle.blockedReason ? {blockedReason: settle.blockedReason} : {})}
+              onClick={settle.onClick}
+              data-testid="genesis-settle-button"
+            />
+            <TxError error={settle.error} />
+            {settle.hash ? <TxSuccess hash={settle.hash} explorerUrl={settle.explorerUrl ?? null} /> : null}
+          </div>
+        </div>
+      ) : null}
+
+      <RowGroup label="The adapter" className="mt-11" data-testid="genesis-wiring">
+        <FieldRow label="AmpsGenesis" hint="Immutable and ownerless. Six immutables, one governed call, one permissionless call, no rescue function.">
+          <Value unavailable={!genesis.address} {...(genesis.address ? {title: genesis.address} : {})}>
+            {genesis.address ? shortAddress(genesis.address) : null}
+          </Value>
+        </FieldRow>
+        <FieldRow label="Settles into" hint="The vault's genesis pointer names this adapter, and the adapter names the vault. Both are set once.">
+          <Value unavailable={!genesis.vault} {...(genesis.vault ? {title: genesis.vault} : {})}>
+            {genesis.vault ? shortAddress(genesis.vault) : null}
+          </Value>
+        </FieldRow>
+        <FieldRow label="USDG floor" hint="$1.00 per AMPS, computed by the adapter from the currency's decimals rather than taken from the proposal.">
+          <Value unavailable={floorQ96ToWholeX18({...(genesis.floorUsdgQ96 !== undefined ? {floorQ96: genesis.floorUsdgQ96} : {}), ...(usdgDecimals !== undefined ? {currencyDecimals: usdgDecimals} : {})}) === undefined}>
+            {(() => {
+              const x18 = floorQ96ToWholeX18({
+                ...(genesis.floorUsdgQ96 !== undefined ? {floorQ96: genesis.floorUsdgQ96} : {}),
+                ...(usdgDecimals !== undefined ? {currencyDecimals: usdgDecimals} : {}),
+              })
+              return x18 === undefined ? null : `${formatUsd18(x18, 6)} per AMPS`
+            })()}
+          </Value>
+        </FieldRow>
+        <FieldRow label="ETH floor" hint="The same $1.00, expressed in wei per AMPS wei at the ETH/USD price the proposal carried and the feed registry cross-checked.">
+          <Value unavailable={floorQ96ToWholeX18({...(genesis.floorEthQ96 !== undefined ? {floorQ96: genesis.floorEthQ96} : {}), currencyDecimals: 18}) === undefined}>
+            {(() => {
+              const x18 = floorQ96ToWholeX18({
+                ...(genesis.floorEthQ96 !== undefined ? {floorQ96: genesis.floorEthQ96} : {}),
+                currencyDecimals: 18,
+              })
+              return x18 === undefined ? null : `${Number(x18) / 1e18} ETH per AMPS`
+            })()}
+          </Value>
+        </FieldRow>
+      </RowGroup>
     </section>
   )
+}
+
+/** Everything the settle button needs, lifted so this file holds no wagmi and no transaction state. */
+export interface SettleAction {
+  phase: TxPhase
+  blockedReason?: string
+  error: SurfacedError | null
+  hash?: `0x${string}`
+  explorerUrl?: string | null
+  onClick: () => void
 }

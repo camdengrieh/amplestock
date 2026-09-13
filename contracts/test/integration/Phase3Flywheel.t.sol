@@ -159,7 +159,9 @@ contract Phase3FlywheelTest is Phase3Fixture {
         uint256 navBefore = vault.previewNavPerShareX18();
         uint256 usdgSupplyBefore = usdg.totalSupply();
         uint256 managerUsdgBefore = usdg.balanceOf(address(poolManager));
-        uint256 creatorUsdgBefore = usdg.balanceOf(CREATOR);
+        // The creator's counter-side slice is an ERC-6909 claim since audit finding 8, so it never leaves the
+        // PoolManager: no token code may run inside the vault's own unlock.
+        uint256 creatorUsdgBefore = poolManager.balanceOf(CREATOR, uint256(uint160(address(usdg))));
         assertEq(usdg.balanceOf(BOB), 0, "the pumper starts with nothing");
 
         // Pump: the whole move is bought out of the ask ladder, one rail-limited step at a time.
@@ -182,12 +184,12 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // behind: `inbound - outbound`, which is the fee take plus the ladder's own convexity and nothing else.
         uint256 minted = usdg.totalSupply() - usdgSupplyBefore;
         uint256 returned = usdg.balanceOf(BOB);
-        uint256 creatorTook = usdg.balanceOf(CREATOR) - creatorUsdgBefore;
+        uint256 creatorTook = poolManager.balanceOf(CREATOR, uint256(uint160(address(usdg)))) - creatorUsdgBefore;
         assertGt(creatorTook, 0, "the compound paid the creator their slice of the counter-side fees");
         assertEq(
             usdg.balanceOf(address(poolManager)),
-            managerUsdgBefore + minted - returned - creatorTook,
-            "the vault's USDG is exactly the seed plus the round trip's residue, less the creator's slice"
+            managerUsdgBefore + minted - returned,
+            "the PoolManager holds the seed plus the round trip's residue: the creator's slice is a claim on it"
         );
         assertGt(minted, returned, "and the residue is positive: the round trip paid, it did not earn");
         assertSweepClean("pump then dump");
@@ -206,13 +208,18 @@ contract Phase3FlywheelTest is Phase3Fixture {
         uint256 creatorBefore = amps.balanceOf(CREATOR);
         uint256 supplyBefore = amps.totalSupply();
 
+        // The divisor is `max(ampsFeeBps, AMPS_FEE_BPS_DEFAULT, the rate actually being charged)` since audit
+        // finding 4: fees collected at `base + dyn` are divided by `base + dyn`, so the dynamic part enlarges the
+        // divisor by exactly what it enlarged the collection and is never creator-eligible. It is read *before*
+        // the call, because a `compound` arms its own surge on the way out.
+        uint256 divisorBps = _creatorDivisorBps();
+
         vm.prank(KEEPER);
         (uint256 ampsFees, uint256 burned) = vault.compound(hubPool);
         assertGt(ampsFees, 0, "the sells really paid a fee in AMPS");
 
-        uint256 ampsFeeBps = hook.ampsFeeBps();
         uint256 creatorBps = vault.creatorBpsAt(block.timestamp);
-        uint256 creatorCut = ampsFees * creatorBps / ampsFeeBps;
+        uint256 creatorCut = ampsFees * creatorBps / divisorBps;
 
         assertEq(amps.balanceOf(CREATOR) - creatorBefore, creatorCut, "the creator's slice, to the wei");
         assertEq(supplyBefore - amps.totalSupply(), burned, "`burned` is exactly what left the supply");
@@ -643,5 +650,16 @@ contract Phase3FlywheelTest is Phase3Fixture {
     /// @dev A buy small enough not to breach a thin spoke's rail.
     function _smallBuy(PoolId poolId) private view returns (uint256 amount) {
         return registry.poolConfig(poolId).counterDecimals == 18 ? 1e14 : 1e5;
+    }
+
+    /// @dev The divisor `VaultPlacementLib._creatorSlice` uses: the live AMPS fee, floored at the launch fee and
+    ///      at the total the hook is charging a sell right now (audit finding 4).
+    function _creatorDivisorBps() private view returns (uint256 divisor) {
+        divisor = hook.ampsFeeBps();
+        if (divisor < Constants.AMPS_FEE_BPS_DEFAULT) divisor = Constants.AMPS_FEE_BPS_DEFAULT;
+        // The larger of the two directions since re-audit finding 3: the divisor is applied to each currency's
+        // fees and the two currencies are earned at two different rates, so it is bounded below by the larger.
+        uint256 chargedBps = hook.chargedFeeBps(hubPool);
+        if (chargedBps > divisor) divisor = chargedBps;
     }
 }

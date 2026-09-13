@@ -22,7 +22,7 @@ to depend on. A Next.js consumer that transpiles `node_modules` should list `@am
 
 One `<contract>Abi` const per contract, `as const` so viem and wagmi infer argument and return types:
 
-`ampsAbi`, `ampsVaultAbi`, `ampsHookAbi`, `ampsBondsAbi`, `ampsRouterAbi`, `bountyPotAbi`, `poolRegistryAbi`,
+`ampsAbi`, `ampsVaultAbi`, `ampsHookAbi`, `ampsBondsAbi`, `ampsRouterAbi`, `ampsGenesisAbi`, `bountyPotAbi`, `poolRegistryAbi`,
 `poolRegistryLensAbi`, `ampsBondsLensAbi`, `oracleGateAbi`, `feedRegistryAbi`, `ampsQuoterAbi`, `bondPolicyAbi`,
 `feePolicyAbi`, `ladderPolicyAbi`, `rolloutPolicyAbi`, `ladderPositionValuerAbi`, `poolManagerAbi`.
 

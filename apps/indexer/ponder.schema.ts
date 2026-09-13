@@ -147,6 +147,136 @@ export const vaultSummary = onchainTable('vault_summary', (t) => ({
   lastTimestamp: t.bigint().notNull(),
 }))
 
+/**
+ * The launch, in one row.
+ *
+ * Genesis is two calls with a 72-hour auction between them, and the row has to be legible at every
+ * point in that window rather than only at the end — so the mint half (`AmpsVault.GenesisMinted`),
+ * the auction half (`AmpsGenesis.AuctionsCreated`) and the settlement half (`AmpsGenesis.Settled`
+ * and the vault's `Genesis`) each fill in their own columns and none of them waits for the others.
+ *
+ * `phase` is *derived* on chain from the block number and is not in any log, so this table cannot
+ * carry a live one: what it carries is the furthest point the logs prove the launch reached
+ * (`created` → `bidding` is a block-number fact, not an event), and the dApp reads `phase()` from
+ * the adapter when it wants "right now". `settledPhase` is the terminal answer — `settled` or
+ * `aborted` — and is the one a log does decide.
+ *
+ * **Zero is not a price.** `p0X18` is zero before settlement and zero for ever after a settlement
+ * in which nothing graduated, which is why `settledBlock` and `graduated` exist beside it: a
+ * consumer must read those, not the number.
+ */
+export const genesis = onchainTable('genesis', (t) => ({
+  id: t.text().primaryKey(),
+  /** `AmpsGenesis`, the adapter. Zero until a genesis log names it. */
+  adapter: t.hex().notNull(),
+  vault: t.hex().notNull(),
+  /** From `GenesisMinted`: the three tranches, and where two of them went. */
+  mintedBlock: t.bigint().notNull(),
+  mintedAt: t.bigint().notNull(),
+  creator: t.hex().notNull(),
+  teamVestingWallet: t.hex().notNull(),
+  teamShares: t.bigint().notNull(),
+  auctionShares: t.bigint().notNull(),
+  polShares: t.bigint().notNull(),
+  /** From `AuctionsCreated`: the two legs and the floors the adapter computed for them. */
+  auctionsBlock: t.bigint().notNull(),
+  usdgAuction: t.hex().notNull(),
+  ethAuction: t.hex().notNull(),
+  floorUsdgQ96: t.bigint().notNull(),
+  floorEthQ96: t.bigint().notNull(),
+  startBlock: t.bigint().notNull(),
+  endBlock: t.bigint().notNull(),
+  /** From `Settled`. `settledBlock` of zero means settlement has not happened. */
+  settledBlock: t.bigint().notNull(),
+  settledAt: t.bigint().notNull(),
+  /** `"settled"` once a leg graduated, `"aborted"` when none did, `""` before settlement. */
+  settledPhase: t.text().notNull(),
+  p0X18: t.bigint().notNull(),
+  raisedUsdg: t.bigint().notNull(),
+  raisedWeth: t.bigint().notNull(),
+  unsoldAmps: t.bigint().notNull(),
+  usdgGraduated: t.boolean().notNull(),
+  ethGraduated: t.boolean().notNull(),
+  /** True when at least one leg graduated: the only honest reading of "did the launch happen". */
+  graduated: t.boolean().notNull(),
+  /** From the vault's own `Genesis`: the launch as the vault recorded it. */
+  launchBlock: t.bigint().notNull(),
+  launchAt: t.bigint().notNull(),
+  totalMinted: t.bigint().notNull(),
+  navPerShareX18: t.bigint().notNull(),
+  /** `A` at the launch checkpoint, and `p0X18 / navPerShareX18 - 1` in bps beside it. */
+  raisedUsd18: t.bigint().notNull(),
+  premiumBps: t.integer().notNull(),
+  /** From `ClearingPricesDiverged`: both legs graduated and their implied prices disagreed. */
+  diverged: t.boolean().notNull(),
+  divergedUsdgP0X18: t.bigint().notNull(),
+  divergedEthP0X18: t.bigint().notNull(),
+  divergenceToleranceBps: t.integer().notNull(),
+  lastBlock: t.bigint().notNull(),
+}))
+
+/**
+ * Bids in the two genesis auctions.
+ *
+ * Additive: the dApp reads a wallet's own bids straight off the auction's `BidSubmitted` logs and
+ * keeps doing so, because that path works with no indexer at all. What this table adds is the whole
+ * book — every bidder, not just the connected one — which a log query per wallet cannot give.
+ *
+ * `amountQ96` is stored as the auction stores it. Dividing by 2^96 is a display step and belongs to
+ * whoever displays it; storing the quotient would throw away the low bits that decide a tick.
+ */
+export const auctionBid = onchainTable(
+  'auction_bid',
+  (t) => ({
+    /** `"<auction>-<bidId>"`, lower-cased. */
+    id: t.text().primaryKey(),
+    auction: t.hex().notNull(),
+    /** `"usdg"` or `"eth"`, from which of the adapter's two legs this auction is. */
+    leg: t.text().notNull(),
+    bidId: t.bigint().notNull(),
+    owner: t.hex().notNull(),
+    maxPriceQ96: t.bigint().notNull(),
+    amountQ96: t.bigint().notNull(),
+    submittedBlock: t.bigint().notNull(),
+    submittedAt: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+    /** Non-zero once the bidder exited: the fill and the refund have been settled. */
+    exitedBlock: t.bigint().notNull(),
+    /** AMPS the exit realised, and the currency it got back. Both zero until the exit. */
+    tokensFilled: t.bigint().notNull(),
+    currencyRefunded: t.bigint().notNull(),
+    /** Non-zero once `claimTokens` moved the filled AMPS. */
+    claimedBlock: t.bigint().notNull(),
+    claimedAmount: t.bigint().notNull(),
+  }),
+  (table) => ({byAuction: index().on(table.auction), byOwner: index().on(table.owner)}),
+)
+
+/**
+ * Every checkpoint either auction wrote: the clearing-price series.
+ *
+ * `checkpoint()` is a write, not a view, so the clearing price only moves when somebody pays to
+ * advance it. That makes the series the honest record of what the auction actually charged at each
+ * point — and it is the only way to draw the price over the bidding window, because a `view` read
+ * gives one number and no history.
+ */
+export const auctionCheckpoint = onchainTable(
+  'auction_checkpoint',
+  (t) => ({
+    id: t.text().primaryKey(),
+    auction: t.hex().notNull(),
+    leg: t.text().notNull(),
+    blockNumber: t.bigint().notNull(),
+    timestamp: t.bigint().notNull(),
+    txHash: t.hex().notNull(),
+    logIndex: t.integer().notNull(),
+    clearingPriceQ96: t.bigint().notNull(),
+    /** Share of the tranche issued by this block, in milli-bips (`1e7` = 100%). */
+    cumulativeMps: t.bigint().notNull(),
+  }),
+  (table) => ({byAuction: index().on(table.auction), byBlock: index().on(table.blockNumber)}),
+)
+
 /** Every `Redeem`: the floor exit. */
 export const redemption = onchainTable(
   'redemption',

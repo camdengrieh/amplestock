@@ -5,6 +5,7 @@ import {AmpsBonds} from "../../src/bonds/AmpsBonds.sol";
 import {IAmpsBonds} from "../../src/interfaces/IAmpsBonds.sol";
 import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IAmpsQuoter} from "../../src/interfaces/IAmpsQuoter.sol";
+import {IOracleGate} from "../../src/interfaces/IOracleGate.sol";
 import {PriceLib} from "../../src/lib/PriceLib.sol";
 import {AmpsQuoter} from "../../src/periphery/AmpsQuoter.sol";
 import {BondPolicy} from "../../src/policy/BondPolicy.sol";
@@ -552,6 +553,30 @@ contract AmpsQuoterTest is QuoterFixture {
         assertEq(quote.dynCapBps, Constants.DYN_CAP_NORMAL_BPS, "the hook's cached cap wins while it answers");
     }
 
+    /// @notice **Audit lead: permissive enum clamps.** An ordinal the quoter does not recognise is the *worse*
+    ///         state, not the better one. These clamps used to fall to zero — `GREEN` and `REGULAR` — so a gate
+    ///         answering with garbage rendered as a perfectly healthy market with no degraded bit set, which is the
+    ///         opposite of what `AmpsHook._snapshotInto` does with the same two words, and the opposite of what a
+    ///         consumer needs.
+    function test_lead_aMalformedGateOrdinalRendersAsDegradedAndClosed() public {
+        // Thirteen well-formed words with two impossible ordinals in them: a legal ABI answer the enums do not
+        // cover, which is exactly the shape a re-pointed or buggy gate produces.
+        bytes memory snapshot;
+        for (uint256 i; i < 13; ++i) {
+            snapshot = abi.encodePacked(snapshot, i == 0 ? uint256(99) : (i == 1 ? uint256(42) : uint256(0)));
+        }
+        vm.mockCall(
+            address(proxies[SOURCE_GATE]),
+            abi.encodeWithSelector(IOracleGate.snapshotByPool.selector, stockPool),
+            snapshot
+        );
+
+        IAmpsQuoter.PoolQuote memory quote = quoter.quotePool(stockPool);
+        assertEq(uint8(quote.gateState), uint8(GateState.DEGRADED), "an unknown gate ordinal reads as degraded");
+        assertEq(uint8(quote.session), uint8(Session.CLOSED), "and an unknown session as closed");
+        assertEq(quote.degraded & quoter.DEGRADED_GATE(), quoter.DEGRADED_GATE(), "with the gate bit raised");
+    }
+
     /// @notice With the hook down, the gate's copies of the cap and the fair tick are what the quote falls back to.
     function test_quotePool_gateIsTheFallbackForTheHooksCache() public {
         proxies[SOURCE_GATE].setTarget(address(gateStub));
@@ -839,6 +864,61 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
         assertEq(charged[0], feePips, "and the hook charged the quoted fee");
     }
 
+    /// @notice **Audit finding 14.** The rail is checked twice on chain — on the start-of-swap tick in
+    ///         `beforeSwap` and on the post-swap tick in `afterSwap` — and this view modelled only the first, so a
+    ///         swap that begins inside the rail and ends beyond it quoted as executable and then reverted. The
+    ///         simulation already computes the tick the swap ends on; that is the number the hook will judge.
+    function test_f14_aSwapThatEndsBeyondTheRailQuotesAsRefused() public {
+        int24 tickBefore = _tickOf(usdgPool);
+        (uint256 out, bool complete, int24 tickAfter) =
+            quoter.simulateExactIn(usdgPool, TICK_SPACING, false, USDG_IN, BUY_FEE_PIPS);
+        assertTrue(complete, "the walk finished");
+        assertGt(out, 0, "and the swap really does execute");
+        assertGt(tickAfter, tickBefore, "a buy moves the tick up");
+
+        // The pool starts 100 ticks from fair on the side a buy makes worse, and ends `tickAfter - fair` away.
+        int24 devBefore = 100;
+        int24 fair = tickBefore - devBefore;
+        int24 devAfter = tickAfter - fair;
+        assertGt(devAfter, devBefore, "so the buy is deviation-increasing");
+        hookStub.setTicks(usdgPool, tickBefore, fair);
+
+        // A rail strictly between the two: inside at the start, outside at the end.
+        int24 rail = devBefore + (devAfter - devBefore) / 2;
+        hookStub.setBands(usdgPool, Constants.INNER_BAND_REGULAR_TICKS, rail, Constants.DYN_CAP_NORMAL_BPS);
+
+        (uint256 quoted, uint24 feePips, bool refuse, uint8 degraded) = quoter.quoteExactIn(usdgPool, false, USDG_IN);
+        assertTrue(refuse, "the quote refuses the swap the hook would refuse");
+        assertEq(quoted, 0, "and offers no output for a route that does not exist");
+        assertEq(feePips, BUY_FEE_PIPS, "while still reporting what it would have cost");
+        assertEq(degraded, 0, "this is a refusal, not a degraded read");
+
+        // `wouldRevert` says which half refused, so a front end can tell the two apart.
+        (bool wouldRefuse, bytes32 reason,) = quoter.wouldRevert(usdgPool, false, true, USDG_IN);
+        assertTrue(wouldRefuse, "wouldRevert agrees");
+        assertEq(reason, bytes32("railAfter"), "and names the post-swap half");
+
+        // The control: widen the rail past the end of the swap and the same quote is executable again.
+        hookStub.setBands(usdgPool, Constants.INNER_BAND_REGULAR_TICKS, devAfter + 1, Constants.DYN_CAP_NORMAL_BPS);
+        (quoted,, refuse,) = quoter.quoteExactIn(usdgPool, false, USDG_IN);
+        assertFalse(refuse, "inside the rail at both ends");
+        assertEq(quoted, out, "and quoted to the wei");
+    }
+
+    /// @notice A deviation-**decreasing** swap is never refused by the post-swap half either, exactly as on chain:
+    ///         `afterSwap` refuses only a swap that ended further from fair than it started.
+    function test_f14_aPriceImprovingSwapIsNeverRefusedByThePostSwapHalf() public {
+        int24 tickBefore = _tickOf(usdgPool);
+        // Fair sits above the pool, so a *buy* moves toward it however far it goes.
+        hookStub.setTicks(usdgPool, tickBefore, tickBefore + 5000);
+        hookStub.setBands(usdgPool, Constants.INNER_BAND_REGULAR_TICKS, 1, Constants.DYN_CAP_NORMAL_BPS);
+
+        (uint256 quoted,, bool refuse, uint8 degraded) = quoter.quoteExactIn(usdgPool, false, USDG_IN);
+        assertFalse(refuse, "a price-improving swap is quoted, however tight the rail");
+        assertGt(quoted, 0, "and it has an output");
+        assertEq(degraded, 0, "clean");
+    }
+
     /// @notice A one-hop uncredited sell, the same way.
     function test_quoteExactIn_sellMatchesARealSwap() public {
         (uint256 quoted, uint24 feePips,, uint8 degraded) = quoter.quoteExactIn(usdgPool, true, AMPS_IN);
@@ -955,6 +1035,65 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
             (, uint24 less,,) = quoter.quoteSellWithCredit(usdgPool, ampsIn, credit - 1);
             assertGe(less, feePips, "more credit is never a higher fee");
         }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Re-audit lead: the quoter must not price a route the router refuses
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit lead (demoted finding).** `quoteRotation` returns zeros for a same-pool route.
+    /// @dev `AmpsRouter.rotate` refuses `hop1 == hop2` (`SameHop`), so quoting it published a route that always
+    ///      reverted on execution -- the one failure a quoter exists to prevent. Zeros throughout, because there is
+    ///      no price to report for a route that cannot be built.
+    function test_r14_quoteRotationIsZeroForASamePoolRoute() public view {
+        (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed) =
+            quoter.quoteRotation(usdgPool, usdgPool, 1000e6);
+        assertEq(amountOut, 0, "no route");
+        assertEq(hop1FeePips, 0, "and no fee to report for it");
+        assertEq(hop2FeePips, 0, "on either leg");
+        assertEq(creditUsed, 0, "and no credit");
+    }
+
+    /// @notice And for a route with no constituent spoke on either leg, which `rotate` refuses as `NotARotation`.
+    /// @dev The two entry pools are the way in and the way out of the index, so a hop between them is not a
+    ///      rotation at any price: pricing it pass-through sold a 60 bp swap against protocol-owned liquidity.
+    function test_r14_quoteRotationIsZeroForARouteWithNoSpokeLeg() public {
+        // Demote the stock pool to an entry-class pool with no constituent: an entry-to-entry pair.
+        registry.setPool(
+            stockPool,
+            PoolConfig({
+                counter: STOCK_ADDRESS,
+                poolClass: PoolClass.ENTRY,
+                counterDecimals: 18,
+                tickSpacing: TICK_SPACING,
+                buyFeeBps: BUY_FEE_BPS,
+                constituentId: 0,
+                registered: true,
+                gridBaseTick: 0
+            })
+        );
+
+        (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed) =
+            quoter.quoteRotation(stockPool, usdgPool, STOCK_IN);
+        assertEq(amountOut, 0, "no route");
+        assertEq(hop1FeePips, 0, "and no fee to report for it");
+        assertEq(hop2FeePips, 0, "on either leg");
+        assertEq(creditUsed, 0, "and no credit");
+    }
+
+    /// @notice **Re-audit lead.** The blend at `ampsIn == 0` answers what the hook answers.
+    /// @dev The hook blends on `uncredited == amountIn - min(credit, amountIn)`, so a zero-sized pass-through sell
+    ///      is "fully covered" and prices at `buyFeeBps` -- which is the question the view surface is being asked,
+    ///      "what would a pass-through sell cost". The quoter required `ampsIn != 0 && credit != 0` and answered
+    ///      `ampsFeeBps` instead: a 495 bp disagreement on the headline rate of a rotation.
+    function test_r14_theZeroAmountBlendMatchesTheHook() public view {
+        (, uint24 zeroNoCredit,,) = quoter.quoteSellWithCredit(usdgPool, 0, 0);
+        (uint24 hookPips,,,) = hookStub.quoteFee(usdgPool, true, true, 0, true);
+        assertEq(zeroNoCredit, hookPips, "the quoter and the hook agree at zero");
+        assertEq(zeroNoCredit, BUY_FEE_PIPS, "which is the pass-through base");
+
+        (, uint24 zeroWithCredit,,) = quoter.quoteSellWithCredit(usdgPool, 0, 1e18);
+        assertEq(zeroWithCredit, BUY_FEE_PIPS, "and a credit does not change it");
     }
 
     /// @notice The `F_MIN_BPS` floor: a fully credited sell in a 1 bp pool would price at 1 bp, and the hook's
@@ -1085,6 +1224,11 @@ contract AmpsQuoterExactnessTest is QuoterFixture {
     /// @notice Sizes from dust to a large fraction of the pool all match a real swap to the wei.
     /// @param amountIn The buy size in USDG.
     function testFuzz_quoteExactIn_matchesARealSwap(uint96 amountIn) public {
+        // This suite is about the swap arithmetic, and the amounts it fuzzes are large enough to walk a fifth of
+        // the pool — which the *production* hook would refuse on the post-swap rail and the quoter now models
+        // (audit finding 14). `QuoterHookStub` enforces no rail of its own, so widening it to the tick domain is
+        // what keeps the two comparable; the rail itself is drilled by `test_f14_*` above.
+        hookStub.setBands(usdgPool, Constants.INNER_BAND_REGULAR_TICKS, 887_272, Constants.DYN_CAP_NORMAL_BPS);
         amountIn = uint96(bound(amountIn, 1e3, 200_000e6));
         (uint256 quoted,,, uint8 degraded) = quoter.quoteExactIn(usdgPool, false, amountIn);
         vm.assume(degraded == 0);

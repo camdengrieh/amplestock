@@ -273,6 +273,7 @@ export function toEnv(addresses: Record<string, string>): NodeJS.ProcessEnv {
     feePolicy: 'AMPS_FEE_POLICY',
     bondPolicy: 'AMPS_BOND_POLICY',
     oracleGate: 'AMPS_ORACLE_GATE',
+    genesis: 'AMPS_GENESIS',
     teamVesting: 'AMPS_TEAM_VESTING',
     usdg: 'AMPS_USDG',
     weth9: 'AMPS_WETH9',

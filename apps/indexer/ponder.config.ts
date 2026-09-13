@@ -12,7 +12,14 @@
  *   apart from any other swap at all: the hook prices a hop at the pass-through fee only when the
  *   `PoolManager`'s caller is `AmpsHook.router()` **and** the hop declares the rotate flag, so a
  *   rotation is a fact about the router's own log, not about the `Swap`. There is no `AmpsStaking`
- *   source: revision 6 removed the contract.
+ *   source: revision 6 removed the contract. `AmpsGenesis` is the newest of them and the only one
+ *   that stops emitting: it announces the two auctions, then settles them, and is finished.
+ * - **The two genesis auctions** are Uniswap's contracts, deployed by Uniswap's factory at
+ *   addresses nobody knows until `AmpsGenesis.createAuctions` runs — so they are a **factory**
+ *   source over `AmpsGenesis.AuctionsCreated`, subscribed twice because Ponder's `factory` reads
+ *   one parameter and the adapter announces both legs in one log. Their ABI is hand-written in
+ *   `src/abi/external.ts` (events only) for the same reason the Stock Token's is: we do not author
+ *   them, so codegen over `contracts/out` will never produce them.
  * - **The Uniswap v4 `PoolManager`** is one shared deployment carrying every pool on the chain, so
  *   `Swap`, `ModifyLiquidity` and `Initialize` are filtered to our own `PoolId`s. When the id set
  *   is known ahead of time (`AMPS_POOL_IDS`, or `AMPS_POOLS` pointing at the `pools.json` that
@@ -36,6 +43,7 @@
 import {
   ampsAbi,
   ampsBondsAbi,
+  ampsGenesisAbi,
   ampsHookAbi,
   ampsRouterAbi,
   ampsVaultAbi,
@@ -49,7 +57,7 @@ import {
 import {createConfig, factory} from 'ponder'
 import {getAbiItem} from 'viem'
 
-import {chainlinkAggregatorAbi} from './src/abi/external'
+import {chainlinkAggregatorAbi, continuousClearingAuctionAbi} from './src/abi/external'
 import {resolveAddresses} from './src/config/addresses'
 import {readEnv} from './src/config/env'
 import {denylistWatchList, poolIdFilter} from './src/config/pools'
@@ -70,6 +78,7 @@ const swapFilter =
 
 const constituentAdded = getAbiItem({abi: poolRegistryAbi, name: 'ConstituentAdded'})
 const feedSet = getAbiItem({abi: feedRegistryAbi, name: 'FeedSet'})
+const auctionsCreated = getAbiItem({abi: ampsGenesisAbi, name: 'AuctionsCreated'})
 
 const chain = {
   id: env.chainId,
@@ -90,6 +99,7 @@ export default createConfig({
     AmpsVault: {chain: 'amps', abi: ampsVaultAbi, address: book.vault, ...window},
     AmpsBonds: {chain: 'amps', abi: ampsBondsAbi, address: book.bonds, ...window},
     AmpsRouter: {chain: 'amps', abi: ampsRouterAbi, address: book.router, ...window},
+    AmpsGenesis: {chain: 'amps', abi: ampsGenesisAbi, address: book.genesis, ...window},
     AmpsToken: {chain: 'amps', abi: ampsAbi, address: book.amps, ...window},
     PoolRegistry: {chain: 'amps', abi: poolRegistryAbi, address: book.registry, ...window},
     OracleGate: {chain: 'amps', abi: oracleGateAbi, address: book.oracleGate, ...window},
@@ -109,6 +119,32 @@ export default createConfig({
       abi: poolManagerAbi,
       address: book.poolManager,
       ...(swapFilter ? {filter: swapFilter} : {}),
+      ...window,
+    },
+    // The two Continuous Clearing Auctions, as two factories over the one `AuctionsCreated` log.
+    // Ponder's `factory` reads a single parameter, and the adapter announces both legs in one
+    // event, so the same event is subscribed twice — once per parameter — and each source carries
+    // only its own leg. That is what lets a bid row say `usdg` or `eth` without a second read.
+    GenesisAuctionUsdg: {
+      chain: 'amps',
+      abi: continuousClearingAuctionAbi,
+      address: factory({
+        address: book.genesis,
+        event: auctionsCreated,
+        parameter: 'usdgAuction',
+        startBlock: env.startBlock,
+      }),
+      ...window,
+    },
+    GenesisAuctionEth: {
+      chain: 'amps',
+      abi: continuousClearingAuctionAbi,
+      address: factory({
+        address: book.genesis,
+        event: auctionsCreated,
+        parameter: 'ethAuction',
+        startBlock: env.startBlock,
+      }),
       ...window,
     },
     ChainlinkAggregator: {

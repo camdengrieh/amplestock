@@ -156,6 +156,14 @@ contract TestnetPools is Registry {
             return;
         }
 
+        // Bootstrap step 2b: the mocks' feeds, and no registration. `AmpsVault.genesisPlace` checkpoints, and a
+        // checkpoint prices WETH9 and USDG, so their feeds have to exist before `06b_GenesisSettle` — while the
+        // pools themselves are opened after it, at `P0`. See `Registry.installFeeds`.
+        if (vm.envOr("REGISTRY_FEEDS_ONLY", false)) {
+            console2.log("feeds-only pass: %s feeds installed", installFeedsOnly(core));
+            return;
+        }
+
         (Assets memory assets, Registry.Result memory result) = execute(core, loadAssets());
         writeAssets(assets);
         recordAssets(assets);
@@ -176,25 +184,39 @@ contract TestnetPools is Registry {
 
         assets = deployAssets(_deployer(core), known, spokes.length);
         _assertOrdering(core.amps, assets);
-
-        // Substitute the mocks for the 4663 addresses the config carries, name by name. The entry pools are
-        // matched by ticker rather than by position, so reordering the config cannot silently swap the hub for
-        // the WETH leg — which `PoolRegistry.registerEntryPool` would then reject on `counterDecimals`.
-        uint256 usdgIndex = _entryIndex(entries, "USDG");
-        uint256 wethIndex = _entryIndex(entries, "WETH");
-        entries[usdgIndex].counter = assets.usdg;
-        entries[usdgIndex].feed = assets.usdgFeed;
-        entries[wethIndex].counter = assets.weth9;
-        entries[wethIndex].feed = assets.wethFeed;
-        for (uint256 i; i < spokes.length; ++i) {
-            spokes[i].token = assets.stocks[i];
-            spokes[i].feed = assets.feeds[i];
-        }
+        _substitute(entries, spokes, assets);
 
         // Inherited, not delegated: `Registry.execute` opens the broadcast window, and a window opened by a
         // *helper contract* writes every transaction with the same nonce (docs/deploy-runbook.md §0.1). Because
         // this contract IS a `Registry`, the window and all ~97 calls belong to the script forge was pointed at.
         result = execute(core, entries, spokes);
+    }
+
+    /// @notice The feeds-only pass, against the mocks: deploys anything missing, substitutes the mock addresses
+    ///         for the 4663 book's and installs every feed, registering nothing.
+    /// @dev Reads what already exists from `script/config/testnet.json`, which the assets pass writes. A caller
+    ///      that already holds the set — a test, or a run that deployed them in the same frame — passes it to the
+    ///      overload instead, because re-reading the file would deploy a *second* set of mocks and install feeds
+    ///      for tokens nothing else in the deployment refers to.
+    /// @param core The core addresses.
+    /// @return installed How many feeds this run configured.
+    function installFeedsOnly(Registry.Wiring memory core) public returns (uint256 installed) {
+        return installFeedsOnly(core, loadAssets());
+    }
+
+    /// @notice The feeds-only pass against a known asset set.
+    /// @param core The core addresses.
+    /// @param known The mocks that already exist; zero entries are deployed.
+    /// @return installed How many feeds this run configured.
+    function installFeedsOnly(Registry.Wiring memory core, Assets memory known) public returns (uint256 installed) {
+        Registry.SpokeSpec[] memory spokes = loadSpokes();
+        Registry.EntryPoolSpec[] memory entries = loadEntryPools();
+
+        Assets memory assets = deployAssets(_deployer(core), known, spokes.length);
+        _assertOrdering(core.amps, assets);
+        _substitute(entries, spokes, assets);
+
+        installed = installFeeds(core, entries, spokes);
     }
 
     /// @notice Deploys the two counter assets, their aggregators and the 30 stock/aggregator pairs, skipping
@@ -349,6 +371,26 @@ contract TestnetPools is Registry {
     }
 
     /// @dev The index of the entry pool with `symbol`, or a revert. Two entries, so a scan is the whole story.
+    /// @dev Substitutes the mocks for the 4663 addresses the config carries, name by name. The entry pools are
+    ///      matched by ticker rather than by position, so reordering the config cannot silently swap the hub for
+    ///      the WETH leg — which `PoolRegistry.registerEntryPool` would then reject on `counterDecimals`.
+    function _substitute(
+        Registry.EntryPoolSpec[] memory entries,
+        Registry.SpokeSpec[] memory spokes,
+        Assets memory assets
+    ) private pure {
+        uint256 usdgIndex = _entryIndex(entries, "USDG");
+        uint256 wethIndex = _entryIndex(entries, "WETH");
+        entries[usdgIndex].counter = assets.usdg;
+        entries[usdgIndex].feed = assets.usdgFeed;
+        entries[wethIndex].counter = assets.weth9;
+        entries[wethIndex].feed = assets.wethFeed;
+        for (uint256 i; i < spokes.length; ++i) {
+            spokes[i].token = assets.stocks[i];
+            spokes[i].feed = assets.feeds[i];
+        }
+    }
+
     function _entryIndex(Registry.EntryPoolSpec[] memory entries, string memory symbol)
         private
         pure

@@ -70,6 +70,34 @@ known failure modes, then closed. Every line of `contracts/src/bonds/**` and
 accounting, oracle gating and accretion floor. The licence gate exists in large part to keep this
 claim mechanically true.
 
+### Uniswap Continuous Clearing Auction — the auction interfaces genesis talks to
+
+Amplestocks sells half of `S0` at launch through two [Continuous Clearing
+Auctions](https://github.com/Uniswap/continuous-clearing-auction) (CCA v2.x, **MIT**), deployed
+through Uniswap's canonical `ContinuousClearingAuctionFactory`. The CCA repository is MIT and would
+have been permissible to vendor. It is not vendored, for a practical reason rather than a licence
+one: its `IContinuousClearingAuction` inherits six storage interfaces plus `ILBPInitializer` from the
+`liquidity-launcher` submodule, so reaching the five functions `AmpsGenesis` actually calls would
+mean adding two git submodules to the build.
+
+`contracts/src/interfaces/external/IContinuousClearingAuction.sol` and
+`IContinuousClearingAuctionFactory.sol` are therefore **hand-written MIT interfaces of our own**,
+declaring only the surface `contracts/src/genesis/AmpsGenesis.sol` uses. They were written against
+the upstream interface files, `TechnicalDocumentation.md` and `CHANGELOG.md` as a specification, and
+they restate two things verbatim because those two things *are* ABI and a paraphrase would be a bug:
+the field order and widths of the `AuctionParameters` struct, and the packing of `auctionStepsData`.
+No CCA source file is imported, copied or compiled into this repository, and nothing under
+`contracts/src/**` links against the CCA or the Liquidity Launcher.
+
+The auction *mechanism* — continuous-time uniform-price clearing with supply rollover — is Uniswap's
+and is not reimplemented here: Amplestocks consumes the deployed auction's result (`clearingPrice`,
+`isGraduated`, `sweepCurrency`, `sweepUnsoldTokens`) rather than re-deriving any of it. The one place
+the protocol departs from the stock integration is the handoff: the Liquidity Launcher's LBP strategy
+initialises a Uniswap v4 pool itself, which `AmpsHook.beforeInitialize` forbids for any sender but the
+vault, so `AmpsGenesis` reads the clearing price and hands the proceeds to `AmpsVault.genesisPlace`
+instead. `contracts/test/mocks/MockCCA.sol` and `MockCCAFactory.sol` are our own test doubles written
+from the same documents; they are not derived from CCA source either.
+
 ## Third-party code we do import
 
 | Dependency | Licence | Where it is used |
@@ -80,6 +108,9 @@ claim mechanically true.
 | [`hookmate`](https://github.com/z0r0z/hookmate) 0.6.0 | MIT | `HookMiner`-adjacent helpers and prebuilt Uniswap v4 artefacts used in tests. |
 | Uniswap v4-core 1.0.2 | mixed — see below | Interfaces, libraries and types imported by `contracts/src/**`. |
 | Uniswap v4-periphery 1.0.3 | MIT | Periphery libraries and `HookMiner`, used by scripts and tests. |
+
+Uniswap's Continuous Clearing Auction is **not** in this table: it is called at runtime through
+hand-written interfaces (above), never imported.
 
 ### Uniswap v4-core is not uniformly MIT
 

@@ -438,7 +438,7 @@ struct Checkpoint {
 ///      [232..255] (free)
 ///
 ///      slot +1
-///      [  0..127] uint128 amount        AMPS wei (ask) or counter raw units (bid) committed at placement
+///      [  0..127] uint128 amount        AMPS wei (ask) or counter raw units (bid) the cell still holds
 ///      [128..191] uint64  tiltX18       the `ladderTilt` in force at placement
 ///      [192..215] int24   anchorTick    the anchor the ladder was measured from
 ///      [216..255] (free)
@@ -450,7 +450,12 @@ struct Checkpoint {
 /// @param buckets The ladder's bucket count at placement time.
 /// @param above True for an ask bucket, false for a bid bucket.
 /// @param placedAt Placement timestamp.
-/// @param amount The token amount committed at placement.
+/// @param amount The token amount the cell holds: what placements committed into it, less what removals took out.
+///        Pro-rated on a partial removal and zeroed on a whole one (the buyback burn, a retired-bid withdrawal, a
+///        pro-rata redemption), so it describes the cell's live inventory rather than its lifetime gross — which
+///        is what it used to do, and what made every off-chain reader over-report the ladder (audit fix,
+///        2026-09-08). It is a disclosure field: the liquidity is authoritative, and `amount` is what makes a
+///        ladder auditable cell by cell against `ILadderPolicy`'s own weight vector.
 /// @param tiltX18 The tilt in force at placement.
 /// @param anchorTick The ladder anchor.
 struct PlacementRecord {
@@ -507,7 +512,7 @@ struct GridCell {
 ///      the lock, which is what lets the gauntlet run entirely on values captured at entry.
 ///
 /// @dev **The gauntlet the vault runs around this** (§3.8, and it is the vault's job, never the policy's): the
-///      transient lock and `_requireHealthy`; `IOracleGate.checkPlacement`; divergence at entry *and* exit;
+///      transient lock and `_requirePlaceable`; `IOracleGate.checkPlacement`; divergence at entry *and* exit;
 ///      sidedness (I9 — asks strictly above `alignUp(currentTick)`, bids strictly below `alignDown(currentTick)`);
 ///      grid membership (I39) and `sum(amounts) <= amount`; the 60-second cooldown; the R1 revert; `armSurge`
 ///      after; `_sweepClean` at exit. Every bucket a policy proposes is re-checked here, never trusted.
@@ -564,7 +569,7 @@ struct Placed {
 ///      [ 16.. 31] uint16 constituentId            [ 24.. 55] uint32 lastUpdate        [ 16.. 47] uint32 surgeArmedAt
 ///      [ 32.. 39] uint8  poolClass                [ 56.. 79] int24  fairTick          [ 48.. 63] uint16 captureFeeBps
 ///      [ 40.. 63] int24  tickSpacing              [ 80..103] int24  innerBandTicks    [ 64.. 95] uint32 captureArmedAt
-///      [ 64.. 87] int24  maxTickMovePerBlock      [104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX18
+///      [ 64.. 87] int24  maxTickMovePerBlock      [104..127] int24  outerRailTicks    [ 96..159] uint64 uiMultiplierX9
 ///      [ 88.. 95] uint8  counterDecimals          [128..143] uint16 dynCapBps         [160..223] uint64 varianceX18
 ///      [ 96..119] int24  gridBaseTick             [144..151] uint8  session           [224..255] uint32 lastCorporate
 ///      [120..127] bool   initialized              [152..159] uint8  gateFlags                            Check
@@ -582,8 +587,10 @@ struct Placed {
 ///      whenever `maxTickMovePerBlock` bound the last write, and that difference is the security property (I25).
 ///
 /// @dev **`gateFlags` is a bitfield**: bit0 `degraded`, bit1 `corporateFreeze`, bit2 `refreshFailed`, bit3
-///      `caArmed`. `refreshFailed` records that a bounded `staticcall` inside the last gate refresh failed and the
-///      cached values were kept — `afterSwap` never reverts for a downstream failure, it raises this flag instead.
+///      `caArmed`, bit4 `stepDown`. `refreshFailed` records that a bounded `staticcall` inside the last gate
+///      refresh failed and the cached values were kept — `afterSwap` never reverts for a downstream failure, it
+///      raises this flag instead. `stepDown` records the sign of the `uiMultiplier()` step the standing capture
+///      toll was armed by, which is what decides the side that toll is charged on.
 ///
 /// @param initialized Whether `afterInitialize` has run for this pool.
 /// @param poolClass The pool's fee bucket.
@@ -591,7 +598,9 @@ struct Placed {
 /// @param buyFeeBps The base buy fee.
 /// @param tickSpacing The pool's tick spacing.
 /// @param maxTickMovePerBlock The oracle truncation cap.
-/// @param uiMultiplierX18 Last observed Stock Token display multiplier.
+/// @param uiMultiplierX9 Last observed Stock Token display multiplier, stored as `uiMultiplier() / 1e9` so that a
+///        name past 18.45x does not saturate the 64-bit field and silence the step detector for good. Multiply by
+///        `1e9` for the 18-decimal number the token itself reports.
 /// @param varianceX18 EWMA realised variance driving `f_vol`.
 /// @param lastSwapAt Timestamp of the last swap.
 /// @param surgeBps Surge fee at arming time.
@@ -620,7 +629,7 @@ struct HookPoolState {
     uint16 buyFeeBps;
     int24 tickSpacing;
     int24 maxTickMovePerBlock;
-    uint64 uiMultiplierX18;
+    uint64 uiMultiplierX9;
     uint64 varianceX18;
     uint32 lastSwapAt;
     uint16 surgeBps;

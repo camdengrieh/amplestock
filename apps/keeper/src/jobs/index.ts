@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The five jobs: how each one is encoded, simulated and priced.
+ * The jobs: how each one is encoded, simulated and priced.
+ *
+ * Five of them are calls on `AmpsVault` and one — `settle` — is a call on `AmpsGenesis`. The
+ * difference matters in exactly two places, {@link encodeJob} and {@link jobTarget}, and nowhere
+ * else: the screen, the simulation, the gas buffer and the send path treat it like any other
+ * unpaid job.
  *
  * Every send is preceded by an `eth_call` and an `eth_estimateGas` against the same block. That is not
  * belt-and-braces — it is where four of the placement gauntlet's nine guards actually become visible:
@@ -28,7 +33,7 @@ import {
   type Hex,
   type PublicClient,
 } from 'viem'
-import {ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
+import {ampsGenesisAbi, ampsVaultAbi, bountyPotAbi} from '@amplestocks/abis'
 import {BOUNTIED_JOBS, type BountyReport, type JobCandidate, type JobKind, type Simulation} from '../domain/types.js'
 
 /**
@@ -47,6 +52,14 @@ import {BOUNTIED_JOBS, type BountyReport, type JobCandidate, type JobKind, type 
  */
 export const KEEPER_ERROR_ABI = parseAbi([
   'error PlacementCooldown(bytes32 poolId, uint32 readyAt)',
+  // `AmpsGenesis`'s own, for the settle job. `AuctionNotEnded` is the one an over-eager keeper
+  // trips; `GateNotHealthy` above is the one a launch stuck behind an early gate pointer trips,
+  // and it is the same error the vault raises because the revert comes from `genesisPlace`.
+  'error AuctionNotEnded(address auction, uint64 endBlock)',
+  'error AlreadySettled()',
+  'error AuctionsNotCreated()',
+  'error NotSweptClean(address token, uint256 balance)',
+  'error ZeroClearingPrice(address auction)',
   'error PlacementDiverged(bytes32 poolId, int24 poolTick, int24 fairTick, int24 maxTicks)',
   'error GateNotHealthy(uint8 state, bytes32 poolId)',
   'error NavBleedExceeded(uint256 navBefore, uint256 navAfter, uint16 maxBleedBps)',
@@ -64,7 +77,7 @@ export const KEEPER_ERROR_ABI = parseAbi([
   'error Reentrancy()',
 ])
 
-/** The vault call one job makes. */
+/** The call one job makes. */
 export function encodeJob(job: JobCandidate): Hex {
   switch (job.kind) {
     case 'compound':
@@ -77,7 +90,29 @@ export function encodeJob(job: JobCandidate): Hex {
       return encodeFunctionData({abi: ampsVaultAbi, functionName: 'checkpoint', args: []})
     case 'touch':
       return encodeFunctionData({abi: ampsVaultAbi, functionName: 'touch', args: []})
+    case 'settle':
+      return encodeFunctionData({abi: ampsGenesisAbi, functionName: 'settle', args: []})
   }
+}
+
+/**
+ * Where one job's transaction goes, and whose ABI decodes its revert.
+ *
+ * Five of the six are the vault. `settle` is `AmpsGenesis`, whose address the job carries in its
+ * own `target` — which is why the target of a `settle` is an address rather than a pool id or a
+ * constituent number. Sending it to the vault would be a call to a selector the vault does not
+ * have, which reverts with no data at all and tells an operator nothing.
+ */
+export function jobTarget(job: JobCandidate, vault: Address, genesis: Address | undefined): Address {
+  if (job.kind !== 'settle') return vault
+  // The candidate carries the adapter, unless it was built without one — `screenSettle` does that for
+  // the "no adapter at all" refusal, which never reaches a simulation or a send. An empty string is
+  // not an address, so it falls through to the topology's pointer rather than being sent as one.
+  return job.target === '' ? (genesis ?? vault) : (job.target as Address)
+}
+
+function abiFor(job: JobCandidate) {
+  return job.kind === 'settle' ? ampsGenesisAbi : ampsVaultAbi
 }
 
 function callArgs(job: JobCandidate): {functionName: string; args: readonly unknown[]} {
@@ -92,6 +127,8 @@ function callArgs(job: JobCandidate): {functionName: string; args: readonly unkn
       return {functionName: 'checkpoint', args: []}
     case 'touch':
       return {functionName: 'touch', args: []}
+    case 'settle':
+      return {functionName: 'settle', args: []}
   }
 }
 
@@ -156,11 +193,13 @@ export async function simulateJob(
   job: JobCandidate,
 ): Promise<Simulation> {
   const {functionName, args} = callArgs(job)
+  const to = jobTarget(job, vault, undefined)
+  const abi = abiFor(job)
   try {
     const {result} = await client.simulateContract({
       account: sender,
-      address: vault,
-      abi: ampsVaultAbi,
+      address: to,
+      abi,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the union of five signatures
       functionName: functionName as any,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -168,8 +207,8 @@ export async function simulateJob(
     })
     const gasEstimate = await client.estimateContractGas({
       account: sender,
-      address: vault,
-      abi: ampsVaultAbi,
+      address: to,
+      abi,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       functionName: functionName as any,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -210,8 +249,21 @@ export function revertLabel(simulation: Simulation): string {
   return simulation.revert?.name ?? 'Unknown'
 }
 
-/** The jobs, in the order the runner considers them. */
-export const JOB_ORDER: readonly JobKind[] = ['touch', 'checkpoint', 'compound', 'deployBonded', 'rollout']
+/**
+ * The jobs, in the order the runner considers them.
+ *
+ * `settle` is first because it is the one job with a deadline the protocol cares about: the launch
+ * cannot proceed until it lands, the five ordinary jobs have nothing to do before it, and once it
+ * has succeeded it never appears again.
+ */
+export const JOB_ORDER: readonly JobKind[] = [
+  'settle',
+  'touch',
+  'checkpoint',
+  'compound',
+  'deployBonded',
+  'rollout',
+]
 
 // ---------------------------------------------------------------------------------------------------------------
 // Reading the vault's own bounty report

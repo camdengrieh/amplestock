@@ -241,28 +241,51 @@ library VaultPlacementLib {
         Pool memory pool = _gauntletEntry(ctx, cooldown, poolManager, poolId);
         _collectAndSplit(ladder, ctx, poolManager, amps, pool.key);
 
-        uint8 buckets;
-        int24 anchor;
+        // **The buyback settles before an ask placement, not after it** (audit fix, 2026-09-08; §3.5's ordering
+        // rule). {_placeLadder} resets the pool's high-water mark on every ask placement, because an ask laid
+        // under a mark older than itself would satisfy the burn predicate from the moment it opened. But the reset
+        // also *discards* the window, so a `place`, a `rollout` or a `deployBonded` that landed before the next
+        // `compound` erased the record that the price had crossed a cell on the way up — and the AMPS the vault
+        // bought back on the way down stayed in the ladder to be sold a second time instead of being burned (I33).
+        // `compound` settles the window itself at step 4; every other ask placement settles it here, so the rule
+        // is the same everywhere: burn back, then place, then reset. The counter the burn frees stays as an
+        // ERC-6909 claim, which `A` values and the placement below may spend.
+        uint256 boughtBackAmps;
         if (above) {
-            buckets = ctx.ladderDoublings;
-            anchor = _referenceTick(ctx, pool);
-        } else {
-            buckets = pool.config.constituentId == 0 ? ctx.seedHalvings : ctx.bondBidHalvings;
-            anchor = pool.tick;
+            (boughtBackAmps,,) = _burnback(ladder, ctx, pool, poolManager, amps);
+            if (boughtBackAmps != 0) {
+                IAmps(amps).burn(address(this), boughtBackAmps);
+                emit Burn(boughtBackAmps, bytes32("buyback"));
+            }
         }
+
+        // **Both sides anchor at the reference** (audit fix, 2026-09-09). Bids used to anchor at `pool.tick`,
+        // which is only the same anchor while the pool sits at `P_ref`. With the pool 1,000-2,600 ticks above the
+        // reference — a rate-limited `P_ref`, or `REF_DIVERGED` — the top bid cell spans
+        // `sqrtPrice(P_ref / P_counter)`, and `LadderPositionValuer` decomposes every position at exactly that
+        // price (I7) and writes the AMPS half of a straddled cell off at zero (I5). `A` then fell by up to a third
+        // of the collateral being placed and the 2 bp R1 post-condition reverted `deployBonded` and governance
+        // bids on a valuation artefact. {_cells}' bid branch already takes `min(fromAnchor, fromTick)`, so the
+        // live tick still binds the ladder whenever it is the lower of the two: the anchor can only pull the
+        // ladder *down*, never up through the reference.
+        uint8 buckets =
+            above ? ctx.ladderDoublings : (pool.config.constituentId == 0 ? ctx.seedHalvings : ctx.bondBidHalvings);
+        int24 anchor = _referenceTick(ctx, pool);
 
         placed =
             _placeLadder(ladder, ctx, pool, poolManager, amps, above, amount, anchor, buckets, reason, strictBudget);
 
         _requireConverged(ctx, poolManager, poolId, pool.config);
 
-        // **The cooldown is the placement's, not the call's** (audit fix, 2026-09-07). Writing it unconditionally
-        // meant a call that placed *nothing* — trivially reachable, and permissionlessly, because `rollout` and
-        // `deployBonded` both reach here with `strictBudget == false` and a full live-cell budget places zero —
-        // still denied the pool to a real `compound` or a governance `place` for `PLACEMENT_COOLDOWN_SECONDS`.
-        // The cooldown exists to rate-limit *placements*; a no-op is not one, so it costs the pool nothing. It is
-        // the same rule §3.6 step 8 applies to a zero-work `compound`.
-        if (placed != 0) cooldown[poolId] = uint32(block.timestamp);
+        // **The cooldown is the work's, not the call's** (audit fix, 2026-09-07, widened 2026-09-09). Writing it
+        // unconditionally meant a call that did *nothing* — trivially reachable, and permissionlessly, because
+        // `rollout` and `deployBonded` both reach here with `strictBudget == false` and a full live-cell budget
+        // places zero — still denied the pool to a real `compound` or a governance `place` for
+        // `PLACEMENT_COOLDOWN_SECONDS`. But this entry point's ask branch also *burns back*, exactly as `compound`
+        // does, and a `place` that bought inventory back and placed none still changed the book: the two entry
+        // points therefore take the cooldown on the same fact, "did this call do any work", and not on two
+        // different ones. A call that placed nothing and bought nothing back costs the pool nothing.
+        if (placed != 0 || boughtBackAmps != 0) cooldown[poolId] = uint32(block.timestamp);
     }
 
     /// @notice The pool price every Amplestocks pool is opened at: the sqrt price of the greatest spacing-aligned
@@ -333,7 +356,7 @@ library VaultPlacementLib {
     ) public returns (uint256 ampsFees, uint256 burned) {
         Ctx memory ctx = _ctx();
         Pool memory pool = _gauntletEntry(ctx, cooldown, poolManager, poolId);
-        (uint256 creatorBps, uint256 feeBps) = _creatorSlice(ctx);
+        (uint256 creatorBps, uint256 feeBps) = _creatorSlice(ctx, poolId);
 
         // 3. Collect, and pay the creator's counter-side slice in kind inside the same unlock. AMPS-side fees come
         //    out as ERC-20 so the burn and the creator's transfer below are plain calls; whatever counter is left
@@ -351,13 +374,19 @@ library VaultPlacementLib {
 
         // 4. The buyback burn, first, so nothing this call places can be mistaken for bought-back inventory
         //    (§3.5's ordering rule).
+        uint256 boughtBack;
         {
-            (uint256 boughtBack, uint256 freedCounter) = _burnback(ladder, pool, poolManager);
+            uint256 freedCounter;
+            uint256 feeBurn;
+            (boughtBack, freedCounter, feeBurn) = _burnback(ladder, ctx, pool, poolManager, amps);
             if (boughtBack != 0) {
                 IAmps(amps).burn(address(this), boughtBack);
                 emit Burn(boughtBack, bytes32("buyback"));
                 burned = boughtBack;
             }
+            // Fees the removed cells had accrued and step 3 had not already collected are fees, not principal:
+            // they went through the creator slice and the burn inside {_burnback}, never into the ladder.
+            burned += feeBurn;
             counter += freedCounter;
         }
 
@@ -378,8 +407,15 @@ library VaultPlacementLib {
         //    fees are burned instead. That is what makes I10 ("ask inventory is genesis POL less sales and rollout
         //    moves") an equality rather than an inequality, and it removes the one path on which `compound` could
         //    re-sell AMPS the protocol had just bought back.
+        //    **And only when the remainder is worth a placement** (audit fix, 2026-09-09). `compound` is
+        //    permissionless, and one wei of counter fee used to make `placed != 0`, which armed `SURGE_MAX_BPS`:
+        //    a dust swap plus a `compound` every sixty seconds pinned a pool's dynamic fee near the cap and its
+        //    placement path closed for a few dollars a day. The remainder is measured with the same feed
+        //    valuation `workValueUsd18` uses above, so the threshold and the bounty agree on what a compound was
+        //    worth; below it the counter simply stays an ERC-6909 claim, where `A` values it (I5) and the next
+        //    compound rolls it in with its own.
         uint256 placed;
-        if (counter != 0) {
+        if (counter != 0 && _counterValueUsd18(ctx, pool.config, counter) >= Constants.COMPOUND_PLACE_MIN_USD18) {
             placed = _placeLadder(
                 ladder,
                 ctx,
@@ -406,27 +442,35 @@ library VaultPlacementLib {
         //    divergence check is **not** gated: it costs the caller nothing and is what proves the pool was not
         //    left mid-manipulation.
         //
-        //    **The two are gated on two different facts** (audit fix, 2026-09-07; kept through revision 6).
-        //    `counterFees != 0` was once in the surge-and-mark condition, and the counter side is whatever a
-        //    *buyer* paid the ladder — one wei of it, which anyone can produce for the price of a dust swap,
-        //    armed `SURGE_MAX_BPS` on the pool and erased the high-water mark the next compound needs to
-        //    recognise its own bought-back inventory. Both are AMPS-side facts and require an AMPS-side event,
-        //    which since revision 6 is exactly `burned != 0`: the fee burn takes the whole AMPS-side remainder
-        //    and the buyback burn is the other half of the same condition, so `burned == 0` means no AMPS moved
-        //    at all. The cooldown is a placement's, so it follows what was actually placed — the counter bids —
-        //    and is zero when a full live-cell budget let none of them commit anything.
-        if (burned != 0) {
-            _resetHighWater(ctx, poolId);
-            _armSurge(ctx, poolId, "compound");
-        }
-        if (placed != 0) cooldown[poolId] = uint32(block.timestamp);
+        //    **The three are gated on three different facts** (audit fix, 2026-09-08). `burned != 0` used to gate
+        //    the mark reset and the surge together, and it is satisfied by a *fee-only* burn — the AMPS side of
+        //    one dust sell, which anybody can produce for the price of a swap. So an unprivileged caller could
+        //    pin the pool's dynamic fee at `SURGE_MAX_BPS` and erase the pending buyback window once a block,
+        //    because the 60-second cooldown was written only when something had been *placed* and a fee-only
+        //    compound places nothing. Each effect now follows the fact it is actually about:
+        //
+        //      * the **mark** is the buyback's own bookkeeping, so it is reset only when inventory really was
+        //        withdrawn and burned (`boughtBack != 0`). A fee burn withdraws nothing and discards no window;
+        //      * the **surge** exists so a placement cannot be sandwiched at the pre-placement fee, so it is
+        //        armed only when this call actually placed something (`placed != 0`);
+        //      * the **cooldown** rate-limits the whole engine per pool, so it is taken whenever the call moved
+        //        inventory — placed something, or bought something back. **A fee-only burn is not that** (audit
+        //        fix, 2026-09-09): `burned` is satisfied by the AMPS side of one dust sell, which anybody can
+        //        produce for the price of a swap, so gating the cooldown on it let a griefer take the pool's
+        //        shared 60-second lock — which `place`, `rollout`, `deployBonded` and `withdrawRetiredBids` all
+        //        honour — once a minute for dust. Burning a fee changes no position and denies nobody anything, so
+        //        it costs the pool nothing; `placed != 0 || boughtBack != 0` is what "this call moved inventory"
+        //        actually means, and it is the same condition {place} takes its own cooldown on.
+        if (boughtBack != 0) _resetHighWater(ctx, poolId);
+        if (placed != 0) _armSurge(ctx, poolId, "compound");
+        if (placed != 0 || boughtBack != 0) cooldown[poolId] = uint32(block.timestamp);
         _requireConverged(ctx, poolManager, poolId, pool.config);
 
         emit Compound(poolId, ampsFees, counterFees, creatorAmps, creatorCounter, burned);
 
         // A `compound` on a pool with no accrued fees and no crossed cell is worth exactly zero, so the pot's
         // `chost` dust guard refuses it and it is paid exactly zero.
-        payBounty(workValueUsd18, gasStart);
+        payBounty(workValueUsd18, gasStart, 1);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -463,8 +507,9 @@ library VaultPlacementLib {
         // separate discriminators because §3.9 gives them separate names and the indexer decodes on them.
         (PoolKey memory key, int24[] memory lowers, uint128[] memory removals) =
             abi.decode(data, (PoolKey, int24[], uint128[]));
-        (uint256 out0, uint256 out1) = _executeHarvest(poolManager, key, lowers, removals);
-        return abi.encode(out0, out1);
+        (uint256 principal0, uint256 principal1, uint256 fees0, uint256 fees1) =
+            _executeHarvest(poolManager, key, lowers, removals);
+        return abi.encode(principal0, principal1, fees0, fees1);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -472,7 +517,7 @@ library VaultPlacementLib {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @dev Steps 2, 3 and 6 of the gauntlet, plus the pool resolution every caller needs. Step 1 (the transient
-    ///      lock and `_requireHealthy`), step 7 (R1) and step 9 (`_sweepClean`) belong to the vault's forwarder;
+    ///      lock and `_requirePlaceable`), step 7 (R1) and step 9 (`_sweepClean`) belong to the vault's forwarder;
     ///      steps 4 and 5 (sidedness and the grid) are per bucket and live in {_executePlace}.
     function _gauntletEntry(
         Ctx memory ctx,
@@ -482,7 +527,17 @@ library VaultPlacementLib {
     ) private view returns (Pool memory pool) {
         // 2. The gate. `REF_DIVERGED` is permitted and has already forced `pRefX18 == navPerShareX18` at the last
         //    checkpoint, which is what "forces the NAV anchor" means in a vault that anchors on the checkpoint.
-        if (ctx.oracleGate != address(0)) IOracleGate(ctx.oracleGate).checkPlacement(poolId);
+        //
+        //    **Bounded** (audit lead, 2026-09-09). The gate is a governance pointer like every other target this
+        //    file reads, so an implementation that loops must not be able to take the placement's whole frame with
+        //    it. It is the one pointer read here that cannot be *degraded*, though: `checkPlacement` refuses **by
+        //    reverting**, so "the call failed" has to keep meaning "refused" and a hand-decoded probe would have to
+        //    invent a verdict. The cap is therefore the whole fix — a bound on the gas a hostile gate can burn —
+        //    and the call stays typed so `GateNotHealthy` still reaches the caller with its own reason. Its return
+        //    value is discarded, so nothing here decodes returndata either.
+        if (ctx.oracleGate != address(0)) {
+            IOracleGate(ctx.oracleGate).checkPlacement{gas: Constants.COMPOSITE_READ_GAS}(poolId);
+        }
 
         // 6. The 60-second per-pool cooldown.
         uint32 last = cooldown[poolId];
@@ -510,7 +565,7 @@ library VaultPlacementLib {
         view
     {
         uint256 priceUsd18 = ctx.pMktX18 != 0 ? ctx.pMktX18 : ctx.pRefX18;
-        uint256 answerUsd8 = _answer(ctx, config.counter);
+        uint256 answerUsd8 = _answer(ctx.feedRegistry, config.counter);
         if (priceUsd18 == 0 || answerUsd8 == 0 || config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) return;
 
         int24 fair = PriceLib.fairTick(priceUsd18, answerUsd8, config.counterDecimals, config.tickSpacing);
@@ -550,6 +605,17 @@ library VaultPlacementLib {
 
         Currency currency = above ? pool.key.currency0 : pool.key.currency1;
         address token = above ? amps : Currency.unwrap(pool.key.currency1);
+        // **The bound stays at `amount`, and the one-wei-per-cell slack above it is deliberate** (audit lead,
+        // 2026-09-09, considered and not taken). The lead is arithmetically right: on the ask side
+        // `LadderLib.liquidityForAmount0Above` **floors** the liquidity a bucket's AMPS buys and the PoolManager's
+        // `getAmount0Delta` then **ceils** what that liquidity costs, so a ladder can be owed up to one wei per
+        // cell more than the sum of its buckets. Tightening the check to `amount + buckets` does not make such a
+        // placement succeed — it makes it fail *earlier*, and it fails a great many placements that succeed today:
+        // `rollout` places exactly what its harvest freed, and `deployBonded` places a constituent's whole idle
+        // claim, so `available == amount` is the *ordinary* case on both paths, not the edge one. The residue is
+        // one wei per cell against a bucket sized in whole tokens, it is caught by the settlement with
+        // `CurrencyNotSettled`, and the fix that would actually help is to place `amount - buckets` rather than to
+        // refuse `amount` — which changes what every caller gets and belongs with a placement-shape revision.
         uint256 available = IPoolManager(poolManager).balanceOf(address(this), currency.toId()) + _probeBalance(token);
         if (amount > available) revert InsufficientInventory(amount, available);
 
@@ -577,10 +643,18 @@ library VaultPlacementLib {
         );
         // §3.5's ordering rule, and it is a **hard** requirement on the ask side (audit fix, 2026-09-07). See
         // {HighWaterResetFailed}: an ask that keeps a mark older than itself is burned as inventory it never was.
-        if (above && !_resetHighWater(ctx, pool.key.toId())) {
-            revert HighWaterResetFailed(PoolId.unwrap(pool.key.toId()));
+        //
+        // **Both effects are the ask side's alone** (audit fix, 2026-09-08). The surge used to be armed for any
+        // committed cell, bids included, which handed `compound`'s step-7 bid re-ladder — reachable with one wei
+        // of counter fee — the power to arm `SURGE_MAX_BPS`, the exact hole step 8's gating was written to close.
+        // A bid is laid *below* the tick out of value the pool already holds: it cannot be sandwiched at the
+        // pre-placement fee the way an ask can, it is not a burn candidate under §3.5's predicate, and it has no
+        // business touching the mark. `compound` arms its own surge for the bids it places, once, under its own
+        // cooldown, and the ask side keeps the hard reset.
+        if (above) {
+            if (!_resetHighWater(ctx, pool.key.toId())) revert HighWaterResetFailed(PoolId.unwrap(pool.key.toId()));
+            _armSurge(ctx, pool.key.toId(), reason);
         }
-        _armSurge(ctx, pool.key.toId(), reason);
     }
 
     /// @dev The whole of the ACTION_PLACE branch: cell selection, sidedness (I9), grid membership (I39), the
@@ -615,19 +689,34 @@ library VaultPlacementLib {
             // budget, and the budget is what bounds the gas of `redeemProRata`. Governance refuses to place at
             // all rather than silently placing less; the bountied paths merge what they can and leave the rest
             // idle, so a full vault degrades into "compound keeps working" rather than "compound reverts".
-            if (_cellIsEmpty(records, lower)) {
-                if (live >= Constants.MAX_LIVE_CELLS) {
-                    if (strictBudget) {
-                        revert CellBudgetExceeded(PoolId.unwrap(p.key.toId()), live, Constants.MAX_LIVE_CELLS);
-                    }
-                    continue;
+            // §3.2's records describe a cell by *side*, and a cell can only be one side at a time. The bid
+            // re-ladder in `compound`'s step 7 always starts at the cell immediately below the tick, which after
+            // any rise is an ask cell the price has already sold through — so merging into it would fold counter
+            // wei into a record whose `amount` counts AMPS and, worse, re-describe it as a bid. `_burnback` reads
+            // `record.above` as "this cell was once sold as an ask", so the bought-back AMPS would never be
+            // burned, and `_askInventory`/`_harvestAsks` would not see it either: the inventory would be
+            // invisible to every accounting path and re-sold on the next rise (I33, I10). The bucket is therefore
+            // skipped and its amount stays unplaced, which is what `strictBudget == false` already means
+            // everywhere else — `Placement.amount` and the caller's `placed` both report the smaller number.
+            (bool cellEmpty, bool cellAbove) = _cellSide(records, lower);
+            if (!cellEmpty && cellAbove != p.above) continue;
+            bool opensCell = cellEmpty;
+            if (opensCell && live >= Constants.MAX_LIVE_CELLS) {
+                if (strictBudget) {
+                    revert CellBudgetExceeded(PoolId.unwrap(p.key.toId()), live, Constants.MAX_LIVE_CELLS);
                 }
-                ++live;
+                continue;
             }
 
             (uint128 liquidity, int256 delta0, int256 delta1) =
                 _placeCell(poolManager, p, lower, width, amount, sqrtPriceX96);
+            // The budget is spent on cells that actually opened (audit fix, 2026-09-08): `++live` used to run
+            // before the placement, so a bucket whose amount could not buy one unit of liquidity over its range
+            // consumed a slot it never used. On the strict governance path that turned into a `CellBudgetExceeded`
+            // with real headroom left; on the bountied paths a caller could walk the ladder's dust cells to pin
+            // the count. Nothing else moves: the *refusal* above still happens before any state changes.
             if (liquidity == 0) continue;
+            if (opensCell) ++live;
 
             owed0 += delta0;
             owed1 += delta1;
@@ -648,15 +737,20 @@ library VaultPlacementLib {
         _settle(poolManager, p.key.currency1, owed1);
     }
 
-    /// @dev Whether the pool holds no liquidity in the cell starting at `lower`, i.e. whether placing there would
-    ///      open a *new* live cell. Used identically here and in {_writeRecords}, on the same unchanged storage,
-    ///      so the budget decision and the count can never disagree.
-    function _cellIsEmpty(PlacementRecord[] storage records, int24 lower) private view returns (bool empty) {
+    /// @dev The cell starting at `lower`, as the records see it: whether it holds no liquidity — i.e. whether
+    ///      placing there would open a *new* live cell — and, when it does hold some, which side it is. Read
+    ///      identically here and in {_writeRecords}, on the same unchanged storage, so the budget decision, the
+    ///      cross-side refusal and the count can never disagree.
+    /// @param records The pool's placement records.
+    /// @param lower The cell's lower tick.
+    /// @return empty Whether the cell holds no liquidity (no record, or a record drained to zero).
+    /// @return above The side of the liquidity it holds; meaningless when `empty`.
+    function _cellSide(PlacementRecord[] storage records, int24 lower) private view returns (bool empty, bool above) {
         uint256 n = records.length;
         for (uint256 i; i < n; ++i) {
-            if (records[i].lowerTick == lower) return records[i].liquidity == 0;
+            if (records[i].lowerTick == lower) return (records[i].liquidity == 0, records[i].above);
         }
-        return true;
+        return (true, false);
     }
 
     /// @dev One cell: the two per-bucket gauntlet checks, the amount-to-liquidity conversion and the add. A
@@ -726,7 +820,20 @@ library VaultPlacementLib {
             if (first >= Constants.GRID_MAX_M) return (first, 0);
             count = uint256(int256(Constants.GRID_MAX_M) - first);
         } else {
-            int256 fromAnchor = _floorDiv(int256(p.anchorTick) - base, w) - 1;
+            // **The bid anchor's rounding residue** (audit fix, 2026-09-09, R10). `p.anchorTick` is the reference
+            // tick snapped *down* onto the tick spacing, and flooring it onto the doubling grid rounds a second
+            // time in the same direction. Two roundings the same way make the bid side strictly stricter than the
+            // ask side, which rounds down and then ceils, and at genesis "strictly stricter" costs a whole
+            // doubling: the grid origin is itself the opening tick snapped down, so a reference a single tick
+            // spacing under it — one wei of `P_ref` movement is enough when the opening tick was exact — puts the
+            // seed bids at `m = -2..-5` instead of the `m = -1..-4` §3.3 specifies, leaving no protocol bid within
+            // a factor of two of the market. Adding the spacing back before the floor undoes the first rounding
+            // and no more: the top bid cell's upper bound is then at most `tickSpacing` ticks above the exact
+            // reference, which is the same bounded, one-sided residue ruling AX already carries on the ask side,
+            // against a cell 6,900 ticks wide. What R10 is really about — a pool 1,000-2,600 ticks above `P_ref`
+            // whose bids used to anchor at `slot0.tick` — is untouched, because a tick spacing is nothing next to
+            // a doubling.
+            int256 fromAnchor = _floorDiv(int256(p.anchorTick) + int256(p.key.tickSpacing) - base, w) - 1;
             int256 fromTick = _floorDiv(int256(p.currentTick) - base, w) - 1;
             first = fromAnchor < fromTick ? fromAnchor : fromTick;
             if (first >= Constants.GRID_MAX_M) first = int256(Constants.GRID_MAX_M) - 1;
@@ -822,12 +929,22 @@ library VaultPlacementLib {
                 );
             } else {
                 PlacementRecord storage record = records[at];
-                if (record.liquidity == 0) ++opened;
+                // **`above` is written only when the cell is opened** (audit fix, 2026-09-09). It is not a
+                // property of the placement, it is a property of the *cell*: which side of the tick the liquidity
+                // sitting there is. A merge adds to liquidity that is already there and cannot re-describe it,
+                // and {_executePlace} has already refused the only way the two could disagree — so this is the
+                // second half of one rule rather than a second rule. "Opened" is `liquidity == 0` at entry: a
+                // record the burnback or the harvest drained to zero is an empty cell that may be re-opened on
+                // either side, which is exactly what the `++opened` beside it already means.
+                bool opensCell = record.liquidity == 0;
+                if (opensCell) {
+                    ++opened;
+                    record.above = p.above;
+                }
                 record.liquidity += liquidity;
                 record.amount = _toUint128(uint256(record.amount) + amount);
                 record.bucketIndex = index;
                 record.buckets = result.cells;
-                record.above = p.above;
                 record.placedAt = uint32(block.timestamp);
                 record.tiltX18 = p.tiltX18;
                 record.anchorTick = p.anchorTick;
@@ -855,20 +972,25 @@ library VaultPlacementLib {
     ///      claim. Fees earned while no position was in range were never credited by v4 and are not ours to claim
     ///      (§10 ruling 13).
     ///
-    /// @dev **The creator's counter-side slice is paid here, in kind, and cannot revert the collect.** The fee is
-    ///      charged in both currencies since revision 6, so the creator is owed `creatorBps / ampsFeeBps` of the
-    ///      counter as well as of the AMPS — and the counter is a Stock Token or WETH, not AMPS, so paying it out
-    ///      means an ERC-20 `transfer` to an address the protocol does not control. This is the one place the
-    ///      vault can make that transfer for free: inside the unlock the positive delta is still unspent, so
-    ///      `take` moves the tokens straight from the PoolManager to the creator with no intermediate custody and
-    ///      no `sync`/`settle` round trip.
+    /// @dev **The creator's counter-side slice is paid as an ERC-6909 claim, and no token code runs inside the
+    ///      unlock** (audit fix, 2026-09-08). The fee is charged in both currencies since revision 6, so the
+    ///      creator is owed `creatorBps / ampsFeeBps` of the counter as well as of the AMPS — and the counter is a
+    ///      Stock Token or WETH, not AMPS, so paying it *in kind* would mean an ERC-20 `transfer` to an address
+    ///      the protocol does not control, from inside the vault's own `unlock`.
     ///
-    ///      A Stock Token that denylists the creator (or the vault, or simply burns the gas it is handed) must not
-    ///      be able to stop a `compound` — that would hand any issuer a veto over the protocol's fee engine and
-    ///      over the buyback burn. The `take` is therefore bounded at `STOCK_TOKEN_PROBE_GAS * 4` and its failure
-    ///      falls back to an ERC-6909 `transfer` of the claim, which no token can refuse: exactly the shape and
-    ///      exactly the budget `VaultRedeemLib._payOut` uses for the redemption floor, and for the same reason.
-    ///      The creator ends up holding a claim they can burn for the token whenever the token allows it.
+    ///      That is the one place such a transfer must never happen, and a gas cap does not make it safe. A
+    ///      `try pm.take{gas: ...}` catches a revert, but a token whose `transfer` returns *normally* having
+    ///      opened its own PoolManager delta — a re-entrant `sync`, a `settle` of its own, any touch of the
+    ///      manager during the unlock — leaves that delta unsettled, and the unlock then fails with
+    ///      `CurrencyNotSettled` **outside** the `catch`, beyond the reach of any fallback. Since the whole point
+    ///      of the bounded `take` was that a hostile issuer must not be able to stop a `compound`, and it can, the
+    ///      `take` is gone: the whole positive delta is minted as claims and the creator's slice moves by
+    ///      `pm.transfer`, an ERC-6909 book entry no token can refuse, block or re-enter. The creator burns the
+    ///      claim for the token whenever the token allows it, exactly as they did on the old fallback path.
+    ///
+    ///      The AMPS side needs no such treatment: `_split` transfers AMPS — the protocol's own token, with no
+    ///      hooks and no denylist — and it runs *after* the unlock has closed, so nothing it touches can open a
+    ///      delta inside one.
     ///
     ///      **The slice is of the *fees* and of nothing else.** It is computed and paid before the buyback frees
     ///      any counter into the same claim balance, so inventory the vault bought back — which is not fee income
@@ -925,19 +1047,10 @@ library VaultPlacementLib {
         if (creator != address(0) && creatorBps != 0) {
             creatorCounter = FullMath.mulDiv(counterFees, creatorBps, feeBps);
         }
-        if (creatorCounter == 0) {
-            pm.mint(address(this), id, counterFees);
-            return (ampsFees, counterFees, 0);
-        }
-
-        try pm.take{gas: Constants.STOCK_TOKEN_PROBE_GAS * 4}(key.currency1, creator, creatorCounter) {
-            if (counterFees != creatorCounter) pm.mint(address(this), id, counterFees - creatorCounter);
-        } catch {
-            // The token refused the creator. Keep the whole delta as claims and hand the creator theirs as one:
-            // an ERC-6909 balance the PoolManager owes, which nothing outside the PoolManager can block.
-            pm.mint(address(this), id, counterFees);
-            pm.transfer(creator, id, creatorCounter);
-        }
+        // The whole positive delta becomes a claim, and the creator's slice is handed over as one: an ERC-6909
+        // balance the PoolManager owes them, which they burn for the token whenever the token allows it.
+        pm.mint(address(this), id, counterFees);
+        if (creatorCounter != 0) pm.transfer(creator, id, creatorCounter);
     }
 
     /// @dev Realises and splits a pool's accrued fees **before** a placement is allowed to merge into one of its
@@ -966,7 +1079,7 @@ library VaultPlacementLib {
         PoolKey memory key
     ) private {
         if (ladder[key.toId()].length == 0) return;
-        (uint256 creatorBps, uint256 feeBps) = _creatorSlice(ctx);
+        (uint256 creatorBps, uint256 feeBps) = _creatorSlice(ctx, key.toId());
         (uint256 ampsFees,,) = _collect(ctx, poolManager, key, creatorBps, feeBps);
         if (ampsFees != 0) _split(ctx.creator, amps, ampsFees, creatorBps, feeBps);
     }
@@ -1009,50 +1122,87 @@ library VaultPlacementLib {
     ///      worth of a cell the price sits exactly on the floor of) is held as a claim — §3.5's own fallback for a
     ///      degenerate range — and re-enters the ladder in step 7 of the same `compound` as a proper grid bid.
     ///      Nothing leaves the pool's economy; only the prices it bids at are re-derived.
-    function _burnback(mapping(PoolId => PlacementRecord[]) storage ladder, Pool memory pool, address poolManager)
-        private
-        returns (uint256 burnedAmps, uint256 freedCounter)
-    {
+    function _burnback(
+        mapping(PoolId => PlacementRecord[]) storage ladder,
+        Ctx memory ctx,
+        Pool memory pool,
+        address poolManager,
+        address amps
+    ) private returns (uint256 burnedAmps, uint256 freedCounter, uint256 feeBurn) {
         PoolId poolId = pool.key.toId();
         int24 highWater = _highWater(poolId);
-        if (highWater == type(int24).min) return (0, 0);
+        if (highWater == type(int24).min) return (0, 0, 0);
 
         PlacementRecord[] storage records = ladder[poolId];
         uint256 n = records.length;
-        if (n == 0) return (0, 0);
+        if (n == 0) return (0, 0, 0);
 
         uint128[] memory removals = new uint128[](n);
         uint32 closed;
         for (uint256 i; i < n; ++i) {
             PlacementRecord storage record = records[i];
-            if (record.liquidity == 0 || record.upperTick > highWater || pool.tick > record.lowerTick) continue;
+            // `record.above` is the third clause and it is not redundant (audit fix, 2026-09-08). A *bid* cell the
+            // price has fallen entirely below satisfies both geometric clauses — its upper bound is under a mark
+            // set while the price was higher, and the tick is under its lower bound — so the predicate admitted
+            // every filled bid in the book. Those cells are the counter side of the ladder, and removing them
+            // whole re-prices a real trade's proceeds: the burn is NAV-dilutive whenever the fill happened above
+            // NAV/share, and valued counterfactually at the checkpoint's reference it can breach the 2 bp R1
+            // bound and revert the very `compound` that made it. Only an ask can have been *sold* as one, and
+            // only what was sold can have been bought back.
+            if (!record.above || record.liquidity == 0 || record.upperTick > highWater || pool.tick > record.lowerTick) continue;
             removals[i] = record.liquidity;
             record.liquidity = 0;
+            // The gross-placed counter goes with the liquidity it described: see {_writeRecords}.
+            record.amount = 0;
             record.above = false;
             ++closed;
         }
-        if (closed == 0) return (0, 0);
+        if (closed == 0) return (0, 0, 0);
         VaultRedeemLib.subLiveCells(closed);
 
-        (burnedAmps, freedCounter) = abi.decode(
+        uint256 fees0;
+        uint256 fees1;
+        (burnedAmps, freedCounter, fees0, fees1) = abi.decode(
             _unlock(poolManager, VaultRedeemLib.ACTION_BURNBACK, abi.encode(pool.key, _lowers(records), removals)),
-            (uint256, uint256)
+            (uint256, uint256, uint256, uint256)
         );
+
+        // The removed cells' own accrued fees are fees, not principal (audit fix, 2026-09-08): they take the
+        // creator slice and the burn, never the ladder. On the `compound` path step 3 has already collected them
+        // and both numbers are zero; on the `place` path this is the only chance they get.
+        uint256 remainder;
+        (remainder, feeBurn) = _routeFees(ctx, poolManager, amps, poolId, pool.key.currency1, fees0, fees1);
+        freedCounter += remainder;
     }
 
     /// @dev ACTION_BURNBACK and ACTION_HARVEST: remove named cells whole, keep the AMPS as an idle ERC-20 balance
     ///      (to burn, or to re-place elsewhere) and the counter as ERC-6909 claims.
+    ///
+    /// @dev **Principal and fees come back separately** (audit fix, 2026-09-08). `modifyLiquidity` returns
+    ///      `callerDelta = principalDelta + feesAccrued`, and this function used to report only the sum, so every
+    ///      caller treated a removed cell's unclaimed fees as principal: `VaultRolloutLib._harvestAsks` re-laddered
+    ///      the entry pools' accrued AMPS fees into a spoke's *asks* to be sold again, `withdrawRetiredBids` minted
+    ///      the counter-side fees as plain claims, and neither passed the creator slice or the mandatory burn that
+    ///      `_collectAndSplit` enforces on the `place` path — so `moved` could exceed the rollout allowance the
+    ///      code believes it cannot. The two are reported apart and every caller routes the fee half through
+    ///      {_routeFees}; nothing folds a fee into a principal again.
+    /// @return principal0 The AMPS the removed positions held, net of fees, now an idle ERC-20 balance.
+    /// @return principal1 The counter the removed positions held, net of fees, now an ERC-6909 claim.
+    /// @return fees0 The AMPS-side fees those positions had accrued.
+    /// @return fees1 The counter-side fees those positions had accrued.
     function _executeHarvest(address poolManager, PoolKey memory key, int24[] memory lowers, uint128[] memory removals)
         private
-        returns (uint256 out0, uint256 out1)
+        returns (uint256 principal0, uint256 principal1, uint256 fees0, uint256 fees1)
     {
         int24 width = LadderLib.doublingTicks(key.tickSpacing);
         int256 delta0;
         int256 delta1;
+        int256 fee0;
+        int256 fee1;
 
         for (uint256 i; i < removals.length; ++i) {
             if (removals[i] == 0) continue;
-            (BalanceDelta callerDelta,) = IPoolManager(poolManager)
+            (BalanceDelta callerDelta, BalanceDelta feesAccrued) = IPoolManager(poolManager)
                 .modifyLiquidity(
                     key,
                     ModifyLiquidityParams({
@@ -1065,16 +1215,29 @@ library VaultPlacementLib {
                 );
             delta0 += int256(callerDelta.amount0());
             delta1 += int256(callerDelta.amount1());
+            fee0 += int256(feesAccrued.amount0());
+            fee1 += int256(feesAccrued.amount1());
         }
 
-        if (delta0 > 0) {
-            out0 = uint256(delta0);
-            IPoolManager(poolManager).take(key.currency0, address(this), out0);
-        }
-        if (delta1 > 0) {
-            out1 = uint256(delta1);
-            IPoolManager(poolManager).mint(address(this), key.currency1.toId(), out1);
-        }
+        // Everything the removal freed is taken or minted in one go, exactly as before — the split below is
+        // bookkeeping over the same total, so a fee can never be paid out twice or left inside the pool.
+        if (delta0 > 0) IPoolManager(poolManager).take(key.currency0, address(this), uint256(delta0));
+        if (delta1 > 0) IPoolManager(poolManager).mint(address(this), key.currency1.toId(), uint256(delta1));
+
+        (principal0, fees0) = _apportion(delta0, fee0);
+        (principal1, fees1) = _apportion(delta1, fee1);
+    }
+
+    /// @dev Splits one currency's realised delta into principal and fees. `feesAccrued` is v4's own number and is
+    ///      part of `callerDelta`, so the fee share is clamped to what actually came out: a negative total (the
+    ///      vault owed more than it freed, which a removal cannot produce but the type allows) yields nothing, and
+    ///      a fee larger than the total is capped at it so `principal + fees` is always exactly what was freed.
+    function _apportion(int256 total, int256 fees) private pure returns (uint256 principal, uint256 feePart) {
+        if (total <= 0) return (0, 0);
+        uint256 freed = uint256(total);
+        feePart = fees > 0 ? uint256(fees) : 0;
+        if (feePart > freed) feePart = freed;
+        principal = freed - feePart;
     }
 
     /// @dev §3.6 step 5, to the wei: the creator's slice, and then the whole remainder is burned. The creator
@@ -1110,6 +1273,61 @@ library VaultPlacementLib {
         }
     }
 
+    /// @notice Routes fees a *harvest* realised — a burnback's, a rollout's, a retired-bid withdrawal's — through
+    ///         exactly the split `compound` applies: the creator's slice of each currency, the whole AMPS-side
+    ///         remainder burned, and the counter-side remainder left as a claim for the ladder.
+    ///
+    /// @dev Public because {VaultRolloutLib} needs it and links against this library already; it runs in the
+    ///      vault's context by `DELEGATECALL` like everything else here, so it reads the vault's own creator,
+    ///      genesis timestamp and pointers out of storage rather than being handed them.
+    /// @dev **What the counter remainder does not do.** It is not re-placed here. `compound` folds it into the bid
+    ///      ladder of the same call (§3.6 step 7); on the rollout paths it stays an ERC-6909 claim, where `A`
+    ///      values it (I5) and the next `compound` or governance `place` lays it as a proper grid bid. Fees never
+    ///      become ask inventory on any path, which is the property that was broken.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param amps The AMPS token.
+    /// @param poolId The pool the fees were earned in.
+    /// @param counter The pool's `currency1`.
+    /// @param fees0 The AMPS-side fees realised.
+    /// @param fees1 The counter-side fees realised, already held as claims.
+    /// @return counterRemainder The counter left after the creator's slice.
+    /// @return ampsBurned The AMPS burned: the whole AMPS-side remainder.
+    function splitHarvestFees(
+        address poolManager,
+        address amps,
+        PoolId poolId,
+        Currency counter,
+        uint256 fees0,
+        uint256 fees1
+    ) public returns (uint256 counterRemainder, uint256 ampsBurned) {
+        return _routeFees(_ctx(), poolManager, amps, poolId, counter, fees0, fees1);
+    }
+
+    /// @dev The split itself. The AMPS side is an ERC-20 balance by the time it gets here, so the creator's slice
+    ///      is a plain transfer and the rest is burned; the counter side is already an ERC-6909 claim, so the
+    ///      creator's slice of it moves by `pm.transfer` — never `take`, for the reason {_executeCollect} gives.
+    function _routeFees(
+        Ctx memory ctx,
+        address poolManager,
+        address amps,
+        PoolId poolId,
+        Currency counter,
+        uint256 fees0,
+        uint256 fees1
+    ) private returns (uint256 counterRemainder, uint256 ampsBurned) {
+        counterRemainder = fees1;
+        if (fees0 == 0 && fees1 == 0) return (0, 0);
+
+        (uint256 creatorBps, uint256 feeBps) = _creatorSlice(ctx, poolId);
+        if (fees0 != 0) (, ampsBurned) = _split(ctx.creator, amps, fees0, creatorBps, feeBps);
+        if (fees1 == 0 || creatorBps == 0 || ctx.creator == address(0)) return (counterRemainder, ampsBurned);
+
+        uint256 creatorCounter = FullMath.mulDiv(fees1, creatorBps, feeBps);
+        if (creatorCounter == 0) return (counterRemainder, ampsBurned);
+        counterRemainder = fees1 - creatorCounter;
+        IPoolManager(poolManager).transfer(ctx.creator, counter.toId(), creatorCounter);
+    }
+
     /// @dev Realises a pool's accrued fees inside one `unlock`, and pays the creator's counter-side slice from
     ///      inside it. See {_executeCollect} for what happens on the far side of the unlock.
     /// @return ampsFees AMPS-side fees, gross, now an idle ERC-20 balance on the vault.
@@ -1139,30 +1357,65 @@ library VaultPlacementLib {
     ///      change: raise the fee and the same creator points come out of a larger collection, cut it and out of
     ///      a smaller one.
     ///
-    /// @dev **Why the old `max(fee, AMPS_FEE_BPS_DEFAULT)` divisor floor is gone, and what bounds the slice
-    ///      now.** The floor existed because the slice used to be taken out of the AMPS side alone, where a cut
-    ///      to `AMPS_FEE_BPS_MIN` (100 bp, equal to `CREATOR_FEE_BPS`) would have routed every wei of the
-    ///      AMPS-side fees to the creator and left the stakers, the burn and the ladder nothing. It also made the
-    ///      payout *not* equal to `creatorBps` of volume, which is the property revision 6 needs in both
-    ///      currencies. The clamp `creatorBps <= ampsFeeBps` is what bounds it now: the creator can never be paid
-    ///      more than the whole of one currency's fees, the quotient is always a true fraction, and at the launch
-    ///      parameters it is 100/500 — one fifth — decaying to zero over 30 days. A fee parked at the floor for
-    ///      that window is a governance decision about a schedule that ends, not a way to starve a permanent
-    ///      constituency, because revision 6 leaves no permanent constituency to starve: what the creator does
-    ///      not take is burned either way.
+    /// @dev **The divisor is not the live base fee alone** (audit fix, 2026-09-08). Fees accrue continuously and
+    ///      are divided *at collect time*, so the live rate is not the rate the volume paid, and both directions
+    ///      of the mismatch paid the creator out of the unconditional burn:
     ///
-    /// @dev The hook charges base + dynamic, so a pool that traded through a surge accrued slightly more than
-    ///      `ampsFeeBps` of volume and the quotient over-states the creator's points by at most
-    ///      `(base + dynCap) / base` — 1.6x under GREEN at the launch base — for as long as the surge lasted. It
-    ///      is bounded, it decays with the schedule, and it is the same over-statement in both currencies.
+    ///        * a governed **cut** retroactively multiplied the creator's share of every in-flight wei by
+    ///          `oldFee / newFee` — at the 100 bp band floor that is 5x, i.e. 100% of *both* currencies, and the
+    ///          counter leg leaves NAV rather than being burned. The floor `max(fee, AMPS_FEE_BPS_DEFAULT)` is
+    ///          back for exactly this: the launch base is the most a cut can pretend the volume paid;
+    ///        * a **raised dynamic** component meant the pool collected `base + dyn` and the slice was still
+    ///          divided by `base`, inflating the payout by up to 1.6x (GREEN), 3x (degraded) or 5x (the escalation
+    ///          cap). So the divisor is additionally bounded below by the rate actually being charged, read from
+    ///          the hook's own {IAmpsHook-quoteFee}: the dynamic part enlarges the divisor by exactly what it
+    ///          enlarged the collection, and is therefore never creator-eligible. The creator is paid
+    ///          `creatorBps` of *volume* and nothing more, in either currency.
+    ///
+    ///      Both bounds move the payout one way only — down — so the identity I31 is asserted against holds as an
+    ///      inequality where it cannot hold as an equality, and what the creator does not take is burned.
+    ///
+    /// @dev A hook that cannot be read leaves the floor in charge, which is the conservative answer: the launch
+    ///      base is the largest divisor a broken pointer can be talked out of, and the clamp
+    ///      `creatorBps <= feeBps` still makes the quotient a true fraction of one currency's fees.
+    /// @param ctx The gathered pointers.
+    /// @param poolId The pool whose charged rate bounds the divisor.
     /// @return creatorBps The creator's points at `block.timestamp`, clamped to `feeBps`; zero when there is no
     ///         creator or the schedule has run out.
-    /// @return feeBps The live `ampsFeeBps`, never zero.
-    function _creatorSlice(Ctx memory ctx) private view returns (uint256 creatorBps, uint256 feeBps) {
+    /// @return feeBps The divisor: `max(liveAmpsFeeBps, AMPS_FEE_BPS_DEFAULT, chargedSellBps, chargedBuyBps)`,
+    ///         never zero.
+    function _creatorSlice(Ctx memory ctx, PoolId poolId) private view returns (uint256 creatorBps, uint256 feeBps) {
         feeBps = _ampsFeeBps(ctx);
+        if (feeBps < Constants.AMPS_FEE_BPS_DEFAULT) feeBps = Constants.AMPS_FEE_BPS_DEFAULT;
+        uint256 chargedBps = _chargedFeeBps(ctx, poolId);
+        if (chargedBps > feeBps) feeBps = chargedBps;
         if (ctx.creator == address(0)) return (0, feeBps);
         creatorBps = _creatorBps(ctx);
         if (creatorBps > feeBps) creatorBps = feeBps;
+    }
+
+    /// @dev The largest total rate the hook is charging in `poolId` right now — base plus the clamped dynamic
+    ///      part, over **both** directions — in bps, or zero when the hook cannot answer. Bounded and never a
+    ///      reason to revert, like every other read of the market reference here; the generous budget is
+    ///      `quoteFee`'s own, which makes a `staticcall` of its own into the fee policy.
+    ///
+    /// @dev **Both directions, and the maximum of the two** (audit fix, 2026-09-09). The divisor this feeds is
+    ///      applied to *each* currency's collected fees, and the two currencies are earned at two different rates:
+    ///      `fees0` accrues at the sell rate and `fees1` at the buy rate, and the dynamic part is asymmetric by
+    ///      construction — it is what makes a deviation-increasing trade expensive. Sampling the sell direction
+    ///      alone therefore divided the counter fees a pool collected at up to 800 bp (2,600 bp under escalation)
+    ///      by the 500 bp base, and paid the creator 1.6x to 4.33x `CREATOR_FEE_BPS` of buy volume out of NAV.
+    ///      One divisor is what §3.6 step 5 and I31 are written against, so the fix is to make that one divisor
+    ///      safe in both currencies rather than to split it: the larger rate bounds both quotients from below and
+    ///      the payout moves one way only, down, which is the direction the burn absorbs.
+    /// @dev **The maximum is taken on the hook's side, in {IAmpsHook-chargedFeeBps}, and read here as one word.**
+    ///      Two `quoteFee` probes here would be the same arithmetic written into this library's bytecode, and this
+    ///      library has under 200 B of EIP-170 headroom while `AmpsHook` has thousands; the rate a pool is
+    ///      charging is the hook's own fact besides, so the hook is where "the larger of the two directions"
+    ///      belongs. A reference that cannot answer — an older hook, a mis-pointed pointer, one that reverts —
+    ///      reads as zero and leaves the launch-fee floor in charge, exactly as before.
+    function _chargedFeeBps(Ctx memory ctx, PoolId poolId) private view returns (uint256 bps) {
+        return uint16(_probeWord(ctx.marketReference, abi.encodeCall(IAmpsHook.chargedFeeBps, (poolId)), 32));
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -1234,16 +1487,27 @@ library VaultPlacementLib {
 
     /// @dev The pool's high-water tick since the vault's last reset, or `type(int24).min` when the market
     ///      reference cannot answer — in which case nothing counts as bought back, which is the safe default.
+    ///
+    /// @dev **A bounded hand-decoded probe, not a typed `try`** (audit lead, 2026-09-09; the last typed read left
+    ///      on a pointer-upgradeable target in this file). Solidity decodes a *successful* call's returndata in
+    ///      this frame, so a market reference answering with fewer than 32 bytes, or with an `int24` word outside
+    ///      the tick range, `Panic`ked **past** the `catch` and took `compound`, `place` and every burnback with
+    ///      it — a governance pointer bricking placements instead of degrading them. Read by hand and
+    ///      range-checked, every one of those shapes is "cannot answer", which is the default the rest of §3.5
+    ///      already takes.
     function _highWater(PoolId poolId) private view returns (int24 tick) {
         address marketRef = address(uint160(_word(SLOT_MARKET_REFERENCE)));
         if (marketRef == address(0)) return type(int24).min;
-        try IMarketReference(marketRef).highWaterTick{gas: Constants.STOCK_TOKEN_PROBE_GAS}(poolId) returns (
-            int24 highWater
-        ) {
-            return highWater;
-        } catch {
-            return type(int24).min;
+        (bool ok, bytes memory returndata) = marketRef.staticcall{gas: Constants.STOCK_TOKEN_PROBE_GAS}(
+            abi.encodeCall(IMarketReference.highWaterTick, (poolId))
+        );
+        if (!ok || returndata.length < 32) return type(int24).min;
+        int256 word;
+        assembly ("memory-safe") {
+            word := mload(add(returndata, 0x20))
         }
+        if (word < TickMath.MIN_TICK || word > TickMath.MAX_TICK) return type(int24).min;
+        return int24(word);
     }
 
     /// @dev Resets the high-water mark, so the next buyback window starts clean (§3.5), and **reports whether it
@@ -1288,14 +1552,12 @@ library VaultPlacementLib {
     ///      when the hook cannot answer — and a hook that answers zero counts as no answer — so the divisor of
     ///      the creator's share is never zero. {_creatorSlice} is its only caller.
     function _ampsFeeBps(Ctx memory ctx) private view returns (uint256 bps) {
-        if (ctx.marketReference != address(0)) {
-            try IAmpsHook(ctx.marketReference).ampsFeeBps{gas: Constants.STOCK_TOKEN_PROBE_GAS}() returns (
-                uint16 value
-            ) {
-                if (value != 0) return value;
-            } catch {}
-        }
-        return Constants.AMPS_FEE_BPS_DEFAULT;
+        // Hand-decoded and masked rather than a typed `try` (audit lead on the typed pointer reads, 2026-09-08):
+        // Solidity decodes a *successful* call's returndata in this frame, so a hook answering with a word wider
+        // than `uint16` — legal ABI — panicked past the `catch` and took the placement with it. Masking cannot.
+        uint256 word = _probeWord(ctx.marketReference, abi.encodeCall(IAmpsHook.ampsFeeBps, ()), 32);
+        uint256 value = uint16(word);
+        return value != 0 ? value : Constants.AMPS_FEE_BPS_DEFAULT;
     }
 
     /// @dev `creatorBps(t) = CREATOR_FEE_BPS x max(0, 1 - (t - genesis) / CREATOR_DECAY_SECONDS)`: the immutable
@@ -1309,15 +1571,24 @@ library VaultPlacementLib {
             / Constants.CREATOR_DECAY_SECONDS;
     }
 
-    /// @dev The last accepted answer for `token`, 8 decimals, or zero. Never reverts.
-    function _answer(Ctx memory ctx, address token) private view returns (uint256 answerUsd8) {
-        if (ctx.feedRegistry == address(0) || token == address(0)) return 0;
-        try IFeedRegistry(ctx.feedRegistry).latestAnswer{gas: Constants.COMPOSITE_READ_GAS}(token) returns (
-            uint256 value, uint32, bool
-        ) {
-            return value;
-        } catch {
-            return 0;
+    /// @dev The last accepted answer for `token` from `feeds`, 8 decimals, or zero. Never reverts, and never
+    ///      panics on a malformed answer either: one bounded `staticcall` whose first word is read by hand, which
+    ///      is the shape the rest of the vault uses for every pointer read (audit lead, 2026-09-08). One function
+    ///      rather than two because the only difference between the old pair was where the registry came from.
+    function _answer(address feeds, address token) private view returns (uint256 answerUsd8) {
+        if (token == address(0)) return 0;
+        answerUsd8 = _probeWord(feeds, abi.encodeCall(IFeedRegistry.latestAnswer, (token)), 96);
+    }
+
+    /// @dev One bounded `staticcall` on a pointer, answered only when at least `minLength` bytes came back, with
+    ///      the first word returned raw. Zero covers every way a pointer can be wrong: absent, codeless,
+    ///      reverting, out of gas, or too short to be the answer it claims.
+    function _probeWord(address target, bytes memory payload, uint256 minLength) private view returns (uint256 word) {
+        if (target == address(0)) return 0;
+        (bool ok, bytes memory returndata) = target.staticcall{gas: Constants.COMPOSITE_READ_GAS}(payload);
+        if (!ok || returndata.length < minLength) return 0;
+        assembly ("memory-safe") {
+            word := mload(add(returndata, 0x20))
         }
     }
 
@@ -1355,7 +1626,7 @@ library VaultPlacementLib {
     ///      `PriceLib.fairTick`'s five-argument form exists so the stricter reading is one argument away should
     ///      the orchestrator rule for it after weighing the cost above.
     function _referenceTick(Ctx memory ctx, Pool memory pool) private view returns (int24 tick) {
-        uint256 answerUsd8 = _answer(ctx, pool.config.counter);
+        uint256 answerUsd8 = _answer(ctx.feedRegistry, pool.config.counter);
         if (ctx.pRefX18 == 0 || answerUsd8 == 0 || pool.config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) {
             return pool.tick;
         }
@@ -1393,12 +1664,17 @@ library VaultPlacementLib {
     ///      pays for a job it cannot price, and an unpaid job still does its work (I21's degradation, not a stop).
     /// @param workValueUsd18 The measured work value, 18-decimal USD.
     /// @param gasStart `gasleft()` as the forwarder entered.
-    function payBounty(uint256 workValueUsd18, uint256 gasStart) public {
+    /// @param hops How many nested message calls separate this frame from the one `gasStart` was taken in: 1 for
+    ///        `compound`, which reaches here by an internal jump inside this library, and 2 for the jobs that come
+    ///        through {VaultRolloutLib}. See {_gasUsed}.
+    function payBounty(uint256 workValueUsd18, uint256 gasStart, uint256 hops) public {
         address pot = address(uint160(_word(SLOT_BOUNTY_POT)));
         if (pot == address(0)) return;
 
         // A pot that is empty, capped out or broken pays nothing and does not revert.
-        try IBountyPot(pot).pay(msg.sender, workValueUsd18, _gasCostUsd18(_gasUsed(gasStart))) returns (uint256) {}
+        try IBountyPot(pot).pay(msg.sender, workValueUsd18, _gasCostUsd18(_gasUsed(gasStart, hops))) returns (
+            uint256
+        ) {}
             catch {}
     }
 
@@ -1412,13 +1688,23 @@ library VaultPlacementLib {
     ///      — under Foundry's 2^30 default limit it is 16.8M gas, eight times a real `compound` — and on chain it
     ///      would let a keeper inflate the pot's own 3x ceiling simply by sending the job with a large gas limit.
     ///      `available = gasleft() * 64 / 63`, so adding back `gasleft() / 63` recovers the true consumption.
-    ///      `Constants.KEEPER_GAS_MAX` is the belt: the correction is exact for one hop (`compound`) and leaves
-    ///      one residual 64th for the two-hop paths that reach here through {VaultRolloutLib}, and no measurement
-    ///      of any shape may report more gas than the worst job can plausibly burn.
-    function _gasUsed(uint256 gasStart) private view returns (uint256 gasUsed) {
+    ///
+    /// @dev **And the reserve compounds with the hops** (audit fix, 2026-09-08). After `h` nested calls
+    ///      `remaining = available x (63/64)^h`, so what has to be added back is
+    ///      `remaining x (64^h - 63^h) / 63^h`: `remaining / 63` for one hop, `remaining x 127 / 3969` for two.
+    ///      `compound` reaches this frame by an internal jump — one hop from the vault's forwarder — but `rollout`,
+    ///      `deployBonded` and `withdrawRetiredBids` go through a second live `DELEGATECALL` frame in
+    ///      {VaultRolloutLib}, and charging them a single reserve overstated the gas by about `txGasLimit / 64`.
+    ///      That term is the *caller's* to choose, which is what made it exploitable: at a 30M limit it lifted the
+    ///      pot's 3x gas cap from $7.03 to $11.12, and past the daily ceiling at larger limits.
+    ///      `Constants.KEEPER_GAS_MAX` remains the belt: no measurement of any shape may report more gas than the
+    ///      worst job can plausibly burn.
+    /// @param gasStart `gasleft()` as the vault's forwarder was entered.
+    /// @param hops The number of nested message calls between that frame and this one.
+    function _gasUsed(uint256 gasStart, uint256 hops) private view returns (uint256 gasUsed) {
         uint256 remaining = gasleft();
         uint256 spent = gasStart > remaining ? gasStart - remaining : 0;
-        uint256 reserved = remaining / 63;
+        uint256 reserved = hops <= 1 ? remaining / 63 : (remaining * 127) / 3969;
         gasUsed = (spent > reserved ? spent - reserved : 0) + Constants.KEEPER_GAS_OVERHEAD;
         if (gasUsed > Constants.KEEPER_GAS_MAX) gasUsed = Constants.KEEPER_GAS_MAX;
     }
@@ -1444,7 +1730,7 @@ library VaultPlacementLib {
             return 0;
         }
 
-        uint256 ethUsd8 = _answerAt(address(uint160(_word(SLOT_FEED_REGISTRY))), weth);
+        uint256 ethUsd8 = _answer(address(uint160(_word(SLOT_FEED_REGISTRY))), weth);
         if (ethUsd8 == 0) return 0;
 
         uint256 basefee = block.basefee;
@@ -1463,7 +1749,7 @@ library VaultPlacementLib {
         returns (uint256 usd18)
     {
         if (amountRaw == 0 || config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) return 0;
-        uint256 answerUsd8 = _answer(ctx, config.counter);
+        uint256 answerUsd8 = _answer(ctx.feedRegistry, config.counter);
         if (answerUsd8 == 0) return 0;
         return PriceLib.counterValueUsd18(amountRaw, config.counterDecimals, answerUsd8);
     }
@@ -1478,18 +1764,6 @@ library VaultPlacementLib {
         uint256 pRefX18 = _word(SLOT_CHECKPOINT0) >> 128;
         if (pRefX18 == 0) return 0;
         return FullMath.mulDiv(amountAmps, pRefX18, Constants.WAD);
-    }
-
-    /// @dev The last accepted answer for `token` from an explicit feed registry, 8 decimals, or zero.
-    function _answerAt(address feeds, address token) private view returns (uint256 answerUsd8) {
-        if (feeds == address(0) || token == address(0)) return 0;
-        try IFeedRegistry(feeds).latestAnswer{gas: Constants.COMPOSITE_READ_GAS}(token) returns (
-            uint256 value, uint32, bool
-        ) {
-            return value;
-        } catch {
-            return 0;
-        }
     }
 
     /// @dev The bucket weights. The *shape* is the pointer-upgradeable policy's to choose; the *bounds* are the
@@ -1509,11 +1783,25 @@ library VaultPlacementLib {
                 uint256[] memory proposed
             ) {
                 if (proposed.length == buckets) {
+                    // **Summed outside checked arithmetic, with an explicit guard** (audit fix, 2026-09-08). This
+                    // body runs in *this* frame, not the callee's, so a `sum` that overflowed here reverted the
+                    // whole placement — the one thing the `try` exists to prevent — and a pointer-upgradeable
+                    // policy could therefore brick `compound`, `rollout` and every genesis ladder with a vector of
+                    // two enormous numbers. An overflow is simply a vector that does not sum to `WAD`, which is
+                    // already the answer for every other malformed vector: `LadderLib` takes over.
                     uint256 sum;
-                    for (uint256 i; i < buckets; ++i) {
-                        sum += proposed[i];
+                    bool overflowed;
+                    unchecked {
+                        for (uint256 i; i < buckets; ++i) {
+                            uint256 next = sum + proposed[i];
+                            if (next < sum) {
+                                overflowed = true;
+                                break;
+                            }
+                            sum = next;
+                        }
                     }
-                    if (sum == Constants.WAD) return proposed;
+                    if (!overflowed && sum == Constants.WAD) return proposed;
                 }
             } catch {}
         }

@@ -16,13 +16,17 @@ import {console2} from "forge-std/console2.sol";
 ///         deploys a different address — one the PoolManager will reject, or worse, one that carries a permission
 ///         bit the design forbids.
 ///
-/// @dev Three checks, in increasing strictness:
+/// @dev Four checks, in increasing strictness:
 ///        1. the current creation code still admits a `0x38C0` address at all, and the one `HookMiner` finds
 ///           carries no returns-delta and no remove-liquidity bit (this needs no recorded file);
 ///        2. the recorded address is internally consistent — it is what `CREATE2(factory, salt, initCode)` gives
 ///           for the recorded init-code hash, and it carries the right bits;
 ///        3. the recorded init-code hash is still the current one. This is the check that fails on a bytecode
-///           change, and the fix is to re-run `forge script script/04_MineHook.s.sol` and commit the result.
+///           change, and the fix is to re-run `forge script script/04_MineHook.s.sol` and commit the result;
+///        4. the creation code checks 1-3 compiled against is the artifact on disk. Checks 1-3 read the blob the
+///           compiler embedded in this unit, which is the same blob the mining script embeds in its own, so a
+///           build that refreshes `src/hook/*` without refreshing its dependents leaves all three agreeing on a
+///           hook that is no longer there. This one reads `out/` instead and fails on exactly that case.
 ///
 /// @dev A missing `script/config/hook.json` logs and skips rather than failing, so a fresh checkout is not
 ///      blocked; the CI job probes for the file for the same reason.
@@ -93,6 +97,24 @@ contract HookAddressTest is Test {
             miner.predictAddress(vm.parseJsonBytes32(json, ".salt"), currentHash),
             vm.parseJsonAddress(json, ".hook"),
             "the recorded salt no longer lands on the recorded address"
+        );
+    }
+
+    /// @notice The creation code this suite compiled against is the creation code on disk.
+    /// @dev The three checks above all measure `type(AmpsHook).creationCode` as embedded in *this* compilation
+    ///      unit. That is the same quantity `script/04_MineHook.s.sol` grinds, so they agree with each other by
+    ///      construction — including when both are stale. `src/hook/*` is compiled under its own
+    ///      `compilation_restrictions` profile, and a build has been observed to refresh
+    ///      `out/AmpsHook.sol/AmpsHook.json` while leaving the artifacts of the script and test files that import
+    ///      it untouched; the recorded salt was then valid for a hook that no longer existed, and every check
+    ///      above still passed. `vm.getCode` reads the artifact rather than the embedded blob, so this is the one
+    ///      assertion in the file that can tell the two apart. A failure here means the build is stale, not that
+    ///      the hook is wrong: run `forge build --force`, re-run `script/04_MineHook.s.sol`, and commit the result.
+    function test_theEmbeddedCreationCodeIsTheArtifactOnDisk() public view {
+        assertEq(
+            keccak256(type(AmpsHook).creationCode),
+            keccak256(vm.getCode("AmpsHook.sol:AmpsHook")),
+            "stale build: the compiled-in creation code is not the artifact's; forge build --force, then re-mine"
         );
     }
 

@@ -71,6 +71,13 @@ error ZeroAmount();
 /// @notice Two array arguments that must be parallel had different lengths.
 error LengthMismatch();
 
+/// @notice An address that must hold code holds none. Shared by `AmpsVault.genesisMint` (the genesis adapter it
+///         mints the auction tranche to) and by `AmpsGenesis.createAuctions` (the auction the factory returned):
+///         both are addresses supplied by a governance proposal that the receiving contract can and must check,
+///         because minting or transferring a tranche to an EOA typo is unrecoverable.
+/// @param account The offending address.
+error NotContract(address account);
+
 /// @notice An index or id was outside the valid range.
 /// @param index The offending value.
 /// @param length The exclusive upper bound.
@@ -120,7 +127,7 @@ error UnknownMarket(uint16 marketId);
 // Gate and safety
 // -------------------------------------------------------------------------------------------------------------
 
-/// @notice The oracle gate refused this path. Thrown by `_requireHealthy` in every state-changing vault and bonds
+/// @notice The oracle gate refused this path. Thrown by the vault's three gate policies in every state-changing
 ///         function except `redeemProRata` and `claim` (invariant I14).
 /// @param state The `GateState` ordinal that refused, so the dApp can explain which layer tripped.
 /// @param poolId The pool the refusal applies to, or `bytes32(0)` for a protocol-wide refusal.
@@ -262,6 +269,21 @@ error UnconfirmedNav();
 /// @param poolId The pool, as `PoolId.unwrap`.
 error HighWaterResetFailed(bytes32 poolId);
 
+/// @notice One spoke's realised index weight cannot be priced right now, so there is no weight to report.
+///
+/// @dev **Why "unknown" has to be a revert and not a zero** (audit fix, 2026-09-09). `VaultNavLib.spokeWeightBps`
+///      used to answer a clean `0` for a dead feed, an absent position valuer or a reference price outside
+///      `PriceLib`'s domain — and both consumers read a successful zero as a *true* weight. `deficit =
+///      (target - current) / target` then evaluates to `1e18`, the **maximum** deficit: the bond discount widens
+///      to `dMax` and the rollout schedule doubles for that name, which is the opposite of the direction an
+///      unreadable price should move either of them. Both consumers already implement the right fail-safe for a
+///      read that *fails* — `PoolRegistry.currentWeightBps` keeps `targetWeightBps`, which prices `deficit == 0` —
+///      and a successful zero is exactly what walked past it. Reverting is what puts that fail-safe back in
+///      charge. A literal `0` is reserved for the one case that means it: the vault holds none of the name.
+/// @param constituentId The constituent whose weight could not be priced.
+/// @param reason Which input was missing: `bytes32("answer")`, `bytes32("valuer")` or `bytes32("refPrice")`.
+error SpokeUnpriceable(uint16 constituentId, bytes32 reason);
+
 // -----------------------------------------------------------------------------------------------------------------
 // `AmpsRouter` (`src/periphery/AmpsRouter.sol`)
 // -----------------------------------------------------------------------------------------------------------------
@@ -277,6 +299,17 @@ error DeadlineExpired(uint256 deadline, uint256 timestamp);
 ///         it at two pass-through fees would make the pool pay for the caller's own noise.
 /// @param poolId The pool named twice, as `PoolId.unwrap`.
 error SameHop(bytes32 poolId);
+
+/// @notice `AmpsRouter.rotate` was asked to rotate between two pools neither of which is a constituent's spoke.
+///
+/// @dev The pass-through fee is the price of *moving through* the index: in at one pool, out at another, with the
+///      AMPS leg netting to zero. A `rotate(hub, wethPool)` does none of that — it is a USDG/WETH swap against
+///      protocol-owned liquidity, priced at 60 bp where the design charges the AMPS fee on both legs, and both
+///      entry pools take their fair tick from their own TWAP so the deviation term is structurally zero. At least
+///      one leg must therefore be a spoke, which is the only shape "rotate between two constituents" can have.
+/// @param hop1 The first hop, as `PoolId.unwrap`.
+/// @param hop2 The second hop, as `PoolId.unwrap`.
+error NotARotation(bytes32 hop1, bytes32 hop2);
 
 /// @notice A rotation's two hops did not net to zero AMPS inside the unlock. Asserted before anything is settled,
 ///         so a router that ever held AMPS across a `rotate` reverts rather than banking it.

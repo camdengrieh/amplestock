@@ -34,10 +34,13 @@ that reason.
 ## Layout
 
 ```
-ponder.config.ts     sources: eleven log contracts, two account (transaction) sources, two block jobs
-ponder.schema.ts     47 tables
+ponder.config.ts     sources: fourteen log contracts (the two genesis auctions among them, as
+                     factories over AmpsGenesis.AuctionsCreated), one read-only contract, two
+                     account (transaction) sources, two block jobs
+ponder.schema.ts     50 tables
 src/config/          the address book and the environment, both read at start-up
-src/abi/external.ts  the Stock Token and Chainlink ABIs (ours come from @amplestocks/abis)
+src/abi/external.ts  the Stock Token, Chainlink and Continuous Clearing Auction ABIs — the three we
+                     do not author, so codegen cannot produce them (ours come from @amplestocks/abis)
 src/lib/             fee decoding, tick and liquidity maths, reconciliation, alerts, ids, flywheel
 src/handlers/        one module per contract, plus the two block jobs and the denylist alarm
 src/api/             GraphQL plus the typed HTTP layer

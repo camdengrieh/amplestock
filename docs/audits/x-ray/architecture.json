@@ -1,0 +1,59 @@
+{
+  "title": "Amplestocks Architecture",
+  "nodes": [
+    {"id": "user", "label": "User / LP", "subtitle": "Trader, bonder, redeemer", "type": "actor", "row": 0},
+    {"id": "keeper", "label": "Keeper", "subtitle": "Bountied upkeep", "type": "actor", "row": 0},
+    {"id": "gov", "label": "Timelock", "subtitle": "Sole governance root", "type": "actor", "row": 0},
+    {"id": "guardian", "label": "Guardian", "subtitle": "Freeze + evacuate", "type": "actor", "row": 0},
+
+    {"id": "bonds", "label": "AmpsBonds", "subtitle": "Discounted issuance, vesting", "type": "protocol", "row": 1},
+    {"id": "vault", "label": "AmpsVault", "subtitle": "NAV, custody, ladders (+4 linked libs)", "type": "protocol", "row": 1},
+    {"id": "genesis", "label": "AmpsGenesis", "subtitle": "Clearing-auction adapter", "type": "protocol", "row": 1},
+    {"id": "router", "label": "AmpsRouter", "subtitle": "Buy / sell / rotate", "type": "protocol", "row": 1},
+
+    {"id": "registry", "label": "PoolRegistry", "subtitle": "Pools, constituents, weights", "type": "protocol", "row": 2},
+    {"id": "tokens", "label": "Amps + BountyPot", "subtitle": "Share token / keeper budget", "type": "protocol", "row": 2},
+    {"id": "gate", "label": "OracleGate", "subtitle": "Calendar, watchdog, breaker", "type": "protocol", "row": 2},
+    {"id": "poolmanager", "label": "PoolManager", "subtitle": "Uniswap v4", "type": "external", "row": 2},
+    {"id": "hook", "label": "AmpsHook", "subtitle": "Fee, rail, TWAP ring", "type": "protocol", "row": 2},
+
+    {"id": "feeds", "label": "FeedRegistry", "subtitle": "Layer C, two-confirmation", "type": "protocol", "row": 3},
+    {"id": "policies", "label": "Policies + Valuer", "subtitle": "Fee / Bond / Ladder / Rollout / LadderPositionValuer", "type": "protocol", "row": 3},
+    {"id": "stock", "label": "Stock Tokens", "subtitle": "Issuer beacons", "type": "external", "row": 3},
+
+    {"id": "chainlink", "label": "Chainlink", "subtitle": "Standard proxies", "type": "external", "row": 4}
+  ],
+  "edges": [
+    {"from": "user", "to": "router", "label": "swap / rotate"},
+    {"from": "user", "to": "vault", "label": "redeem pro-rata"},
+    {"from": "user", "to": "bonds", "label": "bond / claim"},
+    {"from": "keeper", "to": "vault", "label": "compound / rollout"},
+    {"from": "gov", "to": "vault", "label": "governed setters"},
+    {"from": "guardian", "to": "vault", "label": "emergency migrate"},
+    {"from": "gov", "to": "genesis", "label": "create auctions"},
+
+    {"from": "bonds", "to": "vault", "label": "deposit bonded"},
+    {"from": "genesis", "to": "vault", "label": "genesis place"},
+
+    {"from": "vault", "to": "registry", "label": "open pool"},
+    {"from": "vault", "to": "tokens", "label": "mint / burn / pay"},
+    {"from": "vault", "to": "gate", "label": "gate policy"},
+    {"from": "vault", "to": "poolmanager", "label": "unlock, modify liquidity"},
+    {"from": "router", "to": "poolmanager", "label": "exact-input hops"},
+    {"from": "bonds", "to": "gate", "label": "check bond"},
+
+    {"from": "poolmanager", "to": "hook", "label": "swap callbacks"},
+    {"from": "hook", "to": "gate", "label": "cached snapshot"},
+
+    {"from": "gate", "to": "feeds", "label": "freshness + session"},
+    {"from": "hook", "to": "policies", "label": "dynamic fee quote"},
+    {"from": "gate", "to": "stock", "label": "corporate-action probes"},
+    {"from": "hook", "to": "stock", "label": "multiplier step"},
+
+    {"from": "feeds", "to": "chainlink", "label": "latestRoundData"}
+  ],
+  "groups": [
+    {"label": "Custody & periphery", "nodes": ["bonds", "vault", "genesis", "router"]},
+    {"label": "Market & registry layer", "nodes": ["registry", "tokens", "gate", "poolmanager", "hook"]}
+  ]
+}

@@ -24,7 +24,7 @@ Deployment order and why the wiring is not all immutable: `Amps`'s constructor t
 constructor takes AMPS, so the AMPS address is CREATE2-mined first (`script/01_MineAmps`) and passed to the vault
 as an *immutable* before `Amps` itself is deployed at that address. `PoolRegistry`, `AmpsBonds`, `BountyPot` and
 `AmpsHook` each take the vault in *their* constructors, so the vault holds them as **set-once** storage pointers,
-frozen by the `genesis()` latch. `AmpsRouter` names no vault at all — it reads the registry and the PoolManager
+frozen by the `genesisPlace()` latch. `AmpsRouter` names no vault at all — it reads the registry and the PoolManager
 and nothing else — so it is deployed independently and reached only by `AmpsHook.setRouter`.
 
 ## 1. Storage layouts
@@ -59,9 +59,12 @@ slot 2   uint16  redeemFeeBps              [  0.. 15]   the whole governed numer
 slot 3   address creator                   [  0..159]
          uint32  genesisTimestamp          [160..191]
          bool    initialized               [192..199]   the genesis latch, one-way
-         bool    wiringFrozen              [200..207]   set by genesis(); set-once pointers refuse afterwards
-         (free)                            [208..255]
-slot 4,5,7 address registry / bonds / bountyPot                  set-once, frozen by genesis()
+         bool    wiringFrozen              [200..207]   set by genesisPlace(); set-once pointers refuse afterwards
+         bool    genesisMinted             [208..215]   set by genesisMint; `initialized` stays false until
+                                                        genesisPlace, so this is the whole of the window the
+                                                        auction runs in
+         (free)                            [216..255]
+slot 4,5,7 address registry / bonds / bountyPot                  set-once, frozen by genesisPlace()
 slot 6     (reserved)                                            the xAMPS staking vault lived here until
                                                                  revision 6; kept as a hole so slots 7+ do not
                                                                  move under a standby vault written against
@@ -69,18 +72,30 @@ slot 6     (reserved)                                            the xAMPS staki
 slot 8     address marketReference                               pointer-upgradeable (7 d) through setPolicyPointer,
                                                                  exactly like slots 9-13: a mock in Phase 2, pointed
                                                                  at AmpsHook in Phase 3, and re-pointable again after
-                                                                 that (it is not latched by genesis())
+                                                                 that (it is not latched by genesisPlace())
 slot 9-13  address oracleGate / feedRegistry / positionValuer /
            ladderPolicy / rolloutPolicy                          pointer-upgradeable (7 d); the last two are
                                                                  Phase 3, positionValuer is the zero-position stub
 slot 14  address standbyVault                          14-day timelock
-slot 15  uint128 rolloutMoved24h           [  0..127]  Phase 3
-         uint32  rolloutWindowStart        [128..159]
+slot 15  uint128 rolloutMoved24h           [  0..127]  Phase 3; decays linearly to zero over ONE_DAY
+         uint32  rolloutWindowStart        [128..159]   re-stamped on every charge (rolling, not tumbling)
 slot 16  address[] assets                              enumeration for the NAV sum and for redeemProRata
 slot 17  mapping(address => uint256) assetIndex        1-based; 0 means "not an asset"
 slot 18  mapping(PoolId => PlacementRecord[]) ladder   Phase 3, 2 slots per bucket
 slot 19  mapping(PoolId => uint32) lastPlacementAt     Phase 3, 60 s cooldown
+slot 20  uint256 deployThresholdUsd18                  the bonded-deployment dust guard (§10 ruling 15)
+slot 21  bool    navUnconfirmed            [  0..  7]  §12 ruling AS: any priced asset !fresh || unconfirmed
+         uint248 reserved filler           [  8..255]  declared, not implied — see below
+slot 22  address genesis                               the AmpsGenesis adapter. Set once through
+                                                       setPolicyPointer, before genesisMint, and frozen by
+                                                       genesisPlace with the other set-once pointers
 ```
+
+**Slot 21's filler is declared, not implied.** Solidity packs from the low end, so without it the 20-byte
+`genesis` pointer would sit beside `navUnconfirmed` in slot 21 while `VaultNavLib.setPointer` — which writes
+pointers *by slot number* — wrote slot 22. The getter would have read `address(0)` for ever, and `genesisMint`
+would have refused every proposal for a mismatch it could not explain. `VaultLayout.t.sol` pins slot 21 as the
+flag alone, slot 22 as the adapter, and 23 onwards as empty.
 
 Transient (EIP-1153), derived as `keccak256("amplestocks.vault.<name>")` and hard-coded:
 
@@ -197,7 +212,8 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsVault` | `redeemProRata` | **P, U** | — |
 | `AmpsVault` | `checkpoint`, `touch` | **P** (unpaid) | — |
 | `AmpsVault` | `depositBonded`, `mintVesting` | `AmpsBonds` | — |
-| `AmpsVault` | `genesis` | timelock, once | 48 h |
+| `AmpsVault` | `genesisMint` | timelock, once | 48 h |
+| `AmpsVault` | `genesisPlace` | the `genesis` adapter **or** timelock, once | 48 h (timelock form) |
 | `AmpsVault` | `compound`, `rollout`, `deployBonded` (Phase 3) | **P**, paid from `BountyPot` | — |
 | `AmpsVault` | `place` (Phase 3) | timelock, or registry during `addConstituent` | 7 d |
 | `AmpsVault` | `initializePool` | registry | 7 d (via `addConstituent`) |
@@ -260,14 +276,23 @@ hostile, mis-pointed or absent registry cannot close an entry market either.
 ## 3. Call graphs
 
 ```
-genesis (once)
-  timelock -> vault.genesis(params)
-    require(!initialized); require(teamShares + polShares == S0)
-    Amps.mint(teamVestingWallet, TEAM_SHARES); Amps.mint(self, POL_SHARES)
-    for each seed asset: transferFrom(msg.sender -> poolManager); poolManager.settle() -> ERC-6909 claim
-    creator = params.creator; genesisTimestamp = now; initialized = wiringFrozen = true
-    _checkpoint()                                     -> NAV/share == $1.00 by construction
-    emit Genesis, NavCheckpoint, RefCheckpoint
+genesisMint (once)                                        -- docs/genesis-cca.md is the whole mechanism
+  timelock -> vault.genesisMint(params)
+    require(!genesisMinted); require(team + auction + pol == S0 and each == its constant)
+    require(genesis pointer set, equals params.genesis, holds code)
+    Amps.mint(teamVestingWallet, TEAM_SHARES); Amps.mint(genesis, AUCTION_SHARES); Amps.mint(self, POL_SHARES)
+    creator = params.creator; genesisMinted = true          -- A is still 0, initialized still false
+    emit GenesisMinted
+
+genesisPlace (once)  -- AmpsGenesis.settle(), or the timelock on the founders'-seed fallback
+  require(genesisMinted); require(!initialized); require(p0X18 != 0)
+    for each registry asset and each seed token: _registerAsset
+    for each token: transferFrom(msg.sender -> poolManager); settle() -> ERC-6909 claim
+    if unsoldAmps: AMPS.transferFrom(msg.sender -> self)     -- inventory, never in A
+    genesisTimestamp = now; initialized = wiringFrozen = true
+    _checkpoint()                                            -> NAV/share == raised / S0 (fully diluted)
+    pRef = max(p0X18, NAV)
+    emit RefCheckpoint, Genesis, NavCheckpoint
 
 bond
   bonder -> bonds.bond(marketId, amountIn, minAmpsOut, to)
@@ -314,7 +339,7 @@ redeem  (structurally ungated)
     emit Redeem, Burn("redeemInventory"); sweepClean (per token: sync + capped transfer outside any unlock, then
                                                           a try-wrapped per-token unlock for settle + mint;
                                                           `SweepResidue` instead of a revert)
-    -- no _requireHealthy, no gate, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
+    -- no gate read, no oracle, no guardian, no pause; a paused or denylisting constituent is paid
        as an ERC-6909 claim the redeemer takes later, so one issuer can never block the floor (audit fixes 2, 3)
 
 checkpoint  (permissionless, unpaid)
@@ -437,7 +462,12 @@ under `COMPOSITE_READ_GAS`, 400k). The bond shell probes the registry under the 
 and `bond()` could see different deficits depending on warm storage, so the budget is the one that makes the read
 succeed whenever it is readable at all. **The `k_w` under-weight preference is therefore live**: a name held below its
 target weight gets a wider discount, exactly as the formula says, and a registry that cannot answer still prices
-`deficit == 0`. The ABI and the bond bytecode do not change when it lands. A registry
+`deficit == 0`. **And "the vault cannot price this spoke" is a revert, not a zero** (re-audit finding 11,
+2026-09-09): `deficit = (target - current)/target`, so a reported weight of zero is the *largest* deficit the
+formula admits, and a dead feed, an absent position valuer or an out-of-range reference answering a clean `0`
+walked straight past the target-weight fail-safe and widened the discount to `dMax` for exactly the name nobody
+could price. Those three branches now revert `SpokeUnpriceable`, so the probe fails and the fail-safe stands; a
+literal `0` is reserved for the one case that means it, which is that the vault holds none of the name. The ABI and the bond bytecode do not change when it lands. A registry
 that cannot answer must never be able to close a bond market, which is why the read is a bounded probe and not a
 plain call.
 
@@ -482,7 +512,7 @@ asset list and, in Phase 3, with the positions the valuer decomposes), independe
 
 ## 7. The structurally ungated surface
 
-Exactly two external state-changing functions are exempt from `_requireHealthy`:
+Exactly two external state-changing functions are exempt from every gate policy:
 
 | Function | Why |
 |---|---|
@@ -501,32 +531,62 @@ any unlock, so a token that re-enters the PoolManager hits `ManagerLocked` inste
 the vault's own unlock, and the payout falls back to a claims-only unlock if the ERC-20 unlock fails for any reason.
 A third party can degrade a redemption; nothing can revert it (audit fixes 2, 3; re-audit findings 1, 3, 5).
 
-### 7.1 The vault has two gate policies, not one
+### 7.1 The vault has three gate policies, not one
 
-`AmpsVault` reads the gate through one helper with two policies, and the difference is load-bearing:
+`AmpsVault` reads the gate through one helper with three policies, and the differences are load-bearing:
 
 | Policy | Taken by | Refuses | Passes |
 |---|---|---|---|
-| `_requireHealthy` (management) | every mutating selector except the three classified exemptions and the two below | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requirePlaceable` (placement) | `place`, `compound`, `rollout`, `deployBonded`, `withdrawRetiredBids` | `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `REF_DIVERGED` |
+| `_requireManageable` (management) | every governed setter, `checkpoint`, `touch`, `initializePool`, both genesis steps, `setStandbyVault`, `setCreator` | `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG` | `GREEN`, `DEGRADED`, `REF_DIVERGED` |
 | `_requireBondsHealthy` (bonds) | `depositBonded`, `mintVesting` | `DIVERGED`, `SCHEDULED_FREEZE` | `GREEN`, `DEGRADED`, `REF_DIVERGED`, `WATCHDOG` |
-| either policy, gate pointer **reverts, is codeless or answers malformed** | every gated selector | nothing | everything (fail-open through a bounded hand-decoded read; `setPolicyPointer` refuses a codeless target — audit fix 18) |
+| any policy, gate pointer **reverts, is codeless or answers malformed** | every gated selector | nothing | everything (fail-open through a bounded hand-decoded read; `setPolicyPointer` refuses a codeless target — audit fix 18) |
 
 The bond policy is the 24/7 bond decision restated inside the vault. A stale feed or a closed session must widen
-`h_session`, not close a market, so applying the management policy to the two bond entry points would be *stricter
+`h_session`, not close a market, so applying the placement policy to the two bond entry points would be *stricter
 than the design* rather than safer: it would shut every bond market every weekend. It mirrors `IOracleGate.checkBond`
 exactly, which makes the vault defence in depth behind the shell — a buggy or replaced `AmpsBonds` still cannot
 deposit or mint through a market the gate has closed — rather than a second, disagreeing gate.
 
+**Why `DEGRADED` came out of the management set (audit finding 9, 2026-09-08).** `OracleGate.state(0)` reports
+`DEGRADED` whenever an equity feed is stale beyond its session-scaled bound *or the session is simply closed* —
+which is every weekend, every holiday and every night. Applying the placement policy to management therefore meant
+that for roughly 48 hours a week, plus holidays, the timelock could not change a parameter, register a standby,
+open a pool, run either genesis step or — the one that matters most — call `setPolicyPointer`, which is the only way
+to replace a gate that is wrong but readable; and nobody could `checkpoint()` or `touch()` either, so the calendar
+froze governance and NAV upkeep together with no on-chain remedy for the timelock or the guardian. Nothing about
+`DEGRADED` argues for refusing governance: it says a price is not currently actionable, which is a reason to stop
+committing inventory at that price — the placement policy, unchanged — not a reason to stop the contract's owners
+from operating it. The three states that still refuse management are the ones that mean the protocol's own state is
+untrustworthy or deliberately halted: layer E's divergence breaker, a corporate-action or guardian freeze, and layer
+A's watchdog. A guardian protocol freeze still refuses all three policies, and a `checkpoint()` taken against stale
+answers is exactly what slot 21's `navUnconfirmed` flag exists to mark — the bond shell refuses such a NAV itself.
+
 Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
-* **`emergencyMigrate` is not `_requireHealthy`-gated.** It is gated by the on-chain denylist predicate, which is
+* **`emergencyMigrate` is gated by none of the three.** It is gated by the on-chain denylist predicate, which is
   strictly narrower. The incident it exists for — an issuer denylisting the vault while pausing its oracle — is
-  precisely a state in which `_requireHealthy` refuses, so gating it would brick the evacuation path of an immutable
-  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`).
+  precisely a state in which every one of them refuses, so gating it would brick the evacuation path of an immutable
+  contract. `unlockCallback` is the third exemption, guarded by caller identity (`NotPoolManager`). Its 0.5% NAV
+  bleed bound measures *both* sides live at the same instant (audit finding 10, 2026-09-08): comparing the stored
+  checkpoint — unrefreshable, because `checkpoint()` is gated — against a live valuation made ordinary weekend drift
+  of the 24/7 assets roll the whole evacuation back, and an unpriceable side now skips the bound and says so in
+  `MigrationBleedUnchecked` rather than vetoing the escape. It measures both sides at the same *basis* too
+  (re-audit finding 7, 2026-09-09): `navBefore` is taken **after** the `ACTION_UNWIND` that realises every position
+  into claims, so it is balances against balances. Taken before it, positions were valued at
+  `sqrtPrice(P_ref / P_counter)` (I7) while the standby's side was realised at whatever the pools cleared at, and a
+  pool a fraction of a percent below the reference — one front-running sell into a public, urgent, timelock-free
+  call — tripped the 50 bp bound and reverted the guardian's evacuation.
 * **A gate pointer that *reverts* is read as absent, not as a refusal.** The gate is the one pointer that can refuse
   every governance call; if a broken one refused, nobody could call `setPolicyPointer` to replace it and a contract
   holding no funds would have bricked the protocol. Failing open grants an attacker nothing they would not already
-  have with a `GREEN` gate.
+  have with a `GREEN` gate. **The guardian's protocol freeze is read first, and is exempt from that rule**
+  (re-audit finding 6, 2026-09-09): `protocolFreezeUntil()` is one `SLOAD` behind a getter (~2.6k) while `state(0)`
+  walks the calendar, the feeds, the market reference and the registry (330-390k against real aggregators), so
+  reading the expensive one first put the fail-open `return` between the caller and the freeze — and a gated
+  selector sent with a gas limit that starves the composite and nothing else proceeded while the freeze was live.
+  The refusal that cannot be starved therefore runs before the read that can; neither read's own semantics change,
+  and a gate that answers neither is still absent.
 
 **How the I14 enumeration test verifies it** (`test/unit/GuardSymmetry.t.sol`):
 
@@ -548,7 +608,7 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
    merely that it is not gated today.
 5. *Assert at the bytecode level.* `AmpsVault`'s deployed code must contain no `PUSH` of the gate, feed-registry or
    guardian slot in any basic block reachable from the `redeemProRata` selector, and exactly one `Amps.mint` call
-   site reachable from a selector other than `genesis` — `mintVesting` (I10).
+   site reachable from a selector other than **`genesisMint`** — `mintVesting` (I10).
 
 ## 8. Migration surface
 
@@ -594,25 +654,44 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 
 ## 9.1 Bootstrap ordering: the gate and the first pool are circular
 
-`AmpsVault.initializePool` and `genesis()` take `_requireHealthy`, and `OracleGate._referenceIntegrity` reports
-`WATCHDOG` whenever the hub pool is unregistered *or* its observation ring covers less than `twapWindow`. A freshly
-initialised hook pool has no observations at all, so with the gate already wired **no pool can be registered and
-`genesis()` cannot run**: both revert with `GateNotHealthy(WATCHDOG)` until the hub has thirty minutes of history it
-cannot acquire without existing. The Phase 2 integration fixture resolves it the only way the contracts allow, and
-the deploy runbook (`script/05_Registry`, `script/06_Genesis`) must use the same order:
+`AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireManageable`, and
+`OracleGate._referenceIntegrity` reports `WATCHDOG` whenever the hub pool is unregistered *or* its observation ring
+covers less than `twapWindow`. A freshly initialised hook pool has no observations at all, so with the gate already
+wired **no pool can be registered and neither genesis step can run**: all three revert with
+`GateNotHealthy(WATCHDOG)` until the hub has thirty minutes of history it cannot acquire without existing.
 
-1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `bountyPot`) and the
-   pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave `oracleGate` unset**
-   (`_requireGate` returns when the pointer is zero);
-2. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate);
-3. wait until the hook's hub ring covers `twapWindow` — on Robinhood Chain that is thirty minutes of blocks after
+Revision 7 adds a second circularity on top of it. `PoolRegistry._openPool` anchors every pool at
+`AmpsVault.pRefX18()` and registration opens the pool in the same call, so if the 32 pools are to open at the
+auction's clearing price the whole of `05_Registry` has to run **after** `genesisPlace` — while `genesisPlace`
+itself ends in a checkpoint, and a checkpoint prices every asset the vault holds. The Phase 2 integration fixture
+resolves both the only way the contracts allow, and the deploy runbook (`script/05_Registry`,
+`script/06a_GenesisAuction`, `script/06b_GenesisSettle`, `script/09_Phase3Wire`) must use the same order:
+
+1. deploy everything and wire the vault's set-once pointers (`registry`, `bonds`, `bountyPot`, and the new
+   `genesis`) and the pointer-upgradeable `feedRegistry`, `positionValuer`, `marketReference` — but **leave
+   `oracleGate` unset** (`_requireGate` returns when the pointer is zero). `09_Phase3Wire` with
+   `WIRE_DEFER_GATE=true` is that pass;
+2. **install every feed and register nothing** (`05_Registry` with `REGISTRY_FEEDS_ONLY=true`). A checkpoint prices
+   every asset the vault holds, so WETH9's and USDG's feeds must exist before `genesisPlace` — which is why feed
+   installation is now its own step rather than a side effect of registration;
+3. `genesisMint`, then `AmpsGenesis.createAuctions` (`06a_GenesisAuction`): `S0` is minted, the auction tranche is
+   inside the two auctions, `initialized` is still false;
+4. bidding, about 72 hours;
+5. `AmpsGenesis.settle()` → `genesisPlace` (`06b_GenesisSettle`), which writes `P_ref = max(P0, NAV/share)`;
+6. register the 32 pools through `PoolRegistry` (each `vault.initializePool` passes with no gate, and each pool
+   opens at `P0` because `pRefX18()` is no longer zero);
+7. wait until the hook's hub ring covers `twapWindow` — on Robinhood Chain that is thirty minutes of blocks after
    the hub's first observation; on a test chain, seed the ring;
-4. point the vault at `OracleGate` through `setPolicyPointer`, confirm `gate.state(0) == GREEN`;
-5. run `genesis()`.
+8. point the vault at `OracleGate` through `setPolicyPointer`, confirm `gate.state(0) == GREEN` (`09_Phase3Wire`
+   pass 2);
+9. lay the §3.3 ladders (`11_GenesisPlacement`, two phases 60 s apart).
 
 Nothing is lost by the order: a gate that is absent is exactly as permissive as a gate that is `GREEN` (§7.1), the
-vault holds no assets before `genesis()`, and the `wiringFrozen` latch that `genesis()` sets does not cover the
-gate pointer, which stays governable for the life of the vault.
+vault holds no assets before `genesisPlace`, and the `wiringFrozen` latch that `genesisPlace` sets does not cover
+the gate pointer, which stays governable for the life of the vault. One consequence is load-bearing rather than
+incidental: because `settle()` is permissionless *and* gated, **the gate pointer must not be set between steps 3
+and 5** — a third party's `settle()` would revert `GateNotHealthy` and the launch would stall. See
+`docs/genesis-cca.md` §5 for the whole table, including which script each step is.
 
 ## 10. How Phase 2 actually builds: libraries, lenses and per-path compilation
 

@@ -46,6 +46,9 @@ contract Verify is Script {
     /// @notice The deployment's address book.
     string internal constant DEPLOYMENTS_PATH = "./script/config/deployments.json";
 
+    /// @notice The launch parameters, read only for the auction factory `AmpsGenesis` was constructed against.
+    string internal constant GENESIS_PATH = "./script/config/genesis.json";
+
     /// @notice The four linked vault libraries.
     string internal constant LIBRARIES_PATH = "./script/config/libraries.json";
 
@@ -129,7 +132,7 @@ contract Verify is Script {
                 "--libraries src/vault/VaultPlacementLib.sol:VaultPlacementLib:", vm.toString(libs.placementLib)
             );
 
-        Target[] memory buffer = new Target[](24);
+        Target[] memory buffer = new Target[](25);
         uint256 n;
 
         n = _add(buffer, n, "VaultNavLib", "src/vault/VaultNavLib.sol:VaultNavLib", libs.navLib, "", "");
@@ -189,8 +192,8 @@ contract Verify is Script {
         }
     }
 
-    /// @dev The oracle layer, bonds, the pot, the valuer, the quoter and the router.
-    function _addPeriphery(Target[] memory buffer, uint256 n, Core.Set memory set) private pure returns (uint256) {
+    /// @dev The oracle layer, bonds, the pot, the valuer, the quoter, the router and the genesis adapter.
+    function _addPeriphery(Target[] memory buffer, uint256 n, Core.Set memory set) private view returns (uint256) {
         n = _add(
             buffer,
             n,
@@ -254,6 +257,15 @@ contract Verify is Script {
             abi.encode(set.poolManager, set.amps, set.registry, set.weth9),
             ""
         );
+        n = _add(
+            buffer,
+            n,
+            "AmpsGenesis",
+            "src/genesis/AmpsGenesis.sol:AmpsGenesis",
+            set.genesis,
+            abi.encode(set.vault, set.amps, _auctionFactory(), set.weth9, set.usdg, set.timelock),
+            ""
+        );
         return n;
     }
 
@@ -303,8 +315,19 @@ contract Verify is Script {
         set.bondPolicy = _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY");
         set.quoter = _address(json, ".core.quoter", "AMPS_QUOTER");
         set.router = _address(json, ".core.router", "AMPS_ROUTER");
+        set.genesis = _address(json, ".core.genesis", "AMPS_GENESIS");
         set.weth9 = _address(json, ".core.weth9", "AMPS_WETH9");
         set.usdg = _address(json, ".core.usdg", "AMPS_USDG");
+    }
+
+    /// @dev The `ContinuousClearingAuctionFactory` `AmpsGenesis` was constructed against, from
+    ///      `script/config/genesis.json` with `AMPS_CCA_FACTORY` winning. It is a launch parameter rather than
+    ///      deployment state, which is why it is not in `deployments.json`, but it *is* a constructor argument and
+    ///      so has to appear in the verification table.
+    function _auctionFactory() private view returns (address factory) {
+        factory = vm.envOr("AMPS_CCA_FACTORY", address(0));
+        if (factory != address(0)) return factory;
+        factory = vm.readFile(GENESIS_PATH).readAddress(".factory");
     }
 
     /// @dev An address from the config, overridden by `envName` when that variable is set.

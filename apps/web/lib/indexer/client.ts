@@ -27,6 +27,7 @@ import type {
   CreatorFeeStatus,
   FlywheelResponse,
   GateResponse,
+  GenesisResponse,
   IndexerHealth,
   LadderDetail,
   NavPoint,
@@ -40,6 +41,8 @@ import type {
 export const ENDPOINTS = {
   health: '/health',
   vaultSummary: '/api/vault',
+  /** The launch: the mint, the two auctions, the settlement, and the vault's own record of it. */
+  genesis: '/api/genesis',
   navHistory: '/api/nav-history',
   premiumHistory: '/api/premium-history',
   pools: '/api/pools',
@@ -113,6 +116,22 @@ export class IndexerClient {
   /** The vault summary, the last share sample and the last NAV reconciliation, in one call. */
   vaultSummary(): Promise<IndexerResult<VaultResponse>> {
     return this.get<VaultResponse>(ENDPOINTS.vaultSummary)
+  }
+
+  /**
+   * The launch row, plus the bid book and the clearing-price series.
+   *
+   * History and disclosure only. Everything a reader can act on — the phase, `P0`, the raise, whether
+   * settlement is possible — is a chain read of `AmpsGenesis` (`hooks/use-genesis.ts`), because the
+   * adapter derives its phase from the block number and no log carries it. A 404 here means "not
+   * indexed yet", which for a launch that has not happened is the correct answer rather than an error.
+   */
+  genesis(params: {leg?: 'usdg' | 'eth'; bids?: number; checkpoints?: number} = {}): Promise<IndexerResult<GenesisResponse>> {
+    return this.get<GenesisResponse>(ENDPOINTS.genesis, {
+      leg: params.leg,
+      bids: params.bids,
+      checkpoints: params.checkpoints,
+    })
   }
 
   /** NAV/share, `A` and `T` over time, oldest first. */

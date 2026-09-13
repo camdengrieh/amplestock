@@ -139,6 +139,16 @@ describe('registration', () => {
     const names = registeredHandlers()
     for (const name of [
       'AmpsVault:Genesis',
+      'AmpsVault:GenesisMinted',
+      'AmpsGenesis:AuctionsCreated',
+      'AmpsGenesis:Settled',
+      'AmpsGenesis:ClearingPricesDiverged',
+      'GenesisAuctionUsdg:BidSubmitted',
+      'GenesisAuctionUsdg:BidExited',
+      'GenesisAuctionUsdg:TokensClaimed',
+      'GenesisAuctionUsdg:CheckpointUpdated',
+      'GenesisAuctionEth:BidSubmitted',
+      'GenesisAuctionEth:CheckpointUpdated',
       'AmpsVault:NavCheckpoint',
       'AmpsVault:RefCheckpoint',
       'AmpsVault:Redeem',

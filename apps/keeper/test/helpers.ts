@@ -7,10 +7,12 @@
 
 import {
   GateState,
+  GenesisPhase,
   PoolClass,
   Session,
   type ChainSnapshot,
   type ConstituentSnapshot,
+  type GenesisSnapshot,
   type PoolSnapshot,
   type PotSnapshot,
   type VaultSnapshot,
@@ -94,6 +96,26 @@ export function constituent(overrides: Partial<ConstituentSnapshot> = {}): Const
     idleCollateral: 0n,
     idleCollateralUsd18: 0n,
     rolloutWeightBps: 500,
+    ...overrides,
+  }
+}
+
+export const GENESIS = '0x00000000000000000000000000000000000000e0' as const
+
+/**
+ * `AmpsGenesis` in the one state where `settle()` is callable: every leg's end block has passed and
+ * nobody has settled yet. Override `phase` for the other four.
+ *
+ * It is deliberately **not** in the baseline {@link snapshot}: the launch happens once, and the
+ * ordinary state of a running protocol is a snapshot with no genesis in it at all.
+ */
+export function genesis(overrides: Partial<GenesisSnapshot> = {}): GenesisSnapshot {
+  return {
+    address: GENESIS,
+    phase: GenesisPhase.Ended,
+    settled: false,
+    usdgAuction: '0x00000000000000000000000000000000000000e1',
+    ethAuction: '0x00000000000000000000000000000000000000e2',
     ...overrides,
   }
 }

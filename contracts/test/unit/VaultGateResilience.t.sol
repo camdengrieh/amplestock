@@ -29,6 +29,37 @@ contract GasBurningGate {
     }
 }
 
+/// @notice A gate whose composite `state(0)` cannot be read but whose one-slot `protocolFreezeUntil()` can.
+///
+/// @dev The asymmetry is the whole of re-audit finding 6. `IOracleGate.state(0)` walks the calendar, the feed
+///      registry, the market reference and the registry — 330-390k gas against real aggregator proxies — while
+///      `protocolFreezeUntil()` is a getter over one slot at ~2.6k. A caller who sends a gated selector with a
+///      gas limit that starves the first and not the second therefore starved the *un*-starvable signal, because
+///      the vault read them in that order and returned on the first. This gate is that state, made explicit:
+///      everything but the freeze getter burns more than `GATE_READ_GAS` and then reverts.
+contract StarvedStateGate {
+    /// @dev More than the vault's `GATE_READ_GAS`, so the capped read exhausts itself before reaching the revert.
+    uint256 private constant BURN = 2_000_000;
+
+    uint32 private immutable _until;
+
+    constructor(uint32 until_) {
+        _until = until_;
+    }
+
+    /// @notice The guardian's protocol-wide freeze, which is always cheap to read.
+    /// @return until The timestamp the freeze runs to.
+    function protocolFreezeUntil() external view returns (uint32 until) {
+        return _until;
+    }
+
+    fallback() external {
+        uint256 floor_ = gasleft() > BURN ? gasleft() - BURN : 0;
+        while (gasleft() > floor_) {}
+        revert("burned");
+    }
+}
+
 /// @title VaultGateResilienceTest
 /// @notice `docs/phase2-state-model.md` §7.1: **"a gate pointer that cannot be read is absent, not a refusal"**,
 ///         taken literally rather than as far as a typed `try` happens to reach.
@@ -147,6 +178,38 @@ contract VaultGateResilienceTest is AmpsVaultFixture {
             abi.encodeWithSignature("GateNotHealthy(uint8,bytes32)", uint8(GateState.SCHEDULED_FREEZE), bytes32(0))
         );
         vault.checkpoint();
+    }
+
+    /// @notice **Re-audit finding 6.** A `state(0)` read the caller's gas limit starves no longer carries the
+    ///         guardian's protocol freeze down with it.
+    ///
+    /// @dev `_requireGate` read the expensive composite first and returned as soon as it could not be read — the
+    ///      "an unreadable gate is absent" rule, which is load-bearing because this contract is immutable and a
+    ///      broken pointer must never lock governance out of replacing it. But the cheap `protocolFreezeUntil()`
+    ///      refusal sat *after* that return, so a gated selector sent with a gas limit that starves the 330-390k
+    ///      composite and nothing else proceeded while the freeze was live. The order is now the other way round:
+    ///      the refusal that cannot be starved runs first, and neither read's own semantics changed.
+    function test_r07_aStarvedStateReadStillHonoursTheGuardiansFreeze() public {
+        _forceGate(address(new StarvedStateGate(uint32(block.timestamp + 1 days))));
+
+        vm.expectRevert(
+            abi.encodeWithSignature("GateNotHealthy(uint8,bytes32)", uint8(GateState.SCHEDULED_FREEZE), bytes32(0))
+        );
+        vault.checkpoint();
+    }
+
+    /// @notice And the rule the reorder must not break: with no freeze in force, an unreadable `state(0)` is still
+    ///         *absent* rather than a refusal, so every gated selector still works and governance can still
+    ///         replace the gate.
+    function test_r07_anUnreadableStateWithNoFreezeIsStillAbsent() public {
+        _forceGate(address(new StarvedStateGate(0)));
+
+        vault.checkpoint();
+        vault.touch();
+
+        vm.prank(TIMELOCK);
+        vault.setPolicyPointer(bytes32("oracleGate"), address(gate));
+        assertEq(vault.oracleGate(), address(gate), "and governance could still replace it");
     }
 
     // -------------------------------------------------------------------------------------------------------------

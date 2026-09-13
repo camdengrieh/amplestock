@@ -23,6 +23,7 @@ import {FeedConfig, InclusionRecord, PlacementRecord, PoolClass} from "../../src
 import {LadderPositionValuer} from "../../src/valuer/LadderPositionValuer.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
 import {MockAggregator} from "../mocks/MockAggregator.sol";
+import {MockGenesisHolder} from "../mocks/MockGenesisHolder.sol";
 import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {MockUsdg} from "../mocks/MockUsdg.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
@@ -96,17 +97,26 @@ abstract contract Phase3Fixture is V4TestBase {
 
     uint128 internal constant WETH_USD8 = 2500e8;
     uint128 internal constant USDG_USD8 = 1e8;
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    uint256 internal constant SEED_WETH = 4e18;
+    uint256 internal constant SEED_USDG = 10_000e6;
+
+    /// @dev The `p0X18` this fixture asks {IAmpsVault-genesisPlace} for. `genesisPlace` floors the launch
+    ///      reference at NAV/share, so the smallest legal value asks for exactly that floor and `P_ref` starts at
+    ///      NAV — which is what genesis did before revision 7, and what every vector below this line was written
+    ///      against. It matters at the last wei: `VIRTUAL_SHARES` puts NAV/share one wei under $1.00 even with a
+    ///      seed worth exactly `S0` dollars, so asking for a flat `1e18` here would open a one-wei premium and
+    ///      every "the reference is NAV" assertion in the suite would be off by that wei. A launch that really
+    ///      does clear above NAV is `test/unit/VaultGenesis.t.sol`'s subject.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     int24 internal constant TICK_SPACING = 60;
     uint16 internal constant TARGET_WEIGHT_BPS = 1000;
     uint16 internal constant ROLLOUT_WEIGHT_BPS = 1000;
 
-    /// @dev §3.3's confirmed genesis ladders: 1,662.5 AMPS of asks in each entry pool, and each spoke's seed ask
-    ///      at 1% of the 4,750 AMPS POL tranche.
-    uint256 internal constant ENTRY_ASK_AMPS = 1662.5e18;
-    uint256 internal constant SPOKE_SEED_AMPS = 47.5e18;
+    /// @dev §3.3's confirmed genesis ladders: 3,150 AMPS of asks in each entry pool, and each spoke's seed ask
+    ///      at 1% of the 9,000 AMPS POL tranche.
+    uint256 internal constant ENTRY_ASK_AMPS = 3150e18;
+    uint256 internal constant SPOKE_SEED_AMPS = 90e18;
 
     uint160 internal constant HOOK_FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
@@ -127,6 +137,9 @@ abstract contract Phase3Fixture is V4TestBase {
     OracleGate internal gate;
     FeedRegistry internal feeds;
     LadderPositionValuer internal valuer;
+    /// @dev Stands in for the `AmpsGenesis` adapter: the vault's `genesis` pointer and the holder of the auction
+    ///      tranche, which stays there exactly as bidders' AMPS would.
+    MockGenesisHolder internal genesisHolder;
     FeePolicy internal feePolicy;
     LadderPolicy internal ladderPolicy;
     RolloutPolicy internal rolloutPolicy;
@@ -225,7 +238,7 @@ abstract contract Phase3Fixture is V4TestBase {
     // Deployment steps
     // -------------------------------------------------------------------------------------------------------------
 
-    function _deployAssets() private {
+    function _deployAssets() internal virtual {
         weth = deployToken("Wrapped Ether", "WETH", 18);
         usdg = new MockUsdg("Global Dollar", "USDG", 6);
         wethFeed = new MockAggregator("ETH / USD", 8, int256(uint256(WETH_USD8)));
@@ -251,7 +264,7 @@ abstract contract Phase3Fixture is V4TestBase {
     /// @dev The hook takes the registry in its constructor and the registry takes the hook, so one of the two has
     ///      to be predicted. The hook is the mined one, so the registry is what gets predicted: CREATE2 still
     ///      bumps the creator's nonce, which is what makes `nonce + 1` the registry's slot.
-    function _deployCore() private {
+    function _deployCore() internal virtual {
         address predictedVault = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         amps = new Amps{salt: _mineAmpsSalt(predictedVault)}(predictedVault);
         vault = new AmpsVault(address(amps), address(poolManager), TIMELOCK, GUARDIAN);
@@ -328,7 +341,9 @@ abstract contract Phase3Fixture is V4TestBase {
     /// @dev Every pointer except `oracleGate`, which is wired after the pools exist and the rings are covered.
     function _wireVault() private {
         vm.startPrank(TIMELOCK);
+        genesisHolder = new MockGenesisHolder();
         vault.setPolicyPointer(bytes32("registry"), address(registry));
+        vault.setPolicyPointer(bytes32("genesis"), address(genesisHolder));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(hook));
@@ -376,25 +391,28 @@ abstract contract Phase3Fixture is V4TestBase {
         weth.mint(TIMELOCK, SEED_WETH);
         usdg.mint(TIMELOCK, SEED_USDG);
 
-        address[] memory seedTokens = new address[](2);
-        uint256[] memory seedAmounts = new uint256[](2);
-        seedTokens[0] = address(weth);
-        seedAmounts[0] = SEED_WETH;
-        seedTokens[1] = address(usdg);
-        seedAmounts[1] = SEED_USDG;
+        address[] memory tokens = new address[](2);
+        uint256[] memory amounts = new uint256[](2);
+        tokens[0] = address(weth);
+        amounts[0] = SEED_WETH;
+        tokens[1] = address(usdg);
+        amounts[1] = SEED_USDG;
 
         vm.startPrank(TIMELOCK);
         weth.approve(address(vault), type(uint256).max);
         usdg.approve(address(vault), type(uint256).max);
-        vault.genesis(
-            IAmpsVault.GenesisParams({
+        vault.genesisMint(
+            IAmpsVault.GenesisMintParams({
                 teamVestingWallet: address(teamVesting),
                 creator: CREATOR,
+                genesis: address(genesisHolder),
                 teamShares: Constants.TEAM_SHARES,
-                polShares: Constants.POL_SHARES,
-                seedTokens: seedTokens,
-                seedAmounts: seedAmounts
+                auctionShares: Constants.AUCTION_SHARES,
+                polShares: Constants.POL_SHARES
             })
+        );
+        vault.genesisPlace(
+            IAmpsVault.GenesisPlaceParams({p0X18: GENESIS_P0_AT_NAV, tokens: tokens, amounts: amounts, unsoldAmps: 0})
         );
         vm.stopPrank();
     }
@@ -406,7 +424,7 @@ abstract contract Phase3Fixture is V4TestBase {
     /// @notice Warps `dt` seconds forward and produces a block per second with it, so the layer-A watchdog sees a
     ///         chain that kept running rather than a stalled sequencer, then republishes every feed.
     /// @param dt Seconds to warp.
-    function warpBy(uint256 dt) internal {
+    function warpBy(uint256 dt) internal virtual {
         vm.warp(vm.getBlockTimestamp() + dt);
         vm.roll(vm.getBlockNumber() + dt + 1);
         refreshFeeds();
@@ -420,7 +438,7 @@ abstract contract Phase3Fixture is V4TestBase {
     ///      makes the TWAP stop following the pool. `vm.getBlockNumber()` and `vm.getBlockTimestamp()` are
     ///      external calls the optimizer cannot hoist, so the advance is real on every iteration.
     /// @param dt Seconds to advance.
-    function advance(uint256 dt) internal {
+    function advance(uint256 dt) internal virtual {
         vm.warp(vm.getBlockTimestamp() + dt);
         vm.roll(vm.getBlockNumber() + 1);
         refreshFeeds();
@@ -448,7 +466,7 @@ abstract contract Phase3Fixture is V4TestBase {
     ///         at the pool's own tick, called as the PoolManager. This is what a real swap would do to the cache,
     ///         isolated from what a real swap would do to the price.
     /// @param poolId The pool.
-    function refreshGateCache(PoolId poolId) internal {
+    function refreshGateCache(PoolId poolId) internal virtual {
         vm.warp(vm.getBlockTimestamp() + hook.gateCacheSeconds() + 1);
         vm.roll(vm.getBlockNumber() + 1);
         refreshFeeds();
@@ -642,7 +660,7 @@ abstract contract Phase3Fixture is V4TestBase {
     /// @notice Approves permit2 and the v4 router for `who` on `token`.
     /// @param token The token.
     /// @param who The owner.
-    function approveStack(address token, address who) internal {
+    function approveStack(address token, address who) internal virtual {
         vm.startPrank(who);
         MockERC20(token).approve(address(permit2), type(uint256).max);
         MockERC20(token).approve(address(swapRouter), type(uint256).max);

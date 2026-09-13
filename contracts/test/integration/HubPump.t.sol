@@ -52,7 +52,10 @@ contract HubPumpTest is Phase3Fixture {
         }
 
         // --- the pump: ten minutes, +30%, one rail-limited step at a time -----------------------------------
-        (, uint256 steps) = climb(hubPool, BOB, 1e6, hubStart + PUMP_TICKS, 200, 3);
+        // $2 a step, not $1: revision 7's entry ladders are 3,150 AMPS rather than 1,662.5, so the same tick
+        // move costs about 1.9x what it did. The point of the scenario is the *time* the pump takes and what
+        // follows it, not its price — and that the pump is expensive is the §8.1 row's own conclusion.
+        (, uint256 steps) = climb(hubPool, BOB, 2e6, hubStart + PUMP_TICKS, 200, 3);
         uint256 pumpElapsed = vm.getBlockTimestamp() - startedAt;
         assertLt(steps, 200, "the pump reached +30% rather than running out of steps");
         assertLe(pumpElapsed, PUMP_SECONDS, "and it did so inside ten minutes");
@@ -375,8 +378,10 @@ contract HubPumpTest is Phase3Fixture {
     }
 
     /// @dev The stock a spoke arbitrage step spends: a few tenths of a percent of the cell it is walking through.
+    ///      $0.10 rather than revision 6's $0.05, because a spoke's genesis ask is now 90 AMPS (1% of a 9,000
+    ///      POL tranche) instead of 47.5, so each cell holds about twice the depth to walk through.
     function _spokeUnit(uint256 i) private view returns (uint256 unit) {
-        unit = uint256(0.05e18) * 1e8 / uint256(stockUsd8[i]);
+        unit = uint256(0.1e18) * 1e8 / uint256(stockUsd8[i]);
     }
 
     /// @dev The pool's live deviation from the reference the hook is charging against.

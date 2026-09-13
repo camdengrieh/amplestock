@@ -58,6 +58,7 @@ export default defineConfig({
       NEXT_PUBLIC_AMPS_TIMELOCK: E2E.timelock,
       NEXT_PUBLIC_AMPS_AUCTION_USDG: E2E.auctionUsdg,
       NEXT_PUBLIC_AMPS_AUCTION_ETH: E2E.auctionEth,
+      NEXT_PUBLIC_AMPS_GENESIS: E2E.genesis,
       // `header` so the smoke test can drive the geo gate from a request header rather than an IP.
       GEO_PROVIDER: 'header',
       GEO_COUNTRY_HEADER: 'x-geo-country',

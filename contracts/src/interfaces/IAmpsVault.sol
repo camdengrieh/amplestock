@@ -45,7 +45,7 @@ import {Checkpoint, GateState} from "../types/Types.sol";
 ///      the bytecode is {mintVesting}, callable only by `AmpsBonds` (I10). There is no NAV mint, no
 ///      `mintInKind`, no `mintWithUSDG`, and the vault never mints AMPS for its own inventory or to defend a price.
 ///
-/// @dev **`redeemProRata` is structurally ungated.** It contains no `_requireHealthy`, no guardian read, no pause
+/// @dev **`redeemProRata` is structurally ungated.** It contains no gate read, no guardian read, no pause
 ///      flag, no oracle read and no gate reference of any kind — not merely "is not paused", but *cannot be*
 ///      paused (I14, I23). It succeeds with every feed dead, the watchdog tripped, the guardian frozen and the
 ///      timelock hostile. Only chain-level censorship remains, and that is disclosed rather than mitigated.
@@ -55,29 +55,66 @@ import {Checkpoint, GateState} from "../types/Types.sol";
 ///      which absorbs every idle ERC-20 balance it can move and emits {SweepResidue} for anything it cannot,
 ///      rather than reverting, so that no donation of a hostile token can brick an entry point.
 interface IAmpsVault {
-    /// @notice Arguments to {genesis}. Built by `script/06_Genesis` and executed once.
+    /// @notice Arguments to {genesisMint}, step one of two. Built by `script/06a_GenesisAuction` and executed once.
     /// @param teamVestingWallet The OZ `VestingWallet` that receives the 5% team tranche (2-month linear, no cliff).
     /// @param creator The address that receives the decaying creator fee. Only the creator may later reassign it.
+    /// @param genesis The `AmpsGenesis` adapter that receives the 50% auction tranche and later calls
+    ///        {genesisPlace}. Must hold code and must equal the vault's `genesis` pointer.
     /// @param teamShares AMPS wei to the vesting wallet. Must equal `Constants.TEAM_SHARES`.
+    /// @param auctionShares AMPS wei to the adapter. Must equal `Constants.AUCTION_SHARES`.
     /// @param polShares AMPS wei retained by the vault as POL inventory. Must equal `Constants.POL_SHARES`.
-    /// @param seedTokens The founders' seed assets, pulled from `msg.sender`: WETH9 and USDG.
-    /// @param seedAmounts The seed amounts, parallel to `seedTokens`.
-    struct GenesisParams {
+    struct GenesisMintParams {
         address teamVestingWallet;
         address creator;
+        address genesis;
         uint256 teamShares;
+        uint256 auctionShares;
         uint256 polShares;
-        address[] seedTokens;
-        uint256[] seedAmounts;
     }
 
-    /// @notice Emitted once, by {genesis}.
+    /// @notice Arguments to {genesisPlace}, step two of two. Executed once, by the `genesis` adapter out of its
+    ///         own `settle()` or — when no auction graduated — by the timelock with the founders' seed.
+    /// @param p0X18 The launch reference price, 18-decimal USD per AMPS: the auction's clearing price, or `1e18`
+    ///        on the fallback path. Floored at NAV/share so that I24 (`P_ref >= NAV`) holds from block one.
+    /// @param tokens The assets to pull from `msg.sender` into ERC-6909 claims: WETH9 and USDG, never AMPS.
+    /// @param amounts The raw amounts, parallel to `tokens`.
+    /// @param unsoldAmps AMPS wei to pull from `msg.sender` into the vault's own inventory: the part of the
+    ///        auction tranche that never cleared. Neither minted nor counted in `A` — it is the vault's own share.
+    struct GenesisPlaceParams {
+        uint256 p0X18;
+        address[] tokens;
+        uint256[] amounts;
+        uint256 unsoldAmps;
+    }
+
+    /// @notice Emitted once, by {genesisMint}. `S0` exists from here; `A` is still zero and stays zero until
+    ///         {genesisPlace}, which is why nothing may be checkpointed, bonded or redeemed in between.
     /// @param teamVestingWallet The team's vesting wallet.
     /// @param creator The creator address.
+    /// @param genesis The auction adapter the auction tranche was minted to.
+    /// @param teamShares The team tranche.
+    /// @param auctionShares The auction tranche.
+    /// @param polShares The POL tranche retained by the vault.
+    event GenesisMinted(
+        address indexed teamVestingWallet,
+        address indexed creator,
+        address indexed genesis,
+        uint256 teamShares,
+        uint256 auctionShares,
+        uint256 polShares
+    );
+
+    /// @notice Emitted once, by {genesisPlace}. The launch is live from here: `_initialized` is set, the wiring
+    ///         latch is closed and the creator's decay clock starts.
+    /// @param creator The creator address.
     /// @param totalMinted `S0`.
-    /// @param navPerShareX18 NAV/share immediately after genesis. $1.00 by construction.
+    /// @param navPerShareX18 NAV/share immediately after the placement, i.e. `raised / S0` under decision 14.
+    /// @param p0X18 The launch reference price the vault was seeded with. The premium is `p0X18 / navPerShareX18 - 1`
+    ///        and is disclosure, never smoothed.
+    /// @param raisedUsd18 `A` as this checkpoint measured it, reconstructed from NAV/share and `T` — exact to the
+    ///        wei that `navPerShare`'s own rounding drops.
     event Genesis(
-        address indexed teamVestingWallet, address indexed creator, uint256 totalMinted, uint256 navPerShareX18
+        address indexed creator, uint256 totalMinted, uint256 navPerShareX18, uint256 p0X18, uint256 raisedUsd18
     );
 
     /// @notice Emitted on every NAV recomputation.
@@ -220,24 +257,39 @@ interface IAmpsVault {
     event StandbyVaultRegistered(address indexed standby);
 
     /// @notice Emitted when `emergencyMigrate` completes.
+    /// @dev `navPerShareBefore` is measured live at the call's first statement, at the same instant `navAfter`
+    ///      will be, so the pair is comparable and the bleed bound measures the migration rather than the market.
     /// @param newVault The vault that now owns everything.
     /// @param navPerShareBefore NAV/share before the migration.
     /// @param navPerShareAfter NAV/share after it.
     event Migrated(address indexed newVault, uint256 navPerShareBefore, uint256 navPerShareAfter);
+
+    /// @notice Emitted by `emergencyMigrate` when the 0.5% bleed bound could not be applied because one side of it
+    ///         could not be priced. The evacuation still completes: a vault whose assets no feed or valuer can
+    ///         value is exactly the incident the migration exists for, so an unpriceable NAV must not be able to
+    ///         veto it — but it is never silent.
+    /// @param side `"navBefore"` when the vault could not be valued at entry, `"navAfter"` when the standby could
+    ///        not be valued at the end.
+    event MigrationBleedUnchecked(bytes32 side);
 
     /// @notice Emitted when the creator address is reassigned. Only the current creator may do this.
     /// @param previousCreator The old address.
     /// @param newCreator The new address.
     event CreatorChanged(address indexed previousCreator, address indexed newCreator);
 
-    /// @notice {genesis} has already run. The latch is one-way and there is no reset.
+    /// @notice The genesis step being attempted has already run. Both latches are one-way and neither resets.
     error GenesisAlreadyDone();
+
+    /// @notice {genesisPlace} was called before {genesisMint}. The two steps are ordered and the order is a latch,
+    ///         not a convention: there is nothing to place against a supply that does not exist.
+    error GenesisNotMinted();
 
     /// @notice The genesis allocation does not sum to `S0`, or a tranche does not match its constant.
     /// @param teamShares The proposed team tranche.
+    /// @param auctionShares The proposed auction tranche.
     /// @param polShares The proposed POL tranche.
     /// @param expectedTotal `Constants.S0`.
-    error InvalidGenesisAllocation(uint256 teamShares, uint256 polShares, uint256 expectedTotal);
+    error InvalidGenesisAllocation(uint256 teamShares, uint256 auctionShares, uint256 polShares, uint256 expectedTotal);
 
     /// @notice The migration predicate is not satisfied: no constituent reports `isBlocked(vault) == true` and
     ///         fewer than two 1-wei self-transfer probes fail.
@@ -429,13 +481,24 @@ interface IAmpsVault {
     /// @return bps The creator fee.
     function creatorBpsAt(uint256 timestamp) external view returns (uint16 bps);
 
-    /// @notice When {genesis} ran. Zero before it.
+    /// @notice When {genesisPlace} ran, i.e. when the protocol opened. Zero before it.
+    /// @dev The creator's decay clock starts here rather than at {genesisMint}, so the auction's bidding window
+    ///      does not eat into the creator fee's 24-month life.
     /// @return timestamp The genesis timestamp.
     function genesisTimestamp() external view returns (uint32 timestamp);
 
-    /// @notice Whether {genesis} has run.
+    /// @notice Whether {genesisPlace} has run.
     /// @return done The latch.
     function initialized() external view returns (bool done);
+
+    /// @notice Whether {genesisMint} has run.
+    /// @return done The latch.
+    function genesisMinted() external view returns (bool done);
+
+    /// @notice The `AmpsGenesis` adapter: the auction tranche's recipient and the auction-side caller of
+    ///         {genesisPlace}. Set once through {setPolicyPointer} before {genesisMint}.
+    /// @return adapter The adapter address.
+    function genesis() external view returns (address adapter);
 
     // -------------------------------------------------------------------------------------------------------------
     // Reads — the ladder (Phase 3, `view`-only)
@@ -755,10 +818,29 @@ interface IAmpsVault {
     // Mutative — genesis and placement
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Mints `S0`, allocates the team and POL tranches, pulls the founders' seed and sets the creator.
-    ///         **Only timelock**, once, behind a one-way latch.
-    /// @param params The genesis arguments.
-    function genesis(GenesisParams calldata params) external;
+    /// @notice Step one of genesis: mints `S0` and allocates the three tranches. **Only timelock**, once, behind
+    ///         the `genesisMinted` latch. Sets no price, moves no asset and writes no checkpoint.
+    ///
+    /// @dev **What the vault looks like between the two steps.** `totalSupply == S0`, `A == 0`, `_initialized` is
+    ///      still false. {checkpoint}, {touch}, {depositBonded}, {mintVesting}, {place} and {redeemProRata} all
+    ///      refuse with `NotInitialized`; no pool exists so no swap is possible; the team's AMPS is inside a
+    ///      `VestingWallet` and the auction tranche is inside the auctions. That window is the whole point of the
+    ///      split: the auction needs the supply to exist before it can sell any of it, and the vault must not
+    ///      price anything against a `A` of zero.
+    /// @param params The mint arguments.
+    function genesisMint(GenesisMintParams calldata params) external;
+
+    /// @notice Step two of genesis: takes the auction proceeds (or the founders' seed), takes the unsold AMPS back
+    ///         as inventory, seeds `P_ref` at the clearing price and opens the protocol. **Only the `genesis`
+    ///         adapter or the timelock**, once, behind the `initialized` latch.
+    ///
+    /// @dev The adapter calls this out of its own `settle()`; the timelock calls it directly when no auction
+    ///      graduated, with `p0X18 = 1e18` and the founders' seed, which is the pre-revision-7 launch exactly.
+    /// @dev `P_ref` is seeded at `max(p0X18, navPerShare)` and every later checkpoint moves it by the ordinary
+    ///      rule `P_ref = max(NAV, rateLimited(P_mkt))`. The pools have not been opened yet — `PoolRegistry`
+    ///      anchors each one at `pRefX18()`, which is what makes them open at `P0` (§12 ruling C).
+    /// @param params The placement arguments.
+    function genesisPlace(GenesisPlaceParams calldata params) external;
 
     /// @notice Initialises a registered pool through the PoolManager. **Only registry**, from within
     ///         `addConstituent` (or `registerEntryPool`).
@@ -864,14 +946,17 @@ interface IAmpsVault {
     ///
     /// @dev This is the vault's single pointer setter, and it serves two populations of slot:
     ///
-    ///        - **Set-once wiring**, written before {genesis} and refused for ever afterwards: `bytes32("registry")`,
-    ///          `bytes32("bonds")` and `bytes32("bountyPot")`. Each of those contracts takes
-    ///          the vault in *its* constructor, so the vault cannot hold them as immutables; {genesis} sets the
-    ///          `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
+    ///        - **Set-once wiring**, written before {genesisPlace} and refused for ever afterwards:
+    ///          `bytes32("registry")`, `bytes32("bonds")`, `bytes32("bountyPot")` and `bytes32("genesis")`. Each of
+    ///          those contracts takes the vault in *its* constructor, so the vault cannot hold them as immutables;
+    ///          {genesisPlace} sets the `wiringFrozen` latch and a later write reverts with `AlreadyInitialized`.
     ///        - **Pointer-upgradeable policies**, replaceable at any time under the same 7-day delay:
     ///          `bytes32("oracleGate")`, `bytes32("feedRegistry")`, `bytes32("positionValuer")`,
-    ///          `bytes32("ladderPolicy")` and `bytes32("rolloutPolicy")`. `bytes32("marketReference")` sits between
-    ///          the two: set-once before genesis to the Phase 2 mock, and re-pointed to `AmpsHook` afterwards.
+    ///          `bytes32("ladderPolicy")`, `bytes32("rolloutPolicy")` and `bytes32("marketReference")`. The last of
+    ///          those carries **no** set-once or write-once-more latch: `AmpsHook`'s address is its permission set
+    ///          and is mined against one creation-code hash, so a redeployed hook is a new address and a vault that
+    ///          could not be re-pointed at it would lose its observation source for good. Every read of the
+    ///          pointer is a bounded, hand-decoded probe that degrades on failure, and it can move no funds.
     ///
     ///      Any other slot name reverts with {UnknownPointerSlot}, and `address(0)` is refused for every slot.
     ///

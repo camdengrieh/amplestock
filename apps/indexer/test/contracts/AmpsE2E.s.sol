@@ -24,6 +24,7 @@ import {Constants} from "amps/types/Constants.sol";
 import {FeedConfig} from "amps/types/Types.sol";
 import {LadderPositionValuer} from "amps/valuer/LadderPositionValuer.sol";
 import {AmpsVault} from "amps/vault/AmpsVault.sol";
+import {MockGenesisHolder} from "ampstest/mocks/MockGenesisHolder.sol";
 import {MockStockToken} from "ampstest/mocks/MockStockToken.sol";
 import {MockUsdg} from "ampstest/mocks/MockUsdg.sol";
 import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
@@ -138,8 +139,8 @@ contract E2ESwapper is IUnlockCallback {
 ///
 /// @dev **It reuses the Phase 3 scripts rather than reimplementing them.** `10_TestnetPools` deploys the mock
 ///      counter assets and drives `05_Registry` to open the 32 pools; `09_Phase3Wire` deploys `OracleGate`,
-///      installs the calendar and moves the six pointers in the §9.1 order; `11_GenesisPlacement` mints `S0` and
-///      lays the §3.3 ladders. What this script adds is the core deployment those scripts assume already exists
+///      installs the calendar and moves the pointers in the §9.1 order (the `genesis` pointer among them, revision
+///      7's eighth move); `11_GenesisPlacement` lays the §3.3 ladders. What this script adds is the core deployment those scripts assume already exists
 ///      (`Amps`, `AmpsVault`, the mined `AmpsHook`, `PoolRegistry` and the periphery) and the actions afterwards.
 ///
 /// @dev **Every entry point is separately invocable**, because the placement cooldown and the observation ring
@@ -168,17 +169,26 @@ contract AmpsE2E is Script {
     ///      ~65k attempts rather than the 16.7M production's three bytes needs.
     uint160 internal constant AMPS_CEILING = uint160(1) << 144;
 
-    /// @dev The founders' seed: 1 WETH ($2,500) + 2,500 USDG ($2,500) against `S0` = 5,000 AMPS.
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    /// @dev The seed: 4 WETH ($10,000) + 10,000 USDG ($10,000) against `S0` = 20,000 AMPS, so NAV/share opens at
+    ///      $1.00 exactly as it did before revision 7 doubled the supply. In production this money is the
+    ///      auctions' proceeds and arrives through `AmpsGenesis.settle()`; here the timelock supplies it and calls
+    ///      `genesisPlace` itself, which is the founders'-seed fallback path the contracts keep for the case where
+    ///      no auction leg graduates (`docs/genesis-cca.md` §4).
+    uint256 internal constant SEED_WETH = 4e18;
+    uint256 internal constant SEED_USDG = 10_000e6;
 
-    /// @dev The §3.3 genesis ladder: 1,662.5 AMPS of ask in each entry pool, 47.5 in each spoke.
-    uint256 internal constant ENTRY_ASK_AMPS = 1662.5e18;
-    uint256 internal constant SPOKE_SEED_AMPS = 47.5e18;
+    /// @dev The §3.3 genesis ladder: 3,150 AMPS of ask in each entry pool, 90 in each spoke.
+    uint256 internal constant ENTRY_ASK_AMPS = 3150e18;
+    uint256 internal constant SPOKE_SEED_AMPS = 90e18;
+
+    /// @dev `p0X18` for a launch at NAV. `1` asks `genesisPlace` for its NAV floor rather than a flat `1e18`:
+    ///      `VIRTUAL_SHARES` puts NAV/share one wei under $1.00 even with a seed worth exactly `S0` dollars, and a
+    ///      flat `1e18` would open a one-wei premium the reconciliation would then have to explain.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     /// @dev What the actor starts with, and what it trades.
     uint256 internal constant ACTOR_USDG = 500e6;
-    /// @dev Deliberately small. The genesis hub ladder is 1,662.5 AMPS over ten doublings, so 200 USDG walks the
+    /// @dev Deliberately small. The genesis hub ladder is 3,150 AMPS over ten doublings, so 200 USDG walks the
     ///      tick 11,892 ticks — six times the entry pool's 2,000-tick outer rail — and the *next* deviation-
     ///      increasing swap is refused by the hook, which is the rail working exactly as designed. 10 USDG moves
     ///      the pool ~1,000 ticks and leaves room for the sell that follows.
@@ -205,6 +215,8 @@ contract AmpsE2E is Script {
         address feePolicy;
         address bondPolicy;
         address oracleGate;
+        /// @dev The vault's `genesis` pointer: a {MockGenesisHolder}, not the real adapter. See {genesisAsks}.
+        address genesis;
         address teamVesting;
         address usdg;
         address weth9;
@@ -391,7 +403,13 @@ contract AmpsE2E is Script {
         }
     }
 
-    /// @notice Step 3: `genesis()` and the ask ladder in every pool.
+    /// @notice Step 3: the two halves of genesis, then the ask ladder in every pool.
+    /// @dev Revision 7 split `genesis()` into `genesisMint` (the timelock's, mints `S0` three ways) and
+    ///      `genesisPlace` (the `genesis` adapter's, or the timelock's on the founders'-seed fallback). This
+    ///      fixture takes the fallback form: the broadcaster *is* the timelock, so it makes both calls itself, and
+    ///      the auction tranche stays inside the {MockGenesisHolder} — which is the right shape for the indexer,
+    ///      because in production that tranche has cleared to bidders and is in `totalSupply` without being the
+    ///      vault's inventory. `unsoldAmps` is therefore zero: nothing comes back.
     function genesisAsks() external {
         _load();
         _fundSeed();
@@ -409,14 +427,22 @@ contract AmpsE2E is Script {
         vm.startBroadcast(deployer);
         IERC20(d.weth9).approve(d.vault, SEED_WETH);
         IERC20(d.usdg).approve(d.vault, SEED_USDG);
-        vault.genesis(
-            IAmpsVault.GenesisParams({
+        vault.genesisMint(
+            IAmpsVault.GenesisMintParams({
                 teamVestingWallet: d.teamVesting,
                 creator: creator,
+                genesis: d.genesis,
                 teamShares: Constants.TEAM_SHARES,
-                polShares: Constants.POL_SHARES,
-                seedTokens: seedTokens,
-                seedAmounts: seedAmounts
+                auctionShares: Constants.AUCTION_SHARES,
+                polShares: Constants.POL_SHARES
+            })
+        );
+        vault.genesisPlace(
+            IAmpsVault.GenesisPlaceParams({
+                p0X18: GENESIS_P0_AT_NAV,
+                tokens: seedTokens,
+                amounts: seedAmounts,
+                unsoldAmps: 0
             })
         );
         vm.stopBroadcast();
@@ -611,6 +637,10 @@ contract AmpsE2E is Script {
         FeePolicy feePolicy =
             new FeePolicy(Constants.K_VOL_X18, Constants.K_DEV_BPS, Constants.F_WALL_BPS, Constants.LAMBDA_X18);
         VestingWallet vesting = new VestingWallet(team, uint64(block.timestamp), Constants.TEAM_VEST_SECONDS);
+        // The vault's `genesis` pointer has to hold code before `genesisMint` will mint the auction tranche to it.
+        // This fixture is about the *indexer*, not about an auction, so it uses the same stand-in the contracts'
+        // own fixtures use rather than a factory, a block schedule and a bidding window.
+        MockGenesisHolder genesisHolder = new MockGenesisHolder();
         E2ESwapper swapper = new E2ESwapper(IPoolManager(d.poolManager));
         vm.stopBroadcast();
 
@@ -624,6 +654,7 @@ contract AmpsE2E is Script {
         d.rolloutPolicy = address(rolloutPolicy);
         d.feePolicy = address(feePolicy);
         d.teamVesting = address(vesting);
+        d.genesis = address(genesisHolder);
         d.swapper = address(swapper);
     }
 
@@ -685,7 +716,9 @@ contract AmpsE2E is Script {
             ladderPolicy: d.ladderPolicy,
             rolloutPolicy: d.rolloutPolicy,
             feePolicy: d.feePolicy,
-            bondPolicy: d.bondPolicy
+            bondPolicy: d.bondPolicy,
+            router: d.router,
+            genesis: d.genesis
         });
     }
 
@@ -722,6 +755,7 @@ contract AmpsE2E is Script {
                 _kv("feePolicy", d.feePolicy),
                 _kv("bondPolicy", d.bondPolicy),
                 _kv("oracleGate", d.oracleGate),
+                _kv("genesis", d.genesis),
                 _kv("teamVesting", d.teamVesting),
                 _kv("usdg", d.usdg),
                 _kv("weth9", d.weth9),
@@ -757,6 +791,7 @@ contract AmpsE2E is Script {
         d.feePolicy = vm.envAddress("AMPS_FEE_POLICY");
         d.bondPolicy = vm.envAddress("AMPS_BOND_POLICY");
         d.oracleGate = vm.envOr("AMPS_ORACLE_GATE", address(0));
+        d.genesis = vm.envAddress("AMPS_GENESIS");
         d.teamVesting = vm.envAddress("AMPS_TEAM_VESTING");
         d.usdg = vm.envAddress("AMPS_USDG");
         d.weth9 = vm.envAddress("AMPS_WETH9");

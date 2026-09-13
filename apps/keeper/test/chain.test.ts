@@ -304,11 +304,18 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     expect(verdict?.workValueUsd18).toBeGreaterThan(WAD)
     expect(metrics.confirmed.get({job: 'compound'})).toBe(compounds.length)
 
-    // anvil answers `eth_simulateV1`, so the keeper knew the exact payout before it sent: the work value and
-    // the amount it predicted are the vault's own numbers, not an estimate. `paidByPool` is what the chain
-    // actually paid for that pool, and the prediction has to match it exactly.
+    // anvil answers `eth_simulateV1`, so the keeper knew the payout before it sent: the work value and the
+    // amount it predicted are the vault's own numbers, not an estimate. `paidByPool` is what the chain actually
+    // paid for that pool. The two are not byte-equal: under the 3x gas cap the payout is measured from the
+    // job's own gas, and the block the job lands in differs from the simulated one by a few hundred gas of
+    // timestamp-dependent storage writes (the surge clock, the cooldown stamps, the checkpoint), which at a
+    // ~1.5M-gas compound is a few hundredths of a percent. The prediction has to sit inside 0.1% of the payout.
     expect(verdict?.reportedBounty).toBe(true)
-    expect(verdict?.bountyUsd18).toBe(paidByPool.get(verdict!.candidate.target))
+    const predicted = verdict!.bountyUsd18
+    const paid = paidByPool.get(verdict!.candidate.target)!
+    expect(predicted).toBeGreaterThan(0n)
+    const gap = predicted > paid ? predicted - paid : paid - predicted
+    expect(gap * 1_000n, `predicted ${predicted} vs paid ${paid}`).toBeLessThanOrEqual(paid)
   }, 180_000)
 
   it('refuses to compound a pool with nothing accrued, and so would the pot', async () => {
@@ -417,7 +424,7 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
     expect(metrics.skipped.get({job: 'touch', reason: 'protocol-frozen'})).toBe(1)
   }, 180_000)
 
-  it('a DEGRADED gate — the market closed — stops every job', async () => {
+  it('a DEGRADED gate — the market closed — stops every placement and lets the restamp through', async () => {
     // Friday 16:00 ET to Saturday: the equity calendar's CLOSED session, which `OracleGate` reports as DEGRADED
     // for every path but redemption. Three days forward from the fixture's Wednesday lands on Saturday.
     await fixture.increaseTime(3 * 86_400)
@@ -426,7 +433,11 @@ describe.skipIf(!enabled)('keeper against a live chain', () => {
 
     const {runner, metrics} = await makeRunner()
     const result = await runner.scan()
-    expect(result.sent).toHaveLength(0)
+    // Every placement is refused off-chain. `touch` is not: three silent days have tripped the watchdog, which
+    // is exactly what `touch` exists to clear, and the vault's management gate admits DEGRADED (audit fix,
+    // 2026-09-08) — a weekend must not starve the heartbeat, only the ladders.
+    expect(result.sent.map((s) => s.key)).toEqual(['touch:'])
+    expect(result.sent[0]?.success).toBe(true)
     expect(metrics.skipped.get({job: 'compound', reason: 'gate-not-green'})).toBe(6)
   }, 180_000)
 

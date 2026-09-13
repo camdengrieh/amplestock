@@ -2,7 +2,16 @@
 import {AMPS_MAINNET_CHAIN_ID, AMPS_TESTNET_CHAIN_ID} from '@amplestocks/config'
 import {describe, expect, it} from 'vitest'
 
-import {deploymentReady, explorerAddressUrl, explorerTxUrl, isDeployed, readDeployment, referenceBook} from '@/lib/deployment'
+import {
+  deploymentReady,
+  explorerAddressUrl,
+  explorerTxUrl,
+  hasAnyGenesisAuction,
+  isDeployed,
+  readDeployment,
+  readGenesisAuctions,
+  referenceBook,
+} from '@/lib/deployment'
 
 const VALID = '0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99'
 
@@ -25,6 +34,26 @@ describe('readDeployment', () => {
   it('is ready only when every contract the read path needs is present', () => {
     const record = readDeployment({vault: VALID, quoter: VALID, registry: VALID} as never)
     expect(deploymentReady(record)).toBe(true)
+  })
+
+  it('carries the genesis adapter as an ordinary contract, and does not require it for reads', () => {
+    // `AmpsGenesis` is ours and has a generated ABI, so it is a deployment key like any other —
+    // unlike the two auctions, which are Uniswap's and are kept apart. But it is one-shot, so a
+    // deployment without it is a launched protocol, not a broken one.
+    const record = readDeployment({vault: VALID, quoter: VALID, registry: VALID, genesis: VALID} as never)
+    expect(record.genesis).toBe(VALID)
+    expect(isDeployed('genesis', record)).toBe(true)
+    expect(deploymentReady(readDeployment({vault: VALID, quoter: VALID, registry: VALID} as never))).toBe(true)
+  })
+})
+
+describe('the genesis auctions', () => {
+  it('are read separately from the protocol contracts', () => {
+    const auctions = readGenesisAuctions({usdg: VALID, eth: 'not-an-address'} as never)
+    expect(auctions.usdg).toBe(VALID)
+    expect(auctions.eth).toBeUndefined()
+    expect(hasAnyGenesisAuction(auctions)).toBe(true)
+    expect(hasAnyGenesisAuction(readGenesisAuctions({usdg: '', eth: ''} as never))).toBe(false)
   })
 })
 

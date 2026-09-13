@@ -84,7 +84,7 @@ contract QuoterHookStub is IAmpsHook {
         state.tickSpacing = tickSpacing;
         state.buyFeeBps = buyFee;
         state.maxTickMovePerBlock = Constants.MAX_TICK_MOVE_PER_BLOCK_DEFAULT;
-        state.uiMultiplierX18 = uint64(Constants.WAD);
+        state.uiMultiplierX9 = uint64(Constants.WAD / 1e9);
         state.innerBandTicks = Constants.INNER_BAND_REGULAR_TICKS;
         state.outerRailTicks = Constants.OUTER_RAIL_MIN_TICKS;
         state.dynCapBps = Constants.DYN_CAP_NORMAL_BPS;
@@ -282,6 +282,14 @@ contract QuoterHookStub is IAmpsHook {
     {
         FeeAnswer memory answer = _fees[poolId][zeroForOne][passThrough];
         return (answer.feePips, answer.baseBps, answer.dynBps, answer.refuse);
+    }
+
+    /// @inheritdoc IAmpsHook
+    /// @dev The larger of the two ordinary legs, out of the same table {quoteFee} answers from.
+    function chargedFeeBps(PoolId poolId) external view returns (uint16 bps) {
+        uint16 sell = _fees[poolId][true][false].baseBps + _fees[poolId][true][false].dynBps;
+        uint16 buy = _fees[poolId][false][false].baseBps + _fees[poolId][false][false].dynBps;
+        bps = sell > buy ? sell : buy;
     }
 
     /// @inheritdoc IAmpsHook

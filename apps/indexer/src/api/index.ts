@@ -11,7 +11,7 @@
  * - **`/api/*`** — a small typed layer for the shapes the dApp asks for repeatedly, where a
  *   hand-written SQL aggregate beats a client-side join over GraphQL pages: the vault summary, the
  *   NAV/share and premium history, the ladder per pool with its fill and proceeds, the bond board,
- *   the flywheel dashboard, gate status, burn history and the creator fee. There is no
+ *   the flywheel dashboard, gate status, burn history, the creator fee and the launch. There is no
  *   `/api/staking`: revision 6 removed the contract, so an endpoint for it would be a claim that
  *   the thing it describes still exists.
  *
@@ -87,6 +87,40 @@ app.get('/api/vault', async (c) => {
     .orderBy(desc(schema.reconciliation.blockNumber))
     .limit(1)
   return json(c, {summary, shares: shares ?? null, reconciliation: reconciliation ?? null})
+})
+
+/**
+ * The launch: the mint, the two auctions, the settlement and the vault's own record of it.
+ *
+ * One row and two lists. The row is the whole of genesis and is legible at every point in it — a
+ * mint with no auctions yet, auctions with no settlement, a settlement that graduated or one that
+ * did not. `?bids=<n>` and `?checkpoints=<n>` bound the two lists; `?leg=usdg|eth` narrows them.
+ *
+ * **`p0X18` of zero is not a price.** It is zero before settlement and zero for ever after a
+ * settlement in which no leg graduated, so a consumer reads `settledBlock` and `graduated`.
+ */
+app.get('/api/genesis', async (c) => {
+  const [row] = await db.select().from(schema.genesis).where(eq(schema.genesis.id, SINGLETON))
+  if (row === undefined) return json(c, {error: 'not indexed yet'}, 404)
+
+  const leg = c.req.query('leg')
+  const legFilter = leg === 'usdg' || leg === 'eth' ? leg : undefined
+
+  const bids = await db
+    .select()
+    .from(schema.auctionBid)
+    .where(legFilter === undefined ? undefined : eq(schema.auctionBid.leg, legFilter))
+    .orderBy(desc(schema.auctionBid.submittedBlock))
+    .limit(limitOf(c.req.query('bids'), 100))
+
+  const checkpoints = await db
+    .select()
+    .from(schema.auctionCheckpoint)
+    .where(legFilter === undefined ? undefined : eq(schema.auctionCheckpoint.leg, legFilter))
+    .orderBy(desc(schema.auctionCheckpoint.blockNumber))
+    .limit(limitOf(c.req.query('checkpoints'), 200))
+
+  return json(c, {genesis: row, bids, checkpoints: checkpoints.reverse()})
 })
 
 /** NAV/share, `A`, `T` over time. `?since=<block>&limit=<n>`. */

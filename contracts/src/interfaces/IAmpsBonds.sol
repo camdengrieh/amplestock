@@ -40,7 +40,7 @@ import {BondMarket, CollateralClass, Session, VestingPosition} from "../types/Ty
 ///
 /// @dev **`claim()` is structurally ungated.** It reads no gate, no guardian and no pause flag, and it succeeds
 ///      regardless of collateral removal, market pause, policy swap or guardian freeze (I38). It is the second and
-///      last exemption from the `_requireHealthy` enumeration (I14); `AmpsVault.redeemProRata` is the first.
+///      last exemption from the gate-policy enumeration (I14); `AmpsVault.redeemProRata` is the first.
 interface IAmpsBonds {
     /// @notice Emitted on every accepted bond.
     /// @param buyer The bonder.

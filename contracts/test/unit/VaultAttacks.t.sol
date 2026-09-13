@@ -56,18 +56,18 @@ contract VaultAttackTest is AmpsVaultFixture {
     ///         shares, so the deposit is a donation that the attacker recovers only at their own share of supply.
     function test_flashDepositThroughDepositBondedIsALoss() public {
         runGenesis();
-        giveShares(address(this), 500e18); // 10% of supply
+        giveShares(address(this), 2000e18); // 10% of `S0`
 
-        uint256 flash = 1000e18; // $100,000 of stock against a $5,000 vault
+        uint256 flash = 1000e18; // $100,000 of stock against a $20,000 vault
         stock.mint(address(this), flash);
 
         uint256 supply = amps.totalSupply();
         bondDeposit(address(stock), address(this), flash);
 
         uint256 expected =
-            ((flash * 500e18) / supply) * (Constants.BPS - Constants.REDEEM_FEE_BPS_DEFAULT) / Constants.BPS;
+            ((flash * 2000e18) / supply) * (Constants.BPS - Constants.REDEEM_FEE_BPS_DEFAULT) / Constants.BPS;
 
-        vault.redeemProRata(500e18, address(this));
+        vault.redeemProRata(2000e18, address(this));
 
         assertEq(stock.balanceOf(address(this)), expected, "exactly pro rata of the inflated balance, no more");
         assertLt(stock.balanceOf(address(this)), flash, "the attacker is strictly worse off");
@@ -235,16 +235,19 @@ contract VaultAttackTest is AmpsVaultFixture {
         stock.mint(address(vault), 100e18);
         assertEq(vault.totalAssetsUsd18(), 0, "nothing is registered before genesis, so nothing is valued");
 
-        // Genesis mints exactly `S0`, split by the two constants, and folds the donation into everyone's backing.
+        // Genesis mints exactly `S0`, split by the three constants, and folds the donation into everyone's backing.
         runGenesis();
         assertEq(amps.totalSupply(), Constants.S0, "exactly S0, whatever the donation was");
-        assertEq(vault.totalAssetsUsd18(), 15_000e18, "seed plus donation");
-        assertEq(vault.navPerShareX18(), (15_000e18 + 1) * 1e18 / (Constants.S0 + Constants.VIRTUAL_SHARES), "shared");
+        assertEq(vault.totalAssetsUsd18(), 30_000e18, "seed plus donation");
+        assertEq(vault.navPerShareX18(), (30_000e18 + 1) * 1e18 / (Constants.S0 + Constants.VIRTUAL_SHARES), "shared");
 
-        // And the latch means there is no second bite.
-        vm.prank(TIMELOCK);
+        // And both latches mean there is no second bite.
+        vm.startPrank(TIMELOCK);
         vm.expectRevert(IAmpsVault.GenesisAlreadyDone.selector);
-        vault.genesis(genesisParams());
+        vault.genesisMint(genesisMintParams());
+        vm.expectRevert(IAmpsVault.GenesisAlreadyDone.selector);
+        vault.genesisPlace(genesisPlaceParams());
+        vm.stopPrank();
     }
 
     /// @notice The virtual-share guard keeps NAV/share finite even with every share redeemed.
@@ -258,6 +261,7 @@ contract VaultAttackTest is AmpsVaultFixture {
         giveShares(ALICE, Constants.POL_SHARES);
         vm.prank(TEAM_WALLET);
         amps.transfer(ALICE, Constants.TEAM_SHARES);
+        genesisHolder.send(address(amps), ALICE, Constants.AUCTION_SHARES);
 
         vm.prank(ALICE);
         vault.redeemProRata(Constants.S0, ALICE);
@@ -319,13 +323,13 @@ contract VaultAttackTest is AmpsVaultFixture {
             hooks: IHooks(address(0))
         });
 
-        payloads = new bytes[](24);
+        payloads = new bytes[](25);
         payloads[0] = abi.encodeCall(IAmpsVault.redeemProRata, (1e18, ALICE));
         payloads[1] = abi.encodeCall(IAmpsVault.checkpoint, ());
         payloads[2] = abi.encodeCall(IAmpsVault.touch, ());
         payloads[3] = abi.encodeCall(IAmpsVault.depositBonded, (1, address(stock), BOB, 1e18));
         payloads[4] = abi.encodeCall(IAmpsVault.mintVesting, (BONDS, 1e18));
-        payloads[5] = abi.encodeCall(IAmpsVault.genesis, (genesisParams()));
+        payloads[5] = abi.encodeCall(IAmpsVault.genesisMint, (genesisMintParams()));
         payloads[6] = abi.encodeCall(IAmpsVault.initializePool, (key, 1 << 96));
         payloads[7] = abi.encodeCall(IAmpsVault.place, (spokePool, true, 1e18));
         payloads[8] = abi.encodeCall(IAmpsVault.compound, (spokePool));
@@ -344,5 +348,6 @@ contract VaultAttackTest is AmpsVaultFixture {
         payloads[21] = abi.encodeCall(IAmpsVault.setCreator, (BOB));
         payloads[22] = abi.encodeCall(IAmpsVault.emergencyMigrate, (STANDBY));
         payloads[23] = abi.encodeCall(IAmpsVault.setDeployThresholdUsd18, (100e18));
+        payloads[24] = abi.encodeCall(IAmpsVault.genesisPlace, (genesisPlaceParams()));
     }
 }

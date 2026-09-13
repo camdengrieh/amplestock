@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {HookStateLib} from "../../src/hook/HookStateLib.sol";
 import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {IFeePolicy} from "../../src/interfaces/IFeePolicy.sol";
 import {FeePolicy} from "../../src/policy/FeePolicy.sol";
@@ -134,6 +135,22 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertLe(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, Constants.MAX_LP_FEE, "never above MAX_LP_FEE");
     }
 
+    /// @notice **Re-audit lead.** `beforeSwap` saturates `amountSpecified == type(int256).min` instead of
+    ///         panicking on the negation, so the one boundary that did not saturate now does.
+    /// @dev No swap of that size can settle, so the clamp changes nothing a real swap sees; what it changes is how
+    ///      an impossible one is refused. A `Panic` inside `beforeSwap` is a revert for a non-rail reason, which
+    ///      I15 forbids outright.
+    function test_r16_beforeSwapSaturatesTheMinimumAmountSpecified() public {
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: type(int256).min, sqrtPriceLimitX96: 0});
+
+        vm.prank(address(poolManager));
+        (bytes4 selector,, uint24 fee) = hook.beforeSwap(address(this), usdgKey, params, "");
+
+        assertEq(selector, IHooks.beforeSwap.selector, "it answers rather than panicking");
+        assertEq(fee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, 50_000, "at the ordinary 500 bp base");
+    }
+
     // -----------------------------------------------------------------------------------------------------------
     // f_min (§1.4 step 6)
     // -----------------------------------------------------------------------------------------------------------
@@ -196,19 +213,89 @@ contract AmpsHookFeeTest is HookTestFixture {
         );
     }
 
-    /// @notice Past `GATE_CACHE_MAX_AGE` the cached view is not trusted: widest band, degraded cap, frozen floor.
-    function test_aStaleGateCacheSubstitutesTheMostConservativeValues() public {
+    /// @notice Past `GATE_CACHE_MAX_AGE` the cached view is not trusted: the **narrow** band, the degraded cap and
+    ///         the frozen floor.
+    ///
+    /// @dev **Audit finding 13.** "Conservative" is not one direction for all four fields. For the dynamic cap and
+    ///      the frozen floor it means *more* fee; for the band and the rail it means a *tighter* refusal. The
+    ///      substitute used to take `INNER_BAND_MAX_TICKS`, which widened a healthy REGULAR spoke's rail from 800
+    ///      ticks to 4,500 — so the one circuit breaker in the system loosened 5.6x at the exact moment its anchor
+    ///      became self-referential, because the same staleness drops the fair tick back onto the pool's own TWAP.
+    function test_f13_aStaleGateCacheSubstitutesTheNarrowRailAndTheDegradedCap() public {
         policy.setDynOverride(0);
+        int24 healthyRail = hook.outerRailTicks(stockId);
         vm.warp(block.timestamp + Constants.GATE_CACHE_MAX_AGE + 1);
 
         (,, uint16 dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
         assertEq(dyn, Constants.FROZEN_FEE_FLOOR_BPS, "the frozen floor applies while the cache is stale");
-        assertEq(hook.innerBandTicks(stockId), Constants.INNER_BAND_MAX_TICKS, "widest band for the class");
-        assertEq(hook.outerRailTicks(stockId), Constants.INNER_BAND_MAX_TICKS * 3, "and the rail that follows");
+        assertEq(hook.innerBandTicks(stockId), Constants.INNER_BAND_REGULAR_TICKS, "the regular band, not the widest");
+        assertEq(hook.outerRailTicks(stockId), Constants.OUTER_RAIL_MIN_TICKS, "and the rail that follows from it");
+        assertEq(hook.outerRailTicks(stockId), healthyRail, "which is the rail a healthy REGULAR spoke is bounded by");
+        assertLt(
+            hook.outerRailTicks(stockId),
+            Constants.INNER_BAND_MAX_TICKS * Constants.OUTER_RAIL_BAND_MULTIPLE,
+            "the substitute no longer widens the one circuit breaker in the system"
+        );
 
         policy.setDynOverride(type(uint16).max - 1);
         (,, dyn,) = hook.quoteFee(stockId, false, true, 1e18, false);
-        assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "and the degraded cap");
+        assertEq(dyn, Constants.DYN_CAP_DEGRADED_BPS, "and the degraded cap still applies");
+    }
+
+    /// @notice **Audit finding 6.** A swap is judged against the rail it was **quoted** against. The gate refresh
+    ///         runs inside the same `afterSwap` as the post-swap rail check, so at a session close the first swap
+    ///         after the cache interval was priced in `beforeSwap` against the narrow REGULAR rail and then judged
+    ///         against the wide CLOSED one — letting one swap push a spoke several times further from fair than the
+    ///         bound in force when it was quoted (and, at the open, refusing swaps that had quoted as executable).
+    function test_f06_theSwapIsJudgedAgainstTheRailItWasQuotedAgainst() public {
+        // A cached rail of 800 ticks, with the pool 795 ticks from fair: inside the rail, and one boundary from
+        // being outside it.
+        policy.setRailOverride(800);
+        _setFairTick(stockId, _currentTick(stockId) - 795);
+        assertEq(hook.outerRailTicks(stockId), 800, "the rail this swap will be quoted against");
+
+        // The gate now publishes a much wider rail, but nothing has read it yet: the refresh that picks it up is
+        // the one inside the very `afterSwap` that judges the swap below.
+        policy.setRailOverride(5000);
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        (,,, bool refuse) = hook.quoteFee(stockId, false, true, 50e18, false);
+        assertFalse(refuse, "the swap starts inside the rail, so `beforeSwap` allows it");
+
+        (int24 devAfter, int24 railJudged) = _railFromRefusedBuy(50e18);
+        assertEq(railJudged, 800, "and it is judged against that same 800-tick rail");
+        assertGt(devAfter, 800, "having ended beyond it");
+        assertEq(hook.outerRailTicks(stockId), 800, "and the whole swap rolled back, refresh included");
+    }
+
+    /// @notice The buy really does refuse, and the `BeyondRail` payload the PoolManager re-throws is decoded here so
+    ///         the *rail* it was measured against can be asserted rather than assumed.
+    function _railFromRefusedBuy(uint256 amountIn) private returns (int24 devAfter, int24 rail) {
+        try this.buyForRevert(stockKey, amountIn) {
+            revert("the swap should have been refused");
+        } catch (bytes memory wrapped) {
+            bytes memory reason = _wrappedReason(wrapped);
+            assertEq(bytes4(reason), BeyondRail.selector, "refused for the rail and nothing else");
+            (, devAfter, rail) = abi.decode(_body(reason), (bytes32, int24, int24));
+        }
+    }
+
+    /// @notice External wrapper so a refused swap can be caught and its payload read.
+    function buyForRevert(PoolKey memory key, uint256 amountIn) external {
+        require(msg.sender == address(this), "self-call only");
+        _buyRaw(key, amountIn);
+    }
+
+    /// @dev The `reason` member of an ERC-7751 `WrappedError`, which is how the PoolManager re-throws a hook revert.
+    function _wrappedReason(bytes memory wrapped) private pure returns (bytes memory reason) {
+        (,, reason,) = abi.decode(_body(wrapped), (address, bytes4, bytes, bytes));
+    }
+
+    /// @dev ABI-encoded call or revert data with its four-byte selector removed.
+    function _body(bytes memory data) private pure returns (bytes memory stripped) {
+        stripped = new bytes(data.length - 4);
+        for (uint256 i; i < stripped.length; ++i) {
+            stripped[i] = data[i + 4];
+        }
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -536,6 +623,201 @@ contract AmpsHookFeeTest is HookTestFixture {
         assertEq(pips, uint24(expected) * Constants.PIPS_PER_BPS, "fee == clamp(base + dyn)");
         assertLe(expected, Constants.TOTAL_FEE_BPS_MAX, "and below the protocol ceiling");
         assertLe(pips, Constants.MAX_LP_FEE, "and far below MAX_LP_FEE");
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // Re-audit findings 1 and 4
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @notice **Re-audit finding 1.** A gate refresh that moves the fair tick further than the rail no longer
+    ///         reverts the swap that happened to trigger it — and the refresh itself lands.
+    ///
+    /// @dev `afterSwap` captured the rail before the refresh but measured `devAfter` against the fair tick the
+    ///      refresh had just installed, which is two different reference frames. A pool quoted at zero deviation
+    ///      in `beforeSwap` — and reported executable by every `AmpsQuoter` surface, all of which read the
+    ///      pre-refresh cache — therefore reverted `BeyondRail` on the post-swap check, and the revert rolled the
+    ///      refresh back with it, so the next deviation-increasing swap repeated the whole sequence. Judged in the
+    ///      frame it was sold in, the swap below moves the pool a few ticks against a 800-tick rail and is
+    ///      accepted; the 1,500-tick reference jump binds the *next* swap, through `beforeSwap`.
+    function test_r01_aFairTickJumpLargerThanTheRailDoesNotRevertTheSwapThatRefreshes() public {
+        int24 opening = _currentTick(stockId);
+        _setFairTick(stockId, opening);
+        assertEq(hook.fairTick(stockId), opening, "the cache is the pool's own tick");
+
+        // The gate now derives a fair tick 1,500 ticks above the pool — nearly twice the 800-tick rail — but the
+        // hook has not read it yet, so `beforeSwap` will quote this swap at a deviation of zero.
+        int24 jumped = opening + 1500;
+        gate.setPoolState(
+            stockId,
+            MockOracleGate.PoolState({
+                set: true,
+                state: GateState.GREEN,
+                diverged: false,
+                dynCapBps: Constants.DYN_CAP_NORMAL_BPS,
+                poolTick: 0,
+                fairTick: jumped
+            })
+        );
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+
+        // A small sell: away from the *old* fair tick, and further still from the new one.
+        uint256 out = _sell(stockKey, 100e18);
+        assertGt(out, 0, "the swap executes");
+
+        int24 after_ = _currentTick(stockId);
+        assertLt(after_, opening, "and it really was deviation-increasing against the frame it was quoted in");
+        int24 moved = opening - after_;
+        assertLt(moved, int24(800), "by far less than the rail");
+
+        // The whole point of not reverting: the refresh is not rolled back with the swap.
+        assertEq(hook.fairTick(stockId), jumped, "the refresh landed");
+    }
+
+    /// @notice **Re-audit finding 1, the other half.** A pool that has reached its rail is not *pinned* there:
+    ///         the same swap is refused while the reference has not moved and accepted once it has, and the
+    ///         refresh that says so lands with it.
+    ///
+    /// @dev Judging step 9 on the quoted frame alone closes finding 1 and opens a livelock in its place. The
+    ///      cached fair tick advances only inside `afterSwap`, and a refused swap reverts `afterSwap` whole — so a
+    ///      pool sitting at its rail refuses the next deviation-increasing swap, rolls back the observation and
+    ///      the refresh that would have let its own reference catch up, and refuses the one after that for the
+    ///      same reason. Measured on the `AMPS/USDG` hub, whose fair tick *is* its own truncated TWAP, a
+    ///      one-directional market stalled 1,969 ticks above its opening tick and stayed there for an hour of
+    ///      three-second blocks: the TWAP had moved 1,969 ticks and the cached fair tick had not moved at all.
+    ///      Nothing but a trade in the opposite direction could ever unstick it. The check therefore refuses only
+    ///      when the swap is beyond the rail in **both** frames — the one it was quoted in and the one now in
+    ///      force — which is the conjunction of two refusals and not a weakening of either.
+    function test_r01_aPoolAtTheRailIsNotPinnedWhenTheReferenceCatchesUp() public {
+        int24 opening = _currentTick(stockId);
+
+        // Exactly on the 800-tick spoke rail, so `beforeSwap` quotes the sell as executable — `refuse` is
+        // `dev > rail`, not `>=` — and the post-swap check is what decides it. The gate says the same thing the
+        // cache does: the reference has not moved.
+        _setFairTick(stockId, opening + 800);
+        assertEq(hook.fairTick(stockId), opening + 800, "the cache carries the reference above the pool");
+
+        // A sell walks the pool further below that reference, past the rail, and is refused — in both frames.
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+        (int24 devRefused, int24 railRefused) = _railFromRefusedSell(100e18);
+        assertGt(devRefused, railRefused, "beyond the rail against the reference in force");
+        assertEq(hook.fairTick(stockId), opening + 800, "and the whole swap rolled back, refresh included");
+        assertEq(_currentTick(stockId), opening, "the pool has not moved");
+
+        // Now the reference catches up to the pool. The cache still holds the old one — `beforeSwap` will quote
+        // this swap in exactly the frame that refused the last one — but `afterSwap`'s refresh installs the new
+        // reading before step 9 reads it, and against *that* the swap is a few hundred ticks inside the rail.
+        gate.setPoolState(
+            stockId,
+            MockOracleGate.PoolState({
+                set: true,
+                state: GateState.GREEN,
+                diverged: false,
+                dynCapBps: Constants.DYN_CAP_NORMAL_BPS,
+                poolTick: 0,
+                fairTick: opening
+            })
+        );
+        vm.warp(block.timestamp + hook.gateCacheSeconds() + 1);
+
+        uint256 out = _sell(stockKey, 100e18);
+        assertGt(out, 0, "the swap the caught-up reference makes legal executes");
+        assertEq(hook.fairTick(stockId), opening, "and the refresh landed, so the pool is not pinned");
+
+        int24 moved = opening - _currentTick(stockId);
+        assertGt(moved, int24(0), "the sell really moved the pool down");
+        assertLt(moved, int24(800), "inside the rail against the reference now in force");
+        assertGt(moved + 800, int24(800), "and beyond it against the one it was quoted in");
+    }
+
+    /// @notice The sell counterpart of {_railFromRefusedBuy}.
+    function _railFromRefusedSell(uint256 amountIn) private returns (int24 devAfter, int24 rail) {
+        try this.sellForRevert(stockKey, amountIn) {
+            revert("the swap should have been refused");
+        } catch (bytes memory wrapped) {
+            bytes memory reason = _wrappedReason(wrapped);
+            assertEq(bytes4(reason), BeyondRail.selector, "refused for the rail and nothing else");
+            (, devAfter, rail) = abi.decode(_body(reason), (bytes32, int24, int24));
+        }
+    }
+
+    /// @notice External wrapper so a refused sell can be caught and its payload read.
+    function sellForRevert(PoolKey memory key, uint256 amountIn) external {
+        require(msg.sender == address(this), "self-call only");
+        _sellRaw(key, amountIn);
+    }
+
+    /// @notice **Re-audit finding 3, the hook's half.** `chargedFeeBps` is the larger of the two directions'
+    ///         total fee, which is the one number the vault's creator divisor needs.
+    ///
+    /// @dev The dynamic part is asymmetric — `f_dev` is charged on the deviation-*increasing* side — so above the
+    ///      fair tick a buy and a sell are quoted hundreds of basis points apart. The vault applies one divisor to
+    ///      both currencies' collected fees, so it must be bounded below by the larger of the two rates.
+    function test_r05_chargedFeeBpsIsTheLargerOfTheTwoDirections() public {
+        // The pool 400 ticks above its fair tick: a buy pushes it further out and pays `f_dev`, a sell brings it
+        // back and pays none of it.
+        _setFairTick(stockId, _currentTick(stockId) - 400);
+
+        (uint24 sellPips,,,) = hook.quoteFee(stockId, true, true, 0, false);
+        (uint24 buyPips,,,) = hook.quoteFee(stockId, false, true, 0, false);
+        assertGt(buyPips, sellPips, "the deviation-increasing side is the dearer one here");
+
+        uint16 charged = hook.chargedFeeBps(stockId);
+        assertEq(charged, buyPips / Constants.PIPS_PER_BPS, "and `chargedFeeBps` reports it");
+        assertGt(charged, sellPips / Constants.PIPS_PER_BPS, "strictly above the sell rate the divisor used to use");
+
+        // An unknown pool answers zero rather than reverting, which every consumer reads as "no answer".
+        assertEq(hook.chargedFeeBps(PoolId.wrap(keccak256("nothing"))), 0, "an unknown pool is zero");
+    }
+
+    /// @notice **Re-audit finding 4.** An upward `uiMultiplier()` step tolls the AMPS -> stock direction only.
+    /// @dev The direction is the arbitrage's, not the swap's: a `+delta` step makes each raw stock token worth
+    ///      more, so the profitable trade takes stock out of the pool, which is `zeroForOne == true`.
+    function test_r02_anUpwardStepTollsTheStockOutDirectionOnly() public {
+        stock.setUIMultiplier(1.005e18); // +50 bp
+        _refreshGate(stockKey);
+        assertEq(hook.poolState(stockId).captureFeeBps, 40, "0.8 x 50 bp");
+        assertFalse(
+            HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_STEP_DOWN),
+            "the step was upward, so the direction bit is down"
+        );
+        _quiet(stockId);
+
+        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18, false);
+        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18, false);
+        assertEq(dynSell - dynBuy, 40, "the AMPS -> stock side pays exactly the toll");
+        assertEq(dynBuy, 0, "and the stock -> AMPS side pays nothing for it");
+    }
+
+    /// @notice **Re-audit finding 4.** A downward step tolls the *other* direction — the one that harvests it.
+    ///
+    /// @dev `captureDirectionTakesStock` used to be the constant `ctx.sell`, so after a `-199 bp` restatement the
+    ///      AMPS -> stock side — which is now the *losing* side of the mispricing — paid the toll for forty
+    ///      minutes while the stock -> AMPS side that actually harvests it paid the ordinary fee. The sign of the
+    ///      step is recorded when the toll is armed (`gateFlags.stepDown`) precisely because the swap being quoted
+    ///      can arrive up to eight half-lives later and carries no memory of it.
+    function test_r02_aDownwardStepTollsTheStockInDirectionOnly() public {
+        stock.setUIMultiplier(0.995e18); // -50 bp: a reverse dividend-sized restatement
+        _refreshGate(stockKey);
+        assertEq(hook.poolState(stockId).captureFeeBps, 40, "0.8 x 50 bp, whichever way the step went");
+        assertTrue(
+            HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_STEP_DOWN),
+            "and the direction is recorded with it"
+        );
+        _quiet(stockId);
+
+        (,, uint16 dynSell,) = hook.quoteFee(stockId, true, true, 1e18, false);
+        (,, uint16 dynBuy,) = hook.quoteFee(stockId, false, true, 1e18, false);
+        assertEq(dynBuy - dynSell, 40, "the stock -> AMPS side pays exactly the toll");
+        assertEq(dynSell, 0, "and the AMPS -> stock side, which now loses on the step, pays nothing");
+
+        // And the bit goes out with the toll it describes, so the next upward step is not mis-directed.
+        vm.warp(block.timestamp + uint256(Constants.DIVIDEND_CAPTURE_HALF_LIFE) * 8 + 1);
+        _pokeAfterSwap(stockKey, true);
+        assertEq(hook.poolState(stockId).captureFeeBps, 0, "the toll has expired");
+        assertFalse(
+            HookStateLib.hasFlag(hook.poolState(stockId).gateFlags, HookStateLib.FLAG_STEP_DOWN),
+            "and the direction bit with it"
+        );
     }
 
     // -----------------------------------------------------------------------------------------------------------

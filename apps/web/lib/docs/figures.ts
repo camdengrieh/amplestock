@@ -102,6 +102,7 @@ export const FIGURES = {
   addrHook: {label: 'AmpsHook', source: 'deployment', from: 'NEXT_PUBLIC_AMPS_HOOK'},
   addrOracleGate: {label: 'OracleGate', source: 'deployment', from: 'NEXT_PUBLIC_AMPS_ORACLE_GATE'},
   addrTimelock: {label: 'TimelockController', source: 'deployment', from: 'NEXT_PUBLIC_AMPS_TIMELOCK'},
+  addrGenesis: {label: 'AmpsGenesis', source: 'deployment', from: 'NEXT_PUBLIC_AMPS_GENESIS'},
 
   // --- Reference addresses ------------------------------------------------------------------
   refPoolManager: {label: 'PoolManager', source: 'config', from: 'addresses[4663].poolManager'},
@@ -128,11 +129,41 @@ export const FIGURES = {
   auctionEthGraduated: {label: 'AMPS/ETH graduated', source: 'chain', from: 'ContinuousClearingAuction.isGraduated()'},
   ccaLens: {label: 'CCALens', source: 'config', from: 'CCA_LENS_ADDRESS'},
 
+  // --- The genesis adapter --------------------------------------------------------------------
+  // Everything the launch decided, read from the contract that decided it. `P0`, the raise and the
+  // premium are `AmpsGenesis`'s own numbers; NAV/share is the vault's; nothing here is added up
+  // from the two auctions client-side.
+  genesisPhase: {label: 'Genesis phase', source: 'chain', from: 'AmpsGenesis.phase()'},
+  genesisSettled: {label: 'Settled', source: 'chain', from: 'AmpsGenesis.settled()'},
+  genesisP0: {label: 'Launch reference price P₀', source: 'chain', from: 'AmpsGenesis.p0X18()'},
+  genesisRaised: {label: 'Raised at settlement', source: 'chain', from: 'AmpsGenesis.raisedUsd18()'},
+  genesisRaisedUsdg: {label: 'USDG swept', source: 'chain', from: 'AmpsGenesis.raisedUsdg()'},
+  genesisRaisedWeth: {label: 'WETH swept', source: 'chain', from: 'AmpsGenesis.raisedWeth()'},
+  genesisUnsold: {label: 'Unsold AMPS returned', source: 'chain', from: 'AmpsGenesis.unsoldAmps()'},
+  genesisFloorUsdg: {label: 'USDG floor', source: 'chain', from: 'AmpsGenesis.floorUsdgQ96()'},
+  genesisFloorEth: {label: 'ETH floor', source: 'chain', from: 'AmpsGenesis.floorEthQ96()'},
+  genesisEthUsd: {label: 'ETH/USD used', source: 'chain', from: 'AmpsGenesis.ethUsdX18()'},
+  /** `raisedUsd18 / T`, fully diluted — or the vault's own checkpoint once it has one. */
+  genesisNav: {label: 'NAV per share at launch', source: 'chain', from: 'AmpsVault.checkpointData().navPerShareX18'},
+  /** `P0 / NAV − 1`. A disclosure, never a discount, and never quoted as the auction price. */
+  genesisPremium: {label: 'Launch premium', source: 'chain', from: 'AmpsGenesis.p0X18() / navPerShareX18 − 1'},
+
   // --- Launch parameters --------------------------------------------------------------------
   cfgChain: {label: 'Chain', source: 'config', from: 'chainById[chainId].name'},
   cfgChainId: {label: 'Chain id', source: 'config', from: 'chainById[chainId].id'},
   cfgS0: {label: 'Genesis supply S₀', source: 'config', from: 'launchParameters.supply.s0'},
-  cfgLaunchPrice: {label: 'NAV per share at genesis', source: 'config', from: 'launchParameters.seed.launchPriceUsd'},
+  cfgTeamTranche: {label: 'Team tranche', source: 'config', from: 'launchParameters.supply.teamWei'},
+  cfgAuctionTranche: {label: 'Auction tranche', source: 'config', from: 'launchParameters.auction.totalWei'},
+  cfgAuctionUsdgTranche: {label: 'USDG leg', source: 'config', from: 'launchParameters.auction.usdgWei'},
+  cfgAuctionEthTranche: {label: 'ETH leg', source: 'config', from: 'launchParameters.auction.ethWei'},
+  cfgAuctionFloor: {label: 'Auction floor price', source: 'config', from: 'launchParameters.auction.floorPriceUsd'},
+  cfgPolTranche: {label: 'Protocol-owned liquidity', source: 'config', from: 'launchParameters.supply.polWei'},
+  cfgEntryPoolAsks: {label: 'Ask ladder per entry pool', source: 'config', from: 'launchParameters.supply.entryPoolWeiEach'},
+  cfgSpokeSeedAmps: {label: 'Seed ask per spoke', source: 'config', from: 'launchParameters.supply.perSpokeSeedWei'},
+  /** What a full clear at the floor implies. Arithmetic on the two rows above, not a forecast. */
+  cfgNavAtFloor: {label: 'NAV per share at a floor clear', source: 'config', from: 'launchParameters.auction.navPerShareAtFloorUsd'},
+  cfgPremiumAtFloor: {label: 'Premium at a floor clear', source: 'config', from: 'launchParameters.auction.premiumAtFloorBps'},
+  cfgFallbackSeed: {label: 'Fallback seed', source: 'config', from: 'launchParameters.fallbackSeed.totalUsd'},
   cfgTotalPools: {label: 'Pools at launch', source: 'config', from: 'launchParameters.pools.totalPools'},
   cfgSpokePools: {label: 'Spokes at launch', source: 'config', from: 'launchParameters.pools.spokePools'},
   cfgEntryPools: {label: 'Entry pools', source: 'config', from: 'launchParameters.pools.entryPools'},

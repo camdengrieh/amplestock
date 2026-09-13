@@ -174,28 +174,17 @@ export function bidAmountFromQ96(amountQ96: bigint): bigint {
 }
 
 /**
- * NAV per share at launch, from the auction's own outcome.
+ * The genesis premium as a *supply ratio*: `S0 / sold − 1`, in basis points.
  *
- * ```
- * navPerShare = currencyRaisedUsd18 / tokensSold
- * ```
+ * The auction sells half the supply, so a buyer's clearing price exceeds NAV per share by exactly
+ * the ratio of total supply to tokens sold. This is the form the surface can compute **while the
+ * auctions are still running**, from the two auctions' `totalCleared` alone and before there is a
+ * `P0` or a NAV to divide.
  *
- * This is arithmetic on two figures the auction publishes, not a valuation: the raised currency is
- * exactly what becomes the entry pools' bid liquidity, and the tokens sold are exactly what was
- * issued against it.
- */
-export function launchNavPerShareX18(params: {raisedUsd18: bigint; tokensSold: bigint}): bigint | undefined {
-  if (params.tokensSold === 0n) return undefined
-  return (params.raisedUsd18 * 10n ** 18n) / params.tokensSold
-}
-
-/**
- * The genesis premium: `S0 / sold − 1`, in basis points.
- *
- * The auction sells only the entry-pool tranche, not the whole supply. NAV per share divides the
- * raised currency by the *whole* supply, while the clearing price is what a buyer paid for one
- * share — so the market's price at launch exceeds NAV per share by exactly the ratio of total
- * supply to tokens sold. It is arithmetic, and it is disclosed rather than smoothed over.
+ * Once `AmpsGenesis.settle()` has run, `lib/genesis.ts`'s `launchPremiumBps` is the figure to show:
+ * `P0 / NAV − 1`, from the numbers the contracts actually wrote. The two agree by construction —
+ * `P0 = raised / sold` and `NAV = raised / S0` — and the settled form is preferred because it needs
+ * no assumption about what cleared.
  */
 export function genesisPremiumBps(params: {totalSupply: bigint; tokensSold: bigint}): number | undefined {
   if (params.tokensSold === 0n) return undefined

@@ -67,7 +67,8 @@ NEXT_PUBLIC_REOWN_PROJECT_ID   empty -> AppKit is not mounted; injected connecto
 NEXT_PUBLIC_AMPS_INDEXER_URL   empty -> indexed panels render "indexer unavailable"
 
 NEXT_PUBLIC_AMPS_TOKEN / _VAULT / _QUOTER / _BONDS / _BONDS_LENS / _ROUTER /
-NEXT_PUBLIC_AMPS_REGISTRY / _REGISTRY_LENS / _HOOK / _ORACLE_GATE / _TIMELOCK
+NEXT_PUBLIC_AMPS_REGISTRY / _REGISTRY_LENS / _HOOK / _ORACLE_GATE / _TIMELOCK /
+NEXT_PUBLIC_AMPS_GENESIS
 NEXT_PUBLIC_AMPS_AUCTION_USDG / _AUCTION_ETH
 
 NEXT_PUBLIC_FLAG_ACROSS_ZAP     "1" shows the (inert) Across USDC->USDG entry point
@@ -77,6 +78,13 @@ GEO_PROVIDER            vercel | cloudflare | header | none   (server-side only)
 GEO_COUNTRY_HEADER      header name when GEO_PROVIDER=header
 GEO_BLOCKED_COUNTRIES   default US,CA,GB,UK,CH
 ```
+
+`NEXT_PUBLIC_AMPS_GENESIS` is `AmpsGenesis`, the genesis adapter — an ordinary deployment key
+(`deployments.json` calls it `core.genesis`, the deploy scripts read it as `AMPS_GENESIS`), reached
+through `contract('genesis')` like every other Amplestocks contract because it is ours and has a
+generated ABI. The two `_AUCTION_*` addresses are kept apart from the deployment record on purpose:
+those are Uniswap's contracts, deployed by a factory, with no ABI in `@amplestocks/abis`, and no
+surface other than `/auction` should be able to reach for them by accident.
 
 `NEXT_PUBLIC_*` is inlined at **build** time, not read at start time. Changing a deployment address
 means rebuilding.
@@ -203,6 +211,46 @@ The disclosure page.
 - **Writes**: `AmpsVault.checkpoint()` — free, permissionless, and offered as a button.
 - Premium is `pRef / navPerShare - 1` rendered as a signed number with the note that nothing on
   chain consumes it.
+
+### Auction (genesis)
+`app/(gated)/auction` → `components/surfaces/auction.tsx`, `auction-panels.tsx`
+
+The launch, and the only surface that reads a contract Amplestocks did not write. The mechanism as
+built is `docs/genesis-cca.md`; the `/docs/auction` page in the app is the same story for a reader,
+with every figure resolved live.
+
+- **Reads (the auctions)**: the two Continuous Clearing Auctions from
+  `NEXT_PUBLIC_AMPS_AUCTION_USDG` / `_AUCTION_ETH` through `lib/abi/cca.ts` — `currency`, `token`,
+  `totalSupply`, `startBlock`/`endBlock`/`claimBlock`, `clearingPrice`, `floorPrice`, `tickSpacing`,
+  `nextActiveTickPrice`, `currencyRaised`, `totalCleared`, `remainingSupply`, `isGraduated`,
+  `lastCheckpointedBlock`, and a wallet's own bids from its `BidSubmitted` logs. Every price is as of
+  the auction's last checkpoint, because `checkpoint()` is a write rather than a view, and the
+  surface says so rather than implying the number is live.
+- **Reads (the adapter)**: `AmpsGenesis` through `contract('genesis')` and `hooks/use-genesis.ts` —
+  `phase()`, `settled()`, `p0X18()`, `raisedUsdg()`, `raisedWeth()`, `raisedUsd18()`,
+  `unsoldAmps()`, `ethUsdX18()`, `floorUsdgQ96()`, `floorEthQ96()`, `usdgAuction()`, `ethAuction()`,
+  `vault()`. Plus `AmpsVault.S0()`, `checkpointData().pRefX18`, `initialized()`, `liveCells()` and
+  `PoolRegistry.poolCount()` for what the launch got to.
+- **Writes**: `AmpsGenesis.settle()` — permissionless, unpaid, one-shot. Enabled only when
+  `phase() == Ended` and `settled()` is false; otherwise the button carries the reason the state
+  refuses it (`lib/genesis.ts`'s `settleBlockedReason`) rather than being disabled in silence. Also
+  the auctions' own `bid`, `exitBid` and `claimTokens`.
+- **The Settlement panel reads the adapter, and adds nothing up client-side.** Each auction knows its
+  own clearing price in its own currency; `AmpsGenesis` is the only contract that converts them to
+  18-decimal USD, *measures* the factory's protocol fee rather than predicting it, chooses which
+  leg's price becomes `P0` — the USDG leg whenever it graduated, because it is the only one
+  denominated in the unit `P_ref` is quoted in — and hands the lot to `AmpsVault.genesisPlace`.
+- **Launch NAV is `raisedUsd18 / S0`**, fully diluted (decision 14), and the divisor is `S0` from the
+  vault's bytecode rather than `Amps.totalSupply()`, which grows with every bond and would make the
+  launch NAV drift downwards for ever. The premium is `p0X18 / NAV − 1`, shown as a disclosure.
+- **Three states the panel must never blur together.** `Ended` — settlement is possible and offered.
+  `Settled` — the launch is live, and `P0`, NAV/share and the premium are facts about one block.
+  `Aborted` — **no leg graduated, so there was no launch**: bidders refund in full through the
+  auctions themselves rather than through Amplestocks, and the UI says that instead of showing a
+  launch. `p0X18()` is zero both before settlement and for ever after an aborted one, so the panel
+  decides from the phase and never from the number.
+- The fallback is named on the page: if nothing graduates, the AMPS returns to the vault and the
+  timelock opens it at $1.00 out of the founders' seed, which is a governed call with a 7-day delay.
 
 ### Governance
 `app/(gated)/governance` → `components/surfaces/governance.tsx`
@@ -369,7 +417,10 @@ Enforced by `test/copy.test.ts`, which scans every `.ts`, `.tsx` and `.css` file
   the moon", no "cannot lose".
 - **The premium is a number.** Signed, explicit, described as the arithmetic difference between the
   reference price and NAV per share, with the note that nothing on chain consumes it. It is never
-  a target, a forecast or a reason to do anything.
+  a target, a forecast or a reason to do anything. **Never present the launch premium as a discount,
+  and never quote NAV per share as the auction price**: the auction sold half the supply and the
+  whole of it divides the raise, so `P0` opens above NAV by exactly that ratio, and the honest word
+  for it is a premium.
 - **Nothing unavailable is rendered as zero.** A degraded quote field, a missing indexer series and
   an unread parameter all render as `—` with the reason. `AmpsQuoter` zeroing a failed read is the
   whole reason this rule exists.
@@ -387,19 +438,21 @@ Enforced by `test/copy.test.ts`, which scans every `.ts`, `.tsx` and `.css` file
   `LadderPositionValuer` is deliberately *not* one of them: its address is read from
   `AmpsVault.positionValuer()`, which is both one fewer variable and the only answer that cannot go
   stale.
-- **Four ABIs are hand-written and temporary.** `@amplestocks/abis` has not been regenerated since
-  revision 6, so `lib/abi/{vault,quoter,hook,router}.ts` are transcribed from the interfaces in
-  `contracts/src/interfaces/` and `lib/contracts.ts` imports them instead. The generated package's
-  `AmpsVault` still exposes `staking()`, its `AmpsQuoter` is missing `PoolQuote`'s two appended
-  pass-through fee legs — a positional decode, so reading a revision-6 quote against it shifts every
-  field after `sellFeePips` — its `AmpsHook` has no `router()`, and `AmpsRouter` has no artefact at
-  all. When the package regenerates, four imports move and four files go away; `e2e/rpc-mock.ts`
-  imports the same four, because the mock has to encode what the app decodes.
+- **One hand-written ABI is left, and it is not ours.** `lib/abi/cca.ts` transcribes Uniswap's
+  `ContinuousClearingAuction` (v2.1.0, MIT) because the two genesis auctions have no Solidity source
+  in this repository and never will — codegen over `contracts/out` cannot produce them.
+  `apps/indexer/src/abi/external.ts` carries the same five event fragments for the same reason, and
+  the two transcriptions must agree; nothing can check them against an artefact.
+  The four revision-6 transcriptions this document used to list are **gone**: `@amplestocks/abis` was
+  regenerated, so `lib/contracts.ts` takes `ampsVaultAbi` (six-field `Compound`, no `staking()`),
+  `ampsQuoterAbi` (both pass-through legs of `PoolQuote`), `ampsHookAbi` (`router()`/`setRouter`),
+  `ampsRouterAbi` and now `ampsGenesisAbi` straight from the package's `./generated` subpath.
+  `e2e/rpc-mock.ts` imports the same entries, because the mock has to encode what the app decodes.
 - **The indexer's field shapes are a transcription now, not a wish list.** `ENDPOINTS` in
   `lib/indexer/client.ts` matches `docs/indexer.md` §7 route for route, and `lib/indexer/types.ts`
   mirrors the `/api/*` envelopes — `{points}`, `{pools}`, `{burns, total, count}`,
-  `{summary, shares, reconciliation}` — which the client unwraps so a surface holds rows rather than
-  envelopes. Every reader still tolerates a missing field by rendering that panel as unavailable, so
+  `{summary, shares, reconciliation}`, `{genesis, bids, checkpoints}` — which the client unwraps so a
+  surface holds rows rather than envelopes. Every reader still tolerates a missing field by rendering that panel as unavailable, so
   a name that differs costs one panel rather than the page. `bigint` crosses the wire as a decimal
   string, per that document.
 - **Protocol-wide unvested bonded AMPS is still an upper bound.** `AmpsBonds` cannot enumerate its

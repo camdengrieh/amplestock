@@ -87,6 +87,15 @@ describe('the policy', () => {
     expect(policy.checkpointMaxAgeSeconds).toBe(1800)
     expect(policy.allowRefDiverged).toBe(false)
     expect(policy.runUnpaid).toBe(false)
+    // On by default and harmless afterwards: the reader stops asking once `settled()` is true.
+    expect(policy.settleEnabled).toBe(true)
+  })
+
+  it('resolves the genesis adapter from the vault unless it is pinned', () => {
+    expect(loadConfig({...BASE}).genesisAddress).toBeNull()
+    const pinned = loadConfig({...BASE, AMPS_GENESIS_ADDRESS: '0x00000000000000000000000000000000000000e0'})
+    expect(pinned.genesisAddress).toBe('0x00000000000000000000000000000000000000e0')
+    expect(() => loadConfig({...BASE, AMPS_GENESIS_ADDRESS: 'nope'})).toThrow(ConfigError)
   })
 
   it('is overridable end to end', () => {
@@ -96,7 +105,9 @@ describe('the policy', () => {
       AMPS_CHOST_USD18: '5000000000000000000',
       AMPS_SCAN_INTERVAL_SECONDS: '5',
       AMPS_ETH_USD18: '2500000000000000000000',
+      AMPS_SETTLE_ENABLED: 'false',
     })
+    expect(policy.settleEnabled).toBe(false)
     expect(policy.allowRefDiverged).toBe(true)
     expect(policy.chostOverrideUsd18).toBe(5n * 10n ** 18n)
     expect(policy.scanIntervalSeconds).toBe(5)

@@ -19,14 +19,18 @@
 # seconds apart).
 #
 # WHAT IT ASSERTS, with `cast`, against the chain the scripts left behind:
-#   * 32 pools registered, 30 active constituents, 30 bond markets
-#   * every vault pointer, the hook's fee policy, the hook's router pointer and the bonds' policy
+#   * `S0` = 20,000 AMPS split 1,000 / 10,000 / 9,000, and the auction tranche inside two real auctions
+#   * both auctions bid out at the $1.00 floor, settled by a permissionless `AmpsGenesis.settle()`
+#   * `P_ref` = `P0` = $1.00 and NAV/share = raised / S0 = $0.50 — the fully diluted launch of decision 14
+#   * 32 pools registered *after* settlement, so every one of them opens at `P0`
+#   * 30 active constituents, 30 bond markets
+#   * every vault pointer, the vault's genesis adapter, the hook's fee policy, its router and the bonds' policy
 #   * `OracleGate.state(0) == GREEN`
-#   * `S0` = 5,000 AMPS, 250 to the team vesting wallet, NAV/share = $1.00 within 1%
 #   * 328 live ladder cells (32 x 10 asks + 2 x 4 seed bids) and the §3.3 layout, via the script's own
 #     `assertLayout`
-#   * a second full pass registers nothing, deploys nothing (the AmpsRouter included) and moves no number
-#   * `09_Phase3Wire` refuses to re-run after genesis (`AlreadyGenesis`), which is the wiring latch working
+#   * a second full pass registers nothing, deploys nothing (the AmpsRouter and AmpsGenesis included) and moves
+#     no number
+#   * `09_Phase3Wire --deferGate` refuses to re-run after genesis (`AlreadyGenesis`), the wiring latch working
 #   * `03_Core CORE_STAGE=finalize` raises the timelock to 48 h and drops the deployer's proposer role
 #
 # It is localhost-only: anvil, `forge`, `cast`. No RPC leaves the machine and it runs with the network down.
@@ -65,9 +69,21 @@ CREATOR=0x90F79bf6EB2c4f870365E785982E1f101E93b906
 # gated vault path refuses when the session is CLOSED, so the whole run happens on a live trading clock.
 GENESIS_TIME=1788962400
 
-# The launch seed: 1 WETH at the fixture's $2,500 plus 2,500 USDG, against S0 = 5,000 AMPS => NAV/share $1.00.
-SEED_WETH=1000000000000000000
-SEED_USDG=2500000000
+# The auction bids: 5,000 USDG and 2 ETH at the fixture's $2,500, i.e. both 5,000-AMPS tranches clearing in
+# full at the $1.00 floor. `A` is $10,000 against S0 = 20,000 AMPS, so NAV/share is raised / S0 = $0.50 and the
+# launch premium to `P0` = $1.00 is the disclosed 100%.
+BID_USDG=5000000000
+BID_ETH=2000000000000000000
+ETH_USD_X18=2500000000000000000000
+
+# The founders' seed 06b would fall back to if no leg graduated. It is funded but, on this run, never used.
+SEED_WETH=4000000000000000000
+SEED_USDG=10000000000
+
+# The rehearsal's auction window, in blocks. A mainnet launch is 72 h at 100 ms = 2.59M blocks; nobody is going
+# to mine that on anvil, so `06a` takes the window in blocks outright when these are set.
+AUCTION_START_BLOCKS=30
+AUCTION_WINDOW_BLOCKS=60
 
 TWAP_WINDOW=1800
 PLACEMENT_COOLDOWN=60
@@ -127,6 +143,17 @@ advance() {
   rpc evm_mine
 }
 
+# Mines blocks until the chain has reached height `$1`. One `evm_mine` per block rather than `anvil_mine`, so the
+# quantity encoding cannot be the thing that breaks: the auction windows here are tens of blocks, not millions.
+mine_to() {
+  local target="$1" now
+  now=$(cast block-number --rpc-url "$RPC")
+  while [ "$now" -lt "$target" ]; do
+    rpc evm_mine
+    now=$(( now + 1 ))
+  done
+}
+
 # `stage <name> -- <forge script args...>`
 stage() {
   local name="$1"; shift; shift
@@ -179,8 +206,14 @@ export AMPS_GUARDIAN="$GUARDIAN_SAFE"
 export AMPS_CREATOR="$CREATOR"
 export AMPS_TEAM_BENEFICIARY="$CREATOR"
 export AMPS_TEAM_VEST_START="$GENESIS_TIME"
+# The founders'-seed fallback only — `06b_GenesisSettle` reads these, and on this run it never needs them.
+# `11_GenesisPlacement` takes its bid sizes from `AMPS_BID_*` instead, and both are left unset here so it bids
+# whatever the vault actually holds: under revision 7 that is the auction proceeds, not a figure known up front.
 export AMPS_SEED_WETH="$SEED_WETH"
 export AMPS_SEED_USDG="$SEED_USDG"
+export AMPS_ETH_USD_X18="$ETH_USD_X18"
+export AMPS_AUCTION_START_BLOCKS="$AUCTION_START_BLOCKS"
+export AMPS_AUCTION_WINDOW_BLOCKS="$AUCTION_WINDOW_BLOCKS"
 # Two leading zero bytes, not three: 65k CREATE2 attempts instead of 16.7 million. Every counter asset here is an
 # ordinary CREATE address, so two is more than enough for AMPS to be currency0, and `_assertOrdering` checks it
 # rather than assuming it. Production mines three, off-chain, with script/mine-amps.py.
@@ -208,6 +241,19 @@ for _ in $(seq 1 60); do
 done
 cast block-number --rpc-url "$RPC" >/dev/null || fail "anvil did not come up"
 
+# The `ContinuousClearingAuctionFactory` genesis deploys its two auctions through. On 4663 this is Uniswap's
+# canonical deployment and `00_Preflight` asserts its code; on anvil there is none, so the rehearsal deploys the
+# fee-free `MockCCAFactory` from `test/mocks` and points `03_Core` at it with `AMPS_CCA_FACTORY`. That is the one
+# substitution this script makes in the launch path, and it is the same substitution `Phase3Scripts.t.sol` makes.
+say "deploy MockCCAFactory (stands in for the canonical CCA factory)"
+# `--constructor-args` is variadic and greedy, so every other flag has to come before it or it swallows them.
+CCA_FACTORY=$(forge create --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast --json \
+  test/mocks/MockCCAFactory.sol:MockCCAFactory \
+  --constructor-args 0x0000000000000000000000000000000000000000 0 | python3 -c 'import json,sys;print(json.load(sys.stdin)["deployedTo"])')
+[ -n "$CCA_FACTORY" ] || fail "MockCCAFactory did not deploy"
+export AMPS_CCA_FACTORY="$CCA_FACTORY"
+printf '  ok  %-46s %s\n' "cca factory" "$CCA_FACTORY"
+
 # ---------------------------------------------------------------------------------------------------------------
 # The pipeline
 # ---------------------------------------------------------------------------------------------------------------
@@ -234,11 +280,16 @@ run_pipeline() {
   stage "pass ${pass}: 10_TestnetPools (assets)" -- script/10_TestnetPools.s.sol --tc TestnetPools
   unset TESTNET_ASSETS_ONLY
 
-  # 03 — the timelock, the token, the vault, the hook, the registry and the whole periphery.
+  # 03 — the timelock, the token, the vault, the hook, the registry, the whole periphery and the genesis adapter.
   stage "pass ${pass}: 03_Core" -- script/03_Core.s.sol --tc Core $LIBRARY_FLAGS
   read_addresses
+}
 
-  # 05 through 10 — the 32 pools, with the vault's gate pointer still unset (phase2-state-model §9.1 step 2).
+# 05/10 — the 32 pools. Revision 7 runs this **after** the auctions settle, because `PoolRegistry` anchors every
+# pool it opens at `AmpsVault.pRefX18()` and that word is `P0` only once `genesisPlace` has written it. The gate
+# pointer is still unset here (phase2-state-model §9.1), which is what lets `initializePool` pass at all.
+register_pools() {
+  local pass="$1"
   stage "pass ${pass}: 10_TestnetPools (register)" -- script/10_TestnetPools.s.sol --tc TestnetPools $LIBRARY_FLAGS
 }
 
@@ -264,6 +315,7 @@ read_addresses() {
   BOND_POLICY=$(json "$CONFIG_DIR/deployments.json" "['core']['bondPolicy']")
   QUOTER=$(json "$CONFIG_DIR/deployments.json" "['core']['quoter']")
   ROUTER=$(json "$CONFIG_DIR/deployments.json" "['core']['router']")
+  GENESIS=$(json "$CONFIG_DIR/deployments.json" "['core']['genesis']")
   TEAM_VESTING=$(json "$CONFIG_DIR/deployments.json" "['core']['teamVestingWallet']")
   WETH9=$(json "$CONFIG_DIR/deployments.json" "['core']['weth9']")
   USDG=$(json "$CONFIG_DIR/deployments.json" "['core']['usdg']")
@@ -275,7 +327,7 @@ call() { cast call --rpc-url "$RPC" "$@" | awk 'NR==1{print $1}'; }
 
 # The whole chain state the idempotence check compares, as one string.
 fingerprint() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
     "$(call "$REGISTRY" 'poolCount()(uint16)')" \
     "$(call "$REGISTRY" 'activeConstituentCount()(uint16)')" \
     "$(call "$BONDS" 'marketCount()(uint16)')" \
@@ -284,6 +336,7 @@ fingerprint() {
     "$(call "$VAULT" 'navPerShareX18()(uint256)')" \
     "$(call "$VAULT" 'oracleGate()(address)')" \
     "$(call "$HOOK" 'router()(address)')" \
+    "$(call "$VAULT" 'genesis()(address)')" \
     "$(cast to-check-sum-address "$VAULT")"
 }
 
@@ -293,26 +346,119 @@ fingerprint() {
 
 run_pipeline 1
 
-say "assert: 32 pools, 30 constituents, 30 bond markets, gate still unset"
-expect "registry.poolCount" "$(call "$REGISTRY" 'poolCount()(uint16)')" "32"
-expect "registry.activeConstituentCount" "$(call "$REGISTRY" 'activeConstituentCount()(uint16)')" "30"
-expect "bonds.marketCount" "$(call "$BONDS" 'marketCount()(uint16)')" "30"
+say "assert: nothing is registered yet, the pointers are bare and the gate is unset"
+expect "registry.poolCount (before the auctions)" "$(call "$REGISTRY" 'poolCount()(uint16)')" "0"
 expect "vault.oracleGate (unset)" "$(call "$VAULT" 'oracleGate()(address)')" "0x0000000000000000000000000000000000000000"
 expect "vault.registry" "$(call "$VAULT" 'registry()(address)')" "$(cast to-check-sum-address "$REGISTRY")"
 expect "vault.bonds" "$(call "$VAULT" 'bonds()(address)')" "$(cast to-check-sum-address "$BONDS")"
 expect "vault.bountyPot" "$(call "$VAULT" 'bountyPot()(address)')" "$(cast to-check-sum-address "$POT")"
 expect "vault.feedRegistry" "$(call "$VAULT" 'feedRegistry()(address)')" "$(cast to-check-sum-address "$FEEDS")"
-expect "vault.marketReference" "$(call "$VAULT" 'marketReference()(address)')" "$(cast to-check-sum-address "$HOOK")"
-expect "vault.positionValuer" "$(call "$VAULT" 'positionValuer()(address)')" "$(cast to-check-sum-address "$VALUER")"
 expect "amps.vault" "$(call "$AMPS" 'vault()(address)')" "$(cast to-check-sum-address "$VAULT")"
 expect "hook.timelock" "$(call "$HOOK" 'timelock()(address)')" "$(cast to-check-sum-address "$TIMELOCK")"
+expect "genesis.vault" "$(call "$GENESIS" 'vault()(address)')" "$(cast to-check-sum-address "$VAULT")"
+expect "genesis.factory" "$(call "$GENESIS" 'factory()(address)')" "$(cast to-check-sum-address "$CCA_FACTORY")"
 [ "$(printf '%s' "$AMPS" | tr 'A-F' 'a-f')" \< "$(printf '%s' "$USDG" | tr 'A-F' 'a-f')" ] \
   || fail "AMPS does not sort below USDG"
 [ "$(printf '%s' "$AMPS" | tr 'A-F' 'a-f')" \< "$(printf '%s' "$WETH9" | tr 'A-F' 'a-f')" ] \
   || fail "AMPS does not sort below WETH9"
 printf '  ok  %-46s %s\n' "amps sorts below both entry counters" "$AMPS"
 
-# §9.1 step 3: the hub's observation ring has to cover `twapWindow` before the gate can be pointed at.
+# 09 pass 1 — the eight pointer moves, the genesis adapter included. The gate is deliberately deferred: it would
+# report WATCHDOG (no hub pool yet) and make every step below unreachable.
+export WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false WIRE_DEFER_GATE=true
+stage "pass 1: 09_Phase3Wire (pointers)" -- script/09_Phase3Wire.s.sol --tc Phase3Wire $LIBRARY_FLAGS
+unset WIRE_DEFER_GATE
+read_addresses
+
+say "assert: the eight pointer moves, and the gate still unset"
+expect "vault.marketReference" "$(call "$VAULT" 'marketReference()(address)')" "$(cast to-check-sum-address "$HOOK")"
+expect "vault.positionValuer" "$(call "$VAULT" 'positionValuer()(address)')" "$(cast to-check-sum-address "$VALUER")"
+expect "vault.ladderPolicy" "$(call "$VAULT" 'ladderPolicy()(address)')" "$(cast to-check-sum-address "$LADDER_POLICY")"
+expect "vault.rolloutPolicy" "$(call "$VAULT" 'rolloutPolicy()(address)')" "$(cast to-check-sum-address "$ROLLOUT_POLICY")"
+expect "hook.feePolicy" "$(call "$HOOK" 'feePolicy()(address)')" "$(cast to-check-sum-address "$FEE_POLICY")"
+expect "hook.router" "$(call "$HOOK" 'router()(address)')" "$(cast to-check-sum-address "$ROUTER")"
+expect "bonds.policy" "$(call "$BONDS" 'policy()(address)')" "$(cast to-check-sum-address "$BOND_POLICY")"
+expect "vault.genesis" "$(call "$VAULT" 'genesis()(address)')" "$(cast to-check-sum-address "$GENESIS")"
+expect "vault.oracleGate (still unset)" "$(call "$VAULT" 'oracleGate()(address)')" "0x0000000000000000000000000000000000000000"
+
+# The feeds, and not one pool. `genesisPlace` ends in a checkpoint and a checkpoint prices WETH9 and USDG, so
+# their feeds have to exist before 06b — while the pools they belong to are opened after it, at P0. 06a wants the
+# WETH feed even earlier, to cross-check the ETH/USD price the proposal carries.
+export REGISTRY_FEEDS_ONLY=true
+stage "pass 1: 10_TestnetPools (feeds)" -- script/10_TestnetPools.s.sol --tc TestnetPools $LIBRARY_FLAGS
+unset REGISTRY_FEEDS_ONLY
+expect "registry.poolCount (feeds install no pools)" "$(call "$REGISTRY" 'poolCount()(uint16)')" "0"
+expect "feedRegistry knows WETH9" "$(call "$FEEDS" 'feedOf(address)(address)' "$WETH9")" \
+  "$(cast to-check-sum-address "$(json "$CONFIG_DIR/testnet.json" "['wethFeed']")")"
+
+# 06a — genesisMint and the two auctions.
+stage "pass 1: 06a_GenesisAuction" -- script/06a_GenesisAuction.s.sol --tc GenesisAuction $LIBRARY_FLAGS
+
+USDG_AUCTION=$(call "$GENESIS" 'usdgAuction()(address)')
+ETH_AUCTION=$(call "$GENESIS" 'ethAuction()(address)')
+FLOOR_USDG=$(call "$GENESIS" 'floorUsdgQ96()(uint256)')
+FLOOR_ETH=$(call "$GENESIS" 'floorEthQ96()(uint256)')
+
+say "assert: S0 minted, split three ways, and both auctions funded"
+expect "amps.totalSupply" "$(call "$AMPS" 'totalSupply()(uint256)')" "20000000000000000000000"
+expect "team vesting balance" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$TEAM_VESTING")" "1000000000000000000000"
+expect "vault POL inventory" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$VAULT")" "9000000000000000000000"
+expect "usdg auction tranche" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$USDG_AUCTION")" "5000000000000000000000"
+expect "eth auction tranche" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$ETH_AUCTION")" "5000000000000000000000"
+expect "adapter kept nothing" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$GENESIS")" "0"
+expect "vault.creator" "$(call "$VAULT" 'creator()(address)')" "$(cast to-check-sum-address "$CREATOR")"
+expect "vault.initialized (not yet)" "$(call "$VAULT" 'initialized()(bool)')" "false"
+expect "vault.genesisMinted" "$(call "$VAULT" 'genesisMinted()(bool)')" "true"
+expect "vault.pRefX18 (no reference yet)" "$(call "$VAULT" 'pRefX18()(uint256)')" "0"
+
+# The bidding window. Both tranches are bid out at the floor, so each leg graduates and clears in full. The
+# window is read back off the auction rather than recomputed: `06a` derives it from the block height its
+# *simulation* saw, and the broadcast that follows mines a handful of blocks of its own.
+AUCTION_START=$(call "$USDG_AUCTION" 'startBlock()(uint64)')
+AUCTION_END=$(call "$USDG_AUCTION" 'endBlock()(uint64)')
+say "bid both legs out at the \$1.00 floor (blocks ${AUCTION_START}..${AUCTION_END})"
+mine_to "$AUCTION_START"
+cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$USDG" "mint(address,uint256)" "$DEPLOYER" "$BID_USDG" >/dev/null
+cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$USDG" "approve(address,uint256)" "$USDG_AUCTION" "$BID_USDG" >/dev/null
+cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$USDG_AUCTION" "bid(uint256,uint256)" "$FLOOR_USDG" "$BID_USDG" >/dev/null
+cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --value "$BID_ETH" "$ETH_AUCTION" "bid(uint256,uint256)" "$FLOOR_ETH" "$BID_ETH" >/dev/null
+expect "usdg auction graduated" "$(call "$USDG_AUCTION" 'isGraduated()(bool)')" "true"
+expect "eth auction graduated" "$(call "$ETH_AUCTION" 'isGraduated()(bool)')" "true"
+
+say "mine past the auctions' end block"
+mine_to $(( AUCTION_END + 1 ))
+
+# 06b — the permissionless settlement, which calls genesisPlace in the same transaction.
+stage "pass 1: 06b_GenesisSettle" -- script/06b_GenesisSettle.s.sol --tc GenesisSettle $LIBRARY_FLAGS
+
+say "assert: settled at P0, the proceeds in the vault, and the launch NAV of raised / S0"
+expect "genesis.settled" "$(call "$GENESIS" 'settled()(bool)')" "true"
+expect "genesis.phase (Settled)" "$(call "$GENESIS" 'phase()(uint8)')" "3"
+P0=$(call "$GENESIS" 'p0X18()(uint256)')
+[ "$P0" -ge 999000000000000000 ] && [ "$P0" -le 1001000000000000000 ] || fail "P0 $P0 is not \$1.00 +/- 0.1%"
+printf '  ok  %-46s %s\n' "genesis.p0X18 within 0.1% of \$1.00" "$P0"
+expect "genesis.raisedUsdg" "$(call "$GENESIS" 'raisedUsdg()(uint256)')" "$BID_USDG"
+expect "genesis.raisedWeth" "$(call "$GENESIS" 'raisedWeth()(uint256)')" "$BID_ETH"
+expect "genesis.unsoldAmps" "$(call "$GENESIS" 'unsoldAmps()(uint256)')" "0"
+expect "adapter swept clean (amps)" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$GENESIS")" "0"
+expect "adapter swept clean (usdg)" "$(call "$USDG" 'balanceOf(address)(uint256)' "$GENESIS")" "0"
+expect "vault.initialized" "$(call "$VAULT" 'initialized()(bool)')" "true"
+expect "vault.pRefX18 == P0" "$(call "$VAULT" 'pRefX18()(uint256)')" "$P0"
+expect "vault.totalAssetsUsd18" "$(call "$VAULT" 'totalAssetsUsd18()(uint256)')" "10000000000000000000000"
+NAV=$(call "$VAULT" 'navPerShareX18()(uint256)')
+[ "$NAV" -ge 495000000000000000 ] && [ "$NAV" -le 505000000000000000 ] || fail "navPerShare $NAV is not \$0.50 +/- 1%"
+printf '  ok  %-46s %s\n' "navPerShareX18 == raised / S0 (\$0.50)" "$NAV"
+
+# 05/10 — and only now the 32 pools, each opening at P0.
+register_pools 1
+
+say "assert: 32 pools opened at P0, 30 constituents, 30 bond markets"
+expect "registry.poolCount" "$(call "$REGISTRY" 'poolCount()(uint16)')" "32"
+expect "registry.activeConstituentCount" "$(call "$REGISTRY" 'activeConstituentCount()(uint16)')" "30"
+expect "bonds.marketCount" "$(call "$BONDS" 'marketCount()(uint16)')" "30"
+expect "vault.oracleGate (still unset)" "$(call "$VAULT" 'oracleGate()(address)')" "0x0000000000000000000000000000000000000000"
+
+# §9.1: the hub's observation ring has to cover `twapWindow` before the gate can be pointed at.
 say "advance the chain past twapWindow (${TWAP_WINDOW}s)"
 HUB=$(call "$REGISTRY" 'hubPoolId()(bytes32)')
 printf '  --  %-46s %s\n' "hub coverage before" "$(call "$HOOK" "observationCoverage(bytes32)(uint32)" "$HUB")"
@@ -321,39 +467,21 @@ COVERED=$(call "$HOOK" "observationCoverage(bytes32)(uint32)" "$HUB")
 [ "$COVERED" -ge "$TWAP_WINDOW" ] || fail "hub coverage $COVERED < $TWAP_WINDOW"
 printf '  ok  %-46s %s\n' "hub coverage after" "$COVERED"
 
-# 09 — the Phase 3 pointer moves and the gate, in the §9.1 order. The gate was already deployed by 03_Core with
-# the hook as its marketReference, so this run repoints rather than redeploys.
-export WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false
-stage "pass 1: 09_Phase3Wire" -- script/09_Phase3Wire.s.sol --tc Phase3Wire $LIBRARY_FLAGS
+# 09 pass 2 — the gate, last.
+stage "pass 1: 09_Phase3Wire (gate)" -- script/09_Phase3Wire.s.sol --tc Phase3Wire $LIBRARY_FLAGS
 read_addresses
 
-say "assert: the seven pointer moves and a GREEN gate"
-expect "vault.ladderPolicy" "$(call "$VAULT" 'ladderPolicy()(address)')" "$(cast to-check-sum-address "$LADDER_POLICY")"
-expect "vault.rolloutPolicy" "$(call "$VAULT" 'rolloutPolicy()(address)')" "$(cast to-check-sum-address "$ROLLOUT_POLICY")"
-expect "hook.feePolicy" "$(call "$HOOK" 'feePolicy()(address)')" "$(cast to-check-sum-address "$FEE_POLICY")"
-expect "hook.router" "$(call "$HOOK" 'router()(address)')" "$(cast to-check-sum-address "$ROUTER")"
-expect "bonds.policy" "$(call "$BONDS" 'policy()(address)')" "$(cast to-check-sum-address "$BOND_POLICY")"
+say "assert: the gate is wired and GREEN"
 expect "vault.oracleGate" "$(call "$VAULT" 'oracleGate()(address)')" "$(cast to-check-sum-address "$GATE")"
 expect "feedRegistry.oracleGate" "$(call "$FEEDS" 'oracleGate()(address)')" "$(cast to-check-sum-address "$GATE")"
 expect "gate.marketReference" "$(call "$GATE" 'marketReference()(address)')" "$(cast to-check-sum-address "$HOOK")"
 expect "gate.state(0) == GREEN" "$(call "$GATE" 'state(uint16)(uint8)' 0)" "0"
 
-# The founders' seed lives in the timelock, because `genesis()` pulls it from `msg.sender` and `msg.sender` is
-# the timelock. On 4663 that is a transfer the Safe signs; here the mocks have an open mint.
-say "fund the timelock with the launch seed"
-cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$WETH9" "mint(address,uint256)" "$TIMELOCK" "$SEED_WETH" >/dev/null
-cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$USDG" "mint(address,uint256)" "$TIMELOCK" "$SEED_USDG" >/dev/null
-
 stage "pass 1: 11_GenesisPlacement (phase 1)" -- script/11_GenesisPlacement.s.sol --tc GenesisPlacement $LIBRARY_FLAGS
 
-say "assert: S0 minted and an ask ladder in every pool"
-expect "amps.totalSupply" "$(call "$AMPS" 'totalSupply()(uint256)')" "5000000000000000000000"
-expect "team vesting balance" "$(call "$AMPS" 'balanceOf(address)(uint256)' "$TEAM_VESTING")" "250000000000000000000"
-expect "vault.creator" "$(call "$VAULT" 'creator()(address)')" "$(cast to-check-sum-address "$CREATOR")"
+say "assert: an ask ladder in every pool"
 expect "vault.liveCells (asks only)" "$(call "$VAULT" 'liveCells()(uint32)')" "320"
-NAV=$(call "$VAULT" 'navPerShareX18()(uint256)')
-[ "$NAV" -ge 990000000000000000 ] && [ "$NAV" -le 1010000000000000000 ] || fail "navPerShare $NAV is not \$1.00 +/- 1%"
-printf '  ok  %-46s %s\n' "navPerShareX18 within 1% of \$1.00" "$NAV"
+expect "amps.totalSupply" "$(call "$AMPS" 'totalSupply()(uint256)')" "20000000000000000000000"
 
 say "advance past the ${PLACEMENT_COOLDOWN}s per-pool placement cooldown"
 advance $(( PLACEMENT_COOLDOWN + 1 ))
@@ -367,12 +495,14 @@ stage_readonly "pass 1: 12_Verify" -- script/12_Verify.s.sol --tc Verify
 [ -s "$CONFIG_DIR/verify.sh" ] || fail "12_Verify wrote no verify.sh"
 grep -q -- "--verifier blockscout" "$CONFIG_DIR/verify.sh" || fail "verify.sh has no blockscout commands"
 grep -q -- "VaultNavLib.sol:VaultNavLib:" "$CONFIG_DIR/verify.sh" || fail "verify.sh does not pass --libraries"
+grep -q -- "AmpsGenesis" "$CONFIG_DIR/verify.sh" || fail "verify.sh does not name the genesis adapter"
 VERIFY_COUNT=$(grep -c '^forge verify-contract' "$CONFIG_DIR/verify.sh")
 [ "$VERIFY_COUNT" -ge 18 ] || fail "verify.sh names only $VERIFY_COUNT contracts"
 printf '  ok  %-46s %s contracts\n' "verify.sh" "$VERIFY_COUNT"
 
 BEFORE=$(fingerprint)
 ROUTER_BEFORE="$ROUTER"
+GENESIS_BEFORE="$GENESIS"
 
 # ---------------------------------------------------------------------------------------------------------------
 # Pass 2 — the same pipeline again, which must change nothing
@@ -380,10 +510,21 @@ ROUTER_BEFORE="$ROUTER"
 
 run_pipeline 2
 
-# 09 is the one step that is deliberately not repeatable: `genesis()` closed the wiring latch, and re-running the
-# batch against a live vault would be a governance action, not a deployment step.
-expect_revert "pass 2: 09_Phase3Wire" "AlreadyGenesis|0x035e4b00" -- script/09_Phase3Wire.s.sol --tc Phase3Wire \
-  $LIBRARY_FLAGS
+# The pointer pass is the one step that is deliberately not repeatable: `genesisPlace` closed the wiring latch,
+# and re-sending the set-once half against a live vault would be a governance action, not a deployment step. The
+# *gate* pass is repeatable and is exercised below, because the gate pointer stays upgradeable for ever.
+export WIRE_DEFER_GATE=true
+expect_revert "pass 2: 09_Phase3Wire (pointers)" "AlreadyGenesis|0x035e4b00" -- script/09_Phase3Wire.s.sol \
+  --tc Phase3Wire $LIBRARY_FLAGS
+unset WIRE_DEFER_GATE
+
+# 06a and 06b are both idempotent: the mint latch and the settle latch make them no-ops.
+stage "pass 2: 06a_GenesisAuction" -- script/06a_GenesisAuction.s.sol --tc GenesisAuction $LIBRARY_FLAGS
+stage "pass 2: 06b_GenesisSettle" -- script/06b_GenesisSettle.s.sol --tc GenesisSettle $LIBRARY_FLAGS
+
+register_pools 2
+
+stage "pass 2: 09_Phase3Wire (gate)" -- script/09_Phase3Wire.s.sol --tc Phase3Wire $LIBRARY_FLAGS
 unset WIRE_DIRECT WIRE_REDEPLOY_GATE
 
 # 11 with both phases complete walks every pool and re-asserts the §3.3 cell layout.
@@ -395,9 +536,10 @@ read_addresses
 AFTER=$(fingerprint)
 expect "chain fingerprint" "$AFTER" "$BEFORE"
 expect "core.router (pass 2 deployed no new router)" "$ROUTER" "$ROUTER_BEFORE"
+expect "core.genesis (pass 2 deployed no new adapter)" "$GENESIS" "$GENESIS_BEFORE"
 expect "registry.poolCount" "$(call "$REGISTRY" 'poolCount()(uint16)')" "32"
 expect "vault.liveCells" "$(call "$VAULT" 'liveCells()(uint32)')" "328"
-expect "amps.totalSupply" "$(call "$AMPS" 'totalSupply()(uint256)')" "5000000000000000000000"
+expect "amps.totalSupply" "$(call "$AMPS" 'totalSupply()(uint256)')" "20000000000000000000000"
 expect "gate.state(0) == GREEN" "$(call "$GATE" 'state(uint16)(uint8)' 0)" "0"
 
 # ---------------------------------------------------------------------------------------------------------------

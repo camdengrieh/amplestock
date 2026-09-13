@@ -47,9 +47,11 @@ contract ManipulatedTickPlacementTest is Phase3Fixture {
 
     /// @notice The guard is symmetric: a pool pushed *down* away from its reference is refused too.
     function test_placementRevertsOnADownwardManipulationAsWell() public {
-        giveShares(BOB, 400e18);
+        // 1,600 AMPS in 32-AMPS steps: the entry pools' bid side is the fixture's $10,000 of USDG rather than
+        // the old $2,500, so walking the pool 2,000 ticks down takes about four times the AMPS it used to.
+        giveShares(BOB, 1600e18);
         approveStack(address(amps), BOB);
-        slide(hubPool, BOB, 8e18, tickOf(hubPool) - 2000, 200, 3);
+        slide(hubPool, BOB, 32e18, tickOf(hubPool) - 2000, 200, 3);
         assertGt(hook.twapTick30m(hubPool) - tickOf(hubPool), Constants.PLACEMENT_DIVERGENCE_TICKS, "diverged down");
 
         warpBy(Constants.PLACEMENT_COOLDOWN_SECONDS + 1);

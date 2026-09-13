@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {AmpsBonds} from "../src/bonds/AmpsBonds.sol";
+import {AmpsGenesis} from "../src/genesis/AmpsGenesis.sol";
 import {AmpsHook} from "../src/hook/AmpsHook.sol";
 import {IAmpsVault} from "../src/interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../src/interfaces/IFeedRegistry.sol";
@@ -98,6 +99,10 @@ contract Core is Script {
     /// @notice The four linked vault libraries, as `02_Libraries` recorded them.
     string internal constant LIBRARIES_PATH = "./script/config/libraries.json";
 
+    /// @notice The launch parameters, read here only for the `ContinuousClearingAuctionFactory` address the
+    ///         genesis adapter is constructed against.
+    string internal constant GENESIS_PATH = "./script/config/genesis.json";
+
     /// @notice The canonical deterministic-deployment proxy. Every CREATE2 in a Foundry broadcast is routed
     ///         through it, which is why both salt searches mine against it.
     address internal constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
@@ -165,6 +170,7 @@ contract Core is Script {
         address bondPolicy;
         address quoter;
         address router;
+        address genesis;
         address weth9;
         address usdg;
     }
@@ -374,6 +380,14 @@ contract Core is Script {
         // inert rather than dangerous.
         if (set.router == address(0)) {
             set.router = address(new AmpsRouter(IPoolManager(cfg.poolManager), set.amps, set.registry, cfg.weth9));
+        }
+        // The genesis adapter. Deployed here and *named* by `09_Phase3Wire`, exactly like the router: the vault's
+        // `genesis` pointer is set-once wiring, and `AmpsVault.genesisMint` refuses to mint the auction tranche
+        // to anything but the address that pointer already holds. The factory address is a launch parameter
+        // (`script/config/genesis.json`), read here so that a self-deployed fee-free factory needs no code change.
+        if (set.genesis == address(0)) {
+            set.genesis =
+                address(new AmpsGenesis(set.vault, set.amps, _auctionFactory(), cfg.weth9, cfg.usdg, set.timelock));
         }
 
         vm.stopBroadcast();
@@ -585,6 +599,7 @@ contract Core is Script {
         set.bondPolicy = _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY");
         set.quoter = _address(json, ".core.quoter", "AMPS_QUOTER");
         set.router = _address(json, ".core.router", "AMPS_ROUTER");
+        set.genesis = _address(json, ".core.genesis", "AMPS_GENESIS");
         set.weth9 = _address(json, ".core.weth9", "AMPS_WETH9");
         set.usdg = _address(json, ".core.usdg", "AMPS_USDG");
     }
@@ -613,6 +628,7 @@ contract Core is Script {
         vm.serializeAddress(core, "bondPolicy", set.bondPolicy);
         vm.serializeAddress(core, "quoter", set.quoter);
         vm.serializeAddress(core, "router", set.router);
+        vm.serializeAddress(core, "genesis", set.genesis);
         vm.serializeAddress(core, "weth9", set.weth9);
         string memory coreJson = vm.serializeAddress(core, "usdg", set.usdg);
 
@@ -639,7 +655,7 @@ contract Core is Script {
     ///      rather than reconstructed later from memory; `12_Verify` turns this file into the commands.
     /// @param set The addresses.
     function writeConstructorArgs(Set memory set) public {
-        string[] memory items = new string[](14);
+        string[] memory items = new string[](15);
         items[0] = _argEntry("Amps", "src/token/Amps.sol:Amps", set.amps, abi.encode(set.vault));
         items[1] = _argEntry(
             "AmpsVault",
@@ -703,6 +719,12 @@ contract Core is Script {
             "src/periphery/AmpsRouter.sol:AmpsRouter",
             set.router,
             abi.encode(set.poolManager, set.amps, set.registry, set.weth9)
+        );
+        items[14] = _argEntry(
+            "AmpsGenesis",
+            "src/genesis/AmpsGenesis.sol:AmpsGenesis",
+            set.genesis,
+            abi.encode(set.vault, set.amps, _auctionFactory(), set.weth9, set.usdg, set.timelock)
         );
 
         string memory root = "amplestocks.args";
@@ -815,6 +837,7 @@ contract Core is Script {
         vm.serializeString(obj, "bondPolicy", "AMPS_BOND_POLICY");
         vm.serializeString(obj, "quoter", "AMPS_QUOTER");
         vm.serializeString(obj, "router", "AMPS_ROUTER");
+        vm.serializeString(obj, "genesis", "AMPS_GENESIS");
         vm.serializeString(obj, "weth9", "AMPS_WETH9");
         json = vm.serializeString(obj, "usdg", "AMPS_USDG");
     }
@@ -836,6 +859,7 @@ contract Core is Script {
         console2.log("bondPolicy     %s", set.bondPolicy);
         console2.log("quoter         %s", set.quoter);
         console2.log("router         %s", set.router);
+        console2.log("genesis        %s", set.genesis);
         console2.log("teamVesting    %s", set.teamVestingWallet);
     }
 
@@ -845,5 +869,18 @@ contract Core is Script {
         returns (address value)
     {
         value = vm.envOr(envName, json.readAddress(path));
+    }
+
+    /// @dev The `ContinuousClearingAuctionFactory` `AmpsGenesis` is constructed against. It lives in
+    ///      `script/config/genesis.json` rather than in `deployments.json` because it is a *launch parameter* —
+    ///      Uniswap's canonical factory, or a self-deployed one with `protocolFeeController == address(0)` — and
+    ///      not something this deployment produces. `AMPS_CCA_FACTORY` overrides it, which is what the fork-free
+    ///      script tests and any chain without the canonical deployment use.
+    function _auctionFactory() private view returns (address factory) {
+        factory = vm.envOr("AMPS_CCA_FACTORY", address(0));
+        if (factory != address(0)) return factory;
+        string memory json = vm.readFile(GENESIS_PATH);
+        factory = json.readAddress(".factory");
+        if (factory == address(0)) revert MissingAddress("ccaFactory");
     }
 }

@@ -145,7 +145,7 @@ contract LadderLibTest is Test {
 
     function test_splitIsExact() public view {
         uint256[] memory w = ladder.weights(TILT_LAUNCH, 10);
-        uint256[3] memory amounts = [uint256(1), 1662.5e18, 4750e18];
+        uint256[3] memory amounts = [uint256(1), 3150e18, 9000e18];
 
         for (uint256 a = 0; a < amounts.length; ++a) {
             uint256[] memory out = ladder.split(amounts[a], w);
@@ -231,10 +231,10 @@ contract LadderLibTest is Test {
     // The launch ladder
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev Genesis `AMPS/USDG`: 1,662.5 AMPS as ten doublings above $1.00 at tilt 1.25 on a spacing-10 pool.
+    /// @dev Genesis `AMPS/USDG`: 3,150 AMPS as ten doublings above `P0` at tilt 1.25 on a spacing-10 pool.
     function test_launchAskLadder() public view {
         int24 anchor = price.fairTick(1e18, 1e8, 6, 10);
-        uint256 inventory = 1662.5e18;
+        uint256 inventory = 3150e18;
 
         (int24[] memory lowers, int24[] memory uppers, uint128[] memory liquidities) =
             ladder.ladderAmounts(anchor, 10, 10, TILT_LAUNCH, inventory, true);
@@ -271,8 +271,8 @@ contract LadderLibTest is Test {
 
         // Exact per-bucket AMPS, straight from the geometric weights and the exact split.
         assertEq(placedTotal + (inventory - placedTotal), inventory, "accounting closes");
-        assertApproxEqAbs(placed[0], 49_995_634_990_694_670_637, 1e9, "bucket 0 == 49.9956 AMPS");
-        assertApproxEqAbs(placed[9], 372_496_507_992_555_743_827, 1e9, "bucket 9 == 372.4965 AMPS");
+        assertApproxEqAbs(placed[0], 94_728_571_561_316_218_050, 1e9, "bucket 0 == 94.7286 AMPS");
+        assertApproxEqAbs(placed[9], 705_782_857_249_052_980_908, 1e9, "bucket 9 == 705.7829 AMPS");
         assertApproxEqRel(
             placed[0] * 1e18 / inventory, 0.030072562400417847e18, 1e12, "bucket 0 is 3.0% of the tranche"
         );
@@ -394,7 +394,7 @@ contract LadderLibTest is Test {
     /// @dev A ladder that does not fit above (or below) its anchor must fail loudly, not place a truncated ladder.
     function test_revert_degenerateBucket() public {
         vm.expectRevert(abi.encodeWithSelector(LadderLib.DegenerateBucket.selector, uint8(0)));
-        ladder.ladderAmounts(TickMath.MAX_TICK, 10, 10, TILT_LAUNCH, 1662.5e18, true);
+        ladder.ladderAmounts(TickMath.MAX_TICK, 10, 10, TILT_LAUNCH, 3150e18, true);
 
         vm.expectRevert(abi.encodeWithSelector(LadderLib.DegenerateBucket.selector, uint8(0)));
         ladder.ladderAmounts(TickMath.MIN_TICK, 10, 4, TILT_LAUNCH, 2500e6, false);

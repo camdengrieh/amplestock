@@ -110,6 +110,127 @@ export interface VaultResponse {
 }
 
 // -----------------------------------------------------------------------------------------------
+// `/api/genesis`
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * The launch, `genesis` in the schema: one row that is legible at every point in genesis.
+ *
+ * Genesis is two vault calls with a 72-hour auction between them, so four logs on two contracts fill
+ * this row over three days and none of them waits for the others: the mint half from
+ * `AmpsVault.GenesisMinted`, the auction half from `AmpsGenesis.AuctionsCreated`, and the settlement
+ * from `AmpsGenesis.Settled` plus the vault's own `Genesis`. A row with tranches and no auctions, or
+ * auctions and no settlement, is a correct row rather than a partial one.
+ *
+ * **`p0X18` of zero is not a price.** It is zero before settlement and zero for ever after a
+ * settlement in which no leg graduated, so a reader consults `settledBlock` and `graduated` — never
+ * the number. `phase` is not here at all: the adapter derives it from the block number and no log
+ * carries it, so a live phase is a chain read (`hooks/use-genesis.ts`) and `settledPhase` is the
+ * terminal answer a log does decide.
+ */
+export interface GenesisRecord {
+  /** `AmpsGenesis`, and the vault it settles into. Zero until a genesis log names them. */
+  adapter: Address
+  vault: Address
+  /** From `GenesisMinted`. */
+  mintedBlock: NumericString
+  mintedAt: NumericString
+  creator: Address
+  teamVestingWallet: Address
+  teamShares: NumericString
+  auctionShares: NumericString
+  polShares: NumericString
+  /** From `AuctionsCreated`: the two legs and the floors the adapter computed for them. */
+  auctionsBlock: NumericString
+  usdgAuction: Address
+  ethAuction: Address
+  floorUsdgQ96: NumericString
+  floorEthQ96: NumericString
+  startBlock: NumericString
+  endBlock: NumericString
+  /** From `Settled`. `settledBlock` of zero means settlement has not happened. */
+  settledBlock: NumericString
+  settledAt: NumericString
+  /** `"settled"` once a leg graduated, `"aborted"` when none did, `""` before settlement. */
+  settledPhase: string
+  p0X18: NumericString
+  raisedUsdg: NumericString
+  raisedWeth: NumericString
+  unsoldAmps: NumericString
+  usdgGraduated: boolean
+  ethGraduated: boolean
+  /** True when at least one leg graduated: the only honest reading of "did the launch happen". */
+  graduated: boolean
+  /** From the vault's own `Genesis`: the launch as the vault recorded it. */
+  launchBlock: NumericString
+  launchAt: NumericString
+  totalMinted: NumericString
+  navPerShareX18: NumericString
+  raisedUsd18: NumericString
+  /** `p0X18 / navPerShareX18 - 1`, in bps. A disclosure, never a discount. */
+  premiumBps: number
+  /** From `ClearingPricesDiverged`: both legs graduated and their implied prices disagreed. */
+  diverged: boolean
+  divergedUsdgP0X18: NumericString
+  divergedEthP0X18: NumericString
+  divergenceToleranceBps: number
+  lastBlock: NumericString
+}
+
+/**
+ * One bid in one leg, `auction_bid` in the schema.
+ *
+ * Additive: the Auction surface reads the connected wallet's own bids straight off the auction's
+ * `BidSubmitted` logs and keeps doing so, because that path works with no indexer at all. What this
+ * adds is the whole book. `amountQ96` is stored as the auction stores it — dividing by 2^96 is a
+ * display step that would throw away the low bits deciding which tick a bid sits on.
+ */
+export interface AuctionBidRow {
+  auction: Address
+  /** `"usdg"` or `"eth"`. */
+  leg: string
+  bidId: NumericString
+  owner: Address
+  maxPriceQ96: NumericString
+  amountQ96: NumericString
+  submittedBlock: NumericString
+  submittedAt: NumericString
+  txHash: Hex
+  /** Non-zero once the bidder exited; the fill and the refund are then settled. */
+  exitedBlock: NumericString
+  tokensFilled: NumericString
+  currencyRefunded: NumericString
+  claimedBlock: NumericString
+  claimedAmount: NumericString
+}
+
+/**
+ * One checkpoint of one leg, `auction_checkpoint` in the schema — the clearing-price series.
+ *
+ * `checkpoint()` is a write, not a view, so the clearing price only moves when somebody pays to
+ * advance it. That makes this the only record of what the auction actually charged over the window;
+ * a `view` read gives one number and no history.
+ */
+export interface AuctionCheckpointRow {
+  auction: Address
+  leg: string
+  blockNumber: NumericString
+  timestamp: NumericString
+  txHash: Hex
+  logIndex: number
+  clearingPriceQ96: NumericString
+  /** Share of the tranche issued by this block, in milli-bips (`1e7` = 100%). */
+  cumulativeMps: NumericString
+}
+
+/** The `/api/genesis` envelope. `checkpoints` is oldest first; `bids` is newest first. */
+export interface GenesisResponse {
+  genesis: GenesisRecord
+  bids: readonly AuctionBidRow[]
+  checkpoints: readonly AuctionCheckpointRow[]
+}
+
+// -----------------------------------------------------------------------------------------------
 // `/api/nav-history`, `/api/premium-history`, `/api/share-history`
 // -----------------------------------------------------------------------------------------------
 

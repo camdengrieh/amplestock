@@ -19,6 +19,7 @@ import {ZeroPositionValuer} from "../../src/valuer/ZeroPositionValuer.sol";
 import {AmpsVault} from "../../src/vault/AmpsVault.sol";
 import {StubAmpsHook} from "../gas/StubAmpsHook.sol";
 import {MockAggregator} from "../mocks/MockAggregator.sol";
+import {MockGenesisHolder} from "../mocks/MockGenesisHolder.sol";
 import {MockMarketReference} from "../mocks/MockMarketReference.sol";
 import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {MockUsdg} from "../mocks/MockUsdg.sol";
@@ -104,9 +105,21 @@ abstract contract Phase2Fixture is V4TestBase {
     uint128 internal constant WETH_USD8 = 2500e8;
     /// @dev USDG at $1.00.
     uint128 internal constant USDG_USD8 = 1e8;
-    /// @dev The founders' seed: 1 WETH ($2,500) + 2,500 USDG ($2,500) = `A` of $5,000 against `S0` of 5,000 AMPS.
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    /// @dev The founders' seed: 4 WETH ($10,000) + 10,000 USDG ($10,000) = `A` of $20,000 against `S0` of
+    ///      20,000 AMPS, i.e. NAV/share of $1.00. Scaled with `S0` in revision 7 rather than left at $5,000, so
+    ///      that quadrupling the supply does not move every tick and every ladder vector in the suite; the
+    ///      `raised / S0` arithmetic of a real auction launch is exercised in `VaultGenesis.t.sol`.
+    uint256 internal constant SEED_WETH = 4e18;
+    uint256 internal constant SEED_USDG = 10_000e6;
+
+    /// @dev The `p0X18` this fixture asks {IAmpsVault-genesisPlace} for. `genesisPlace` floors the launch
+    ///      reference at NAV/share, so the smallest legal value asks for exactly that floor and `P_ref` starts at
+    ///      NAV — which is what genesis did before revision 7, and what every vector below this line was written
+    ///      against. It matters at the last wei: `VIRTUAL_SHARES` puts NAV/share one wei under $1.00 even with a
+    ///      seed worth exactly `S0` dollars, so asking for a flat `1e18` here would open a one-wei premium and
+    ///      every "the reference is NAV" assertion in the suite would be off by that wei. A launch that really
+    ///      does clear above NAV is `test/unit/VaultGenesis.t.sol`'s subject.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     /// @dev The five constituents. Index 0 is the NVDA-like name every bond journey uses; index 4 is the CRWD-like
     ///      name that carries a 4.0 display multiplier from block one (raw balances are unaffected — that is the
@@ -140,6 +153,9 @@ abstract contract Phase2Fixture is V4TestBase {
     ZeroPositionValuer internal valuer;
     StubAmpsHook internal hook;
     VestingWallet internal teamVesting;
+    /// @dev Stands in for the `AmpsGenesis` adapter: the vault's `genesis` pointer and the auction tranche's
+    ///      holder. The tranche stays there — it is in `totalSupply` exactly as bidders' AMPS would be.
+    MockGenesisHolder internal genesisHolder;
 
     MockERC20 internal weth;
     MockUsdg internal usdg;
@@ -179,8 +195,8 @@ abstract contract Phase2Fixture is V4TestBase {
         _registerPools();
     }
 
-    /// @notice Runs `genesis()` with the confirmed launch parameters: 250 AMPS to the team wallet, 4,750 retained
-    ///         as POL, 1 WETH and 2,500 USDG of seed.
+    /// @notice Runs both genesis steps with the confirmed launch parameters: 1,000 AMPS to the team wallet,
+    ///         10,000 to the genesis adapter, 9,000 retained as POL, 4 WETH and 10,000 USDG of seed.
     function runPhase2Genesis() internal {
         weth.mint(TIMELOCK, SEED_WETH);
         usdg.mint(TIMELOCK, SEED_USDG);
@@ -188,27 +204,34 @@ abstract contract Phase2Fixture is V4TestBase {
         vm.startPrank(TIMELOCK);
         weth.approve(address(vault), type(uint256).max);
         usdg.approve(address(vault), type(uint256).max);
-        vault.genesis(genesisParams());
+        vault.genesisMint(genesisMintParams());
+        vault.genesisPlace(genesisPlaceParams());
         vm.stopPrank();
     }
 
-    /// @notice The launch genesis arguments.
-    function genesisParams() internal view returns (IAmpsVault.GenesisParams memory params) {
-        address[] memory seedTokens = new address[](2);
-        uint256[] memory seedAmounts = new uint256[](2);
-        seedTokens[0] = address(weth);
-        seedAmounts[0] = SEED_WETH;
-        seedTokens[1] = address(usdg);
-        seedAmounts[1] = SEED_USDG;
-
-        params = IAmpsVault.GenesisParams({
+    /// @notice The step-one arguments.
+    function genesisMintParams() internal view returns (IAmpsVault.GenesisMintParams memory params) {
+        params = IAmpsVault.GenesisMintParams({
             teamVestingWallet: address(teamVesting),
             creator: CREATOR,
+            genesis: address(genesisHolder),
             teamShares: Constants.TEAM_SHARES,
-            polShares: Constants.POL_SHARES,
-            seedTokens: seedTokens,
-            seedAmounts: seedAmounts
+            auctionShares: Constants.AUCTION_SHARES,
+            polShares: Constants.POL_SHARES
         });
+    }
+
+    /// @notice The step-two arguments: the founders' seed at the $1.00 fallback price.
+    function genesisPlaceParams() internal view returns (IAmpsVault.GenesisPlaceParams memory params) {
+        address[] memory tokens = new address[](2);
+        uint256[] memory amounts = new uint256[](2);
+        tokens[0] = address(weth);
+        amounts[0] = SEED_WETH;
+        tokens[1] = address(usdg);
+        amounts[1] = SEED_USDG;
+
+        params =
+            IAmpsVault.GenesisPlaceParams({p0X18: GENESIS_P0_AT_NAV, tokens: tokens, amounts: amounts, unsoldAmps: 0});
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -276,6 +299,7 @@ abstract contract Phase2Fixture is V4TestBase {
         pot = new BountyPot(address(usdg), address(vault), TIMELOCK);
         valuer = new ZeroPositionValuer();
         teamVesting = new VestingWallet(TEAM, uint64(GENESIS_TIME), Constants.TEAM_VEST_SECONDS);
+        genesisHolder = new MockGenesisHolder();
 
         vm.label(address(registry), "PoolRegistry");
         vm.label(address(bonds), "AmpsBonds");
@@ -316,6 +340,7 @@ abstract contract Phase2Fixture is V4TestBase {
     function _wireVault() private {
         vm.startPrank(TIMELOCK);
         vault.setPolicyPointer(bytes32("registry"), address(registry));
+        vault.setPolicyPointer(bytes32("genesis"), address(genesisHolder));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(marketRef));

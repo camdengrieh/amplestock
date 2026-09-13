@@ -115,24 +115,53 @@ test('the `verify` flag is set exactly when a token or feed is missing', () => {
   }
 })
 
-test('supply arithmetic matches the genesis split', () => {
+test('supply arithmetic matches the revision-7 genesis split', () => {
   const s = config.launchParameters.supply
-  assert.equal(s.teamAmps + s.polAmps, s.s0Amps, '5% team + 95% POL must equal S0')
-  assert.equal(s.teamWei + s.polWei, s.s0, 'wei split must equal S0 exactly')
-  assert.equal(s.perSpokeSeedAmps * s.spokeCount, s.spokeSeedTotalAmps, '47.5 x 30 = 1,425')
-  assert.equal(s.perSpokeSeedWei * BigInt(s.spokeCount), 1_425n * 10n ** 18n)
-  assert.equal(s.entryPoolAmpsEach * 2, s.entryPoolTotalAmps, 'two entry pools at 1,662.5 each')
-  assert.equal(s.spokeSeedTotalAmps + s.entryPoolTotalAmps, s.polAmps, '1,425 + 3,325 = 4,750 POL')
+  assert.equal(s.teamAmps + s.auctionAmps + s.polAmps, s.s0Amps, '5% team + 50% auction + 45% POL must equal S0')
+  assert.equal(s.teamWei + s.auctionWei + s.polWei, s.s0, 'wei split must equal S0 exactly')
+  // The three tranches are `Constants.sol` figures, and `genesisMint` refuses any other allocation.
+  assert.equal(s.s0Amps, 20_000)
+  assert.equal(s.teamAmps, 1_000)
+  assert.equal(s.auctionAmps, 10_000)
+  assert.equal(s.polAmps, 9_000)
+  assert.equal(s.perSpokeSeedAmps * s.spokeCount, s.spokeSeedTotalAmps, '90 x 30 = 2,700')
+  assert.equal(s.perSpokeSeedWei * BigInt(s.spokeCount), 2_700n * 10n ** 18n)
+  assert.equal(s.entryPoolAmpsEach * 2, s.entryPoolTotalAmps, 'two entry pools at 3,150 each')
+  assert.equal(s.spokeSeedTotalAmps + s.entryPoolTotalAmps, s.polAmps, '2,700 + 6,300 = 9,000 POL')
   assert.equal(s.entryPoolWeiEach * 2n + s.perSpokeSeedWei * BigInt(s.spokeCount), s.polWei)
+  // `spokeSeedBps` is 100 bp of the POL tranche, and 90 is exactly that.
+  assert.equal(s.perSpokeSeedAmps, (s.polAmps * 100) / 10_000)
 })
 
-test('seed is $5,000 split 50/50 and prices AMPS at $1.00', () => {
-  const seed = config.launchParameters.seed
+test('the auction sells half of S0 in two legs at a $1.00 floor', () => {
+  const a = config.launchParameters.auction
+  const s = config.launchParameters.supply
+  assert.equal(a.usdgAmps + a.ethAmps, a.totalAmps, 'the two legs must be the whole tranche')
+  assert.equal(a.usdgWei + a.ethWei, a.totalWei)
+  assert.equal(a.usdgAmps, a.ethAmps, 'the legs are sized 50/50')
+  assert.equal(a.totalAmps, s.auctionAmps, 'the auction block and the supply block must agree')
+  assert.equal(a.totalAmps * 2, s.s0Amps, 'half the supply is sold')
+  assert.equal(a.legs, 2)
+  assert.equal(a.floorPriceUsd, 1.0)
+  // A full clear at the floor: raised = tranche x floor, NAV/share = raised / S0 (fully diluted,
+  // Decision 14), premium = P0 / NAV - 1. All three are arithmetic, not assumptions.
+  assert.equal(a.raisedAtFloorUsd, a.totalAmps * a.floorPriceUsd)
+  assert.equal(a.navPerShareAtFloorUsd, a.raisedAtFloorUsd / s.s0Amps)
+  assert.equal(a.premiumAtFloorBps, Math.round((a.floorPriceUsd / a.navPerShareAtFloorUsd - 1) * 10_000))
+})
+
+test('the founders seed survives only as the non-graduation fallback', () => {
+  const seed = config.launchParameters.fallbackSeed
+  const s = config.launchParameters.supply
+  assert.equal('seed' in config.launchParameters, false, 'launchParameters.seed must not exist any more')
   assert.equal(seed.ethUsd + seed.usdgUsd, seed.totalUsd)
-  assert.equal(seed.ethUsd, seed.usdgUsd)
+  assert.equal(seed.ethUsd, seed.usdgUsd, 'the fallback seed is 50/50')
   assert.equal(seed.launchPriceUsd, 1.0)
-  // 5,000 AMPS backed by $5,000, fully diluted (Decision 14).
-  assert.equal(seed.totalUsd / config.launchParameters.supply.s0Amps, seed.launchPriceUsd)
+  // $20,000 against 20,000 AMPS fully diluted is NAV/share $1.00 — the pre-revision-7 launch,
+  // scaled to the new S0. These are the raw amounts `script/config/genesis.json` approves.
+  assert.equal(seed.totalUsd / s.s0Amps, seed.launchPriceUsd)
+  assert.equal(seed.usdgRaw, 10_000_000_000n, '10,000 USDG at 6 decimals')
+  assert.equal(seed.wethWei, 4n * 10n ** 18n, '4 WETH')
 })
 
 test('every start value sits inside its hard band', () => {

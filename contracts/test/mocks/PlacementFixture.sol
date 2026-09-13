@@ -17,6 +17,7 @@ import {AmpsVault} from "../../src/vault/AmpsVault.sol";
 import {V4TestBase} from "../utils/V4TestBase.sol";
 import {MockVaultRole} from "./AmpsVaultFixture.sol";
 import {MockAggregator} from "./MockAggregator.sol";
+import {MockGenesisHolder} from "./MockGenesisHolder.sol";
 import {MockStockToken} from "./MockStockToken.sol";
 import {MockUsdg} from "./MockUsdg.sol";
 import {PlacementHookStub} from "./PlacementHookStub.sol";
@@ -78,8 +79,17 @@ abstract contract PlacementFixture is V4TestBase {
 
     uint128 internal constant WETH_USD8 = 2500e8;
     uint128 internal constant USDG_USD8 = 1e8;
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    uint256 internal constant SEED_WETH = 4e18;
+    uint256 internal constant SEED_USDG = 10_000e6;
+
+    /// @dev The `p0X18` this fixture asks {IAmpsVault-genesisPlace} for. `genesisPlace` floors the launch
+    ///      reference at NAV/share, so the smallest legal value asks for exactly that floor and `P_ref` starts at
+    ///      NAV — which is what genesis did before revision 7, and what every vector below this line was written
+    ///      against. It matters at the last wei: `VIRTUAL_SHARES` puts NAV/share one wei under $1.00 even with a
+    ///      seed worth exactly `S0` dollars, so asking for a flat `1e18` here would open a one-wei premium and
+    ///      every "the reference is NAV" assertion in the suite would be off by that wei. A launch that really
+    ///      does clear above NAV is `test/unit/VaultGenesis.t.sol`'s subject.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     /// @dev Two spokes is enough for every property in §3 and keeps the suites fast; the redemption gas test
     ///      extrapolates from the measured per-pool cost to the 32-pool launch shape.
@@ -89,10 +99,10 @@ abstract contract PlacementFixture is V4TestBase {
     uint16 internal constant TARGET_WEIGHT_BPS = 5000;
     uint16 internal constant ROLLOUT_WEIGHT_BPS = 5000;
 
-    /// @dev The confirmed genesis ladder amounts of §3.3: 1,662.5 AMPS of asks in each entry pool, 47.5 AMPS
-    ///      (1% of the 4,750 POL tranche) as each spoke's seed ask.
-    uint256 internal constant ENTRY_ASK_AMPS = 1662.5e18;
-    uint256 internal constant SPOKE_SEED_AMPS = 47.5e18;
+    /// @dev The confirmed genesis ladder amounts of §3.3: 3,150 AMPS of asks in each entry pool, 90 AMPS
+    ///      (1% of the 9,000 POL tranche) as each spoke's seed ask.
+    uint256 internal constant ENTRY_ASK_AMPS = 3150e18;
+    uint256 internal constant SPOKE_SEED_AMPS = 90e18;
 
     uint160 internal constant HOOK_FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
@@ -110,6 +120,9 @@ abstract contract PlacementFixture is V4TestBase {
     OracleGate internal gate;
     FeedRegistry internal feeds;
     LadderPositionValuer internal valuer;
+    /// @dev Stands in for the `AmpsGenesis` adapter: the vault's `genesis` pointer and the holder of the auction
+    ///      tranche, which stays there exactly as bidders' AMPS would.
+    MockGenesisHolder internal genesisHolder;
     PlacementHookStub internal hook;
     PlacementLadderPolicyStub internal ladderPolicy;
     PlacementRolloutPolicyStub internal rolloutPolicy;
@@ -138,8 +151,10 @@ abstract contract PlacementFixture is V4TestBase {
     // Deployment
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Deploys and wires the whole world, registers the four pools and runs `genesis()`. After this the
-    ///         vault holds 4,750 AMPS of POL inventory, `A` is $5,000 and NAV/share is $1.00.
+    /// @notice Deploys and wires the whole world, registers the four pools and runs both genesis steps. After
+    ///         this the vault holds 9,000 AMPS of POL inventory, the auction tranche sits with the genesis
+    ///         holder, `A` is $20,000 (4 WETH at $2,500 plus 10,000 USDG) and NAV/share is $1.00 against
+    ///         `S0` = 20,000.
     function deployPlacementWorld() internal {
         vm.warp(GENESIS_TIME);
         vm.roll(GENESIS_BLOCK);
@@ -254,7 +269,9 @@ abstract contract PlacementFixture is V4TestBase {
 
     function _wireVault() private {
         vm.startPrank(TIMELOCK);
+        genesisHolder = new MockGenesisHolder();
         vault.setPolicyPointer(bytes32("registry"), address(registry));
+        vault.setPolicyPointer(bytes32("genesis"), address(genesisHolder));
         vault.setPolicyPointer(bytes32("bonds"), address(bondsRole));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
         vault.setPolicyPointer(bytes32("marketReference"), address(hook));
@@ -298,25 +315,28 @@ abstract contract PlacementFixture is V4TestBase {
         weth.mint(TIMELOCK, SEED_WETH);
         usdg.mint(TIMELOCK, SEED_USDG);
 
-        address[] memory seedTokens = new address[](2);
-        uint256[] memory seedAmounts = new uint256[](2);
-        seedTokens[0] = address(weth);
-        seedAmounts[0] = SEED_WETH;
-        seedTokens[1] = address(usdg);
-        seedAmounts[1] = SEED_USDG;
+        address[] memory tokens = new address[](2);
+        uint256[] memory amounts = new uint256[](2);
+        tokens[0] = address(weth);
+        amounts[0] = SEED_WETH;
+        tokens[1] = address(usdg);
+        amounts[1] = SEED_USDG;
 
         vm.startPrank(TIMELOCK);
         weth.approve(address(vault), type(uint256).max);
         usdg.approve(address(vault), type(uint256).max);
-        vault.genesis(
-            IAmpsVault.GenesisParams({
+        vault.genesisMint(
+            IAmpsVault.GenesisMintParams({
                 teamVestingWallet: TEAM,
                 creator: CREATOR,
+                genesis: address(genesisHolder),
                 teamShares: Constants.TEAM_SHARES,
-                polShares: Constants.POL_SHARES,
-                seedTokens: seedTokens,
-                seedAmounts: seedAmounts
+                auctionShares: Constants.AUCTION_SHARES,
+                polShares: Constants.POL_SHARES
             })
+        );
+        vault.genesisPlace(
+            IAmpsVault.GenesisPlaceParams({p0X18: GENESIS_P0_AT_NAV, tokens: tokens, amounts: amounts, unsoldAmps: 0})
         );
         vm.stopPrank();
     }
@@ -363,6 +383,21 @@ abstract contract PlacementFixture is V4TestBase {
         seedAllRings(hubPriceUsd18());
         refreshFeeds();
         vault.checkpoint();
+    }
+
+    /// @notice TEST ONLY. Puts the vault's reference price exactly on the hub's live price, which is where a
+    ///         rate-limited `P_ref` arrives on its own once the market has stopped moving.
+    ///
+    /// @dev `checkpoint()` walks `P_ref` toward `P_mkt` at `refUpRateBps` per period, so a fixture that has just
+    ///      walked the hub a whole doubling with one swap would need days of warps to let the reference follow.
+    ///      Every test that uses this is testing something else — where `compound` lays its bids, what the
+    ///      buyback burns — and needs the market and the reference to agree, which is the ordinary state of the
+    ///      world. Slot 0's high half is `pRefX18` (`docs/phase2-state-model.md` §1.1), which `VaultLayout.t.sol`
+    ///      pins; `syncMarket()` has already put `P_mkt` on the same price, so the two agree after this rather
+    ///      than diverging.
+    function catchUpRef() internal {
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(0))));
+        vm.store(address(vault), bytes32(uint256(0)), bytes32((hubPriceUsd18() << 128) | (word & type(uint128).max)));
     }
 
     /// @notice The AMPS price the hub is actually trading at right now, 18 decimals. Re-seeding every ring at

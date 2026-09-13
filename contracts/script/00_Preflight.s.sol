@@ -55,6 +55,9 @@ contract Preflight is Script {
     /// @notice The deployment's own addresses.
     string internal constant DEPLOYMENTS_PATH = "./script/config/deployments.json";
 
+    /// @notice The launch parameters, read here only for the auction factory address.
+    string internal constant GENESIS_PATH = "./script/config/genesis.json";
+
     /// @notice Where the report is written.
     string internal constant REPORT_PATH = "./script/config/preflight-report.json";
 
@@ -122,6 +125,7 @@ contract Preflight is Script {
         checkTransientStorage();
         checkConstituents();
         checkAmpsOrdering();
+        checkAuctionFactory();
         checkDeploymentState();
 
         (uint256 failures, uint256 warnings) = summarise();
@@ -306,10 +310,27 @@ contract Preflight is Script {
         else _fail("ampsOrdering", string.concat(vm.toString(offenders), " counter assets sort BELOW AMPS"));
     }
 
+    /// @notice The `ContinuousClearingAuctionFactory` genesis will deploy its two auctions through holds code.
+    /// @dev A **failure**, not a warning: `03_Core` constructs `AmpsGenesis` against this address as an
+    ///      immutable, and an adapter pointed at an empty address cannot be repaired — it would have to be
+    ///      redeployed, and by then it may already hold half of `S0`. `AMPS_CCA_FACTORY` overrides the configured
+    ///      address, which is what a self-deployed fee-free factory and every test chain use.
+    function checkAuctionFactory() public {
+        address factory = vm.envOr("AMPS_CCA_FACTORY", address(0));
+        if (factory == address(0)) factory = vm.readFile(GENESIS_PATH).readAddress(".factory");
+        if (factory == address(0)) {
+            _fail("ccaFactory", "no ContinuousClearingAuctionFactory configured");
+        } else if (factory.code.length == 0) {
+            _fail("ccaFactory", string.concat(vm.toString(factory), " holds no code on this chain"));
+        } else {
+            _pass("ccaFactory", string.concat(vm.toString(factory), " holds code"));
+        }
+    }
+
     /// @notice Which of the deployment's own addresses already hold code, i.e. what a re-run would skip.
     function checkDeploymentState() public {
         string memory json = vm.readFile(DEPLOYMENTS_PATH);
-        string[13] memory names = [
+        string[14] memory names = [
             "timelock",
             "guardian",
             "amps",
@@ -322,14 +343,15 @@ contract Preflight is Script {
             "oracleGate",
             "positionValuer",
             "quoter",
-            "router"
+            "router",
+            "genesis"
         ];
         uint256 deployed;
         for (uint256 i; i < names.length; ++i) {
             address target = _readOptional(json, string.concat(".core.", names[i]));
             if (target != address(0) && target.code.length != 0) ++deployed;
         }
-        _pass("deploymentState", string.concat(vm.toString(deployed), " of 13 core addresses already hold code"));
+        _pass("deploymentState", string.concat(vm.toString(deployed), " of 14 core addresses already hold code"));
     }
 
     // -----------------------------------------------------------------------------------------------------------

@@ -113,13 +113,37 @@ test('Auction reads both legs and explains the mechanism', async ({page}) => {
   await expect(page.getByTestId('auction-explainer')).toContainText('everything is refunded')
   // The clearing price is the auction's own, in its own currency, off the Q96 grid.
   await expect(page.getByTestId('auction-headline-usdg')).toContainText('USDG')
-  await expect(page.getByTestId('auction-headline-usdg')).toContainText('3,325 AMPS')
+  // Each leg sells 5,000 AMPS: half the 10,000-AMPS auction tranche, which is half of S₀.
+  await expect(page.getByTestId('auction-headline-usdg')).toContainText('5,000 AMPS')
   // …and in dollars, through the Chainlink answer rather than by assuming USDG is a dollar.
   await expect(page.getByTestId('auction-headline-usdg')).toContainText('$1.0001')
   // There is no ETH/USD feed in the reference book, so the ETH leg's dollar column is a dash.
   await expect(page.getByTestId('auction-headline-eth').locator('[data-unavailable="true"]').first()).toBeVisible()
   // No wallet, so the bid list says so rather than claiming there are none.
   await expect(page.getByTestId('bids-usdg')).toContainText('Connect a wallet')
+})
+
+test('Auction settlement reads the genesis adapter and discloses the premium', async ({page}) => {
+  await page.goto('/auction')
+  const settlement = page.getByTestId('auction-settlement')
+  await expect(settlement).toBeVisible()
+  // The phase comes from the adapter, not from adding the two auctions up.
+  await expect(page.getByTestId('genesis-phase-note')).toContainText('Settled')
+  // $10,000 raised against S₀ = 20,000 is NAV/share $0.50 at a P₀ of $1.00: a 100% premium, and it
+  // is printed as a premium rather than smoothed away or called a discount.
+  await expect(settlement).toContainText('$1.000000')
+  await expect(settlement).toContainText('$10,000')
+  await expect(settlement).toContainText('$0.5000')
+  await expect(settlement).toContainText('+100.00%')
+  await expect(settlement).not.toContainText('discount')
+  // Where the money came from, in each currency, and what came back unsold. Each leg is shown in its
+  // own units *and* in USD, because 5,000 USDG and 2 WETH are the same $5,000 and neither figure is
+  // derivable from the other without the ETH/USD price the adapter used.
+  await expect(page.getByTestId('genesis-proceeds')).toContainText('5,000 USDG · $5,000.00')
+  await expect(page.getByTestId('genesis-proceeds')).toContainText('2 WETH · $5,000.00')
+  await expect(page.getByTestId('genesis-proceeds')).toContainText('2,000 AMPS')
+  // settle() is one-shot, so the button is refused with the reason rather than silently disabled.
+  await expect(page.getByTestId('genesis-settle')).toContainText('already been settled')
 })
 
 test('Bond shows the board, including the market that cannot be bonded and why', async ({page}) => {
@@ -221,6 +245,12 @@ test('the docs auction page reads both auctions and refuses to invent the gradua
   await expect(page.getByTestId('docs-article')).toContainText('One price for everybody')
   await expect(page.getByTestId('docs-article')).toContainText('The graduation target is not readable')
   await expect(page.getByTestId('docs-rail')).toContainText('The two auctions')
+  // The two-step genesis, and the premium as a disclosure rather than a discount.
+  await expect(page.getByTestId('docs-article')).toContainText('Genesis is two calls')
+  await expect(page.getByTestId('docs-article')).toContainText('The premium is a disclosure, not a discount')
+  // Live settlement figures, resolved from the adapter — none of them typed into the page.
+  await expect(page.getByTestId('docs-article')).toContainText('$0.5000')
+  await expect(page.getByTestId('docs-article')).toContainText('2,000 AMPS')
 })
 
 test('the docs sidebar collapses to a select on a narrow viewport', async ({page}) => {

@@ -2,6 +2,8 @@
 pragma solidity 0.8.30;
 
 import {IAmpsBonds} from "../src/interfaces/IAmpsBonds.sol";
+import {IAmpsGenesis} from "../src/interfaces/IAmpsGenesis.sol";
+import {IAmpsVault} from "../src/interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../src/interfaces/IFeedRegistry.sol";
 import {IPoolRegistry} from "../src/interfaces/IPoolRegistry.sol";
 import {Constants} from "../src/types/Constants.sol";
@@ -43,6 +45,17 @@ import {console2} from "forge-std/console2.sol";
 ///      once all 30 are `ACTIVE`, where the only constraints are `[166, 3000]` per name and a sum of exactly
 ///      10,000. That is not a workaround: `setIndexWeights` is the published quarterly-rule entry point and the
 ///      launch vector is its first application.
+///
+/// @dev **Every pool opens at `P0`, which is why this script runs after the auctions** (`docs/genesis-cca.md`,
+///      `docs/phase3-state-model.md` §12 ruling C). `PoolRegistry` registers a constituent and initialises its
+///      pool in one call — `_registerPool` then `_openPool`, with no way to do the first without the second — and
+///      `_openPool` anchors at `AmpsVault.pRefX18()`, falling back to $1.00 only while that word is still zero.
+///      Revision 7 writes `P0` into it in `AmpsVault.genesisPlace`, inside `AmpsGenesis.settle()`. So the order is
+///      **this script with `REGISTRY_FEEDS_ONLY=true`** (the feeds, no pools) -> `06a` (mint + auctions) ->
+///      bidding -> `06b` (settle, `P_ref = P0`) -> **this script in full** -> ring warm-up -> `09_Phase3Wire`
+///      pass 2 (the gate) -> `11_GenesisPlacement`. Running the registration before `06b` would open all 32 pools
+///      at $1.00 and leave every ladder a grid away from the market; {assertAnchor} is what refuses that, and
+///      {installFeeds} is what keeps the feed half of the job available at the point genesis needs it.
 ///
 /// @dev **What it does not do.** It places no liquidity — the §3.3 genesis ladders are `11_GenesisPlacement`'s
 ///      job — and it never points the vault at the `OracleGate`. Pool registration must happen with the gate
@@ -96,6 +109,11 @@ contract Registry is Script {
 
     /// @dev `PoolRegistry.PoolOpened(PoolId indexed, address indexed, uint160)`.
     bytes32 internal constant POOL_OPENED_TOPIC = keccak256("PoolOpened(bytes32,address,uint160)");
+
+    /// @notice How far the vault's reference may sit from the adapter's clearing price before {assertAnchor}
+    ///         refuses. They are written by the same transaction, so the only slack is the NAV floor
+    ///         `genesisPlace` applies to `p0X18`.
+    uint16 internal constant ANCHOR_TOLERANCE_BPS = 100;
 
     // -----------------------------------------------------------------------------------------------------------
     // Types
@@ -201,6 +219,16 @@ contract Registry is Script {
     /// @param what Which one.
     error MissingAddress(string what);
 
+    /// @notice `AmpsVault.genesisPlace` has not run, so `pRefX18()` is still zero and every pool would open at
+    ///         the $1.00 fallback anchor instead of the auctions' clearing price. `06b_GenesisSettle` comes first.
+    error AnchorNotSet();
+
+    /// @notice The vault's reference is not the price the auctions cleared at, so the pools would not open where
+    ///         the ladders will be anchored.
+    /// @param pRefX18 What the vault holds.
+    /// @param p0X18 What the adapter settled at.
+    error AnchorMismatch(uint256 pRefX18, uint256 p0X18);
+
     // -----------------------------------------------------------------------------------------------------------
     // Entry points
     // -----------------------------------------------------------------------------------------------------------
@@ -213,8 +241,63 @@ contract Registry is Script {
     ///      (`docs/deploy-runbook.md` §0.1).
     function run() external virtual {
         Wiring memory w = loadWiring();
+        if (vm.envOr("REGISTRY_FEEDS_ONLY", false)) {
+            console2.log("feeds-only pass: %s feeds installed", installFeeds(w, loadEntryPools(), loadSpokes()));
+            return;
+        }
         Result memory result = execute(w, loadEntryPools(), loadSpokes());
         writePools(w, result);
+    }
+
+    /// @notice Installs every configured feed — the two entry counters and the constituents — and registers
+    ///         nothing at all.
+    ///
+    /// @dev **Bootstrap step 2b, and revision 7 is why it exists.** `AmpsVault.genesisPlace` ends in a
+    ///      checkpoint, and a checkpoint prices every asset the vault holds; the assets it holds at that moment
+    ///      are the auction proceeds, WETH9 and USDG. Their feeds therefore have to be installed *before*
+    ///      `06b_GenesisSettle`, and registration can no longer carry them there: the 32 pools are opened after
+    ///      settlement so that they open at `P0` (§12 ruling C). `06a_GenesisAuction` wants the WETH feed even
+    ///      earlier, to cross-check the ETH/USD price the proposal carries. So the feed half of this script runs
+    ///      once before the auctions and the registration half once after them.
+    ///
+    /// @dev Installing a feed neither needs nor implies a pool, and `_installFeed` is idempotent — it compares
+    ///      `feedOf(token)` first — so the full pass afterwards re-installs nothing and the two passes can be
+    ///      run in either order, or twice, without consequence.
+    /// @param w The addresses to call into.
+    /// @param entries The two entry pools.
+    /// @param spokes The constituents.
+    /// @return installed How many feeds were configured by this run.
+    function installFeeds(Wiring memory w, EntryPoolSpec[] memory entries, SpokeSpec[] memory spokes)
+        public
+        returns (uint256 installed)
+    {
+        if (w.timelock == address(0)) revert MissingAddress("timelock");
+        if (w.feedRegistry == address(0)) revert MissingAddress("feedRegistry");
+
+        IFeedRegistry feeds = IFeedRegistry(w.feedRegistry);
+
+        Gov.Ctx memory ctx = Gov.load(w.timelock);
+        Gov.describe(ctx);
+        Gov.begin(ctx);
+        for (uint256 i; i < entries.length; ++i) {
+            EntryPoolSpec memory e = entries[i];
+            if (e.counter == address(0) || e.feed == address(0)) {
+                revert PlaceholderAddress(e.symbol, e.counter, e.feed);
+            }
+            if (feeds.feedOf(e.counter) == e.feed) continue;
+            _installFeed(ctx, w.feedRegistry, e.counter, e.feed, e.heartbeatSeconds);
+            ++installed;
+        }
+        for (uint256 i; i < spokes.length; ++i) {
+            SpokeSpec memory sp = spokes[i];
+            if (sp.token == address(0) || sp.feed == address(0)) {
+                revert PlaceholderAddress(sp.symbol, sp.token, sp.feed);
+            }
+            if (feeds.feedOf(sp.token) == sp.feed) continue;
+            _installFeed(ctx, w.feedRegistry, sp.token, sp.feed, sp.heartbeatSeconds);
+            ++installed;
+        }
+        Gov.end(ctx);
     }
 
     /// @notice Registers every entry pool and constituent in `entries`/`spokes` that is not registered yet, then
@@ -234,6 +317,8 @@ contract Registry is Script {
         if (w.timelock == address(0)) revert MissingAddress("timelock");
         if (w.amps == address(0)) revert MissingAddress("amps");
         if (w.hook == address(0)) revert MissingAddress("hook");
+
+        assertAnchor(w);
 
         IPoolRegistry registry = IPoolRegistry(w.registry);
         result.pools = new OpenedPool[](entries.length + spokes.length);
@@ -311,6 +396,42 @@ contract Registry is Script {
         }
         result.pools = trimmed;
         _readOpeningPrices(result.pools);
+    }
+
+    /// @notice The precondition revision 7 adds: the vault's reference price is `P0`, so every pool this run
+    ///         opens opens there.
+    ///
+    /// @dev Three states are accepted, and each one is a real launch shape:
+    ///
+    ///        * `vault == address(0)` — the registry is not wired to a vault this script can read (a mock, a
+    ///          fixture): nothing to check;
+    ///        * the vault has run `genesisPlace` and its `pRefX18()` matches the adapter's `p0X18()`, or the
+    ///          adapter is absent / never settled (the founders'-seed fallback, where `P_ref` is $1.00);
+    ///        * `REGISTRY_ANCHOR_OVERRIDE=true` — the operator has decided to register at whatever anchor the
+    ///          vault currently holds. That is the escape hatch for a re-run that adds a 33rd constituent long
+    ///          after launch, when `P_ref` has moved and is *supposed* to have.
+    ///
+    ///      Everything else refuses, because opening 32 pools at the wrong anchor is not recoverable: a pool can
+    ///      be initialised exactly once.
+    /// @param w The addresses.
+    function assertAnchor(Wiring memory w) public view {
+        if (vm.envOr("REGISTRY_ANCHOR_OVERRIDE", false)) return;
+
+        address vaultAddress = IPoolRegistry(w.registry).vault();
+        if (vaultAddress == address(0)) return;
+
+        IAmpsVault vault = IAmpsVault(vaultAddress);
+        if (!vault.initialized()) revert AnchorNotSet();
+
+        address adapter = vault.genesis();
+        if (adapter == address(0) || adapter.code.length == 0) return;
+        if (!IAmpsGenesis(adapter).settled()) return;
+        uint256 p0 = IAmpsGenesis(adapter).p0X18();
+        if (p0 == 0) return; // nothing graduated: the fallback launch set `P_ref` itself.
+
+        uint256 pRef = vault.pRefX18();
+        uint256 gap = pRef > p0 ? pRef - p0 : p0 - pRef;
+        if (gap * Constants.BPS > p0 * ANCHOR_TOLERANCE_BPS) revert AnchorMismatch(pRef, p0);
     }
 
     // -----------------------------------------------------------------------------------------------------------

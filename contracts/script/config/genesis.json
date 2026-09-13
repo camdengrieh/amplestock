@@ -1,0 +1,60 @@
+{
+  "$comment": "The Continuous Clearing Auction parameters script/06a_GenesisAuction.s.sol builds AuctionParameters from, and the settlement knobs script/06b_GenesisSettle.s.sol reads. Everything here is a launch decision, not deployment state: the addresses live in script/config/deployments.json. Tranche sizes are NOT here — they are src/types/Constants.sol (S0 = 20,000, team 1,000, auction 10,000 split 5,000/5,000, POL 9,000) and AmpsVault.genesisMint refuses anything else. Neither is the floor price: it is $1.00 per AMPS in each currency and AmpsGenesis computes it from the currency's decimals and ethUsdX18.",
+  "chainId": 0,
+  "network": "unset",
+  "factory": "0x000000001F26a0044BaA66024e7b6599c61963F8",
+  "factoryNote": "The canonical ContinuousClearingAuctionFactory (CCA v2.1.0, MIT). Phase 0 asserts eth_getCode on it before anything else runs; a self-deployed factory with protocolFeeController == address(0) is the alternative and only changes this key.",
+  "ethUsdX18": 0,
+  "ethUsdX18Note": "ETH/USD, 18 decimals, at the moment the auctions are created. It fixes the ETH leg's floor at $1.00 per AMPS and is cross-checked against the vault's FeedRegistry answer for WETH inside refDivergenceBps. Zero means 'read the feed and use that' (06a fills it in).",
+  "blockMs": 100,
+  "blockMsNote": "Robinhood Chain produces a block every 100 ms, so 72 h of bidding is 2,592,000 blocks. Every block figure below is derived from this and durationHours. Zero falls back to 100.",
+  "startBlocksNote": "AMPS_AUCTION_START_BLOCKS and AMPS_AUCTION_WINDOW_BLOCKS override the hour figures below with a block count outright. They exist for a rehearsal on a chain nobody will mine 2.59 million blocks on (test/script/broadcast.sh); a mainnet run leaves both unset.",
+  "startDelayHours": 24,
+  "durationHours": 72,
+  "claimDelayHours": 0,
+  "usdg": {
+    "enabled": true,
+    "tickSpacing": "792281625142643375935439503",
+    "tickSpacingNote": "1% of the USDG floor price (1e6 * 2^96 / 1e18). Upstream's minimum is 2 and its guidance is at least one basis point of the floor; 1% keeps the tick book small enough that the auction cannot be griefed into an out-of-gas.",
+    "requiredCurrencyRaised": "1000000000",
+    "requiredCurrencyRaisedNote": "1,000 USDG raw units at 6 decimals = $1,000. Below this the USDG leg does not graduate, every bidder refunds in full and its tranche returns to the vault.",
+    "validationHook": "0x0000000000000000000000000000000000000000",
+    "validationHookNote": "An IValidationHook (geo-block, allowlist). address(0) is an open auction: the dApp's geo-block does not bind a contract, so a jurisdiction the launch must exclude needs a hook here.",
+    "salt": "0x0000000000000000000000000000000000000000000000000000000000000001",
+    "steps": [{"mps": 0, "blocks": 0}],
+    "stepsNote": "The packed per-block issuance schedule. Leave a single {mps: 0, blocks: 0} entry to have 06a build a flat schedule over the whole window; otherwise SUM(mps x blocks) must be 10,000,000 (= 100% of the tranche) and SUM(blocks) must equal endBlock - startBlock, which AmpsGenesis.createAuctions checks before it deploys anything."
+  },
+  "eth": {
+    "enabled": true,
+    "tickSpacing": "316912650057057350374175801",
+    "tickSpacingNote": "1% of the ETH floor at ETH/USD = 2,500 (2^96 * 1e18 / 2500e18). Recompute it with ethUsdX18: it is a Q96 price step, not a ratio.",
+    "requiredCurrencyRaised": "400000000000000000",
+    "requiredCurrencyRaisedNote": "0.4 WETH at ETH/USD = 2,500 = $1,000, the same graduation bar as the USDG leg.",
+    "validationHook": "0x0000000000000000000000000000000000000000",
+    "salt": "0x0000000000000000000000000000000000000000000000000000000000000002",
+    "steps": [{"mps": 0, "blocks": 0}]
+  },
+  "fallback": {
+    "$comment": "The founders' seed 06b uses when NO leg graduates: AmpsGenesis.settle() returns the whole tranche to the vault and the timelock then calls AmpsVault.genesisPlace itself with p0X18 = 1e18 and these amounts, which is the pre-revision-7 launch exactly. The assets must be sitting in the timelock and approved to the vault.",
+    "p0X18": "1000000000000000000",
+    "seedWeth": "4000000000000000000",
+    "seedUsdg": "10000000000"
+  },
+  "envOverrides": {
+    "factory": "AMPS_CCA_FACTORY",
+    "ethUsdX18": "AMPS_ETH_USD_X18",
+    "startDelayHours": "AMPS_AUCTION_START_DELAY_HOURS",
+    "durationHours": "AMPS_AUCTION_DURATION_HOURS",
+    "claimDelayHours": "AMPS_AUCTION_CLAIM_DELAY_HOURS",
+    "usdgRequiredCurrencyRaised": "AMPS_AUCTION_USDG_REQUIRED",
+    "ethRequiredCurrencyRaised": "AMPS_AUCTION_ETH_REQUIRED",
+    "usdgEnabled": "AMPS_AUCTION_USDG_ENABLED",
+    "ethEnabled": "AMPS_AUCTION_ETH_ENABLED",
+    "validationHook": "AMPS_AUCTION_VALIDATION_HOOK",
+    "seedWeth": "AMPS_SEED_WETH",
+    "seedUsdg": "AMPS_SEED_USDG",
+    "startBlocks": "AMPS_AUCTION_START_BLOCKS",
+    "windowBlocks": "AMPS_AUCTION_WINDOW_BLOCKS",
+    "blockMs": "AMPS_BLOCK_MS"
+  }
+}

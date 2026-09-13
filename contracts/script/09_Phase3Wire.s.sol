@@ -22,7 +22,7 @@ import {console2} from "forge-std/console2.sol";
 /// @title Phase3Wire
 /// @notice The Phase 3 pointer moves, and the bootstrap ordering they have to happen inside.
 ///
-///         Seven moves (`docs/phase3-state-model.md` §7 and §10 ruling 10):
+///         Eight moves (`docs/phase3-state-model.md` §7 and §10 ruling 10):
 ///
 ///         | # | Move | Delay |
 ///         |---|---|---|
@@ -33,11 +33,17 @@ import {console2} from "forge-std/console2.sol";
 ///         | 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 7 d |
 ///         | 6 | `AmpsHook.setRouter(AmpsRouter)` | 7 d |
 ///         | 7 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
+///         | 8 | `AmpsVault.genesis -> AmpsGenesis` | 7 d, set-once |
 ///
 ///         Move 6 is revision 6's: `AmpsHook.router()` is the pass-through exemption, and while it is
 ///         `address(0)` every hop in every pool — a rotation included — pays `ampsFeeBps`. It is a pointer, so it
 ///         goes in this batch at the pointer delay, and {checkBootstrap} refuses to let the gate pointer (and
-///         therefore genesis) move until it is set, so a launch cannot open trading with rotations mispriced.
+///         therefore trading) move until it is set, so a launch cannot open with rotations mispriced.
+///
+///         Move 8 is revision 7's: `AmpsVault.genesis` names the `AmpsGenesis` adapter that receives the auction
+///         tranche and later calls `genesisPlace`. It is **set-once wiring**, not a policy pointer — half of `S0`
+///         is minted to whatever address it holds — so it must be written before `06a_GenesisAuction` and it is
+///         frozen for ever by `genesisPlace`. {checkBootstrap} requires it.
 ///
 ///         plus the `OracleGate` redeploy: a fresh gate constructed with `AmpsHook` as its `marketReference`, so
 ///         it reads the hook's `poolState` for the corporate-action flag and keeps its own token probes as the
@@ -56,16 +62,31 @@ import {console2} from "forge-std/console2.sol";
 ///      freshly initialised pool has no observations, so with the gate already wired **no pool can be registered
 ///      and `genesis()` can never run**. The order is therefore:
 ///
-///        1. deploy everything, the `AmpsRouter` included; wire the vault's set-once pointers (`registry`,
-///           `bonds`, `bountyPot`) and `feedRegistry` / `positionValuer` / `marketReference`, and **leave
-///           `oracleGate` unset** — a gate that is absent is exactly as permissive as a gate that is `GREEN`;
-///        2. register the 32 pools (`05_Registry`), each `vault.initializePool` passing with no gate;
-///        3. wait until the hub's ring covers `twapWindow` — thirty minutes of blocks on Robinhood Chain;
-///        4. point the vault at `OracleGate` and confirm `gate.state(0) == GREEN`;
-///        5. run `genesis()` and the §3.3 ladders (`11_GenesisPlacement`).
+///        1. deploy everything, the `AmpsRouter` and `AmpsGenesis` included; wire the vault's set-once pointers
+///           (`registry`, `bonds`, `bountyPot`, `genesis`) and `feedRegistry` / `positionValuer` /
+///           `marketReference`, and **leave `oracleGate` unset** — a gate that is absent is exactly as permissive
+///           as a gate that is `GREEN`. This is `WIRE_DEFER_GATE=true`, the first of the two passes;
+///        2. `05_Registry` with `REGISTRY_FEEDS_ONLY=true`: every feed, no pool. `genesisPlace` checkpoints and a
+///           checkpoint prices WETH9 and USDG, so their feeds cannot wait for the registration pass any more;
+///        3. `06a_GenesisAuction`: `genesisMint` and the two auctions. No pool, no gate, no price;
+///        4. bidding, then `06b_GenesisSettle`: `settle()` calls `genesisPlace`, which sets `P_ref = P0`;
+///        5. register the 32 pools (`05_Registry` in full), each opening at `P0` and each `vault.initializePool`
+///           passing with no gate;
+///        6. wait until the hub's ring covers `twapWindow` — thirty minutes of blocks on Robinhood Chain;
+///        7. **this script again**, without `WIRE_DEFER_GATE`: point the vault at `OracleGate` and confirm
+///           `gate.state(0) == GREEN`;
+///        8. run the §3.3 ladders (`11_GenesisPlacement`).
 ///
-///      {checkBootstrap} asserts steps 1-4 as a precondition and {assertGateGreen} is the step-4 gate itself, so
-///      the ordering is a check in code rather than a paragraph in a runbook.
+///      {checkBootstrap} asserts steps 1-6 as a precondition of the gate move and {assertGateGreen} is step 7's
+///      own check, so the ordering is a check in code rather than a paragraph in a runbook.
+///
+/// @dev **Why the script runs twice, and what changed in revision 7.** Before the CCA, the pools were registered
+///      at a fixed $1.00 anchor *before* genesis, so one pass through this script could do every pointer move and
+///      the gate move together. Revision 7 makes the pools open at the auctions' clearing price, so registration
+///      has to happen after settlement — and settlement has to happen after the pointer moves, because the vault
+///      needs its `genesis` pointer before it will mint the auction tranche. The pointer batch therefore runs
+///      first (`WIRE_DEFER_GATE=true`, which also relaxes {checkBootstrap} to tolerate "no pools yet"), and the
+///      gate move runs last, once the pools exist and the hub ring has warmed.
 ///
 /// @dev **`WIRE_REDEPLOY_GATE`.** `03_Core` already deploys an `OracleGate` against `AmpsHook`, so a fresh
 ///      deployment runs this with `WIRE_REDEPLOY_GATE=false` and the script only re-points. `true` deploys a new
@@ -78,7 +99,10 @@ import {console2} from "forge-std/console2.sol";
 ///   # emit the proposal calldata for the Safe (default)
 ///   forge script script/09_Phase3Wire.s.sol
 ///
-///   # execute directly, on a chain where the configured timelock is this script's sender
+///   # pass 1: the eight pointer moves, before the auctions. The gate pointer is left alone.
+///   WIRE_DIRECT=true WIRE_DEFER_GATE=true forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC
+///
+///   # pass 2: the gate pointer, after 05_Registry and the TWAP warm-up
 ///   WIRE_DIRECT=true forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC
 /// ```
 contract Phase3Wire is Script {
@@ -100,6 +124,7 @@ contract Phase3Wire is Script {
     bytes32 internal constant SLOT_LADDER_POLICY = bytes32("ladderPolicy");
     bytes32 internal constant SLOT_ROLLOUT_POLICY = bytes32("rolloutPolicy");
     bytes32 internal constant SLOT_ORACLE_GATE = bytes32("oracleGate");
+    bytes32 internal constant SLOT_GENESIS = bytes32("genesis");
 
     /// @notice The year the bundled NYSE holiday bitmap covers. Later years are installed by their own
     ///         `setHolidayBitmap` proposal; the gate treats an unknown year as having no full-day closures, which
@@ -126,6 +151,7 @@ contract Phase3Wire is Script {
         address feePolicy;
         address bondPolicy;
         address router;
+        address genesis;
     }
 
     /// @notice One timelock call, in `TimelockController.scheduleBatch` order.
@@ -163,7 +189,8 @@ contract Phase3Wire is Script {
     /// @param expected How many were expected.
     error PoolsMissing(uint16 registered, uint16 expected);
 
-    /// @notice `genesis()` has already run, so the wiring latch is closed and this batch is stale.
+    /// @notice `genesisPlace()` has already run, so the wiring latch is closed and the set-once half of this
+    ///         batch is stale. Only the pointer pass refuses on it; the gate pass runs after genesis by design.
     error AlreadyGenesis();
 
     // -----------------------------------------------------------------------------------------------------------
@@ -175,11 +202,16 @@ contract Phase3Wire is Script {
         Targets memory t = loadTargets();
         bool direct = vm.envOr("WIRE_DIRECT", false);
         bool redeployGate = vm.envOr("WIRE_REDEPLOY_GATE", true);
+        bool deferGate = vm.envOr("WIRE_DEFER_GATE", false);
 
         if (direct) {
-            address gate = execute(t, redeployGate);
-            console2.log("oracleGate now %s", gate);
-            recordGate(gate);
+            address gate = execute(t, redeployGate, deferGate);
+            if (deferGate) {
+                console2.log("pointer pass complete; the gate pointer waits for 05_Registry and the ring");
+            } else {
+                console2.log("oracleGate now %s", gate);
+                recordGate(gate);
+            }
         } else {
             writeProposal(buildCalls(t, t.oracleGate));
         }
@@ -191,21 +223,25 @@ contract Phase3Wire is Script {
     ///      ring covers `twapWindow`, and {assertGateGreen} then proves the vault is genuinely open for business.
     /// @param t The addresses.
     /// @param redeployGate Whether to deploy a fresh `OracleGate` reading `AmpsHook.poolState`.
-    /// @return gate The gate the vault ends up pointing at.
-    function execute(Targets memory t, bool redeployGate) public returns (address gate) {
+    /// @param deferGate Pass 1: make the pointer moves and stop, leaving the gate pointer unset so that
+    ///        `06a`/`06b` and `05_Registry` can run ungated.
+    /// @return gate The gate the vault ends up pointing at, or the configured one when `deferGate` is set.
+    function execute(Targets memory t, bool redeployGate, bool deferGate) public returns (address gate) {
         _require(t.timelock, "timelock");
         _require(t.vault, "vault");
         _require(t.hook, "hook");
 
         IAmpsVault vault = IAmpsVault(t.vault);
-        if (vault.initialized()) revert AlreadyGenesis();
+        // The set-once half of the batch is stale once the wiring latch closes. The gate pass is not: the gate
+        // pointer is upgradeable for ever, and revision 7 moves it *after* genesis by design.
+        if (deferGate && vault.initialized()) revert AlreadyGenesis();
 
         Gov.Ctx memory ctx = Gov.load(t.timelock);
         Gov.describe(ctx);
         Gov.requireBootstrappable(ctx);
 
         gate = t.oracleGate;
-        if (redeployGate) {
+        if (redeployGate && !deferGate) {
             _require(t.guardian, "guardian");
             _require(t.registry, "registry");
             _require(t.feedRegistry, "feedRegistry");
@@ -216,14 +252,20 @@ contract Phase3Wire is Script {
             vm.stopBroadcast();
             console2.log("OracleGate redeployed at %s (marketReference = AmpsHook)", gate);
             installCalendar(t, gate);
-        } else if (gate != address(0) && IOracleGate(gate).marketReference() != t.hook) {
+        } else if (!deferGate && gate != address(0) && IOracleGate(gate).marketReference() != t.hook) {
             Gov.begin(ctx);
             Gov.send(ctx, gate, abi.encodeCall(IOracleGate.setMarketReference, (t.hook)));
             Gov.end(ctx);
         }
-        _require(gate, "oracleGate");
+        if (!deferGate) _require(gate, "oracleGate");
 
         Gov.begin(ctx);
+
+        // Revision 7's move 8: the genesis adapter. Set-once, so it can only be written before `genesisPlace`,
+        // and `AmpsVault.genesisMint` refuses to mint the auction tranche anywhere else.
+        if (t.genesis != address(0) && vault.genesis() == address(0)) {
+            Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_GENESIS, t.genesis)));
+        }
 
         if (vault.marketReference() != t.hook) {
             Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_MARKET_REFERENCE, t.hook)));
@@ -254,10 +296,16 @@ contract Phase3Wire is Script {
 
         Gov.end(ctx);
 
-        // Step 4 of §9.1, and only now: the gate pointer goes in last, and only if the pools and the hub ring
-        // are actually there. Before this line the vault is ungated, which is what let step 2 happen at all.
-        checkBootstrap(t, uint16(_expectedPools()));
+        // Pass 1 stops here: the pools do not exist yet, the auctions have not run, and a gate pointer set now
+        // would refuse every `initializePool` (`OracleGate` reports `WATCHDOG` until the hub ring has warmed).
+        checkBootstrap(t, deferGate ? 0 : uint16(_expectedPools()));
+        if (deferGate) {
+            console2.log("bootstrap pass 1 complete: pointers set, gate deliberately unset, 06a may run");
+            return gate;
+        }
 
+        // Step 6 of §9.1, and only now: the gate pointer goes in last, and only if the pools and the hub ring
+        // are actually there. Before this line the vault is ungated, which is what let steps 2-4 happen at all.
         Gov.begin(ctx);
         if (vault.oracleGate() != gate) {
             Gov.send(ctx, t.vault, abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_ORACLE_GATE, gate)));
@@ -265,7 +313,7 @@ contract Phase3Wire is Script {
         Gov.end(ctx);
 
         assertGateGreen(gate);
-        console2.log("bootstrap step 4 complete: gate is GREEN, genesis() may run");
+        console2.log("bootstrap step 6 complete: gate is GREEN, 11_GenesisPlacement may run");
     }
 
     /// @notice Records the gate this run ended up pointing at in `script/config/deployments.json`.
@@ -298,11 +346,16 @@ contract Phase3Wire is Script {
     // Bootstrap checks
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice Asserts steps 1-3 of the §9.1 bootstrap: every pointer the vault needs before genesis is set, the
-    ///         hook knows its router, the pools are registered, and the hub pool's observation ring covers
-    ///         `twapWindow`.
+    /// @notice Asserts the §9.1 bootstrap so far: every pointer the vault needs is set, the hook knows its
+    ///         router, the vault knows its genesis adapter, and — once the pools are expected to exist — they are
+    ///         registered and the hub pool's observation ring covers `twapWindow`.
+    /// @dev **`expectedPools == 0` is pass 1.** Revision 7 registers the 32 pools *after* the auctions settle, so
+    ///      on the pointer pass "no pools yet" is the correct state rather than an unfinished step, and the ring
+    ///      cannot have warmed because the hub pool does not exist. The pool and coverage checks are therefore
+    ///      skipped when no pools are expected; every pointer check still runs, because those must all be true
+    ///      before `06a_GenesisAuction` mints anything.
     /// @param t The addresses.
-    /// @param expectedPools How many pools must already be registered.
+    /// @param expectedPools How many pools must already be registered, or 0 for the pointer pass.
     function checkBootstrap(Targets memory t, uint16 expectedPools) public view {
         IAmpsVault vault = IAmpsVault(t.vault);
         if (vault.registry() == address(0)) revert PointerUnset(bytes32("registry"));
@@ -317,6 +370,12 @@ contract Phase3Wire is Script {
         // is the one price the index cannot open with. This runs before the gate pointer moves, so `genesis()`
         // cannot be reached with the exemption still withdrawn.
         if (IAmpsHook(t.hook).router() == address(0)) revert PointerUnset(bytes32("router"));
+
+        // Revision 7: half of `S0` is minted to this pointer, so a launch cannot proceed without it.
+        if (vault.genesis() == address(0)) revert PointerUnset(SLOT_GENESIS);
+
+        // Pass 1: the pools are registered later, at `P0`, so there is nothing to count and no ring to measure.
+        if (expectedPools == 0) return;
 
         IPoolRegistry registry = IPoolRegistry(vault.registry());
         uint16 pools = registry.poolCount();
@@ -339,14 +398,14 @@ contract Phase3Wire is Script {
     // Proposal building
     // -----------------------------------------------------------------------------------------------------------
 
-    /// @notice The seven moves as timelock calls, in the order they must execute.
+    /// @notice The eight moves as timelock calls, in the order they must execute.
     /// @dev The gate redeploy is not expressible as a proposal call — the gate has to exist before it can be
     ///      pointed at — so in proposal mode it is deployed out of band and its address passed in as `gate`.
     /// @param t The addresses.
     /// @param gate The `OracleGate` the vault should end up pointing at.
     /// @return calls The batch.
     function buildCalls(Targets memory t, address gate) public pure returns (Call[] memory calls) {
-        calls = new Call[](8);
+        calls = new Call[](9);
         calls[0] = Call({
             target: t.vault,
             value: 0,
@@ -390,6 +449,12 @@ contract Phase3Wire is Script {
             what: "bonds.setPolicy(BondPolicy)"
         });
         calls[7] = Call({
+            target: t.vault,
+            value: 0,
+            data: abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_GENESIS, t.genesis)),
+            what: "vault.genesis = AmpsGenesis (set-once, before genesisMint)"
+        });
+        calls[8] = Call({
             target: t.vault,
             value: 0,
             data: abi.encodeCall(IAmpsVault.setPolicyPointer, (SLOT_ORACLE_GATE, gate)),
@@ -487,7 +552,8 @@ contract Phase3Wire is Script {
             rolloutPolicy: _address(json, ".core.rolloutPolicy", "AMPS_ROLLOUT_POLICY"),
             feePolicy: _address(json, ".core.feePolicy", "AMPS_FEE_POLICY"),
             bondPolicy: _address(json, ".core.bondPolicy", "AMPS_BOND_POLICY"),
-            router: _address(json, ".core.router", "AMPS_ROUTER")
+            router: _address(json, ".core.router", "AMPS_ROUTER"),
+            genesis: _address(json, ".core.genesis", "AMPS_GENESIS")
         });
     }
 

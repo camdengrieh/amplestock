@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import {IAmpsHook} from "../../src/interfaces/IAmpsHook.sol";
 import {AmpsRouter} from "../../src/periphery/AmpsRouter.sol";
 import {Constants} from "../../src/types/Constants.sol";
-import {SameHop} from "../../src/types/Errors.sol";
+import {NotARotation, SameHop} from "../../src/types/Errors.sol";
 import {Phase3Fixture} from "../integration/Phase3Fixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
@@ -188,8 +188,8 @@ contract RotationCreditGamingTest is Phase3Fixture {
     /// @notice A stranger who sends the right 32 bytes gets nothing: no credit on the buy, the full AMPS fee on
     ///         the sell. The flag is a declaration the hook checks against an address, not a password.
     function test_aForgedFlagFromANonRouterSenderPaysTheAmpsFeeAndEarnsNothing() public {
-        (uint24 honestBuy, uint24 honestSell) = _ordinaryQuotes();
-        (uint256 credit, uint24 buyFee, uint24 sellFee) = this.forgedFlagEntry();
+        (uint24 honestBuy,) = _ordinaryQuotes();
+        (uint256 credit, uint24 buyFee, uint24 sellFee, uint24 honestSell) = this.forgedFlagEntry();
 
         assertEq(credit, 0, "the forged buy credited nothing");
         assertEq(buyFee & LPFeeLibrary.REMOVE_OVERRIDE_MASK, honestBuy, "and paid what an unflagged buy pays");
@@ -207,7 +207,11 @@ contract RotationCreditGamingTest is Phase3Fixture {
 
     /// @notice Self-call entry point: the callbacks driven directly with a forged `hookData`, which is exactly
     ///         what an attacker able to reach the PoolManager would build.
-    function forgedFlagEntry() external returns (uint256 credit, uint24 buyFee, uint24 sellFee) {
+    /// @dev The honest comparison is taken **inside** this frame, immediately before the forged sell. The buy's
+    ///      `afterSwap` above updates the pool's variance, its last tick and — past the cache interval — its whole
+    ///      gate view, so a quote taken before the entry is a quote of a different state and the comparison would
+    ///      be measuring the callback's own side effects rather than the flag.
+    function forgedFlagEntry() external returns (uint256 credit, uint24 buyFee, uint24 sellFee, uint24 honestSellPips) {
         require(msg.sender == address(this), "self-call only");
 
         // Read the key first: `vm.prank` binds to the *next* call, and an argument that is itself an external
@@ -223,6 +227,7 @@ contract RotationCreditGamingTest is Phase3Fixture {
         credit = hook.rotationCredit(MALLORY);
 
         SwapParams memory sell = SwapParams({zeroForOne: true, amountSpecified: -int256(1000e18), sqrtPriceLimitX96: 0});
+        (honestSellPips,,,) = hook.quoteFee(hubPool, true, true, 1000e18, false);
         vm.prank(address(poolManager));
         (,, sellFee) = hook.beforeSwap(MALLORY, key, sell, rotateFlag);
     }
@@ -262,6 +267,12 @@ contract RotationCreditGamingTest is Phase3Fixture {
     ///         manufacture any more — the dust buy is an ordinary buy — so the exit pays the AMPS fee in full and
     ///         is never better than the honest one.
     function test_aDustBuyCannotDiscountARealExit() public {
+        // Warm the gate cache first, in a swap both branches share. `beforeSwap` prices a pool whose cache has
+        // aged past `GATE_CACHE_MAX_AGE` against the conservative substitute, and the *first* swap of any kind
+        // refreshes it — so without this the comparison below would be measuring that refresh (a public good any
+        // swap performs, and one the dust buy pays the conservative fee for) rather than the credit.
+        buyAmps(hubPool, ALICE, 1e6);
+
         uint256 snapshot = vm.snapshotState();
         (uint256 credit, uint16 baseBps, uint256 gamed) = this.dustBuyEntry();
         vm.revertToState(snapshot);
@@ -333,6 +344,129 @@ contract RotationCreditGamingTest is Phase3Fixture {
         require(msg.sender == address(this), "self-call only");
         (, exactInputBase,,) = hook.quoteFee(hubPool, true, true, 1000e18, true);
         (, exactOutputBase,,) = hook.quoteFee(hubPool, true, false, 0, true);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Shape 5b — what a rotation has to be (audit finding 3)
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// @notice The shape the exemption is *for* is untouched by the fix: `stock -> AMPS -> stock` pays the two
+    ///         pools' pass-through fees, 5-30 bp apiece, and no `ampsFeeBps` anywhere.
+    function test_f03_aStockToStockRotationStillPaysBuyPlusBuy() public {
+        seedSpokeBids(1);
+        uint16 hop1PassThrough = registry.poolConfig(spokePools[0]).buyFeeBps;
+        uint16 hop2PassThrough = registry.poolConfig(spokePools[1]).buyFeeBps;
+
+        (uint24 rotationPips, uint16 rotationBase,,) = hook.quoteFee(spokePools[0], false, true, ROTATION_IN, true);
+        assertEq(rotationBase, hop1PassThrough, "hop 1 is priced at the spoke's pass-through fee");
+
+        vm.recordLogs();
+        (uint256 amountOut, uint256 ampsThrough) =
+            _rotateThroughRouter(spokePools[0], spokePools[1], ALICE, ROTATION_IN);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint24[] memory fees = swapFees(logs);
+        assertEq(fees.length, 2, "two hops");
+        assertEq(fees[0], rotationPips, "hop 1 charged exactly the flagged quote");
+        assertLt(fees[0], _ampsFeePips(), "which is nowhere near the AMPS fee");
+        assertLt(fees[1], _ampsFeePips(), "and neither is hop 2's");
+        (uint256 consumed, uint16 blendedBase) = _lastCreditConsumed(logs);
+        assertEq(blendedBase, hop2PassThrough, "hop 2's blended base is the other spoke's pass-through fee");
+        assertEq(consumed, ampsThrough, "spending exactly the AMPS hop 1 realised");
+        assertGt(amountOut, 0, "and the other constituent came out");
+    }
+
+    /// @notice And so is `USDG -> AMPS -> stock`: one entry leg at 30 bp, one spoke leg at its own buy fee, and no
+    ///         `ampsFeeBps`. Entering the index and landing on a constituent *is* a move through it; what the fix
+    ///         refuses is the route that never touches a constituent at all.
+    function test_f03_anEntryToSpokeRotationPaysThirtyBpPlusTheSpokeBuyFee() public {
+        seedSpokeBids(0);
+        uint16 hop1PassThrough = registry.poolConfig(hubPool).buyFeeBps;
+        uint16 hop2PassThrough = registry.poolConfig(spokePools[0]).buyFeeBps;
+        assertEq(hop1PassThrough, Constants.BUY_FEE_BPS_ENTRY_DEFAULT, "the hub's pass-through fee is 30 bp");
+
+        (uint24 rotationPips, uint16 rotationBase,,) = hook.quoteFee(hubPool, false, true, 2e6, true);
+        assertEq(rotationBase, hop1PassThrough, "hop 1 is the entry pool's pass-through fee");
+
+        vm.recordLogs();
+        (uint256 amountOut,) = _rotateThroughRouter(hubPool, spokePools[0], ALICE, 2e6);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint24[] memory fees = swapFees(logs);
+        assertEq(fees.length, 2, "two hops");
+        assertEq(fees[0], rotationPips, "hop 1 charged the flagged quote");
+        assertLt(fees[0], _ampsFeePips(), "not the AMPS fee");
+        assertLt(fees[1], _ampsFeePips(), "and hop 2 did not pay it either");
+        (, uint16 blendedBase) = _lastCreditConsumed(logs);
+        assertEq(blendedBase, hop2PassThrough, "hop 2's blended base is the spoke's pass-through fee");
+        assertGt(amountOut, 0, "and the constituent came out");
+    }
+
+    /// @notice **The finding.** `USDG -> AMPS -> WETH` is not a rotation: neither leg is a constituent, so it is a
+    ///         60 bp USDG/WETH swap against protocol-owned liquidity where the design charges the AMPS fee on both
+    ///         legs — and both entry pools take their fair tick from their own TWAP, so the deviation term that
+    ///         would otherwise price the move is structurally zero. It reverts by name.
+    function test_f03_anEntryToEntryRotationIsRefused() public {
+        address counter = registry.poolConfig(hubPool).counter;
+        fund(counter, ALICE, 2e6);
+        vm.startPrank(ALICE);
+        IERC20(counter).approve(address(protocolRouter), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(NotARotation.selector, PoolId.unwrap(hubPool), PoolId.unwrap(wethPool)));
+        protocolRouter.rotate(hubPool, wethPool, 2e6, 0, ALICE, false, type(uint256).max);
+        vm.stopPrank();
+
+        // The other direction too: the check is on the pair, not on which one is named first.
+        address wethCounter = registry.poolConfig(wethPool).counter;
+        fund(wethCounter, ALICE, 0.001e18);
+        vm.startPrank(ALICE);
+        IERC20(wethCounter).approve(address(protocolRouter), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(NotARotation.selector, PoolId.unwrap(wethPool), PoolId.unwrap(hubPool)));
+        protocolRouter.rotate(wethPool, hubPool, 0.001e18, 0, ALICE, false, type(uint256).max);
+        vm.stopPrank();
+    }
+
+    /// @notice And the same USDG -> AMPS -> WETH route is still *available* to anybody through an ordinary router
+    ///         — it simply pays `ampsFeeBps` on both hops, which is what it always did and what the refusal above
+    ///         protects. The protocol refuses to *price* it as a rotation, it does not refuse to let it happen.
+    function test_f03_theSameEntryToEntryRouteThroughAnOrdinaryRouterPaysTheAmpsFeeTwice() public {
+        vm.recordLogs();
+        uint256 amountOut = rotate(hubPool, wethPool, ALICE, 2e6);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint24[] memory fees = swapFees(logs);
+        assertEq(fees.length, 2, "the route executed, two hops");
+        assertGe(fees[0], _ampsFeePips(), "hop 1 paid the AMPS fee");
+        assertGe(fees[1], _ampsFeePips(), "and so did hop 2");
+        assertEq(_creditConsumedCount(logs), 0, "no credit was created, so none was spent");
+        assertGt(amountOut, 0, "and the caller got their WETH");
+    }
+
+    /// @notice **The second half of the finding.** `rotate(A, B)` then `rotate(B, A)` in one transaction rebuilds
+    ///         the round trip `SameHop` refuses, out of two calls. The hook counts the pass-through hops it has
+    ///         priced per pool per transaction, so the second pass over each pool pays `ampsFeeBps`: the closing
+    ///         leg of a round trip is priced as the exit it is, and the honest one-hop-per-pool rotation above is
+    ///         untouched.
+    function test_f03_aTwoCallRoundTripPaysTheAmpsFeeOnTheSecondPass() public {
+        seedSpokeBids(0);
+
+        vm.recordLogs();
+        this.twoCallRoundTripEntry();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint24[] memory fees = swapFees(logs);
+        assertEq(fees.length, 4, "four hops in one transaction");
+        assertLt(fees[0], _ampsFeePips(), "the first rotation's hop 1 is pass-through");
+        assertLt(fees[1], _ampsFeePips(), "and so is its hop 2");
+        assertGe(fees[2], _ampsFeePips(), "the second rotation's hop 1 is a second pass over the hub");
+        assertGe(fees[3], _ampsFeePips(), "and its hop 2 a second pass over the spoke");
+    }
+
+    /// @notice Self-call entry point: two rotations over the same pair of pools inside one transaction's transient
+    ///         storage, which is the only place the per-pool count can be observed.
+    function twoCallRoundTripEntry() external {
+        require(msg.sender == address(this), "self-call only");
+        _rotateThroughRouter(spokePools[0], hubPool, ALICE, ROTATION_IN);
+        _rotateThroughRouter(hubPool, spokePools[0], ALICE, 2e6);
     }
 
     // -------------------------------------------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {IFeedRegistry} from "../interfaces/IFeedRegistry.sol";
+import {IMarketReference} from "../interfaces/IMarketReference.sol";
 import {IOracleGate} from "../interfaces/IOracleGate.sol";
 import {IPoolRegistry} from "../interfaces/IPoolRegistry.sol";
 import {IRolloutPolicy} from "../interfaces/IRolloutPolicy.sol";
@@ -60,6 +61,8 @@ library VaultRolloutLib {
     uint256 private constant SLOT_PARAMS = 2;
     /// @dev slot 4, the pool registry.
     uint256 private constant SLOT_REGISTRY = 4;
+    /// @dev slot 8, the market reference (`AmpsHook` in production), which owns the high-water mark.
+    uint256 private constant SLOT_MARKET_REFERENCE = 8;
     /// @dev slot 9, the oracle gate.
     uint256 private constant SLOT_ORACLE_GATE = 9;
     /// @dev slot 10, the feed registry.
@@ -138,21 +141,10 @@ library VaultRolloutLib {
         // re-placement has had its chance at the same pools.
         uint256[2] memory movedFrom;
         for (uint256 i; i < 2 && moved < amount; ++i) {
-            movedFrom[i] = _harvestAsks(ladder, cooldown, poolManager, entries[i], amount - moved);
+            movedFrom[i] = _harvestAsks(ladder, cooldown, poolManager, amps, entries[i], amount - moved);
             moved += movedFrom[i];
         }
         if (moved == 0) return 0;
-
-        // **The 24-hour window is charged on `moved` — what left the entry pools** (audit fix, 2026-09-07).
-        //
-        // Charging it on `placed` was exactly backwards. The window is I32's rate limit on *draining the entry
-        // pools*, and inventory leaves them on the harvest, whether or not the destination takes it. With a full
-        // live-cell budget `place(strictBudget = false)` places nothing at all, so nothing was charged, and the
-        // same call could be repeated every `PLACEMENT_COOLDOWN_SECONDS`: the entry pools could be emptied to
-        // `entryFloorBps` at one full daily allowance per sixty seconds — seventeen days of budget in seventeen
-        // minutes — while the window stayed at zero. `moved <= amount <= budget` by the two checks above, so
-        // charging the harvest can never overrun the allowance, and it is the harvest the allowance is about.
-        _addRolloutMoved(moved);
 
         // The bountied paths merge into cells that already exist and leave the remainder idle rather than
         // revert when the live-cell budget is full (§12 ruling E), which is what `strictBudget == false` says.
@@ -176,6 +168,24 @@ library VaultRolloutLib {
             );
         }
 
+        // **The 24-hour window is charged on what actually left the entry pools** (audit fix, 2026-09-07, corrected
+        // 2026-09-09).
+        //
+        // Charging it on `placed` was exactly backwards. The window is I32's rate limit on *draining the entry
+        // pools*, and inventory leaves them on the harvest, whether or not the destination takes it. With a full
+        // live-cell budget `place(strictBudget = false)` places nothing at all, so nothing was charged, and the
+        // same call could be repeated every `PLACEMENT_COOLDOWN_SECONDS`: the entry pools could be emptied to
+        // `entryFloorBps` at one full daily allowance per sixty seconds while the window stayed at zero.
+        //
+        // But the charge belongs *after* the rollback, not before it. The loop above puts whatever the destination
+        // refused straight back into the same entry pools, so on a full live-cell budget the harvest and the
+        // rollback cancelled exactly and the whole day's allowance was consumed with zero net movement — a
+        // permissionless call, costing only gas, that denied rollout for a day. `moved - returned` is the realised
+        // drain, it is what I32 rate-limits, and it is bounded above by `moved <= amount <= budget`, so charging
+        // it here can no more overrun the allowance than charging `moved` could.
+        uint256 drained = moved - returned;
+        if (drained != 0) _addRolloutMoved(drained);
+
         // The source pools' cooldowns, written once and last: the harvest took them, the re-placement was the
         // same keeper's same call, and everything after this is rate-limited by them as usual.
         for (uint256 i; i < 2; ++i) {
@@ -188,7 +198,9 @@ library VaultRolloutLib {
         // paying for a harvest the destination refused is what made the drain above worth a keeper's gas. What
         // went back into the entry pools is not new work either — it is the call undoing its own harvest.
         // A schedule that proposes nothing returns above, having paid nothing.
-        VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(placed), gasStart);
+        // Two hops: the vault's forwarder called into this library, which calls into `VaultPlacementLib`, so the
+        // EIP-150 reserve has compounded twice by the time the measurement is taken (§12.4, audit fix 2026-09-08).
+        VaultPlacementLib.payBounty(VaultPlacementLib.ampsValueUsd18(placed), gasStart, 2);
     }
 
     /// @notice `deployBonded(constituentId)`: places idle bonded collateral as the spoke's bid ladder, four
@@ -249,7 +261,9 @@ library VaultRolloutLib {
         // The work value is the collateral actually placed, at the same feed price the deploy threshold was
         // tested against, so the guard and the bounty can never disagree about what the job was worth (§12.4).
         VaultPlacementLib.payBounty(
-            placed == idle ? idleUsd18 : PriceLib.counterValueUsd18(placed, constituent.decimals, answerUsd8), gasStart
+            placed == idle ? idleUsd18 : PriceLib.counterValueUsd18(placed, constituent.decimals, answerUsd8),
+            gasStart,
+            2
         );
     }
 
@@ -257,15 +271,22 @@ library VaultRolloutLib {
     ///         positions and into ERC-6909 claims, where `A` still values it and `redeemProRata` still pays it.
     /// @dev Nothing is placed, so the divergence half of the gauntlet does not apply; the gate, the transient lock
     ///      and R1 do, and all three are the vault forwarder's.
+    /// @dev **The bids' accrued fees are fees** (audit fix, 2026-09-08). A retired spoke's cells have been earning
+    ///      in both currencies since the last `compound`, and the removal frees principal *and* fees in one delta;
+    ///      minting the sum as claims quietly turned the creator's slice and the AMPS-side burn into vault
+    ///      inventory. The two halves come back apart from {VaultPlacementLib-splitHarvestFees} and only the
+    ///      principal is reported as `amountMoved`.
     /// @param ladder The vault's placement records.
     /// @param cooldown The vault's per-pool placement timestamps.
     /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param amps The AMPS token, for the fee split's burn.
     /// @param constituentId The retired constituent.
-    /// @return amountMoved The counter-asset amount moved into claims, in raw units.
+    /// @return amountMoved The counter-asset principal moved into claims, in raw units.
     function withdrawRetiredBids(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         mapping(PoolId => uint32) storage cooldown,
         address poolManager,
+        address amps,
         uint16 constituentId
     ) public returns (uint256 amountMoved) {
         address registry = _addr(SLOT_REGISTRY);
@@ -286,19 +307,21 @@ library VaultRolloutLib {
             if (records[i].above || records[i].liquidity == 0) continue;
             removals[i] = records[i].liquidity;
             records[i].liquidity = 0;
+            // The gross-placed counter leaves with the liquidity it described, so the record is not write-only.
+            records[i].amount = 0;
             ++closed;
         }
         if (closed == 0) return 0;
         VaultRedeemLib.subLiveCells(closed);
 
-        (, amountMoved) = abi.decode(
-            _unlock(
-                poolManager,
-                VaultRedeemLib.ACTION_HARVEST,
-                abi.encode(IPoolRegistry(registry).poolKey(poolId), lowers, removals)
-            ),
-            (uint256, uint256)
+        PoolKey memory key = IPoolRegistry(registry).poolKey(poolId);
+        uint256 fees0;
+        uint256 fees1;
+        (, amountMoved, fees0, fees1) = abi.decode(
+            _unlock(poolManager, VaultRedeemLib.ACTION_HARVEST, abi.encode(key, lowers, removals)),
+            (uint256, uint256, uint256, uint256)
         );
+        VaultPlacementLib.splitHarvestFees(poolManager, amps, poolId, key.currency1, fees0, fees1);
         cooldown[poolId] = uint32(block.timestamp);
     }
 
@@ -306,8 +329,18 @@ library VaultRolloutLib {
     // Internals — the harvest side
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev The AMPS held by a pool's *unfilled* ask cells: the only inventory rollout may move, because moving a
-    ///      filled cell would take a counter asset out of the market that raised it (I29, I35).
+    /// @dev The AMPS held by a pool's *unfilled, movable* ask cells: the only inventory rollout may move, because
+    ///      moving a filled cell would take a counter asset out of the market that raised it (I29, I35).
+    ///
+    /// @dev **The high-water clause is {_harvestAsks}'s, and this must apply it too** (audit fix, 2026-09-09).
+    ///      The harvest skips a cell whose upper bound the mark has crossed — AMPS the vault sold on the way up
+    ///      and bought back on the way down, which belongs to the burn and not to a spoke's ask ladder — but this
+    ///      count included them, so the I32 entry floor and the schedule's inventory input were both inflated by
+    ///      the bought-back amount. The two numbers are what `rollout` compares against each other: an inflated
+    ///      inventory makes `_floorRoom` grant room that the tradeable depth does not have, so the depth actually
+    ///      quotable in the entry pools could sit *below* the governed floor while the check said it did not. One
+    ///      selection, used by both, is the only way those two can agree. When the mark cannot be read nothing is
+    ///      skipped, which is the same "nothing counts as bought back" default `_burnback` and `_harvestAsks` take.
     function _askInventory(mapping(PoolId => PlacementRecord[]) storage ladder, address poolManager, PoolId poolId)
         private
         view
@@ -317,10 +350,12 @@ library VaultRolloutLib {
         uint256 n = records.length;
         if (n == 0) return 0;
         (, int24 tick) = PoolStateLib.sqrtPriceAndTick(IExtsload(poolManager), poolId);
+        int24 highWater = _highWater(poolId);
 
         for (uint256 i; i < n; ++i) {
             PlacementRecord memory record = records[i];
             if (!record.above || record.liquidity == 0 || record.lowerTick <= tick) continue;
+            if (highWater != type(int24).min && record.upperTick <= highWater) continue;
             inventory += LadderLib.amount0ForLiquidity(
                 TickMath.getSqrtPriceAtTick(record.lowerTick),
                 TickMath.getSqrtPriceAtTick(record.upperTick),
@@ -336,10 +371,20 @@ library VaultRolloutLib {
     /// @dev **It does not write the cooldown.** {rollout} does, once, after it has had the chance to put the
     ///      unplaced remainder back into these same pools; taking the cooldown here would have made that
     ///      re-placement revert on the very pool the inventory came out of.
+    ///
+    /// @dev **A cell the buyback owns is not rollout's to move** (audit fix, 2026-09-08). This selection is
+    ///      `VaultPlacementLib._burnback`'s geometry minus its high-water clause, and every unfilled ask cell
+    ///      satisfies `tick <= lowerTick` by construction — so a cell whose upper bound the mark had crossed, i.e.
+    ///      AMPS the vault sold on the way up and bought back on the way down, was eligible here. A `rollout`
+    ///      ordered before the next `compound` moved exactly that inventory into a spoke's **ask** ladder to be
+    ///      sold a second time instead of burned (I33), and it is permissionless, so the ordering is anybody's to
+    ///      choose. Cells under the mark are therefore skipped and left for the burn; when the mark cannot be read
+    ///      nothing is skipped, which is the same "nothing counts as bought back" default `_burnback` takes.
     function _harvestAsks(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         mapping(PoolId => uint32) storage cooldown,
         address poolManager,
+        address amps,
         PoolId poolId,
         uint256 wanted
     ) private returns (uint256 harvested) {
@@ -348,6 +393,7 @@ library VaultRolloutLib {
         if (n == 0 || wanted == 0) return 0;
 
         (PoolKey memory key, int24 tick) = _gauntlet(cooldown, poolManager, poolId);
+        int24 highWater = _highWater(poolId);
 
         uint128[] memory removals = new uint128[](n);
         int24[] memory lowers = new int24[](n);
@@ -361,6 +407,8 @@ library VaultRolloutLib {
         for (uint256 j = n; j != 0 && remaining != 0; --j) {
             PlacementRecord storage record = records[j - 1];
             if (!record.above || record.liquidity == 0 || record.lowerTick <= tick) continue;
+            // The buyback's own cells, left for the burn: see the note above.
+            if (highWater != type(int24).min && record.upperTick <= highWater) continue;
 
             uint160 sqrtLower = TickMath.getSqrtPriceAtTick(record.lowerTick);
             uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(record.upperTick);
@@ -378,6 +426,9 @@ library VaultRolloutLib {
                 remaining = 0;
             }
             removals[j - 1] = removal;
+            // The gross-placed AMPS follows the liquidity out, pro rata, so `PlacementRecord.amount` describes
+            // what the cell still holds rather than everything ever put into it (audit fix, 2026-09-08).
+            record.amount -= _shareOf(record.amount, removal, record.liquidity);
             record.liquidity -= removal;
             if (record.liquidity == 0) ++closed;
             any = true;
@@ -385,9 +436,40 @@ library VaultRolloutLib {
         if (!any) return 0;
         VaultRedeemLib.subLiveCells(closed);
 
-        (harvested,) = abi.decode(
-            _unlock(poolManager, VaultRedeemLib.ACTION_HARVEST, abi.encode(key, lowers, removals)), (uint256, uint256)
+        uint256 fees0;
+        uint256 fees1;
+        (harvested,, fees0, fees1) = abi.decode(
+            _unlock(poolManager, VaultRedeemLib.ACTION_HARVEST, abi.encode(key, lowers, removals)),
+            (uint256, uint256, uint256, uint256)
         );
+
+        // The harvested cells' accrued fees never become rollout inventory: the creator's slice and the burn take
+        // them here, exactly as `compound` would (audit fix, 2026-09-08). Only principal is returned, so `moved`
+        // is what the entry pools actually gave up and the daily window is charged on that alone.
+        VaultPlacementLib.splitHarvestFees(poolManager, amps, poolId, key.currency1, fees0, fees1);
+    }
+
+    /// @dev `amount x part / whole`, saturated at `amount`, for pro-rating a record's disclosure field as its
+    ///      liquidity leaves. A zero `whole` cannot be reached from the caller (a record with no liquidity is
+    ///      skipped) and answers zero rather than dividing.
+    function _shareOf(uint128 amount, uint128 part, uint128 whole) private pure returns (uint128 share) {
+        if (amount == 0 || whole == 0) return 0;
+        if (part >= whole) return amount;
+        share = uint128(FullMath.mulDiv(amount, part, whole));
+    }
+
+    /// @dev The pool's high-water tick from the market reference, or `type(int24).min` when it cannot answer — in
+    ///      which case nothing counts as bought back, which is the safe default and the one `_burnback` takes.
+    function _highWater(PoolId poolId) private view returns (int24 tick) {
+        address marketRef = _addr(SLOT_MARKET_REFERENCE);
+        if (marketRef == address(0)) return type(int24).min;
+        try IMarketReference(marketRef).highWaterTick{gas: Constants.STOCK_TOKEN_PROBE_GAS}(poolId) returns (
+            int24 highWater
+        ) {
+            return highWater;
+        } catch {
+            return type(int24).min;
+        }
     }
 
     /// @dev The source side of §3.8: gate, cooldown and divergence, then the key and the live tick.
@@ -489,27 +571,46 @@ library VaultRolloutLib {
         return false;
     }
 
-    /// @dev The rolling 24-hour rollout window (slot 15), rolled forward here and charged in {_addRolloutMoved}.
-    function _rollWindow(uint16 rolloutBpsPerDay) private returns (uint256 budget) {
-        uint256 word = _word(SLOT_ROLLOUT_WINDOW);
-        uint256 moved = uint128(word);
-        uint32 windowStart = uint32(word >> 128);
-
-        if (windowStart == 0 || block.timestamp >= uint256(windowStart) + Constants.ONE_DAY) {
-            moved = 0;
-            _setWord(SLOT_ROLLOUT_WINDOW, uint256(block.timestamp) << 128);
-        }
-
+    /// @dev What is left of the rolling 24-hour rollout allowance (slot 15).
+    ///
+    /// @dev **Rolling, not tumbling** (audit fix, 2026-09-09). The window used to zero `moved` outright the first
+    ///      time a rollout arrived after `windowStart + ONE_DAY` and re-stamp the start at that instant, so a
+    ///      keeper who moved the whole allowance a second before the edge and the whole allowance again a second
+    ///      after it moved `2 x rolloutBpsPerDay` — 360 AMPS at the launch parameters — inside a rolling interval
+    ///      of about zero length. Nothing left the vault that I32 forbids in the *tumbling* accounting, which is
+    ///      the point: the limit did not limit what it says it limits, and halving the time to drain the entry
+    ///      pools to `entryFloorBps` is the thing it exists to prevent. `moved` now decays linearly toward zero
+    ///      over `ONE_DAY` from the last charge and the start advances on every charge, so there is no edge left
+    ///      to straddle: the budget released between two rollouts is exactly the elapsed fraction of one day's
+    ///      allowance, whenever they happen.
+    function _rollWindow(uint16 rolloutBpsPerDay) private view returns (uint256 budget) {
         uint256 allowance = FullMath.mulDiv(Constants.POL_SHARES, rolloutBpsPerDay, Constants.BPS);
+        uint256 moved = _decayedMoved();
         budget = allowance > moved ? allowance - moved : 0;
     }
 
-    /// @dev Charges `amount` against the current rollout window.
-    function _addRolloutMoved(uint256 amount) private {
+    /// @dev The window's charge, decayed to now: `moved x (ONE_DAY - min(elapsed, ONE_DAY)) / ONE_DAY`.
+    function _decayedMoved() private view returns (uint256 moved) {
         uint256 word = _word(SLOT_ROLLOUT_WINDOW);
-        uint256 moved = uint256(uint128(word)) + amount;
+        moved = uint128(word);
+        if (moved == 0) return 0;
+        uint32 windowStart = uint32(word >> 128);
+        if (windowStart == 0 || block.timestamp <= windowStart) return moved;
+        uint256 elapsed = block.timestamp - windowStart;
+        if (elapsed >= Constants.ONE_DAY) return 0;
+        return FullMath.mulDiv(moved, Constants.ONE_DAY - elapsed, Constants.ONE_DAY);
+    }
+
+    /// @dev Charges `amount` against the rolling window and re-stamps it, so the decay above runs from this charge.
+    function _addRolloutMoved(uint256 amount) private {
+        uint256 moved = _decayedMoved() + amount;
         if (moved > type(uint128).max) moved = type(uint128).max;
-        _setWord(SLOT_ROLLOUT_WINDOW, (word & ~uint256(type(uint128).max)) | moved);
+        uint256 word = _word(SLOT_ROLLOUT_WINDOW);
+        // Everything above bit 159 is left exactly as it was: this slot is the window's and nothing else's, but
+        // the mask is what makes that true rather than assumed.
+        word &= ~uint256(type(uint128).max);
+        word &= ~(uint256(type(uint32).max) << 128);
+        _setWord(SLOT_ROLLOUT_WINDOW, word | (uint256(uint32(block.timestamp)) << 128) | moved);
     }
 
     /// @dev How much of the entry pools' inventory may move without taking them below `entryFloorBps`.
@@ -534,16 +635,22 @@ library VaultRolloutLib {
         }
     }
 
-    /// @dev The last accepted answer for `token`, 8 decimals, or zero. Never reverts.
+    /// @dev The last accepted answer for `token`, 8 decimals, or zero. Never reverts, **and never panics either**
+    ///      (audit lead, 2026-09-09): a bounded `staticcall` whose first word is read by hand, which is the shape
+    ///      every other pointer read in the vault already uses. A typed `try` decodes a *successful* call's
+    ///      returndata in this frame, so a feed registry replaced with one that answers fewer than three words —
+    ///      or with a non-canonical `bool` in the third — `Panic`ked past the `catch` and bricked `deployBonded`
+    ///      and every bounty valuation instead of degrading them to "no answer". `latestAnswer` is a composite
+    ///      read (an aggregator probe plus up to two historical rounds), so the budget is the generous
+    ///      {COMPOSITE_READ_GAS} the rest of the placement path gives it.
     function _answer(address token) private view returns (uint256 answerUsd8) {
         address feeds = _addr(SLOT_FEED_REGISTRY);
         if (feeds == address(0) || token == address(0)) return 0;
-        try IFeedRegistry(feeds).latestAnswer{gas: Constants.COMPOSITE_READ_GAS}(token) returns (
-            uint256 value, uint32, bool
-        ) {
-            return value;
-        } catch {
-            return 0;
+        (bool ok, bytes memory returndata) =
+            feeds.staticcall{gas: Constants.COMPOSITE_READ_GAS}(abi.encodeCall(IFeedRegistry.latestAnswer, (token)));
+        if (!ok || returndata.length < 96) return 0;
+        assembly ("memory-safe") {
+            answerUsd8 := mload(add(returndata, 0x20))
         }
     }
 

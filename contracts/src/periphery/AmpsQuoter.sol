@@ -319,7 +319,14 @@ contract AmpsQuoter is IAmpsQuoter {
         if (refuse) return (0, feePips, true, 0);
 
         uint8 simDegraded;
-        (amountOut, simDegraded) = _simulate(poolId, zeroForOne, amountIn, feePips);
+        int24 tickAfter;
+        (amountOut, simDegraded, tickAfter) = _simulate(poolId, zeroForOne, amountIn, feePips);
+        // **The post-swap half of the rail check** (audit fix, 2026-09-08). `beforeSwap` refuses on the
+        // start-of-swap tick and `afterSwap` refuses again on the tick the swap *ended* on, so a swap that begins
+        // inside the rail and ends beyond it quoted as executable here and then reverted on chain — the one
+        // failure mode a quoter exists to prevent. The tick the simulation already computed is exactly the number
+        // the hook will judge, so modelling the second half costs one more bounded read and no new machinery.
+        if (simDegraded == 0 && _refusesAfterSwap(poolId, tickAfter)) return (0, feePips, true, 0);
         return (amountOut, feePips, false, simDegraded);
     }
 
@@ -338,6 +345,14 @@ contract AmpsQuoter is IAmpsQuoter {
         view
         returns (uint256 amountOut, uint24 hop1FeePips, uint24 hop2FeePips, uint256 creditUsed)
     {
+        // **The router's own two preconditions, mirrored** (audit fix, 2026-09-09). `rotate` refuses `hop1 ==
+        // hop2` and a pair with no spoke leg, so a quote for either shape is a quote for a transaction that
+        // always reverts — the one thing this contract exists to stop a front end from publishing. Zeros
+        // throughout: there is no fee to report for a route that cannot be built, and `amountOut == 0` is already
+        // this function's "no route".
+        if (PoolId.unwrap(hop1) == PoolId.unwrap(hop2)) return (0, 0, 0, 0);
+        if (!_isSpoke(hop1) && !_isSpoke(hop2)) return (0, 0, 0, 0);
+
         bool refuse1;
         {
             bool okFee1;
@@ -349,8 +364,11 @@ contract AmpsQuoter is IAmpsQuoter {
         uint256 ampsIn;
         {
             uint8 degraded;
-            (ampsIn, degraded) = _simulate(hop1, false, amountIn, hop1FeePips);
+            int24 tickAfter;
+            (ampsIn, degraded, tickAfter) = _simulate(hop1, false, amountIn, hop1FeePips);
             if (degraded != 0 || ampsIn == 0) return (0, hop1FeePips, 0, 0);
+            // Hop 1's own post-swap rail: a rotation whose first leg ends beyond the rail is not a route.
+            if (_refusesAfterSwap(hop1, tickAfter)) return (0, hop1FeePips, 0, 0);
         }
         creditUsed = ampsIn;
 
@@ -375,7 +393,10 @@ contract AmpsQuoter is IAmpsQuoter {
         if (feePips == 0) return (0, 0, false, DEGRADED_HOOK);
         if (refused) return (0, feePips, true, 0);
 
-        (amountOut, degraded) = _simulate(poolId, true, ampsIn, feePips);
+        int24 tickAfter;
+        (amountOut, degraded, tickAfter) = _simulate(poolId, true, ampsIn, feePips);
+        // The post-swap rail, as in {quoteExactIn}.
+        if (degraded == 0 && _refusesAfterSwap(poolId, tickAfter)) return (0, feePips, true, 0);
     }
 
     /// @inheritdoc IAmpsQuoter
@@ -388,9 +409,20 @@ contract AmpsQuoter is IAmpsQuoter {
         if (!okSlot0) degraded |= DEGRADED_POOL;
         else if (sqrtPriceX96 == 0) return (true, "uninitialized", degraded);
 
-        (bool okFee,,, bool refused) = _quoteFee(poolId, zeroForOne, exactInput, amount, false);
+        (bool okFee, uint24 feePips,, bool refused) = _quoteFee(poolId, zeroForOne, exactInput, amount, false);
         if (!okFee) return (false, bytes32(0), degraded | DEGRADED_HOOK);
-        return (refused, refused ? bytes32("rail") : bytes32(0), degraded);
+        if (refused) return (true, bytes32("rail"), degraded);
+
+        // The post-swap half, which this view used to model not at all (audit fix, 2026-09-08). It is reachable
+        // only for an exact-input amount, because that is the only shape the simulator walks; an exact-output
+        // question still gets the start-of-swap answer, and says so by reporting no reason rather than a wrong
+        // one. `"railAfter"` is a distinct reason so a front end can tell the two refusals apart.
+        if (exactInput && amount != 0) {
+            (, uint8 simDegraded, int24 tickAfter) = _simulate(poolId, zeroForOne, amount, feePips);
+            if (simDegraded != 0) return (false, bytes32(0), degraded | simDegraded);
+            if (_refusesAfterSwap(poolId, tickAfter)) return (true, bytes32("railAfter"), degraded);
+        }
+        return (false, bytes32(0), degraded);
     }
 
     /// @inheritdoc IAmpsQuoter
@@ -503,10 +535,12 @@ contract AmpsQuoter is IAmpsQuoter {
     /// @param feePips The total fee in pips the hook would override.
     /// @return amountOut The output amount.
     /// @return complete Whether the walk consumed the whole input within {MAX_SWAP_STEPS}.
+    /// @return tickAfter The pool's tick once the whole input has been consumed — what `AmpsHook._afterSwap` will
+    ///         measure its own half of the rail check against. Meaningless unless `complete`.
     function simulateExactIn(PoolId poolId, int24 tickSpacing, bool zeroForOne, uint256 amountIn, uint24 feePips)
         external
         view
-        returns (uint256 amountOut, bool complete)
+        returns (uint256 amountOut, bool complete, int24 tickAfter)
     {
         QuoterSwapLib.Result memory result = QuoterSwapLib.exactInput(
             QuoterSwapLib.Params({
@@ -519,7 +553,7 @@ contract AmpsQuoter is IAmpsQuoter {
                 maxSteps: MAX_SWAP_STEPS
             })
         );
-        return (result.amountOut, result.complete && result.initialized);
+        return (result.amountOut, result.complete && result.initialized, result.tick);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -597,10 +631,18 @@ contract AmpsQuoter is IAmpsQuoter {
             quote.degraded |= DEGRADED_GATE;
             return;
         }
+        // **An ordinal nobody recognises is the worse state, not the better one** (audit fix, 2026-09-08). These
+        // clamps used to fall to zero — `GREEN` and `REGULAR` — so a gate that answered with garbage rendered as a
+        // perfectly healthy market with no degraded bit set, which is the opposite of what
+        // `AmpsHook._snapshotInto` does with the same words and the opposite of what a consumer needs. A malformed
+        // answer is now `DEGRADED`, `CLOSED` and bit 1, which is what an unreadable gate already reports.
         uint256 gateState = _word(data, 0);
         uint256 session = _word(data, 1);
-        quote.gateState = gateState > uint256(uint8(type(GateState).max)) ? 0 : uint8(gateState);
-        quote.session = session > uint256(uint8(type(Session).max)) ? 0 : uint8(session);
+        if (gateState > uint256(uint8(type(GateState).max)) || session > uint256(uint8(type(Session).max))) {
+            quote.degraded |= DEGRADED_GATE;
+        }
+        quote.gateState = gateState > uint256(uint8(type(GateState).max)) ? uint8(GateState.DEGRADED) : uint8(gateState);
+        quote.session = session > uint256(uint8(type(Session).max)) ? uint8(Session.CLOSED) : uint8(session);
         quote.feedStale = _word(data, 2) != 0;
         quote.corporateFreeze = _word(data, 3) != 0;
         // The hook's cached band, rail and fair tick are what `beforeSwap` charges from, so they win while it is
@@ -759,10 +801,24 @@ contract AmpsQuoter is IAmpsQuoter {
         ampsFeeBps = uint16(ampsFeeBps);
         buyFeeBps = uint16(buyFeeBps);
 
-        uint256 base = ampsFeeBps;
-        if (ampsIn != 0 && credit != 0 && ampsFeeBps > buyFeeBps) {
-            uint256 consumed = credit < ampsIn ? credit : ampsIn;
-            base = buyFeeBps + FullMath.mulDivRoundingUp(ampsFeeBps - buyFeeBps, ampsIn - consumed, ampsIn);
+        // **`ampsIn == 0` is the hook's "fully covered" case, not its "no credit" one** (audit fix, 2026-09-09).
+        // `AmpsHook._quote` blends on `uncredited == amountIn - min(credit, amountIn)`, so a zero-sized
+        // pass-through sell leaves `uncredited == 0` and is priced at `buyFeeBps` — which is the answer the view
+        // surface is being asked for, "what would a pass-through sell cost", and not "what does a zero-sized one
+        // cost". Requiring `ampsIn != 0` here answered `ampsFeeBps` instead, so the quoter and the hook disagreed
+        // by up to 495 bp on the one call a front end makes to render a rotation's headline rate.
+        // **The condition is `uncredited == 0`, exactly as the hook's is** (audit fix, 2026-09-09).
+        // `AmpsHook._quote` blends on `uncredited = amountIn - min(credit, amountIn)` and prices a fully covered
+        // pass-through sell — the `ampsIn == 0` degenerate case included, which is "what would a pass-through sell
+        // cost" and not "what does a zero-sized one cost" — at `buyFeeBps`. Requiring `ampsIn != 0 && credit != 0`
+        // here answered `ampsFeeBps` for that case instead, so the quoter and the hook disagreed by up to 495 bp
+        // on the one call a front end makes to render a rotation's headline rate.
+        uint256 uncredited = ampsIn > credit ? ampsIn - credit : 0;
+        uint256 base = buyFeeBps;
+        if (uncredited != 0) {
+            base = ampsFeeBps > buyFeeBps
+                ? buyFeeBps + FullMath.mulDivRoundingUp(ampsFeeBps - buyFeeBps, uncredited, ampsIn)
+                : ampsFeeBps;
         }
 
         uint256 total = base + dynBps;
@@ -771,29 +827,68 @@ contract AmpsQuoter is IAmpsQuoter {
         return uint24(total) * Constants.PIPS_PER_BPS;
     }
 
-    /// @dev One bounded simulation, with the pool's tick spacing resolved first.
+    /// @dev One bounded simulation, with the pool's tick spacing resolved first. `tickAfter` is the tick the walk
+    ///      ended on, which is what the post-swap rail is judged against; it is zero and meaningless whenever a
+    ///      degraded bit comes back.
     function _simulate(PoolId poolId, bool zeroForOne, uint256 amountIn, uint24 feePips)
         private
         view
-        returns (uint256 amountOut, uint8 degraded)
+        returns (uint256 amountOut, uint8 degraded, int24 tickAfter)
     {
         (bool ok, PoolConfig memory cfg) = _poolConfig(poolId);
         int24 tickSpacing = cfg.tickSpacing;
         if (!ok || tickSpacing <= 0) {
             (bool okHook, HookPoolState memory hookState) = _poolState(poolId);
-            if (!okHook) return (0, DEGRADED_REGISTRY | DEGRADED_HOOK);
+            if (!okHook) return (0, DEGRADED_REGISTRY | DEGRADED_HOOK, 0);
             tickSpacing = hookState.tickSpacing;
             degraded |= DEGRADED_REGISTRY;
         }
 
         try this.simulateExactIn{gas: SIMULATION_GAS}(poolId, tickSpacing, zeroForOne, amountIn, feePips) returns (
-            uint256 out, bool complete
+            uint256 out, bool complete, int24 endTick
         ) {
-            if (!complete) return (0, degraded | DEGRADED_POOL);
-            return (out, degraded);
+            if (!complete) return (0, degraded | DEGRADED_POOL, 0);
+            return (out, degraded, endTick);
         } catch {
-            return (0, degraded | DEGRADED_POOL);
+            return (0, degraded | DEGRADED_POOL, 0);
         }
+    }
+
+    /// @dev `AmpsHook._afterSwap`'s own refusal, modelled: a swap that **increased** the deviation from fair and
+    ///      ended beyond the pool's effective outer rail reverts `BeyondRail`, and the state it wrote goes with
+    ///      it. Both inputs are read from the hook rather than derived here — `fairTick` is the gate's number and
+    ///      `outerRailTicks` is the *effective* rail, i.e. already the conservative substitute when the hook's
+    ///      gate cache has gone stale — so this cannot disagree with the contract that will judge the swap.
+    ///
+    /// @dev A hook or PoolManager that cannot be read answers `false`: the pre-swap half above is already
+    ///      reported, and inventing a refusal from a failed read would tell a front end a working route is closed.
+    /// @param poolId The pool.
+    /// @param tickAfter The tick the simulated swap ended on.
+    /// @return refuse Whether `afterSwap` would revert.
+    function _refusesAfterSwap(PoolId poolId, int24 tickAfter) private view returns (bool refuse) {
+        (bool okSlot0,, int24 tickBefore) = _slot0(poolId);
+        if (!okSlot0) return false;
+
+        (bool okFair, uint256 fairWord) =
+            _uintReadChecked(_hook, abi.encodeWithSelector(IAmpsHook.fairTick.selector, poolId));
+        (bool okRail, uint256 railWord) =
+            _uintReadChecked(_hook, abi.encodeWithSelector(IAmpsHook.outerRailTicks.selector, poolId));
+        if (!okFair || !okRail) return false;
+
+        int24 fair = int24(int256(fairWord));
+        int24 rail = int24(int256(railWord));
+        if (rail <= 0) return false;
+
+        uint256 devAfter = _distance(tickAfter, fair);
+        if (devAfter <= _distance(tickBefore, fair)) return false;
+        refuse = devAfter > uint256(uint24(rail));
+    }
+
+    /// @dev `|a - b|` over the wide type, so the subtraction cannot overflow `int24` the way the hook's own
+    ///      saturating `_deviation` is written to avoid.
+    function _distance(int24 a, int24 b) private pure returns (uint256 distance) {
+        int256 delta = int256(a) - int256(b);
+        distance = uint256(delta < 0 ? -delta : delta);
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -814,6 +909,17 @@ contract AmpsQuoter is IAmpsQuoter {
         cfg.constituentId = uint16(_word(data, 5));
         cfg.registered = _word(data, 6) != 0;
         cfg.gridBaseTick = int24(int256(_word(data, 7)));
+    }
+
+    /// @dev Whether a pool is a constituent's spoke, i.e. whether it can be a leg of a rotation at all. Mirrors
+    ///      `AmpsRouter._isSpoke`, through this contract's own bounded registry probe: an unreadable registry
+    ///      reads as "not a spoke", so a route the quoter cannot verify is quoted as no route rather than as one
+    ///      that might revert.
+    /// @param poolId The pool.
+    /// @return spoke Whether it carries a non-zero `constituentId`.
+    function _isSpoke(PoolId poolId) private view returns (bool spoke) {
+        (bool ok, PoolConfig memory cfg) = _poolConfig(poolId);
+        spoke = ok && cfg.registered && cfg.constituentId != 0;
     }
 
     /// @dev `IAmpsHook.poolState`, hand-decoded. Only the fields the quote renders are unpacked; the rest of the

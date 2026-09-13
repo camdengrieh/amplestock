@@ -37,6 +37,7 @@ const VAULT_READS = [
   'redeemFeeBps',
   'REDEEM_FEE_BPS_MAX',
   'genesisTimestamp',
+  'S0',
   'CREATOR_FEE_BPS',
   'CREATOR_DECAY_SECONDS',
   'liveCells',
@@ -96,6 +97,14 @@ export function useVaultSnapshot() {
     /** The ceiling hardcoded in the vault; governance cannot widen it. */
     redeemFeeBpsMax: num('REDEEM_FEE_BPS_MAX'),
     genesisTimestamp: num('genesisTimestamp'),
+    /**
+     * `S0`, the whole genesis supply, from the vault's own bytecode.
+     *
+     * It is the denominator of NAV per share **at launch** and it never moves, which is what makes
+     * it the right divisor for a settlement figure: `Amps.totalSupply()` grows with every bond, so
+     * dividing the auction's raise by it would make the launch NAV drift downwards for ever after.
+     */
+    s0: value<bigint>('S0'),
     creatorFeeBps: num('CREATOR_FEE_BPS'),
     creatorDecaySeconds: num('CREATOR_DECAY_SECONDS'),
     liveCells: num('liveCells'),

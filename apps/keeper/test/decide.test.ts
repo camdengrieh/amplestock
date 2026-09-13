@@ -7,12 +7,13 @@ import {
   screenCompound,
   screenDeployBonded,
   screenRollout,
+  screenSettle,
   screenTouch,
 } from '../src/domain/decide.js'
 import {DEFAULT_POLICY} from '../src/domain/policy.js'
-import {GateState, PoolClass, type Simulation} from '../src/domain/types.js'
+import {GateState, GenesisPhase, PoolClass, type Simulation} from '../src/domain/types.js'
 import {WAD} from '../src/domain/bounty.js'
-import {constituent, HUB_POOL, NOW, pool, pot, snapshot, vault, SPOKE_POOL} from './helpers.js'
+import {constituent, genesis, GENESIS, HUB_POOL, NOW, pool, pot, snapshot, vault, SPOKE_POOL} from './helpers.js'
 
 const POLICY = DEFAULT_POLICY
 
@@ -177,6 +178,64 @@ describe('checkpoint and touch', () => {
   })
 })
 
+describe('settle — the one-shot launch job', () => {
+  it('is eligible exactly when every leg has ended and nobody has settled', () => {
+    const s = snapshot({genesis: genesis()})
+    const screening = screenSettle(s)
+    expect(screening.eligible).toBe(true)
+    // The target is the adapter's address, because that is where the transaction goes.
+    expect(screening.candidate.target).toBe(GENESIS)
+    expect(screening.candidate.key).toBe(`settle:${GENESIS}`)
+  })
+
+  it('is not due while the auctions are still running', () => {
+    for (const phase of [GenesisPhase.Created, GenesisPhase.Bidding]) {
+      const screening = screenSettle(snapshot({genesis: genesis({phase})}))
+      expect(screening.eligible).toBe(false)
+      expect(screening.reason).toBe('not-due')
+    }
+  })
+
+  it('retires itself once the launch has happened, whatever the outcome', () => {
+    for (const phase of [GenesisPhase.Settled, GenesisPhase.Aborted]) {
+      const screening = screenSettle(snapshot({genesis: genesis({phase, settled: true})}))
+      expect(screening.eligible).toBe(false)
+      expect(screening.reason).toBe('already-settled')
+    }
+    // `settled()` alone is enough: it is the latch, and the phase is derived from it.
+    expect(screenSettle(snapshot({genesis: genesis({settled: true})})).reason).toBe('already-settled')
+  })
+
+  it('is NOT refused on gate state, so a launch stuck behind an early gate is visible', () => {
+    // `settle()` takes the vault's health check and the hub pool does not exist yet, so a gate
+    // pointer set too early makes it revert `GateNotHealthy`. Screening it out here would hide
+    // that behind "gate not green" for ever; the simulation names the real problem instead.
+    const degraded = snapshot({genesis: genesis(), globalGateState: GateState.DEGRADED})
+    expect(screenSettle(degraded).eligible).toBe(true)
+  })
+
+  it('is not a candidate at all when the snapshot carries no adapter', () => {
+    expect(screen(snapshot(), POLICY, 0).some((x) => x.candidate.kind === 'settle')).toBe(false)
+    expect(screen(snapshot({genesis: genesis()}), POLICY, 0).filter((x) => x.candidate.kind === 'settle')).toHaveLength(1)
+  })
+
+  it('is unpaid, so qualification sends it the moment the simulation succeeds', () => {
+    const screening = screenSettle(snapshot({genesis: genesis()}))
+    const verdict = qualify(screening, ok(undefined), snapshot({genesis: genesis()}), POLICY)
+    expect(verdict.send).toBe(true)
+    expect(verdict.bountyUsd18).toBe(0n)
+    expect(verdict.workValueUsd18).toBe(0n)
+  })
+
+  it('is refused when the simulation reverts, and the revert is the report', () => {
+    const screening = screenSettle(snapshot({genesis: genesis()}))
+    const verdict = qualify(screening, reverted('GateNotHealthy', [5, HUB_POOL]), snapshot(), POLICY)
+    expect(verdict.send).toBe(false)
+    expect(verdict.reason).toBe('simulation-reverted')
+    expect(verdict.detail).toBe('GateNotHealthy')
+  })
+})
+
 describe('the whole scan', () => {
   it('produces one candidate per pool and two per constituent, plus the two upkeep jobs', () => {
     const s = snapshot()
@@ -186,9 +245,11 @@ describe('the whole scan', () => {
     expect(screenings.filter((x) => x.candidate.kind === 'deployBonded')).toHaveLength(s.constituents.length)
     expect(screenings.filter((x) => x.candidate.kind === 'touch')).toHaveLength(1)
     expect(screenings.filter((x) => x.candidate.kind === 'checkpoint')).toHaveLength(1)
+    // A running protocol has no launch left to settle, so there is no settle candidate at all.
+    expect(screenings.filter((x) => x.candidate.kind === 'settle')).toHaveLength(0)
   })
 
-  it('a DEGRADED gate refuses every job', () => {
+  it('a DEGRADED gate refuses every job on the vault', () => {
     const degraded = snapshot({globalGateState: GateState.DEGRADED})
     for (const screening of screen(degraded, POLICY, 0)) {
       expect(screening.eligible, screening.candidate.key).toBe(false)

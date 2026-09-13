@@ -522,7 +522,7 @@ contract VaultRedeemTest is PlacementFixture {
 
     /// @dev Slot 4 `registry`, 8 `marketReference`, 9 `oracleGate`, 10 `feedRegistry`, 11 `positionValuer`,
     ///      12 `ladderPolicy`, 13 `rolloutPolicy`, 14 `standbyVault`.
-    function _assertNotAPointerSlot(bytes32 slot) private view {
+    function _assertNotAPointerSlot(bytes32 slot) private pure {
         uint256 value = uint256(slot);
         assertFalse(value == 4 || (value >= 8 && value <= 14), "the redemption read a pointer slot");
     }

@@ -49,6 +49,7 @@ export const EXPORTED_CONTRACTS = [
   {name: 'AmpsHook', source: 'AmpsHook', contract: 'AmpsHook'},
   {name: 'AmpsBonds', source: 'AmpsBonds', contract: 'AmpsBonds'},
   {name: 'AmpsRouter', source: 'AmpsRouter', contract: 'AmpsRouter'},
+  {name: 'AmpsGenesis', source: 'AmpsGenesis', contract: 'AmpsGenesis'},
   {name: 'BountyPot', source: 'BountyPot', contract: 'BountyPot'},
   {name: 'PoolRegistry', source: 'PoolRegistry', contract: 'PoolRegistry'},
   {name: 'PoolRegistryLens', source: 'PoolRegistryLens', contract: 'PoolRegistryLens'},

@@ -44,11 +44,11 @@ contract AmpsVaultTest is AmpsVaultFixture {
     // Genesis (section 3)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice The launch vector: $5,000 of seed against 5,000 AMPS is $1.00 of backing per AMPS.
+    /// @notice The fixture's launch vector: $20,000 of seed against 20,000 AMPS is $1.00 of backing per AMPS.
     function test_genesis_navPerShareIsOneDollar() public {
         runGenesis();
 
-        assertEq(vault.totalAssetsUsd18(), 5000e18, "A == $5,000");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18, "A == $20,000");
         assertEq(amps.totalSupply(), Constants.S0, "T == S0");
         // (A + 1) * 1e18 / (T + VIRTUAL_SHARES) rounds down, so NAV/share is $1.00 less one wei by construction.
         assertEq(vault.navPerShareX18(), 999_999_999_999_999_999, "NAV/share");
@@ -56,16 +56,23 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.previewNavPerShareX18(), vault.navPerShareX18(), "live NAV matches the checkpoint");
     }
 
-    /// @notice The allocation lands where the launch table says: 250 AMPS vesting, 4,750 AMPS of POL in the vault.
+    /// @notice The allocation lands where the launch table says: 1,000 AMPS vesting, 10,000 to the auction
+    ///         adapter, 9,000 of POL in the vault.
     function test_genesis_allocation() public {
         runGenesis();
 
         assertEq(amps.balanceOf(TEAM_WALLET), Constants.TEAM_SHARES, "team tranche");
+        assertEq(amps.balanceOf(address(genesisHolder)), Constants.AUCTION_SHARES, "auction tranche");
         assertEq(amps.balanceOf(address(vault)), Constants.POL_SHARES, "POL tranche");
-        assertEq(amps.balanceOf(TEAM_WALLET) + amps.balanceOf(address(vault)), Constants.S0, "the whole of S0");
+        assertEq(
+            amps.balanceOf(TEAM_WALLET) + amps.balanceOf(address(genesisHolder)) + amps.balanceOf(address(vault)),
+            Constants.S0,
+            "the whole of S0"
+        );
         assertEq(vault.creator(), CREATOR, "creator");
         assertEq(vault.genesisTimestamp(), uint32(block.timestamp), "genesis timestamp");
-        assertTrue(vault.initialized(), "latch");
+        assertTrue(vault.genesisMinted(), "mint latch");
+        assertTrue(vault.initialized(), "place latch");
     }
 
     /// @notice The seed never rests on the vault: it goes straight into the PoolManager as ERC-6909 claims (I12).
@@ -90,44 +97,55 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertFalse(vault.isAsset(address(amps)), "AMPS is never an asset");
     }
 
-    /// @notice The latch is one-way.
+    /// @notice Both latches are one-way.
     function test_genesis_revertsOnSecondCall() public {
         runGenesis();
-        vm.prank(TIMELOCK);
+        vm.startPrank(TIMELOCK);
         vm.expectRevert(IAmpsVault.GenesisAlreadyDone.selector);
-        vault.genesis(genesisParams());
+        vault.genesisMint(genesisMintParams());
+        vm.expectRevert(IAmpsVault.GenesisAlreadyDone.selector);
+        vault.genesisPlace(genesisPlaceParams());
+        vm.stopPrank();
     }
 
-    /// @notice Only the timelock may open the protocol.
+    /// @notice Only the timelock may mint `S0`.
     function test_genesis_onlyTimelock() public {
         vm.expectRevert(abi.encodeWithSelector(NotTimelock.selector, ALICE));
         vm.prank(ALICE);
-        vault.genesis(genesisParams());
+        vault.genesisMint(genesisMintParams());
     }
 
-    /// @notice The allocation must be exactly the two constants, and they must sum to `S0`.
+    /// @notice The allocation must be exactly the three constants, and they must sum to `S0`.
     function test_genesis_rejectsWrongAllocation() public {
-        IAmpsVault.GenesisParams memory params = genesisParams();
+        IAmpsVault.GenesisMintParams memory params = genesisMintParams();
         params.teamShares = Constants.TEAM_SHARES + 1;
         vm.prank(TIMELOCK);
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAmpsVault.InvalidGenesisAllocation.selector, params.teamShares, params.polShares, Constants.S0
+                IAmpsVault.InvalidGenesisAllocation.selector,
+                params.teamShares,
+                params.auctionShares,
+                params.polShares,
+                Constants.S0
             )
         );
-        vault.genesis(params);
+        vault.genesisMint(params);
     }
 
     /// @notice Parallel arrays must be parallel.
     function test_genesis_rejectsUnbalancedSeedArrays() public {
-        IAmpsVault.GenesisParams memory params = genesisParams();
-        params.seedAmounts = new uint256[](1);
+        vm.prank(TIMELOCK);
+        vault.genesisMint(genesisMintParams());
+
+        IAmpsVault.GenesisPlaceParams memory params = genesisPlaceParams();
+        params.amounts = new uint256[](1);
         vm.prank(TIMELOCK);
         vm.expectRevert(LengthMismatch.selector);
-        vault.genesis(params);
+        vault.genesisPlace(params);
     }
 
-    /// @notice `genesis` freezes the wiring: the four set-once pointers refuse afterwards, the upgradeable ones do not.
+    /// @notice `genesisPlace` freezes the wiring: the set-once pointers refuse afterwards, the upgradeable ones
+    ///         do not.
     /// @dev Every replacement here is a *contract* address, and has to be: `setPolicyPointer` refuses a codeless
     ///      pointer before it looks at the slot at all. That guard is what stops one mistyped `oracleGate` write
     ///      from bricking the only call that could undo it — see `unit/VaultGateResilience.t.sol`.
@@ -142,6 +160,8 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.setPolicyPointer(bytes32("bonds"), replacement);
         vm.expectRevert(AlreadyInitialized.selector);
         vault.setPolicyPointer(bytes32("bountyPot"), replacement);
+        vm.expectRevert(AlreadyInitialized.selector);
+        vault.setPolicyPointer(bytes32("genesis"), replacement);
 
         // Pointer-upgradeable slots stay open; `marketReference` is re-pointed once, to the hook, in Phase 3.
         vault.setPolicyPointer(bytes32("oracleGate"), address(gate));
@@ -217,7 +237,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         runGenesis();
         feeds.clearAnswer(address(stock));
         vault.checkpoint();
-        assertEq(vault.totalAssetsUsd18(), 5000e18, "unchanged");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18, "unchanged");
     }
 
     /// @notice `checkpoint` is permissionless, pokes the gate and stamps the block.
@@ -487,9 +507,12 @@ contract AmpsVaultTest is AmpsVaultFixture {
     ///      by zero, and it still holds.
     function test_redeem_fullSupplyLeavesNavFinite() public {
         runGenesis();
+        // Every one of `S0`'s three tranches, gathered in one hand: the vault's POL, the team's vested AMPS and
+        // the auction tranche the genesis holder is standing in for. Redeeming the lot is what takes `T` to zero.
         giveShares(ALICE, Constants.POL_SHARES);
         vm.prank(TEAM_WALLET);
         amps.transfer(ALICE, Constants.TEAM_SHARES);
+        genesisHolder.send(address(amps), ALICE, Constants.AUCTION_SHARES);
 
         vm.prank(ALICE);
         vault.redeemProRata(Constants.S0, ALICE);
@@ -518,7 +541,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(settled, 5e18, "settled in full");
         assertEq(claimOf(address(stock)), before + 5e18, "as a claim");
         assertEq(stock.balanceOf(address(vault)), 0, "never on the vault");
-        assertEq(vault.totalAssetsUsd18(), 5000e18 + 500e18, "and it is backing at once");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18 + 500e18, "and it is backing at once");
     }
 
     /// @notice Only the bonds shell may deposit or mint.
@@ -983,31 +1006,47 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(vault.assetCount(), before, "both counters were already registered at genesis");
     }
 
-    /// @notice Genesis rejects a zero vesting wallet, a zero creator and a seed the payer has not approved.
+    /// @notice `genesisMint` rejects a zero vesting wallet, a zero creator and an adapter the pointer disagrees
+    ///         with; `genesisPlace` rejects a zero seed token, a zero amount and a zero `p0X18`.
     function test_genesis_rejectsZeroAddresses() public {
-        IAmpsVault.GenesisParams memory params = genesisParams();
-        params.teamVestingWallet = address(0);
+        IAmpsVault.GenesisMintParams memory mintParams = genesisMintParams();
+        mintParams.teamVestingWallet = address(0);
         vm.prank(TIMELOCK);
         vm.expectRevert(ZeroAddress.selector);
-        vault.genesis(params);
+        vault.genesisMint(mintParams);
 
-        params = genesisParams();
-        params.creator = address(0);
+        mintParams = genesisMintParams();
+        mintParams.creator = address(0);
         vm.prank(TIMELOCK);
         vm.expectRevert(ZeroAddress.selector);
-        vault.genesis(params);
+        vault.genesisMint(mintParams);
 
-        params = genesisParams();
-        params.seedTokens[0] = address(0);
+        mintParams = genesisMintParams();
+        mintParams.genesis = ALICE;
         vm.prank(TIMELOCK);
         vm.expectRevert(ZeroAddress.selector);
-        vault.genesis(params);
+        vault.genesisMint(mintParams);
 
-        params = genesisParams();
-        params.seedAmounts[0] = 0;
+        vm.prank(TIMELOCK);
+        vault.genesisMint(genesisMintParams());
+
+        IAmpsVault.GenesisPlaceParams memory placeParams = genesisPlaceParams();
+        placeParams.tokens[0] = address(0);
+        vm.prank(TIMELOCK);
+        vm.expectRevert(ZeroAddress.selector);
+        vault.genesisPlace(placeParams);
+
+        placeParams = genesisPlaceParams();
+        placeParams.amounts[0] = 0;
         vm.prank(TIMELOCK);
         vm.expectRevert(ZeroAmount.selector);
-        vault.genesis(params);
+        vault.genesisPlace(placeParams);
+
+        placeParams = genesisPlaceParams();
+        placeParams.p0X18 = 0;
+        vm.prank(TIMELOCK);
+        vm.expectRevert(ZeroAmount.selector);
+        vault.genesisPlace(placeParams);
     }
 
     /// @notice Before genesis there is no supply, so the redemption preview is all zeroes rather than a revert.
@@ -1051,7 +1090,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.depositBonded(0, address(outsider), BOB, 10e18);
 
         assertTrue(vault.isAsset(address(outsider)), "registered on deposit");
-        assertEq(vault.totalAssetsUsd18(), 5000e18 + 500e18, "10 at $50, valued at 18 decimals");
+        assertEq(vault.totalAssetsUsd18(), 20_000e18 + 500e18, "10 at $50, valued at 18 decimals");
 
         vm.prank(ALICE);
         vault.redeemProRata(500e18, ALICE);

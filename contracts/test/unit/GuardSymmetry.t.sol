@@ -38,12 +38,21 @@ contract AlwaysReverts {
 ///      the list, assert its length against an expected count and assert that the exempt set is exactly the three
 ///      classified entries — so adding a function without classifying it fails here as well as in CI.
 ///
-/// @dev **Two gate policies.** Every mutating selector but the three exemptions is classified as `MANAGEMENT` or
-///      `BONDS`. The management policy is section 7 step 2's four refusing states. The bond policy — taken only by
-///      `depositBonded` and `mintVesting` — refuses `DIVERGED` and `SCHEDULED_FREEZE` and tolerates `DEGRADED` and
-///      `WATCHDOG`, because bond markets stay open 24/7 through stale feeds and closed sessions and widen
-///      `h_session` instead (the plan's Decision 10, and section 2's own table). It mirrors
-///      `IOracleGate.checkBond`, so the vault is defence in depth behind the shell rather than a stricter gate.
+/// @dev **Three gate policies** (audit finding 9, 2026-09-08). Every mutating selector but the three exemptions is
+///      classified as `PLACEMENT`, `MANAGEMENT` or `BONDS`, and the three refusal sets nest:
+///
+///        * `PLACEMENT` — `place`, `compound`, `rollout`, `deployBonded`, `withdrawRetiredBids` — is section 7 step
+///          2's four states: `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE`, `WATCHDOG`. Committing inventory at a
+///          price nobody vouches for is exactly what `DEGRADED` should stop.
+///        * `MANAGEMENT` — every governed setter, `checkpoint`, `touch`, `initializePool`, both genesis steps and
+///          `setStandbyVault` — refuses `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG` but **not** `DEGRADED`. The
+///          trading calendar reports `DEGRADED` whenever the equity session is closed, so the old shared policy
+///          shut governance, NAV upkeep and `setPolicyPointer` — the only way to replace a wrong-but-readable gate
+///          — for roughly 48 hours a week plus holidays, with no on-chain remedy for the timelock or the guardian.
+///        * `BONDS` — `depositBonded` and `mintVesting` — refuses `DIVERGED` and `SCHEDULED_FREEZE` only, because
+///          bond markets stay open 24/7 through stale feeds and closed sessions and widen `h_session` instead (the
+///          plan's Decision 10, and section 2's own table). It mirrors `IOracleGate.checkBond`, so the vault is
+///          defence in depth behind the shell rather than a stricter gate.
 ///
 /// @dev **Three classified exemptions, not two.** `redeemProRata` is the structural one section 7 names.
 ///      `unlockCallback` is guarded by caller identity (`NotPoolManager`) and is unreachable except from inside a
@@ -53,7 +62,7 @@ contract AlwaysReverts {
 ///      extra exemptions are asserted below to refuse for their own reason in every gate state.
 contract GuardSymmetryTest is AmpsVaultFixture {
     /// @dev Every external state-changing selector on `AmpsVault`. Update the count deliberately, never silently.
-    uint256 internal constant EXPECTED_MUTATING_COUNT = 25;
+    uint256 internal constant EXPECTED_MUTATING_COUNT = 26;
 
     // -------------------------------------------------------------------------------------------------------------
     // The `AmpsBonds` half of step 1
@@ -107,7 +116,10 @@ contract GuardSymmetryTest is AmpsVaultFixture {
 
     /// @dev How a selector is guarded.
     enum Guard {
-        /// @dev Takes `_requireHealthy`: refuses `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG`.
+        /// @dev Takes `_requirePlaceable`: refuses `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG`.
+        PLACEMENT,
+        /// @dev Takes `_requireManageable`: refuses `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG`, and tolerates
+        ///      `DEGRADED`, because the equity calendar reports `DEGRADED` every weekend and every holiday.
         MANAGEMENT,
         /// @dev Takes `_requireBondsHealthy`: refuses only `DIVERGED` and `SCHEDULED_FREEZE`, because bond markets
         ///      stay open through stale feeds and closed sessions and widen the haircut instead.
@@ -143,6 +155,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
 
         uint256 exempt;
         uint256 bondsGated;
+        uint256 placement;
         for (uint256 i; i < entries.length; ++i) {
             bytes4 selector = bytes4(entries[i].callData);
             for (uint256 j = i + 1; j < entries.length; ++j) {
@@ -150,10 +163,12 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             }
             if (entries[i].guard == Guard.EXEMPT) ++exempt;
             if (entries[i].guard == Guard.BONDS) ++bondsGated;
+            if (entries[i].guard == Guard.PLACEMENT) ++placement;
         }
         assertEq(exempt, 3, "redeemProRata, emergencyMigrate and unlockCallback, and nothing else");
         assertEq(bondsGated, 2, "depositBonded and mintVesting, and nothing else");
-        assertEq(entries.length - exempt - bondsGated, 20, "the rest take the management policy");
+        assertEq(placement, 5, "place, compound, rollout, deployBonded and withdrawRetiredBids");
+        assertEq(entries.length - exempt - bondsGated - placement, 16, "the rest take the management policy");
     }
 
     /// @notice The `AmpsBonds` classification is complete, disjoint and the size the ABI says it should be.
@@ -191,8 +206,9 @@ contract GuardSymmetryTest is AmpsVaultFixture {
     // Step 2 — every gated selector refuses in every unhealthy state
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG` refuse every management-gated selector,
-    ///         and `DIVERGED` and `SCHEDULED_FREEZE` refuse the two bond entry points as well.
+    /// @notice `DEGRADED`, `DIVERGED`, `SCHEDULED_FREEZE` and `WATCHDOG` refuse every placement-gated selector;
+    ///         the first three of those minus `DEGRADED` refuse every management-gated one; and `DIVERGED` and
+    ///         `SCHEDULED_FREEZE` refuse the two bond entry points as well.
     function test_step2_everyGatedSelectorRefusesInEveryUnhealthyState() public {
         for (uint256 s; s < REFUSING_STATES.length; ++s) {
             GateState state = REFUSING_STATES[s];
@@ -200,6 +216,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
 
             for (uint256 i; i < entries.length; ++i) {
                 if (entries[i].guard == Guard.EXEMPT) continue;
+                if (entries[i].guard == Guard.MANAGEMENT && state == GateState.DEGRADED) continue;
                 if (
                     entries[i].guard == Guard.BONDS && state != GateState.DIVERGED
                         && state != GateState.SCHEDULED_FREEZE
@@ -215,6 +232,54 @@ contract GuardSymmetryTest is AmpsVaultFixture {
                     string.concat(entries[i].name, " must refuse with GateNotHealthy")
                 );
             }
+        }
+    }
+
+    /// @notice **Audit finding 9.** `DEGRADED` is the trading calendar's ordinary state — `OracleGate.state(0)` is
+    ///         `DEGRADED` whenever the equity session is closed — so it refuses **placements** and nothing else.
+    ///         Every management selector works through a weekend, a holiday and a stale feed; every placement
+    ///         refuses; and `setPolicyPointer`, which is the only way to replace a wrong-but-readable gate, is on
+    ///         the working side of that line.
+    function test_f09_managementSurvivesDegradedWhileEveryPlacementRefuses() public {
+        gate.setDefaultState(GateState.DEGRADED);
+
+        bytes memory refusal = abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.DEGRADED), bytes32(0));
+        for (uint256 i; i < entries.length; ++i) {
+            if (entries[i].guard != Guard.PLACEMENT) continue;
+            vm.prank(entries[i].caller);
+            (bool ok, bytes memory returndata) = address(vault).call(entries[i].callData);
+            assertFalse(ok, string.concat(entries[i].name, " must refuse under DEGRADED"));
+            assertEq(returndata, refusal, string.concat(entries[i].name, " refuses with GateNotHealthy"));
+        }
+
+        // And the management selectors that matter most, spelled out: NAV upkeep, the two setters a stuck protocol
+        // needs, and the pointer swap that is the only way to replace a wrong-but-readable gate.
+        vm.prank(TIMELOCK);
+        vault.setRedeemFeeBps(50);
+        vm.prank(TIMELOCK);
+        vault.setRolloutParams(200, 3000);
+        vault.checkpoint();
+        vault.touch();
+        MockOracleGate replacement = new MockOracleGate();
+        replacement.setDefaultState(GateState.DEGRADED);
+        vm.prank(TIMELOCK);
+        vault.setPolicyPointer(bytes32("oracleGate"), address(replacement));
+        assertEq(vault.oracleGate(), address(replacement), "governance replaced the gate on a closed weekend");
+        vm.prank(TIMELOCK);
+        vault.setStandbyVault(STANDBY);
+    }
+
+    /// @notice And the states that mean the protocol's own state is untrustworthy still refuse management: layer
+    ///         E's divergence breaker, a freeze, and layer A's watchdog.
+    function test_f09_managementStillRefusesDivergedFreezeAndWatchdog() public {
+        GateState[3] memory refusing = [GateState.DIVERGED, GateState.SCHEDULED_FREEZE, GateState.WATCHDOG];
+        for (uint256 s; s < refusing.length; ++s) {
+            gate.setDefaultState(refusing[s]);
+            vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(refusing[s]), bytes32(0)));
+            vault.checkpoint();
+            vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(refusing[s]), bytes32(0)));
+            vm.prank(TIMELOCK);
+            vault.setRedeemFeeBps(50);
         }
     }
 
@@ -275,10 +340,10 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             assertEq(amps.totalSupply(), supplyBefore + 1e18, "and the vest was minted");
         }
 
-        // The management policy is unchanged by any of that: a checkpoint still refuses.
+        // The placement policy is unchanged by any of that: a `compound` still refuses under `DEGRADED`.
         gate.setDefaultState(GateState.DEGRADED);
         vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.DEGRADED), bytes32(0)));
-        vault.checkpoint();
+        vault.compound(spokePool);
     }
 
     /// @notice `REF_DIVERGED` is tolerated by the bond policy too: the shell prices at `q_floor` instead.
@@ -374,9 +439,14 @@ contract GuardSymmetryTest is AmpsVaultFixture {
     }
 
     /// @notice Every *other* path is refused in that same world, which is what makes the exemption meaningful.
+    ///
+    /// @dev The world this breaks into is frozen *and* watchdogged, and since the re-audit fix of 2026-09-09
+    ///      `AmpsVault._requireGate` reads `protocolFreezeUntil()` before `state()` — so the refusal it reports is
+    ///      the freeze (`SCHEDULED_FREEZE`), not the watchdog. Which of the two is named is not the property under
+    ///      test; that a non-redemption path is refused at all is.
     function test_step3_everythingElseIsRefusedInThatWorld() public {
         _breakTheWorld();
-        vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.WATCHDOG), bytes32(0)));
+        vm.expectRevert(abi.encodeWithSelector(GateNotHealthy.selector, uint8(GateState.SCHEDULED_FREEZE), bytes32(0)));
         vault.checkpoint();
     }
 
@@ -508,7 +578,10 @@ contract GuardSymmetryTest is AmpsVaultFixture {
             Guard.BONDS
         );
         _add("mintVesting", abi.encodeCall(IAmpsVault.mintVesting, (BONDS, 1e18)), BONDS, Guard.BONDS);
-        _add("genesis", abi.encodeCall(IAmpsVault.genesis, (genesisParams())), TIMELOCK, Guard.MANAGEMENT);
+        _add("genesisMint", abi.encodeCall(IAmpsVault.genesisMint, (genesisMintParams())), TIMELOCK, Guard.MANAGEMENT);
+        _add(
+            "genesisPlace", abi.encodeCall(IAmpsVault.genesisPlace, (genesisPlaceParams())), TIMELOCK, Guard.MANAGEMENT
+        );
         _add(
             "initializePool",
             abi.encodeCall(IAmpsVault.initializePool, (key, 1 << 96)),
@@ -518,15 +591,15 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         // `place` is timelock-or-registry (`docs/phase3-state-model.md` §10 ruling 11), so the entry that
         // proves the *gate* refuses it has to be called by one of those two: a wrong caller would refuse for
         // access control and the refusal would not be the gate's. The classification is unchanged.
-        _add("place", abi.encodeCall(IAmpsVault.place, (spokePool, true, 1e18)), TIMELOCK, Guard.MANAGEMENT);
-        _add("compound", abi.encodeCall(IAmpsVault.compound, (spokePool)), ALICE, Guard.MANAGEMENT);
-        _add("rollout", abi.encodeCall(IAmpsVault.rollout, (1)), ALICE, Guard.MANAGEMENT);
-        _add("deployBonded", abi.encodeCall(IAmpsVault.deployBonded, (1)), ALICE, Guard.MANAGEMENT);
+        _add("place", abi.encodeCall(IAmpsVault.place, (spokePool, true, 1e18)), TIMELOCK, Guard.PLACEMENT);
+        _add("compound", abi.encodeCall(IAmpsVault.compound, (spokePool)), ALICE, Guard.PLACEMENT);
+        _add("rollout", abi.encodeCall(IAmpsVault.rollout, (1)), ALICE, Guard.PLACEMENT);
+        _add("deployBonded", abi.encodeCall(IAmpsVault.deployBonded, (1)), ALICE, Guard.PLACEMENT);
         _add(
             "withdrawRetiredBids",
             abi.encodeWithSignature("withdrawRetiredBids(uint16)", 1),
             address(registry),
-            Guard.MANAGEMENT
+            Guard.PLACEMENT
         );
         _add("setRedeemFeeBps", abi.encodeCall(IAmpsVault.setRedeemFeeBps, (50)), TIMELOCK, Guard.MANAGEMENT);
         _add("setRefUpRateBps", abi.encodeCall(IAmpsVault.setRefUpRateBps, (500)), TIMELOCK, Guard.MANAGEMENT);

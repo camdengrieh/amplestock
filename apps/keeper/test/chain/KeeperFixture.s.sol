@@ -26,6 +26,7 @@ import {MockWeth9} from "ampsscript/10_TestnetPools.s.sol";
 import {GenesisPlacement} from "ampsscript/11_GenesisPlacement.s.sol";
 
 import {MockAggregator} from "ampstest/mocks/MockAggregator.sol";
+import {MockGenesisHolder} from "ampstest/mocks/MockGenesisHolder.sol";
 import {MockMarketReference} from "ampstest/mocks/MockMarketReference.sol";
 import {MockStockToken} from "ampstest/mocks/MockStockToken.sol";
 import {MockUsdg} from "ampstest/mocks/MockUsdg.sol";
@@ -87,7 +88,7 @@ import {V4PoolManagerDeployer} from "hookmate/artifacts/V4PoolManager.sol";
 ///      | 1 | v4 PoolManager, the mock assets, the core system, every vault pointer **except** the gate |
 ///      | 2 | feeds, the two entry pools, the spokes, the index weight vector — all with the gate still unset |
 ///      | 3 | the six Phase 3 pointer moves and the `OracleGate` deploy; the gate must come out GREEN |
-///      | 4 | `genesis()` plus an ask ladder in every pool |
+///      | 4 | `genesisMint` then `genesisPlace` in the founders'-seed form, plus an ask ladder in every pool |
 ///      | 5 | the entry pools' seed bid ladders, once the 60 s cooldown has passed |
 ///      | 6 | fund `BountyPot`, and mint counter assets to the operator for the swap and bond drills |
 ///
@@ -124,13 +125,20 @@ contract KeeperFixture is Script {
     ///         than enough against ordinary CREATE addresses; production mines three.
     uint160 internal constant AMPS_CEILING = uint160(1) << 144;
 
-    /// @notice The founders' seed: 1 WETH ($2,500) + 2,500 USDG against `S0` = 5,000 AMPS.
-    uint256 internal constant SEED_WETH = 1e18;
-    uint256 internal constant SEED_USDG = 2500e6;
+    /// @notice The founders' seed: 4 WETH ($10,000) + 10,000 USDG against `S0` = 20,000 AMPS, so NAV/share opens
+    ///         at $1.00. In production this money is the auctions' proceeds and arrives through
+    ///         `AmpsGenesis.settle()`; here the operator is the timelock and supplies it to `genesisPlace`
+    ///         directly, which is the founders'-seed fallback path (`docs/genesis-cca.md` §4).
+    uint256 internal constant SEED_WETH = 4e18;
+    uint256 internal constant SEED_USDG = 10_000e6;
 
-    /// @notice `11_GenesisPlacement`'s per-pool ask inventory: 1,662.5 AMPS per entry pool, 47.5 per spoke.
-    uint256 internal constant ENTRY_ASK_AMPS = 1662.5e18;
-    uint256 internal constant SPOKE_SEED_AMPS = 47.5e18;
+    /// @notice `11_GenesisPlacement`'s per-pool ask inventory: 3,150 AMPS per entry pool, 90 per spoke.
+    uint256 internal constant ENTRY_ASK_AMPS = 3150e18;
+    uint256 internal constant SPOKE_SEED_AMPS = 90e18;
+
+    /// @notice `p0X18` for a launch at NAV: `1` asks `genesisPlace` for its NAV floor rather than a flat `1e18`,
+    ///         which would open a one-wei premium over the `VIRTUAL_SHARES`-adjusted NAV/share.
+    uint256 internal constant GENESIS_P0_AT_NAV = 1;
 
     /// @notice $2,500 and $1.00, 8 decimals.
     int256 internal constant ETH_USD8 = 2500e8;
@@ -243,10 +251,16 @@ contract KeeperFixture is Script {
         MockMarketReference phase2Reference = new MockMarketReference();
         VestingWallet teamVesting = new VestingWallet(operator, uint64(block.timestamp), Constants.TEAM_VEST_SECONDS);
         KeeperSwapper swapper = new KeeperSwapper(IPoolManager(poolManager));
+        // The vault's `genesis` pointer has to hold code before `genesisMint` will mint the auction tranche to
+        // it. This fixture is about the keeper, not about an auction, so it uses the same stand-in the contracts'
+        // own fixtures use: the tranche stays inside the holder, in `totalSupply` and outside the inventory,
+        // exactly the shape a settled auction leaves behind.
+        MockGenesisHolder genesisHolder = new MockGenesisHolder();
 
         vault.setPolicyPointer(bytes32("registry"), address(registry));
         vault.setPolicyPointer(bytes32("bonds"), address(bonds));
         vault.setPolicyPointer(bytes32("bountyPot"), address(pot));
+        vault.setPolicyPointer(bytes32("genesis"), address(genesisHolder));
         vault.setPolicyPointer(bytes32("feedRegistry"), address(feedRegistry));
         vault.setPolicyPointer(bytes32("marketReference"), address(phase2Reference));
         vault.setPolicyPointer(bytes32("positionValuer"), address(valuer));
@@ -266,6 +280,7 @@ contract KeeperFixture is Script {
         _emit("rolloutPolicy", address(rolloutPolicy));
         _emit("feePolicy", address(feePolicy));
         _emit("teamVesting", address(teamVesting));
+        _emit("genesis", address(genesisHolder));
         _emit("swapper", address(swapper));
         _emit("usdg", address(usdg));
         _emit("usdgFeed", address(usdgFeed));
@@ -412,14 +427,25 @@ contract KeeperFixture is Script {
         IERC20(weth9).approve(address(vault), SEED_WETH);
         IERC20(usdg).approve(address(vault), SEED_USDG);
 
-        vault.genesis(
-            IAmpsVault.GenesisParams({
+        // Revision 7 split `genesis()` in two. The operator is the timelock here, so it makes both calls
+        // itself: the auction tranche is minted to the holder and stays there, and the seed goes in through
+        // `genesisPlace` at the NAV floor.
+        vault.genesisMint(
+            IAmpsVault.GenesisMintParams({
                 teamVestingWallet: vm.envAddress("FIXTURE_TEAMVESTING"),
                 creator: operator,
+                genesis: vm.envAddress("FIXTURE_GENESIS"),
                 teamShares: Constants.TEAM_SHARES,
-                polShares: Constants.POL_SHARES,
-                seedTokens: seedTokens,
-                seedAmounts: seedAmounts
+                auctionShares: Constants.AUCTION_SHARES,
+                polShares: Constants.POL_SHARES
+            })
+        );
+        vault.genesisPlace(
+            IAmpsVault.GenesisPlaceParams({
+                p0X18: GENESIS_P0_AT_NAV,
+                tokens: seedTokens,
+                amounts: seedAmounts,
+                unsoldAmps: 0
             })
         );
 

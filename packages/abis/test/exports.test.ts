@@ -62,6 +62,7 @@ describe('exported surface', () => {
       'AmpsHook',
       'AmpsBonds',
       'AmpsRouter',
+      'AmpsGenesis',
       'BountyPot',
       'PoolRegistry',
       'PoolRegistryLens',

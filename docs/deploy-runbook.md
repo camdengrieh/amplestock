@@ -6,10 +6,14 @@ component list suggests. Four facts drive everything below.
 1. **`AmpsVault` is a `DELEGATECALL` consumer of four deployed libraries.** An unlinked artefact carries
    `__$…$__` placeholders and cannot be deployed at all, so the library addresses are the first thing the
    deployment fixes (`docs/phase2-state-model.md` §10.1, `docs/phase3-state-model.md` §12 ruling A).
-2. **The gate and the first pool are circular.** `AmpsVault.initializePool` and `genesis()` both take
-   `_requireHealthy`, and `OracleGate` reports `WATCHDOG` while the hub pool is unregistered *or* its observation
-   ring covers less than `twapWindow`. A freshly initialised pool has no observations, so with the gate already
-   wired **no pool can be registered and `genesis()` can never run** (`docs/phase2-state-model.md` §9.1).
+2. **The gate and the first pool are circular, and revision 7 adds a second circle.**
+   `AmpsVault.initializePool`, `genesisMint` and `genesisPlace` all take `_requireManageable`, and `OracleGate`
+   reports `WATCHDOG` while the hub pool is unregistered *or* its observation ring covers less than `twapWindow`.
+   A freshly initialised pool has no observations, so with the gate already wired **no pool can be registered and
+   neither genesis step can run** (`docs/phase2-state-model.md` §9.1). On top of that, `PoolRegistry` opens each
+   pool at `AmpsVault.pRefX18()` in the same call that registers it, and revision 7 makes that word the genesis
+   auctions' clearing price — so **the whole of `05_Registry` runs after settlement**, which splits the wiring
+   script into two passes and gives feed installation a pass of its own (`docs/genesis-cca.md` §5).
 3. **The timelock address is immutable.** `AmpsVault`, `PoolRegistry` and `AmpsHook` take it in their
    constructors and hold it in bytecode. There is no `setTimelock`. Whatever address the constructors are given
    has to make all ~100 bootstrap calls itself, so the bootstrap runs *through* the `TimelockController`, at
@@ -96,13 +100,17 @@ nonces and splitting them would mean re-deriving the same predictions four times
 | — | `script/02_Libraries.s.sol` | the four linked vault libraries (two passes) |
 | `02_Token` + `03_Vault` + `07_Bonds` | `script/03_Core.s.sol` | the timelock, the token, the vault, the hook, the registry, the whole periphery — `AmpsQuoter` and `AmpsRouter` included — and the set-once wiring |
 | `04_MineHook` | `script/04_MineHook.s.sol` | the hook salt; `03_Core` mines the same salt inline, and this stays as the standalone re-check CI runs after every dependency bump |
-| `05_Registry` | `script/05_Registry.s.sol` | the 32 pools and 30 bond markets |
-| — | `script/09_Phase3Wire.s.sol` | the Phase 3 pointer moves and the gate (§5) |
+| `05_Registry` | `script/05_Registry.s.sol` | the 32 feeds (`REGISTRY_FEEDS_ONLY=true`), then the 32 pools and 30 bond markets |
+| — | `script/09_Phase3Wire.s.sol` | the Phase 3 pointer moves (pass 1, `WIRE_DEFER_GATE`) and the gate (pass 2) (§5) |
 | — | `script/10_TestnetPools.s.sol` | mock counter assets + registration, on a test chain only |
-| `06_Genesis` | `script/11_GenesisPlacement.s.sol` | `genesis()` and the §3.3 ladders |
+| `06_Genesis` | `script/06a_GenesisAuction.s.sol` | `genesisMint` and `AmpsGenesis.createAuctions` (§6) |
+| — | `script/06b_GenesisSettle.s.sol` | `AmpsGenesis.settle()` — and the founders'-seed fallback if nothing graduated (§6) |
+| — | `script/11_GenesisPlacement.s.sol` | the §3.3 ladders, after settlement (§6) |
 | — | `script/12_Verify.s.sol` | the Blockscout verification commands |
 
-`03_Vault` and `07_Bonds` are aliases for parts of `03_Core`; `06_Genesis` is an alias for `11_GenesisPlacement`.
+`03_Vault` and `07_Bonds` are aliases for parts of `03_Core`. **`06_Genesis` is `06a_GenesisAuction` now**, not
+`11_GenesisPlacement`: revision 7 split genesis into a mint that opens two auctions and a settlement that opens the
+vault, and `11_GenesisPlacement` only lays the ladders afterwards.
 The file names do not change. **`08_Staking` is gone**: plan revision 6 removed staking from the protocol, so
 there is no `AmpsStaking` to deploy and no `staking` vault pointer to wire. What revision 6 added in its place is
 `AmpsRouter`, deployed by `03_Core` with `(poolManager, amps, registry, weth)`, recorded under `core.router` in
@@ -138,30 +146,53 @@ CORE_PROPOSER_SAFE=$PROPOSER_SAFE AMPS_GUARDIAN=$GUARDIAN_SAFE AMPS_CREATOR=$CRE
 AMPS_TEAM_BENEFICIARY=$TEAM AMPS_SALT=$SALT \
   forge script script/03_Core.s.sol --broadcast --rpc-url $RPC $LIBS
 
-# 4. the 32 pools and 30 bond markets, with the gate pointer still unset (§4)
+# 4. the pointer moves, with the gate deliberately deferred (§5)
+WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false WIRE_DEFER_GATE=true \
+  forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# 5. every feed, and no pool: genesisPlace ends in a checkpoint, and a checkpoint prices WETH9 and USDG (§4)
+REGISTRY_FEEDS_ONLY=true forge script script/05_Registry.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# 6. genesisMint + the two Continuous Clearing Auctions (§6)
+forge script script/06a_GenesisAuction.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# 7. ...the bidding window, ~72 h. Do NOT set the gate pointer during it: settle() is permissionless AND
+#    gated, so a gate pointed now makes anybody's settle() revert GateNotHealthy (§6, genesis-cca.md §5).
+cast call $GENESIS "phase()(uint8)" --rpc-url $RPC        # 1 Bidding -> 2 Ended
+
+# 8. settle: sweep both legs, derive P0, call genesisPlace (§6). Permissionless — the keeper does it too.
+forge script script/06b_GenesisSettle.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# 9. NOW the 32 pools and 30 bond markets, each pool opened at P0 (§4)
 forge script script/05_Registry.s.sol --broadcast --rpc-url $RPC $LIBS
 
-# 5. wait ~30 minutes of blocks for the hub's observation ring (§5)
+# 10. wait ~30 minutes of blocks for the hub's observation ring (§5)
 cast call $HOOK "observationCoverage(bytes32)(uint32)" $HUB_POOL_ID --rpc-url $RPC
 
-# 6. the Phase 3 pointer moves and the gate (§5)
+# 11. the gate (§5), pass 2 of the same script
 WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false \
   forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC $LIBS
 
-# 7. move the founders' $5,000 into the timelock, then genesis and the ladders (§6)
+# 12. the §3.3 ladders (§6). With AMPS_BID_* unset it bids exactly the proceeds the vault holds.
 forge script script/11_GenesisPlacement.s.sol --broadcast --rpc-url $RPC $LIBS
 #    ...wait out the 60-second per-pool cooldown, then run it again for the entry-pool seed bids
 forge script script/11_GenesisPlacement.s.sol --broadcast --rpc-url $RPC $LIBS
 
-# 8. verification (§7)
+# 13. verification (§7)
 forge script script/12_Verify.s.sol --rpc-url $RPC && bash script/config/verify.sh
 
-# 9. hand governance over: minDelay 0 -> 48 h, deployer stops being a proposer (§0.2)
+# 14. hand governance over: minDelay 0 -> 48 h, deployer stops being a proposer (§0.2)
 CORE_STAGE=finalize forge script script/03_Core.s.sol --broadcast --rpc-url $RPC $LIBS
 ```
 
-On a **testnet** replace steps 3–4 with `10_TestnetPools` on either side of `03_Core` (§9), and drop
-`AMPS_GOV_RELAY` if the timelock is simply an EOA you hold.
+On a **testnet** replace the two `05_Registry` runs with `10_TestnetPools` (`REGISTRY_FEEDS_ONLY=true` first, then
+in full after settlement) on either side of `03_Core` (§9), and drop `AMPS_GOV_RELAY` if the timelock is simply an
+EOA you hold.
+
+**The order of steps 4-9 is forced, not preferred.** `06a` needs the `genesis` pointer, so the pointer pass comes
+first; `06b` needs WETH9's and USDG's feeds, so the feeds-only pass comes before it; `05_Registry` in full needs
+`pRefX18() == P0`, so it comes after `06b`; and the gate needs the hub pool, so it comes last. `Registry.installFeeds`
+compares `feedOf(token)` first, so step 9 re-installs nothing step 5 already did.
 
 ---
 
@@ -232,17 +263,36 @@ creation code moves with solc *and* with the library addresses. CI's `hook-addre
 
 ---
 
-## 4. Registering the 32 pools
+## 4. The feeds, then the 32 pools
+
+`05_Registry` runs **twice**, and revision 7 is why: `PoolRegistry` registers a constituent and opens its pool in
+one call, `_openPool` anchors at `AmpsVault.pRefX18()`, and that word does not hold the launch price until
+`AmpsGenesis.settle()` has run. But settlement ends in a checkpoint, and a checkpoint prices every asset the vault
+holds — WETH9 and USDG, the auction proceeds — so their feeds must be installed *before* it. Hence a feeds-only
+pass first and the registration pass after settlement.
 
 ```bash
+# pass A, before the auctions settle: every feed, no pool
+REGISTRY_FEEDS_ONLY=true forge script script/05_Registry.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# pass B, after 06b_GenesisSettle: the pools, each opened at P0
 forge script script/05_Registry.s.sol --broadcast --rpc-url $RPC $LIBS
 ```
 
-`registerEntryPool` for `AMPS/USDG` and `AMPS/WETH`, then `addConstituent` for each of the 30 names in
-`script/config/constituents.json`, then one `setIndexWeights` that installs the launch weight vector, then any
-per-market bond parameter that differs from the contract default. Each `vault.initializePool` passes because
-there is no gate yet. Idempotent: anything already registered is skipped, so a run that dies half way through is
-resumed by running it again. Writes `script/config/pools.json`.
+Pass A calls `Registry.installFeeds` only: all 32 `FeedRegistry` entries and nothing else. `06a` needs the WETH
+feed too, to cross-check the ETH/USD price its proposal carries.
+
+Pass B is the old behaviour: `registerEntryPool` for `AMPS/USDG` and `AMPS/WETH`, then `addConstituent` for each of
+the 30 names in `script/config/constituents.json`, then one `setIndexWeights` that installs the launch weight
+vector, then any per-market bond parameter that differs from the contract default. Each `vault.initializePool`
+passes because there is no gate yet, and each pool opens at `P0` because `pRefX18()` is no longer zero.
+`_installFeed` compares `feedOf(token)` first, so pass B re-installs none of pass A's feeds. Idempotent: anything
+already registered is skipped, so a run that dies half way through is resumed by running it again. Writes
+`script/config/pools.json`.
+
+`REGISTRY_ANCHOR_OVERRIDE` exists for a test chain that wants a specific anchor; on mainnet, leave it unset and let
+`assertAnchor` fail loudly if `pRefX18()` is still zero — that means settlement has not happened and the pools would
+open at $1.00 instead of at the price bidders paid.
 
 In relay mode this is ~97 governed calls and therefore ~194 transactions. `--slow` is worth the time.
 
@@ -267,29 +317,46 @@ cast call $HOOK "observationCoverage(bytes32)(uint32)" $HUB_POOL_ID --rpc-url $R
 
 and wait until it is at least `vault.twapWindow()` (1,800 s at launch).
 
-### Step 4 — the pointer moves, then the gate
+### Step 4 — the pointer moves (pass 1), then the gate (pass 2)
 
 ```bash
 # emit the proposal calldata for the Safe (default)
 forge script script/09_Phase3Wire.s.sol
 
-# or execute it now, at the bootstrap timelock's zero delay
+# pass 1, before the auctions: every pointer EXCEPT the gate
+WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false WIRE_DEFER_GATE=true \
+  forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# pass 2, after 05_Registry and the ring: the gate
 WIRE_DIRECT=true WIRE_REDEPLOY_GATE=false \
   forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $RPC $LIBS
 ```
 
-Eight calls, in this order:
+Nine calls, in this order:
 
-| # | Move | Delay class |
-|---|---|---|
-| 1 | `vault.marketReference → AmpsHook` | 7 d |
-| 2 | `vault.positionValuer → LadderPositionValuer` | 7 d |
-| 3 | `vault.ladderPolicy → LadderPolicy` | 7 d |
-| 4 | `vault.rolloutPolicy → RolloutPolicy` | 7 d |
-| 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 7 d |
-| 6 | `AmpsHook.setRouter(AmpsRouter)` | 7 d |
-| 7 | `AmpsBonds.setPolicy(BondPolicy)` | 7 d |
-| 8 | `vault.oracleGate → OracleGate` | 7 d |
+| # | Move | Pass | Delay class |
+|---|---|---|---|
+| 1 | `vault.marketReference → AmpsHook` | 1 | 7 d |
+| 2 | `vault.positionValuer → LadderPositionValuer` | 1 | 7 d |
+| 3 | `vault.ladderPolicy → LadderPolicy` | 1 | 7 d |
+| 4 | `vault.rolloutPolicy → RolloutPolicy` | 1 | 7 d |
+| 5 | `AmpsHook.setFeePolicy(FeePolicy)` | 1 | 7 d |
+| 6 | `AmpsHook.setRouter(AmpsRouter)` | 1 | 7 d |
+| 7 | `AmpsBonds.setPolicy(BondPolicy)` | 1 | 7 d |
+| 8 | `vault.genesis → AmpsGenesis` | 1 | 7 d |
+| 9 | `vault.oracleGate → OracleGate` | 2 | 7 d |
+
+**Move 8 is revision 7's, and pass 1 exists because of it.** `genesisMint` refuses unless the vault's set-once
+`genesis` pointer is already set, holds code and equals the address the proposal names — so the pointer batch has to
+precede `06a`, while the gate has to follow registration, which now follows settlement. `WIRE_DEFER_GATE=true` is
+that split, and it also switches the run's own assertions to `checkBootstrap(t, 0)`: every pointer check still runs,
+including the new one, and the pool-count and ring-coverage checks are skipped because "no pools yet" is the correct
+state on that pass rather than an unfinished step.
+
+**The gate must not move early.** `settle()` is permissionless *and* takes the vault's health check through
+`genesisPlace`, and at settlement time the hub pool does not exist — so a gate pointed between `06a` and `06b` makes
+every attempt at `settle()` revert `GateNotHealthy(WATCHDOG)` and the launch stalls until a 7-day proposal unpoints
+it. An absent gate is exactly as permissive as a `GREEN` one (`docs/phase2-state-model.md` §7.1).
 
 **Call 6 is revision 6's, and its position in the order is deliberate.** Until it executes, `AmpsHook.router()` is
 the zero address and no hop in any pool can be priced pass-through: every swap, in both directions, pays
@@ -298,12 +365,12 @@ mispriced — so there is no window in which the exemption is granted to somethi
 afterwards with `cast call $HOOK "router()(address)"` against `deployments.json`'s `core.router`; the dApp's Rotate
 surface reads the same pointer and warns if the two disagree.
 
-Moves 1 and 2 are already made by `03_Core`, so on a fresh deployment this run makes 3–8 and skips the rest —
-the script is idempotent per pointer. `WIRE_REDEPLOY_GATE=false` is the flag for a deployment where `03_Core`
-already deployed the gate against `AmpsHook`; `true` deploys a fresh one and re-installs the calendar, which is
-the shape a *later* gate replacement takes. Call 7 goes last, after `checkBootstrap` has confirmed the pools
-exist and the hub ring is covered, and the run ends by asserting `gate.state(0) == GREEN` and recording the gate
-in `deployments.json`.
+Moves 1 and 2 are already made by `03_Core`, so on a fresh deployment pass 1 makes 3–8 and skips the rest — the
+script is idempotent per pointer. `WIRE_REDEPLOY_GATE=false` is the flag for a deployment where `03_Core` already
+deployed the gate against `AmpsHook`; `true` deploys a fresh one and re-installs the calendar, which is the shape a
+*later* gate replacement takes. Call 9 goes last, in pass 2, after `checkBootstrap` has confirmed the pools exist
+and the hub ring is covered, and that pass ends by asserting `gate.state(0) == GREEN` and recording the gate in
+`deployments.json`.
 
 Proposal mode writes `script/config/phase3-proposal.json` with `scheduleBatch` / `executeBatch` calldata for the
 proposer Safe; the gate must be deployed before the batch is scheduled, because call 7 points at it.
@@ -314,35 +381,61 @@ choice, not a safety one. `docs/launch-runbook.md` §9 carries it as a recurring
 
 ---
 
-## 6. Genesis and the §3.3 ladders
+## 6. Genesis: the auctions, the settlement, then the §3.3 ladders
 
-`genesis()` pulls the seed from `msg.sender`, and `msg.sender` is the timelock — so **the founders' $5,000 must be
-sitting in the `TimelockController`** before this runs, not in the deployer's wallet. On mainnet that is a
-transfer the proposer Safe signs (`docs/launch-runbook.md` §2 step 8).
+`genesis()` is gone. Revision 7 splits it in two, with a 72-hour auction between the halves, and the mechanism as
+built is `docs/genesis-cca.md`.
+
+* **`06a_GenesisAuction`** runs `AmpsVault.genesisMint` — 20,000 AMPS minted once, 1,000 to the team's
+  `VestingWallet`, 10,000 to the `AmpsGenesis` adapter, 9,000 retained — and then `AmpsGenesis.createAuctions`,
+  which deploys and funds two Uniswap Continuous Clearing Auctions from `script/config/genesis.json`. Both calls are
+  `onlyTimelock`. Nothing is priced yet: `A` is zero, `initialized` is false, and every path that would divide one
+  by the other reverts `NotInitialized`.
+* **`06b_GenesisSettle`** calls `AmpsGenesis.settle()` once every leg's `endBlock` has passed. It is
+  **permissionless** — the keeper's `settle` job sends the same transaction (`docs/keeper-runbook.md` §1) — and it
+  sweeps both legs, wraps the ether, derives `P0`, and calls `AmpsVault.genesisPlace` inside the same transaction.
+* **`11_GenesisPlacement`** then lays the ladders, in two phases 60 seconds apart.
+
+**Nothing needs to be in the timelock for the normal path** — the auctions supply the backing, and they pay it to
+the adapter rather than to anybody's wallet. The founders' seed ($10,000 USDG + 4 WETH) must be in the
+`TimelockController` **only if neither leg graduates**, because `genesisPlace` pulls from `msg.sender` and on that
+path `msg.sender` is the timelock. `06b` assembles those two governed calls itself (`_fallbackPlace`, `p0X18 = 1e18`).
 
 ```bash
-# phase 1: genesis() plus the ask ladder in all 32 pools
+# the mint and the two auctions
+forge script script/06a_GenesisAuction.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# ...~72 h of bidding, then settle. Anybody may send this.
+forge script script/06b_GenesisSettle.s.sol --broadcast --rpc-url $RPC $LIBS
+
+# ...05_Registry in full (§4 pass B), the ring, 09_Phase3Wire pass 2, and only then:
+
+# phase 1: the ask ladder in all 32 pools
 forge script script/11_GenesisPlacement.s.sol --broadcast --rpc-url $RPC $LIBS
 
 # ...wait out the 60-second per-pool cooldown, then run it again for the entry-pool seed bids
 forge script script/11_GenesisPlacement.s.sol --broadcast --rpc-url $RPC $LIBS
 ```
 
-The script works out which phase is due from chain state (`nextPhase`), so `--resume` is just "run it again";
-`cooldownRemaining` reports the wait, read off the ladder records' own `placedAt`. Everything in this step is a
-governed call: `genesis()` is `onlyTimelock`, and `AmpsVault.place` is
-`msg.sender == timelock || msg.sender == registry` — the `locked` modifier in its signature is not the whole
-guard. So the two approvals, `genesis()` and all 34 placements go through `Gov`. The launch vector:
+The placement script works out which phase is due from chain state (`nextPhase`), so `--resume` is just "run it
+again"; `cooldownRemaining` reports the wait, read off the ladder records' own `placedAt`. `AmpsVault.place` is
+`msg.sender == timelock || msg.sender == registry` — the `locked` modifier in its signature is not the whole guard —
+so all 34 placements go through `Gov`. The launch vector:
 
 | Where | What | Cells |
 |---|---|---|
-| `AMPS/USDG`, `AMPS/WETH` | 1,662.5 AMPS of asks each, 10 doublings, tilt 1.25 | `m = 0..9` |
-| `AMPS/USDG`, `AMPS/WETH` | $2,500 of counter each as seed bids, 4 halvings | `m = -1..-4` |
-| 30 spokes | 47.5 AMPS each (1% of the 4,750 POL tranche) | `m = 0..9` |
+| `AMPS/USDG`, `AMPS/WETH` | 3,150 AMPS of asks each, 10 doublings, tilt 1.25 | `m = 0..9` |
+| `AMPS/USDG`, `AMPS/WETH` | the auction proceeds held in each pool's counter as seed bids, 4 halvings | `m = -1..-4` |
+| 30 spokes | 90 AMPS each (1% of the 9,000 POL tranche) | `m = 0..9` |
 
-3,325 + 1,425 = 4,750 AMPS of POL, 250 to the team's `VestingWallet`, `S0` = 5,000, NAV/share = $1.00. The run
-asserts NAV/share against the launch price and checks the cell layout with `assertLayout`. 328 live cells when
-both phases are done.
+6,300 + 2,700 = 9,000 AMPS of POL, 10,000 sold at auction, 1,000 to the team's `VestingWallet`, `S0` = 20,000, and
+**NAV/share = raised / `S0`** — $0.50 at a full clear at the $1.00 floor, with the premium disclosed rather than
+smoothed. Every ladder is anchored at `P0`. The run asserts the anchor and checks the cell layout with
+`assertLayout`. 328 live cells when both phases are done.
+
+**`11_GenesisPlacement` takes explicit bid sizes from `AMPS_BID_WETH` / `AMPS_BID_USDG`; leave them unset and it
+bids exactly what the vault holds.** Do not use `AMPS_SEED_*` for that — those are `06b`'s fallback seed, and
+pointing the placement at them makes the vault try to bid money it never received.
 
 > **Known deviation from §3.3.** Valuing a freshly placed ask ladder at the reference price picks up a sliver of
 > counter-side value on the cell the price sits in, so each placement lifts NAV/share — about +2 bps across all 32
@@ -389,6 +482,12 @@ Three things the command line has to carry, and all three are why this is genera
    from `foundry.toml`, which is why the commands run from `contracts/` rather than through a web form.
 
 `script/config/verification.json` carries the same data machine-readably, for verifying one contract by hand.
+`AmpsGenesis` is in both, with its six constructor addresses (`vault, amps, factory, weth9, usdg, timelock`).
+
+**What to assert once the run is done** (`12_Verify` prints them, and `docs/launch-runbook.md` §3 has the
+`cast` lines): `S0` = 20,000 AMPS with 1,000 in the team's `VestingWallet`; `AmpsVault.genesis()` equal to the
+deployed adapter; `AmpsVault.pRefX18() == AmpsGenesis.p0X18()` unless the NAV floor bound it; NAV/share equal to
+`AmpsGenesis.raisedUsd18() / S0`; 32 pools, 30 bond markets, `gate.state(0) == GREEN` and 328 live cells.
 
 ---
 
@@ -402,26 +501,34 @@ pnpm --filter @amplestocks/contracts broadcast-test   # the real thing, against 
 python3 ../scripts/licence-gate.py               # no BUSL/AGPL/GPL reachable from src/
 ```
 
-**`test/script/Phase3Scripts.t.sol`** runs `02`, `05`, `09`, `10` and `11` against a local `PoolManager` and
-asserts the state they leave: 32 pools, 30 bond markets, the pointers, the genesis vector and the ladder layout —
-then runs them again and asserts nothing moves. It never broadcasts, which is its limit.
+**`test/script/Phase3Scripts.t.sol`** runs `02`, `05`, `06a`, `06b`, `09`, `10` and `11` against a local
+`PoolManager` and asserts the state they leave, in the order §1 forces: the pointer pass, the feeds-only pass, the
+mint and the auctions, the settlement, the 32 pools at `P0`, the gate, the ladders — then runs them again and asserts
+nothing moves. It never broadcasts, which is its limit.
 
 **`test/script/broadcast.sh`** is the one that broadcasts. It starts an anvil on chain 46630, runs
-`00 → 02 → 10(assets) → 03 → 10(register) → 09 → 11 → 11 → 12` with `--broadcast --slow --private-key <anvil key 0>`
-through a real `TimelockController` in relay mode, advances the chain past `twapWindow` and the placement
-cooldown with `evm_increaseTime`, and then asserts the resulting chain state with `cast`: 32 pools, 30
-constituents, 30 bond markets, every pointer, `gate.state(0) == GREEN`, `S0` = 5,000 AMPS with 250 vesting,
-NAV/share within 1% of $1.00, 328 live cells and the §3.3 layout. Then it runs the entire pipeline a second time
-and asserts that a chain fingerprint (pool count, constituent count, market count, total supply, live cells,
-NAV/share, gate pointer) is byte-identical — except `09_Phase3Wire`, which must refuse with `AlreadyGenesis`.
-Finally it runs `CORE_STAGE=finalize` and checks the timelock ended at 48 h with the deployer no longer a
-proposer and the guardian still a canceller.
+`00 → 02 → 10(assets) → 03 → 10(register) → 09(pointers) → 10(feeds) → 06a → 06b → 09(gate) → 11 → 11 → 12` with
+`--broadcast --slow --private-key <anvil key 0>` through a real `TimelockController` in relay mode, bids both legs
+out at the $1.00 floor from the deployer key, mines past each auction's `endBlock`, advances the chain past
+`twapWindow` and the placement cooldown with `evm_increaseTime`, and then asserts the resulting chain state with
+`cast`: `S0` = 20,000 AMPS with 1,000 vesting, 5,000 in each auction and 9,000 retained; `initialized` false and
+`pRefX18` zero *before* settlement; both legs graduated; `P0` = 999999999999999992 (the Q96 floor is eight wei under
+a dollar and that is the price the auction actually enforces); `A` = $10,000 and NAV/share = $0.50; 32 pools opened at
+`P0`, 30 constituents, 30 bond markets, every pointer, `gate.state(0) == GREEN`, 328 live cells and the §3.3 layout.
+The auction window is compressed for the rehearsal — `AMPS_AUCTION_START_BLOCKS=30`, `AMPS_AUCTION_WINDOW_BLOCKS=60`,
+because 72 h at 100 ms is 2.59M blocks and anvil mines them one at a time — and the founders' fallback seed is funded
+but never used, because both legs graduate. Then it runs the entire pipeline a second time and asserts that a chain
+fingerprint (pool count, constituent count, market count, total supply, live cells, NAV/share, gate pointer) is
+byte-identical, with `06a` and `06b` idempotent no-ops behind their own latches — except `09_Phase3Wire`, which must
+refuse with `AlreadyGenesis`. Finally it runs `CORE_STAGE=finalize` and checks the timelock ended at 48 h with the
+deployer no longer a proposer and the guardian still a canceller.
 
-It needs nothing beyond localhost. Measured on a 4-core runner: **370 s of pipeline** across the eighteen stages
-(the slowest are `03_Core` at 59 s, `11_GenesisPlacement` phase 1 at 48 s and `12_Verify` at 45 s), on top of
-whatever `forge build` costs. Most of the pipeline time is `forge script` recompiling: `--libraries` changes the
-compiler input, so the run pays for three distinct configurations — none, the `VaultPlacementLib` flag alone, and
-all four — and each one re-runs the via-IR compile of `src/vault/*`, `src/bonds/*` and `src/hook/*`. A cold cache
+It needs nothing beyond localhost. Measured on a 4-core runner: **PASSED in 3,373 s across 25 stages** on the
+revision-7 pipeline, on top of whatever `forge build` costs — the two extra genesis stages, the second `09` pass and
+the block mining for the compressed auction window are the difference from the eighteen-stage revision-6 run.
+
+Most of the pipeline time is `forge script` recompiling: `--libraries` changes the compiler input, so the run pays
+for three distinct configurations — none, the `VaultPlacementLib` flag alone, and all four — and each one re-runs the via-IR compile of `src/vault/*`, `src/bonds/*` and `src/hook/*`. A cold cache
 adds twenty minutes or so on top, essentially all of it that compile.
 
 It runs as its own `broadcast-test` job in `.github/workflows/ci.yml`, after Foundry is installed and separately
@@ -443,9 +550,19 @@ TESTNET_ASSETS_ONLY=true forge script script/10_TestnetPools.s.sol --broadcast -
 
 # 2. 03_Core, as in §3
 
-# 3. registration, through the inherited 05_Registry
+# 3. the pointer pass, gate deferred (§5), then the feeds only — 06b needs WETH9's and USDG's feeds
+WIRE_DIRECT=true WIRE_DEFER_GATE=true forge script script/09_Phase3Wire.s.sol --broadcast --rpc-url $TESTNET_RPC $LIBS
+REGISTRY_FEEDS_ONLY=true forge script script/10_TestnetPools.s.sol --broadcast --rpc-url $TESTNET_RPC $LIBS
+
+# 4. 06a, the bidding window, 06b (§6). On a mock chain the window is set in blocks:
+#    AMPS_AUCTION_START_BLOCKS / AMPS_AUCTION_WINDOW_BLOCKS, as test/script/broadcast.sh does.
+
+# 5. registration, through the inherited 05_Registry — now the pools open at P0
 forge script script/10_TestnetPools.s.sol --broadcast --rpc-url $TESTNET_RPC $LIBS
 ```
+
+`10_TestnetPools` inherits `installFeedsOnly` from `05_Registry`, so `REGISTRY_FEEDS_ONLY=true` does the feeds-only
+pass against the mock aggregators and registers nothing.
 
 Idempotent and resumable off `script/config/testnet.json`, asset by asset; it also records the PoolManager, WETH9
 and USDG it settled on into `deployments.json` so `03_Core` picks them up. It refuses to run on any chain but
@@ -487,3 +604,11 @@ it is filled in; `00_Preflight` reports it as `TODO`.
 | `AlreadyGenesis` | `09_Phase3Wire` re-run after genesis | expected; later moves are governance proposals |
 | `PlaceholderAddress` | a constituent still carries a Phase 0 `TODO` | fill in `constituents.json`, or drop the name from this deployment |
 | `CellBudgetExhausted` | more than `MAX_LIVE_CELLS` (512) cells | `docs/phase3-state-model.md` §12 ruling E; the registry cannot carry this many pools at this ladder shape |
+| `AnchorNotSet` | `05_Registry` was run in full before settlement, so `pRefX18()` is still zero | run `06b_GenesisSettle` first; the pools must open at `P0`, and `REGISTRY_FEEDS_ONLY=true` is the pass that legitimately runs earlier |
+| `GenesisNotMinted` | `06b`/`genesisPlace` reached before `06a` | run `06a_GenesisAuction`; the two halves are ordered by a latch, not by convention |
+| `GenesisAlreadyDone` | `06a` or `06b` re-run after it succeeded | expected: both are one-shot and both are no-ops on a second run |
+| `AuctionNotEnded(auction, endBlock)` | `settle()` sent before a leg's `endBlock` | wait for the block; `AmpsGenesis.phase()` reads `Ended` when it is time |
+| `GateNotHealthy` on `settle()` | the gate pointer was set between `06a` and `06b` | §5: unpoint it (a 7-day proposal) or wait for a hub pool that cannot exist yet. Do not set the gate before settlement |
+| `TrancheNotFunded` / `AuctionNotFunded` | `createAuctions` ran before `genesisMint`, or the factory did not take the tranche | check `Amps.balanceOf(AmpsGenesis)` equals 10,000e18 before `createAuctions`; the adapter asserts each auction's balance itself |
+| `EthUsdMismatch` | `AMPS_ETH_USD_X18` disagrees with `FeedRegistry` beyond `refDivergenceBps` | fix the proposal's price, or leave `ethUsdX18` at `0` and let `06a` read the feed |
+| `InvalidSteps` | `usdg.steps`/`eth.steps` do not sum to `1e7` over exactly the window | check the blob offline with `AmpsGenesis.stepsTotals(bytes)` before signing |

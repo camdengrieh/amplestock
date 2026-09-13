@@ -47,24 +47,42 @@ library Constants {
     // Supply and genesis (immutable: `S0` and the split are not governable at all)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice `S0`: the entire genesis supply, minted exactly once. 5,000 AMPS.
-    uint256 internal constant S0 = 5000e18;
+    /// @notice `S0`: the entire genesis supply, minted exactly once. 20,000 AMPS.
+    /// @dev At the $1.00 auction floor that is a $20,000 fully diluted market capitalisation, and a full clear of
+    ///      the auction tranche at the floor raises $10,000, i.e. `NAV/share = raised / S0 = $0.50` under the
+    ///      fully diluted accounting of decision 14. The premium `P0 / NAV - 1` is disclosed, never smoothed.
+    uint256 internal constant S0 = 20_000e18;
 
     /// @notice Team tranche: 5% of `S0` into an OZ `VestingWallet`, 2-month linear, no cliff.
-    uint256 internal constant TEAM_SHARES = 250e18;
+    uint256 internal constant TEAM_SHARES = 1000e18;
 
-    /// @notice Protocol-owned-liquidity tranche: 95% of `S0`, held by the vault as ask inventory.
-    uint256 internal constant POL_SHARES = 4750e18;
+    /// @notice Auction tranche: 50% of `S0`, sold through two Continuous Clearing Auctions at genesis.
+    /// @dev Minted to the `AmpsGenesis` adapter by {IAmpsVault-genesisMint}; whatever does not clear comes back
+    ///      to the vault as inventory at {IAmpsVault-genesisPlace}.
+    uint256 internal constant AUCTION_SHARES = 10_000e18;
+
+    /// @notice The USDG leg of the auction tranche: half of {AUCTION_SHARES}, sold for USDG.
+    uint256 internal constant AUCTION_USDG_SHARES = 5000e18;
+
+    /// @notice The ETH leg of the auction tranche: half of {AUCTION_SHARES}, sold for native ETH and wrapped to
+    ///         WETH9 at settlement.
+    uint256 internal constant AUCTION_ETH_SHARES = 5000e18;
+
+    /// @notice Protocol-owned-liquidity tranche: 45% of `S0`, held by the vault as ask inventory.
+    /// @dev 2,700 of it leaves as the 30 spokes' seed asks (`spokeSeedBps` = 100 bp of this tranche, 90 AMPS
+    ///      each) and 6,300 as the two entry pools' ask ladders (3,150 each), all anchored at the clearing
+    ///      price `P0` rather than at $1.00.
+    uint256 internal constant POL_SHARES = 9000e18;
 
     /// @notice Team vest length: 60 days, linear, no cliff.
     uint32 internal constant TEAM_VEST_SECONDS = 60 * ONE_DAY;
 
     /// @notice The divide-by-zero guard in `navPerShare = (A + 1) / (T + VIRTUAL_SHARES)`. 1e3 wei of AMPS, i.e.
     ///         1e-15 AMPS: enough to make the denominator non-zero in every reachable state (I22) and far too small
-    ///         to matter against a 5,000e18 supply. There is no genesis burn because there is no NAV mint.
+    ///         to matter against a 20,000e18 supply. There is no genesis burn because there is no NAV mint.
     uint256 internal constant VIRTUAL_SHARES = 1e3;
 
-    /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 47.5 AMPS per spoke.
+    /// @notice Seed ask placed in each spoke at genesis, in bps of the POL tranche. 1% == 90 AMPS per spoke.
     uint16 internal constant SPOKE_SEED_BPS_DEFAULT = 100;
 
     /// @notice Lower bound of the governed `spokeSeedBps`.
@@ -535,6 +553,29 @@ library Constants {
     ///      `beforeSwap` by an exact-input sell, blended and rounded up.
     bytes32 internal constant ROTATION_CREDIT_SLOT = keccak256("amplestocks.hook.ROTATION_CREDIT");
 
+    /// @notice Base of the EIP-1153 slots counting how many router pass-through hops one pool has already been
+    ///         priced in **this transaction**: `keccak256(PASS_THROUGH_TOUCHED_SLOT, poolId)`.
+    ///
+    /// @dev **What it bounds: atomic round trips.** `rotate` refuses `hop1 == hop2`, but two `rotate` calls inside
+    ///      one transaction — `rotate(A, B)` then `rotate(B, A)` — rebuild the same round trip out of four
+    ///      pass-through hops. The counter prices the first flagged hop in a pool at `buyFeeBps` and every later
+    ///      one at `ampsFeeBps`, so an atomic wash pays the exit fee on its closing leg while an honest rotation —
+    ///      one hop per pool — is untouched. Transient storage is zero at the start of every transaction by EVM
+    ///      rule, so that bound is per transaction by construction.
+    ///
+    /// @dev **What it does not bound, and why that is the fee model rather than a gap** (audit disposition,
+    ///      2026-09-09). A round trip split across two transactions starts each of them with a cleared counter and
+    ///      therefore pays the pass-through base on all four hops. That is not an evasion of the schedule: the
+    ///      owner's fee model (2026-09-07, reconfirmed 2026-09-08) prices *moving through* the index at the pool
+    ///      fees, so entering and leaving a constituent position through AMPS costs ~35 bp and the round trip is
+    ///      the arithmetic consequence of that price. Closing it would need a block- or time-scoped counter in
+    ///      real storage, which on a 100 ms-block chain with a first-come sequencer only moves the split one block
+    ///      further out while charging every honest rotation an extra cold `SSTORE`. The residual — MEV against
+    ///      the protocol's own ladders at pool-fee cost — is bounded by the placement surge, the outer rail and
+    ///      the placement cooldown, and is recorded in `docs/audits/fix-log.md` for the owner rather than fixed
+    ///      here.
+    bytes32 internal constant PASS_THROUGH_TOUCHED_SLOT = keccak256("amplestocks.hook.PASS_THROUGH_TOUCHED");
+
     /// @notice The `hookData` flag the protocol router puts on both hops of a rotation, and the only thing that
     ///         makes a swap hop *pass-through*: `keccak256("amplestocks.router.ROTATE")`.
     /// @dev A hop is pass-through iff `sender == AmpsHook.router()` **and** `hookData` is exactly these 32 bytes.
@@ -812,13 +853,40 @@ library Constants {
     // Gas reserves on the ungated redemption path (audit fix wave 2, finding 1)
     // -------------------------------------------------------------------------------------------------------------
 
+    /// @notice The smallest counter remainder `compound` will re-ladder as bids: $0.10 at the asset's feed price.
+    ///
+    /// @dev **A placement has to be worth making** (audit fix, 2026-09-09). `compound` is permissionless and one
+    ///      wei of counter fee used to satisfy `placed != 0`, which armed `SURGE_MAX_BPS` and — with the
+    ///      cooldown — pinned a pool's dynamic fee at the cap and its placement path closed for the price of a
+    ///      dust swap once a minute. Below this floor the remainder is simply left as an ERC-6909 claim, where `A`
+    ///      already values it (I5) and the next `compound` rolls it in, so nothing is lost and nothing is armed.
+    ///      $0.10 is two orders of magnitude below the ~$200 of churn the keeper drill puts through the hub and
+    ///      four above the dust a griefer can produce, which is the whole width the threshold has to separate.
+    uint256 internal constant COMPOUND_PLACE_MIN_USD18 = 0.1e18;
+
     /// @notice Gas `VaultRedeemLib.payout` holds back from the ERC-20 payout `unlock` so that the claims-only
     ///         fallback unlock is always affordable.
     /// @dev The redemption floor pays every asset either as an ERC-20 or as an ERC-6909 claim, and the second is
     ///      unblockable: it moves balances inside the PoolManager and touches no token contract. That guarantee is
     ///      only real if the fallback can still be *paid for* after the first attempt has failed, so the first
-    ///      `unlock` is given `gasleft() - REDEEM_PAYOUT_RESERVE_GAS` and never the whole frame. 700,000 is an
-    ///      `unlock` (~3k) plus one `transfer` of an ERC-6909 balance (~5k warm, ~25k cold) for every asset the
-    ///      protocol can register ({MAX_CONSTITUENTS} plus the two entry counters), with room to spare.
-    uint256 internal constant REDEEM_PAYOUT_RESERVE_GAS = 700_000;
+    ///      `unlock` is given `gasleft() - reserve` and never the whole frame.
+    ///
+    /// @dev **The reserve scales with the asset list** (audit fix, 2026-09-09). It used to be a flat 700,000,
+    ///      which was described as covering every registerable asset and did not: one cold ERC-6909 `transfer`
+    ///      costs ~27.5k, so the claims-only unlock needs ~900k at 32 assets and ~1.8M at the 66 the registry
+    ///      admits. The fallback therefore ran out of gas in exactly the case it exists for — a hostile
+    ///      constituent that burns the first attempt's whole allowance — and the structurally ungated redemption
+    ///      reverted. `REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS x tokens.length + REDEEM_PAYOUT_RESERVE_FIXED_GAS`
+    ///      keeps the same claim, honestly, at every list length.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS = 32_000;
+
+    /// @notice The fixed part of the claims-only fallback's gas reserve: the `unlock` itself and the loop around
+    ///         it, independent of how many assets are being paid.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_FIXED_GAS = 60_000;
+
+    /// @notice The smallest frame in which the ERC-20 payout attempt is worth making at all.
+    /// @dev Below `reserve + this`, `payout` skips straight to the claims-only unlock rather than spending the
+    ///      difference on an attempt that cannot finish: a first attempt that runs out mid-way costs the whole
+    ///      difference and pays nobody, while the fallback pays every asset.
+    uint256 internal constant REDEEM_PAYOUT_ATTEMPT_GAS = 200_000;
 }

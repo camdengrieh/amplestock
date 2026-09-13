@@ -214,6 +214,53 @@ contract PlacementHookStub is BaseHook, IMarketReference {
         ampsFeeBps = value;
     }
 
+    /// @notice The dynamic component {quoteFee} reports on top of {ampsFeeBps}, in bps: a surge, in other words.
+    /// @dev The creator's divisor is bounded below by the rate the pool is actually charging, so this is what a
+    ///      test moves to prove the dynamic part is never creator-eligible (audit finding 4).
+    uint16 public dynBps;
+
+    /// @notice The dynamic component {quoteFee} reports on the **buy** direction (`zeroForOne == false`), in bps.
+    /// @dev The real hook's dynamic part is asymmetric — `f_dev` is charged on the deviation-*increasing* side —
+    ///      so above the fair tick a buy is quoted several hundred basis points above a sell. The creator's
+    ///      divisor is applied to both currencies' fees, so it must be bounded below by the larger of the two
+    ///      rates (re-audit finding 3), and this is the knob that makes them differ.
+    uint16 public dynBuyBps;
+
+    /// @notice Sets {dynBps} **and** {dynBuyBps}: the symmetric case, which is what most tests want.
+    function setDynBps(uint16 value) external {
+        dynBps = value;
+        dynBuyBps = value;
+    }
+
+    /// @notice Sets {dynBuyBps} alone, leaving the sell direction where it is.
+    function setDynBuyBps(uint16 value) external {
+        dynBuyBps = value;
+    }
+
+    /// @notice `IAmpsHook.quoteFee`, in the one shape `VaultPlacementLib` asks for: what a sell is charged right
+    ///         now, base plus the clamped dynamic part.
+    /// @dev The real hook's answer depends on the pool's whole cached state; this reports exactly the two numbers
+    ///      the vault's creator-slice divisor reads, which is all of it the placement path touches.
+    function quoteFee(PoolId, bool zeroForOne, bool, uint256, bool)
+        external
+        view
+        returns (uint24 feePips, uint16 baseBps, uint16 dynamicBps, bool refuse)
+    {
+        baseBps = ampsFeeBps;
+        dynamicBps = zeroForOne ? dynBps : dynBuyBps;
+        feePips = (uint24(baseBps) + uint24(dynamicBps)) * 100;
+        refuse = false;
+    }
+
+    /// @notice `IAmpsHook.chargedFeeBps`: the larger of the two directions' total, which is the number the
+    ///         vault's creator divisor is bounded below by (re-audit finding 3).
+    /// @param poolId The pool.
+    /// @return bps The larger of `ampsFeeBps + dynBps` and `ampsFeeBps + dynBuyBps`.
+    function chargedFeeBps(PoolId poolId) external view returns (uint16 bps) {
+        poolId;
+        bps = ampsFeeBps + (dynBps > dynBuyBps ? dynBps : dynBuyBps);
+    }
+
     /// @notice Sets a pool's buy fee, in bps.
     function setBuyFeeBps(PoolId poolId, uint16 value) external {
         _obs[poolId].buyFeeBps = value;

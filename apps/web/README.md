@@ -64,14 +64,13 @@ components/common/   Value, Stat, DegradedNotice, TxButton — the shared vocabu
 hooks/               wagmi read hooks, the write/simulate hook, approvals, the indexer hook
 lib/                 the pure maths and policy: fees, route encoding, auction Q96 maths, bonds,
                      redeem, quoter, theme, geo, terms, copy, config and the indexer client
-lib/abi/             the hand-written ABIs. `cca.ts` is a third-party dependency with no artefact
-                     here; `router.ts`, `hook.ts`, `quoter.ts` and `vault.ts` are temporary and
-                     say so — `@amplestocks/abis` has not been regenerated since revision 6, and
-                     its AmpsVault still exposes staking(), its AmpsQuoter is missing the two
-                     appended pass-through fee legs of PoolQuote (a positional decode, so reading
-                     a revision-6 quote against it shifts every later field), and its AmpsHook has
-                     no router(). When the package regenerates, four imports in lib/contracts.ts
-                     move and these four files go away.
+lib/abi/             two files. `cca.ts` transcribes Uniswap's ContinuousClearingAuction, a
+                     third-party dependency with no Solidity source here, so codegen can never
+                     produce it; `router.ts` re-exports the generated ampsRouterAbi and keeps
+                     routerDeadline beside it. The four temporary transcriptions this list used to
+                     name are gone: @amplestocks/abis was regenerated from the revision-6 and
+                     revision-7 artefacts, so lib/contracts.ts takes ampsVaultAbi, ampsQuoterAbi,
+                     ampsHookAbi, ampsRouterAbi and ampsGenesisAbi from the package itself.
 lib/docs/            the documentation as data: pages, blocks, the figure catalogue and the pure
                      resolver that turns live reads into the strings a page prints
 proxy.ts             the IP half of the geo gate (Next 16's name for middleware)

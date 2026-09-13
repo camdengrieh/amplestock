@@ -36,10 +36,18 @@ export const publicEnv = {
     hook: str(process.env.NEXT_PUBLIC_AMPS_HOOK),
     oracleGate: str(process.env.NEXT_PUBLIC_AMPS_ORACLE_GATE),
     timelock: str(process.env.NEXT_PUBLIC_AMPS_TIMELOCK),
+    /**
+     * `AmpsGenesis`, the genesis adapter. It sits with the protocol contracts rather than with the
+     * auctions below because it is the vault's own set-once `genesis` pointer, it has a generated
+     * ABI, and its errors belong in the decoder — but it is one-shot like the auctions, and once
+     * `settled()` is true nothing on the site reads it except the Auction surface's record of what
+     * the launch decided.
+     */
+    genesis: str(process.env.NEXT_PUBLIC_AMPS_GENESIS),
   },
   /**
    * The genesis Continuous Clearing Auctions. Separate from `addresses` because they are not part
-   * of the running protocol: they exist once, sell the entry-pool tranche, and are then finished.
+   * of the running protocol: they exist once, sell the 10,000-AMPS auction tranche, and are then finished.
    */
   auctions: {
     usdg: str(process.env.NEXT_PUBLIC_AMPS_AUCTION_USDG),

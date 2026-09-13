@@ -10,7 +10,7 @@ import {console} from "forge-std/console.sol";
 /// @title Phase3LaunchShapeTest
 /// @notice The launch shape itself: **32 pools** - the two entry pools and thirty spokes - opened, registered,
 ///         genesis-laddered and then redeemed against, which is the only place the plan's real numbers can be
-///         read rather than extrapolated: the whole 4,750 AMPS POL tranche placed, 328 live grid cells, and one
+///         read rather than extrapolated: the whole 9,000 AMPS POL tranche placed, 328 live grid cells, and one
 ///         `redeemProRata` that has to unwind every one of them inside a single block.
 ///
 /// @dev {Phase3Fixture} is parameterised on {Phase3Fixture-spokeCount} for exactly this. The four-pool shape of
@@ -34,10 +34,10 @@ contract Phase3LaunchShapeTest is Phase3Fixture {
     function test_theLaunchShapeIsThirtyTwoPoolsAndTheWholePolTranche() public view {
         assertEq(allPools().length, 32, "two entry pools and thirty spokes");
         assertEq(amps.totalSupply(), Constants.S0, "S0 minted, and nothing else");
-        assertEq(amps.balanceOf(address(teamVesting)), Constants.TEAM_SHARES, "250 AMPS vesting for the team");
+        assertEq(amps.balanceOf(address(teamVesting)), Constants.TEAM_SHARES, "1,000 AMPS vesting for the team");
 
         uint256 placed = ENTRY_ASK_AMPS * 2 + SPOKE_SEED_AMPS * spokeCount();
-        assertEq(placed, Constants.POL_SHARES, "the ladders account for the whole 4,750 AMPS POL tranche");
+        assertEq(placed, Constants.POL_SHARES, "the ladders account for the whole 9,000 AMPS POL tranche");
 
         uint32 cells = vault.liveCells();
         console.log("live cells at the launch shape", cells, "budget", Constants.MAX_LIVE_CELLS);

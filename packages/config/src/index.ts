@@ -405,33 +405,99 @@ export interface Band<T> {
  */
 export const launchParameters = {
   supply: {
-    /** `S0` — minted once, in the deploy script. 5,000 AMPS, 18 decimals. */
-    s0: 5_000n * WAD,
-    s0Amps: 5_000,
+    /**
+     * `S0` — minted once, by `AmpsVault.genesisMint`. 20,000 AMPS, 18 decimals.
+     *
+     * Revision 7 doubled the supply and split it three ways instead of two, because half of it is
+     * now **sold at auction** rather than retained: the launch price is whatever two Continuous
+     * Clearing Auctions clear at, not a number chosen in advance. `contracts/src/types/Constants.sol`
+     * holds the same three figures as constants and `genesisMint` rejects any other allocation, so
+     * these are a mirror of the bytecode rather than a parameter set.
+     */
+    s0: 20_000n * WAD,
+    s0Amps: 20_000,
     /** 5% to the team under an OZ `VestingWallet`, 2-month linear, no cliff. */
-    teamAmps: 250,
-    teamWei: 250n * WAD,
+    teamAmps: 1_000,
+    teamWei: 1_000n * WAD,
     teamVestSeconds: 60 * DAY,
     teamCliffSeconds: 0,
-    /** 95% protocol-owned liquidity. */
-    polAmps: 4_750,
-    polWei: 4_750n * WAD,
-    /** 1% of the POL tranche seeded as the ask in each of the 30 spokes: 47.5 x 30 = 1,425. */
-    perSpokeSeedAmps: 47.5,
-    perSpokeSeedWei: 475n * 10n ** 17n,
+    /** 50% sold through the two auctions. See {@link launchParameters.auction}. */
+    auctionAmps: 10_000,
+    auctionWei: 10_000n * WAD,
+    /** 45% protocol-owned liquidity, placed after settlement and anchored at the clearing price. */
+    polAmps: 9_000,
+    polWei: 9_000n * WAD,
+    /** 1% of the POL tranche seeded as the ask in each of the 30 spokes: 90 x 30 = 2,700. */
+    perSpokeSeedAmps: 90,
+    perSpokeSeedWei: 90n * WAD,
     spokeCount: 30,
-    spokeSeedTotalAmps: 1_425,
-    /** The remaining 3,325 AMPS, split evenly across the two entry pools. */
-    entryPoolAmpsEach: 1_662.5,
-    entryPoolWeiEach: 16_625n * 10n ** 17n,
-    entryPoolTotalAmps: 3_325,
+    spokeSeedTotalAmps: 2_700,
+    /** The remaining 6,300 AMPS, split evenly across the two entry pools. */
+    entryPoolAmpsEach: 3_150,
+    entryPoolWeiEach: 3_150n * WAD,
+    entryPoolTotalAmps: 6_300,
   },
-  seed: {
-    /** Founders' liquidity, 50/50 (Decision 18). */
-    totalUsd: 5_000,
-    ethUsd: 2_500,
-    usdgUsd: 2_500,
-    /** NAV/share at genesis. Fully diluted: protocol-held inventory counts (Decision 14). */
+  /**
+   * The genesis auction (plan revision 7, `docs/genesis-cca.md`).
+   *
+   * Half of `S0` is sold through **two Uniswap Continuous Clearing Auctions** — one denominated in
+   * USDG, one in native ETH — at a floor of $1.00 per AMPS in each currency. The uniform clearing
+   * price becomes `P0`, the vault's launch reference price, and all 32 pools are opened at it; the
+   * currency raised becomes the vault's backing and the entry pools' bid ladders.
+   *
+   * **The tranche sizes and the floor are not governance parameters.** `AmpsGenesis.createAuctions`
+   * computes the floor itself and refuses any allocation other than the constants, so what a
+   * proposal actually sets is the schedule, the tick spacing, the graduation bar and the validation
+   * hook — `contracts/script/config/genesis.json`, not this file.
+   *
+   * `navPerShareAtFloorUsd` is arithmetic on the two figures above, not a promise: at a full clear
+   * at the floor the auctions raise $10,000 against a fully diluted `S0` of 20,000, so NAV/share
+   * opens at $0.50 and the launch premium is 100%. It is **disclosed, not smoothed** — the vault
+   * keeps 45% of the supply as inventory backed by nothing until it sells, and every ask that fills
+   * at or above `P0` raises the backing.
+   */
+  auction: {
+    /** Both legs together: `Constants.AUCTION_SHARES`. */
+    totalAmps: 10_000,
+    totalWei: 10_000n * WAD,
+    /** `Constants.AUCTION_USDG_SHARES` — sold for USDG. */
+    usdgAmps: 5_000,
+    usdgWei: 5_000n * WAD,
+    /** `Constants.AUCTION_ETH_SHARES` — sold for native ETH, wrapped to WETH9 at settlement. */
+    ethAmps: 5_000,
+    ethWei: 5_000n * WAD,
+    /** $1.00 per AMPS in each currency, computed inside `AmpsGenesis.createAuctions`. */
+    floorPriceUsd: 1.0,
+    legs: 2,
+    mechanism: 'Uniswap Continuous Clearing Auction v2.1.0',
+    /** What a full clear at the floor raises, in USD. */
+    raisedAtFloorUsd: 10_000,
+    /** `raised / S0` at a full clear at the floor, fully diluted (Decision 14). */
+    navPerShareAtFloorUsd: 0.5,
+    /** `P0 / NAV - 1` at a full clear at the floor. Disclosed, never smoothed. */
+    premiumAtFloorBps: 10_000,
+  },
+  /**
+   * The founders' seed, kept **only** as the non-graduation fallback.
+   *
+   * If neither auction reaches its `requiredCurrencyRaised`, bidders refund in full through the
+   * auctions themselves, `AmpsGenesis.settle()` returns the whole tranche to the vault and calls
+   * nothing, and the timelock runs `AmpsVault.genesisPlace` with `p0X18 = 1e18` out of this seed —
+   * the pre-revision-7 launch exactly, pools opening at $1.00. It is scaled to `S0`: $20,000
+   * against 20,000 AMPS is NAV/share $1.00, the same price the floor would have cleared at.
+   *
+   * `contracts/script/config/genesis.json`'s `fallback.seedUsdg` / `fallback.seedWeth` carry the
+   * raw amounts the script approves; these are the human figures behind them.
+   */
+  fallbackSeed: {
+    totalUsd: 20_000,
+    usdgUsd: 10_000,
+    ethUsd: 10_000,
+    /** 10,000 USDG at 6 decimals. */
+    usdgRaw: 10_000_000_000n,
+    /** 4 WETH — $10,000 at the $2,500 ETH the fixtures price it at. */
+    wethWei: 4n * WAD,
+    /** `p0X18` on the fallback path, and therefore NAV/share at a $20,000 seed against `S0`. */
     launchPriceUsd: 1.0,
     entryPools: ['AMPS/WETH', 'AMPS/USDG'],
   },

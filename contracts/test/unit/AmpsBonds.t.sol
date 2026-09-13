@@ -48,8 +48,10 @@ import {Vm} from "forge-std/Vm.sol";
 /// @notice The shared fixture: a real `Amps`, a vault mock that mints and takes custody, the gate, feed registry,
 ///         registry and market marketRef the bond shell reads, one `CONSTITUENT` market on a $180 stock and one
 ///         closed `ENTRY` market on 6-decimal USDG.
-/// @dev Numbers are the confirmed launch parameters: 5,000 AMPS of supply at $1.00 NAV/share, so the per-epoch
-///      capacity is 25 AMPS (50 bp) and the daily cap is 100 AMPS (200 bp).
+/// @dev The supply here is the mock's, not the launch vector's: a round 5,000 AMPS at $1.00 NAV/share, chosen
+///      so the capacity arithmetic reads off the page — 25 AMPS an epoch (50 bp) and 100 AMPS a day (200 bp).
+///      `AmpsBonds` never reads `Constants.S0`; it reads whatever `T` and `A` the vault reports, so revision 7's
+///      20,000-AMPS genesis changes none of these vectors.
 abstract contract BondsFixture is Test {
     Amps internal amps;
     MockAmpsVault internal vaultMock;
