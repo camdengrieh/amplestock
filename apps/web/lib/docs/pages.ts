@@ -29,6 +29,14 @@ export interface DocsPage {
    */
   source: string
   group: DocsGroupId
+  /**
+   * A third-party attribution rendered in the page header, under the lede.
+   *
+   * Only one value so far and it is not decoration: the genesis auction is Uniswap's Continuous
+   * Clearing Auction, MIT-licensed, and a page that explains its mechanism has to say whose code
+   * it is explaining and link to it. See `components/ledger/powered-by-uniswap.tsx`.
+   */
+  attribution?: 'uniswap-cca'
   blocks: readonly Block[]
 }
 
@@ -111,6 +119,7 @@ export const PAGES: readonly DocsPage[] = [
     lede: 'Half the supply was sold at auction, the price it cleared at became the reference price, and every pool was opened at it.',
     source: 'IAmpsGenesis\nIAmpsVault.genesisMint / genesisPlace\nIContinuousClearingAuction\nlib/genesis.ts\nlib/auction.ts',
     group: 'surfaces',
+    attribution: 'uniswap-cca',
     blocks: [
       {
         kind: 'p',
@@ -169,7 +178,24 @@ export const PAGES: readonly DocsPage[] = [
         kind: 'note',
         tone: 'warning',
         title: 'The graduation target is not readable',
-        text: 'The auction keeps the minimum it must raise as an internal immutable and exposes no getter for it. isGraduated() is the only on-chain answer, so the interface shows that and marks the target unavailable rather than printing a number it cannot see.',
+        text: 'The auction keeps the minimum it must raise as an internal immutable and exposes no getter for it. isGraduated() is the only on-chain answer, so the interface shows that and marks the target unavailable rather than printing a number it cannot see. The figure below is what the deployment configured, not what the contract will admit to.',
+      },
+      {kind: 'h', level: 2, text: 'The terms the operator set'},
+      {
+        kind: 'p',
+        text: 'Neither the tranche sizes nor the floor is in this list: AmpsGenesis computes the floor itself and refuses any allocation but the constants. What a proposal actually chooses is the schedule, the grid, the graduation bar and whether there is an on-chain validation hook \u2014 and each of those is in script/config/genesis.json, reviewed and signed off with the file\u2019s commit hash before the auctions are created.',
+      },
+      {
+        kind: 'rows',
+        title: 'Auction parameters',
+        rows: [
+          {label: 'Start delay', figure: 'cfgAuctionStartDelay', hint: 'Between createAuctions and the first issuance block'},
+          {label: 'Bidding window', figure: 'cfgAuctionDuration'},
+          {label: 'Claim delay', figure: 'cfgAuctionClaimDelay', hint: 'Zero: an exited bid can be claimed in the same block'},
+          {label: 'Tick spacing', figure: 'cfgAuctionTickSpacing', hint: 'As a fraction of each leg\u2019s own floor. It keeps the tick book small enough that the auction cannot be griefed into an out-of-gas.'},
+          {label: 'Graduation bar, per leg', figure: 'cfgGraduationPerLeg'},
+          {label: 'Validation hook', figure: 'cfgAuctionValidationHook', hint: 'None. The geo-block on this interface is a front-end control and binds no contract; saying otherwise would be a claim the chain does not support.'},
+        ],
       },
       {kind: 'h', level: 2, text: 'Genesis is two calls, and the auction runs between them'},
       {
@@ -212,6 +238,15 @@ export const PAGES: readonly DocsPage[] = [
         ],
       },
       {
+        kind: 'rows',
+        title: 'At the graduation minimum',
+        rows: [
+          {label: 'Graduation bar, per leg', figure: 'cfgGraduationPerLeg', hint: 'Both legs have to clear it independently; a leg that misses it sells nothing and refunds everybody'},
+          {label: 'NAV per share', figure: 'cfgNavAtGraduation', hint: 'Half the raise, and the same S\u2080 divides it'},
+          {label: 'Premium', figure: 'cfgPremiumAtGraduation', hint: 'Larger than at a full clear, not smaller: a smaller raise against the same supply'},
+        ],
+      },
+      {
         kind: 'note',
         tone: 'warning',
         title: 'The premium is a disclosure, not a discount',
@@ -220,7 +255,7 @@ export const PAGES: readonly DocsPage[] = [
       {kind: 'h', level: 2, text: 'If neither leg graduates'},
       {
         kind: 'p',
-        text: 'Then there is no launch to show. Bidders refund in full through the auctions themselves rather than through Amplestocks; settle() returns the whole tranche to the vault and calls nothing; the vault stays shut and the phase reads Aborted. The founders\u2019 seed survives only for that case: the timelock opens the vault itself at $1.00 with its own money, which is the pre-auction launch exactly, and it is a governed call with a seven-day delay and a visible proposal.',
+        text: 'Then there is no launch to show. Bidders refund in full through the auctions themselves rather than through Amplestocks; settle() returns the whole tranche to the vault as inventory and calls nothing; the vault stays shut and the phase reads Aborted. The founders\u2019 seed survives only for that case: the timelock opens the vault itself at $1.00 with its own money, which is the pre-auction launch exactly. The whole supply then divides a $20,000 seed, so NAV per share is $1.00 as well and the premium on that path is zero. It is a governed call with a seven-day delay and a visible proposal.',
       },
       {
         kind: 'rows',
@@ -229,6 +264,7 @@ export const PAGES: readonly DocsPage[] = [
           {label: 'AmpsGenesis', figure: 'addrGenesis', hint: 'Immutable, ownerless, one-shot: one governed call to create the auctions, one permissionless call to settle them, and no rescue function'},
           {label: 'AmpsVault', figure: 'addrVault', hint: 'Receives the proceeds as backing and the unsold AMPS as inventory'},
           {label: 'Fallback seed', figure: 'cfgFallbackSeed', hint: 'Used only if no leg graduates. It is not spent otherwise.'},
+          {label: 'Fallback launch price', figure: 'cfgFallbackLaunchPrice', hint: 'P\u2080 on that path. The same $20,000 against the same S\u2080, so NAV matches it and the premium is zero.'},
           {label: 'CCALens', figure: 'ccaLens', hint: 'The optional tick-reading helper, at the same address on every chain that has it. This interface does not need it: floorPrice, tickSpacing and nextActiveTickPrice are on the auction itself.'},
         ],
       },

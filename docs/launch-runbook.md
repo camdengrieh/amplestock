@@ -22,11 +22,11 @@ Do not start §2 until all of these are true. They are the plan's Phase 6 exit c
 | 5 | Governance drills in §9 passed on 46630 | drill log |
 | 6 | `00_Preflight` on 4663 reports zero `FAIL` and zero `TODO` | `script/config/preflight-report.json` |
 | 7 | Counsel sign-off on the structure, the geo-block set and discounted issuance through bonds | written |
-| 8 | Written contact with Chainlink Labs and Robinhood chain/BD, including bond-collateral custody | written |
+| 8 | Written contact with Robinhood chain/BD, including bond-collateral custody | written |
 | 9 | Proposer Safe 3/5 and guardian Safe 2/4 deployed on 4663, signers confirmed, hardware keys in hand | Safe addresses |
 | 10 | Deployer key is a fresh hardware key used for nothing else | key ceremony note |
 | 11 | The founders' **fallback** seed ($10,000 USDG + 4 WETH) is in the proposer Safe — used **only** if neither auction graduates | on-chain |
-| 11b | `script/config/genesis.json` reviewed and signed off: the CCA factory address, the 24 h start delay, the 72 h window, both `requiredCurrencyRaised` bars, both tick spacings and the validation hook | written, with the file's commit hash |
+| 11b | `script/config/genesis.json` reviewed and signed off: the CCA factory address, the 24 h start delay, the 72 h window, the two $2,500 graduation bars, both tick spacings and the absent validation hook | written, with the file's commit hash |
 | 12 | `pnpm --filter @amplestocks/contracts broadcast-test` green twice in a row on the launch commit | CI run |
 
 **Stop conditions from Phase 0 still apply.** If modelled fee revenue is below modelled gap LVR + bounty + gas on
@@ -88,13 +88,14 @@ step 11 the genesis latch is closed and the only way back is a migration (§8.11
 `endBlock` and the worst outcome is a launch that does not graduate, which is a refund for every bidder and the
 fallback below.
 
-**If neither leg graduates.** `settle()` still runs, returns the whole tranche to the vault and calls nothing;
-`AmpsGenesis.phase()` reads `Aborted` and bidders refund in full **through the auctions themselves**. Then, and
-only then, the founders' fallback seed is used: the proposer Safe moves $10,000 USDG and 4 WETH into the
-`TimelockController` (`genesisPlace` pulls from `msg.sender`, and that is the timelock) and `06b_GenesisSettle`
-assembles the two governed calls that open the vault at `p0X18 = 1e18` — the pre-revision-7 launch exactly, pools
-at $1.00. It is a 7-day-class proposal with a visible calldata, and the announcement has to say the launch was the
-fallback rather than the auction.
+**If neither leg graduates.** `settle()` still runs, returns the whole tranche to the vault **as inventory** and
+calls nothing; `AmpsGenesis.phase()` reads `Aborted` and bidders refund in full **through the auctions
+themselves**. Then, and only then, the founders' fallback seed is used: the proposer Safe moves $10,000 USDG and
+4 WETH into the `TimelockController` (`genesisPlace` pulls from `msg.sender`, and that is the timelock) and
+`06b_GenesisSettle` assembles the two governed calls that open the vault at `p0X18 = 1e18` — the pre-revision-7
+launch exactly, pools at $1.00. The same $20,000 divides the same `S0`, so NAV/share is $1.00 as well and the
+premium on that path is zero rather than a figure to disclose. It is a 7-day-class proposal with a visible
+calldata, and the announcement has to say the launch was the fallback rather than the auction.
 
 ---
 
@@ -116,6 +117,7 @@ are `Constants.sol` values and `genesisMint` refuses any other allocation. The m
 | → entry pools | 3,150 AMPS each in `AMPS/USDG` and `AMPS/WETH` = 6,300 AMPS |
 | Launch price | **`P0`, the auctions' uniform clearing price** — ≈$1.00 at a clear at the floor. Every pool is opened at it |
 | NAV/share at launch | `raised / S0`, fully diluted (decision 14) = **$0.50 at a full clear at the floor**, and the premium (`P0 / NAV − 1` = 100%) is **disclosed, not smoothed** |
+| At the graduation minimum | 2,500 USDG + $2,500 of ETH = $5,000 raised for 5,000 AMPS, against the same `S0`: NAV/share **$0.25** and the premium **300%** — a smaller raise discloses a *larger* premium, not a smaller one |
 | Seed bids | the auction proceeds themselves — 5,000 USDG and 2 WETH at a full floor clear — as 4 halvings, cells `m = -1..-4`, entry pools only |
 | Founders' fallback seed | $10,000 USDG + 4 WETH, spent **only** if neither leg graduates, opening the vault at $1.00 |
 | Ask ladder | 10 doublings, tilt 1.25, cells `m = 0..9` (`P0` → 1,024·`P0`) |
@@ -148,10 +150,11 @@ environment variable at run time:
 | `startDelayHours` | 24 | Blocks between `createAuctions` and the first issuance block. `AMPS_AUCTION_START_DELAY_HOURS` |
 | `durationHours` | 72 | The bidding window. `AMPS_AUCTION_DURATION_HOURS` |
 | `claimDelayHours` | 0 | Between `endBlock` and claiming. `AMPS_AUCTION_CLAIM_DELAY_HOURS` |
-| `usdg.requiredCurrencyRaised`, `eth.requiredCurrencyRaised` | 1,000 USDG / 0.4 WETH — $1,000 a leg at $2,500 ETH | The graduation bar per leg, in that currency's raw units. A leg that misses it sells nothing and refunds everybody. Review it against the raise the launch actually needs. `AMPS_AUCTION_USDG_REQUIRED`, `AMPS_AUCTION_ETH_REQUIRED` |
+| `usdg.requiredCurrencyRaised` | **2,500 USDG** (`2500000000`) | The USDG leg's graduation bar. A leg that misses it sells nothing and refunds everybody. `AMPS_AUCTION_USDG_REQUIRED` |
+| `eth.requiredUsd18` | **`2500e18`** | The ETH leg's bar **in dollars**; `06a_GenesisAuction` converts it at the ETH/USD feed when `eth.requiredCurrencyRaised` is zero, the same way it derives that leg's floor. `AMPS_AUCTION_ETH_REQUIRED` still overrides with a raw amount |
 | `usdg.tickSpacing`, `eth.tickSpacing` | 1% of that leg's floor | Q96 price granularity. Upstream's minimum is 2; 1% keeps the tick book small enough that the auction cannot be griefed into an out-of-gas |
-| `usdg.validationHook`, `eth.validationHook` | zero | An `IValidationHook` for geo-blocking or an allowlist |
-| `usdg.steps`, `eth.steps` | flat | `[{mps, blocks}]`; must sum to `1e7` over exactly the window. A single `{0,0}` asks `06a` for a flat schedule |
+| `usdg.validationHook`, `eth.validationHook` | zero | An `IValidationHook` for geo-blocking or an allowlist. **Left at zero deliberately**: the dApp's geo-block is a front-end control and a validation hook would claim an on-chain restriction the protocol does not enforce |
+| `usdg.steps`, `eth.steps` | flat, with the increasing tail | `[{mps, blocks}]`; must sum to `1e7` over exactly the window. A single `{0,0}` asks `06a` for the flat schedule |
 | `ethUsdX18` | 0 (read the feed) | The ETH/USD price `06a` carries, cross-checked against `FeedRegistry` within the vault's `refDivergenceBps` |
 | `fallback.seedUsdg`, `fallback.seedWeth` | 10,000 USDG, 4 WETH | The fallback seed only. **Not** `11_GenesisPlacement`'s bid sizes, which are `AMPS_BID_*` |
 

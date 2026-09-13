@@ -155,9 +155,20 @@ export const STATE = {
    * Burn`. Neither `Bond.ampsOut` nor `Redeem.shares` is applied on top — `AmpsBonds` receives its
    * AMPS through `mintVesting`, so a `Bond` always has a `VestingMinted(reason: "bond")` of the
    * same amount beside it, and `redeemProRata` emits `Burn(shares, "redeem")` for the redeemer's
-   * shares as well as `Burn(inventoryBurned, "redeemInventory")` for the vault's slice.
+   * shares. Revision 8 defers the vault's own slice: the released inventory is burned by the
+   * **next** checkpoint as `Burn(amount, "redeemInventory")`, which this same running total
+   * subtracts whenever that arrives.
    */
   supplyEvented: 'amps.supplyFromEvents',
+  /**
+   * Set to 1 by every event that is *allowed* to move NAV/share — `Bond`, `Redeem`, `Placement`,
+   * `Compound`, a pool `Swap`, a feed `AnswerUpdated` — and cleared by each `NavCheckpoint`.
+   *
+   * It exists for exactly one check: `nav-drift`. A checkpoint whose NAV/share is below the
+   * previous one while this flag is clear is the L-1 convergence step, and the flag is the only
+   * way to tell that apart from the ordinary case of the assets having actually moved.
+   */
+  navMoved: 'vault.navMovedSinceCheckpoint',
   inventory: 'vault.inventoryAmps',
   genesisAt: 'vault.genesisAt',
   lastCheckpointBlock: 'vault.lastCheckpointBlock',
@@ -168,6 +179,17 @@ export const STATE = {
    */
   poolIds: 'registry.poolIds',
 } as const
+
+/**
+ * Note that something happened which is allowed to move NAV/share.
+ *
+ * Called from the handlers of every such event. It is deliberately a single flag rather than a
+ * list: `nav-drift` only asks "did anything move the assets or their prices since the last
+ * checkpoint", and a flag answers that without the indexer keeping a per-block ledger of causes.
+ */
+export async function markNavMoved(db: Db, blockNumber: bigint): Promise<void> {
+  await setState(db, STATE.navMoved, 1n, blockNumber)
+}
 
 /**
  * Record an alert and hand it to the sink. Always writes the row first, so a delivery failure never

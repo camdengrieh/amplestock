@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 import {defineConfig, devices} from '@playwright/test'
 
-import {E2E, RPC_URL} from './e2e/addresses'
+import {E2E, INDEXER_URL, RPC_URL} from './e2e/addresses'
 
 /**
  * The smoke run.
@@ -42,7 +42,9 @@ export default defineConfig({
       NEXT_PUBLIC_AMPS_CHAIN_ID: '4663',
       NEXT_PUBLIC_AMPS_RPC_URL: RPC_URL,
       NEXT_PUBLIC_REOWN_PROJECT_ID: '',
-      NEXT_PUBLIC_AMPS_INDEXER_URL: '',
+      // Nothing listens on it; `e2e/harness.ts` answers `/api/genesis` and nothing else, so the run
+      // covers the indexed auction panels and the degraded state of every other indexer panel.
+      NEXT_PUBLIC_AMPS_INDEXER_URL: INDEXER_URL,
       NEXT_PUBLIC_FLAG_ACROSS_ZAP: '1',
       NEXT_PUBLIC_FLAG_TESTNET_BANNER: '1',
       NEXT_PUBLIC_AMPS_TOKEN: E2E.amps,

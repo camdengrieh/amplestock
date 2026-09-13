@@ -63,10 +63,10 @@ export function RedeemPreviewTable({preview}: {preview: RedeemPreview | null}) {
           </div>
         ))}
         <DataRow
-          label="Inventory AMPS burned alongside"
-          note="Released protocol-owned inventory is burned too, so total supply falls by more than you redeem."
+          label="Inventory AMPS released, burned over 24 hours"
+          note="Protocol-owned AMPS the unwind crosses is released rather than burned in this transaction, and it then leaves the supply on a 24-hour linear stream that every checkpoint and every redemption settles. Total supply falls by exactly what you redeem now, and by this over the day that follows."
         >
-          <Value>{formatAmount(preview.inventoryBurned, 18)} AMPS</Value>
+          <Value>{formatAmount(preview.inventoryReleased, 18)} AMPS</Value>
         </DataRow>
       </RowGroup>
     </div>
@@ -101,7 +101,7 @@ export function RedeemSurface() {
     return buildRedeemPreview({
       shares,
       redeemFeeBps,
-      inventoryBurned: data[2],
+      inventoryReleased: data[2],
       tokens: data[0],
       amounts: data[1],
       meta: (token) => ({symbol: symbolForCounter(token), decimals: 18}),
@@ -195,7 +195,7 @@ export function RedeemSurface() {
             <DataRow
               label="Your share of the vault"
               labelClassName="text-[15px] text-dim"
-              note="Total supply falls by more than this: the released inventory AMPS is burned too."
+              note="Total supply falls by exactly this. The inventory AMPS the unwind releases is burned separately, on a 24-hour stream."
             >
               <Value unavailable={totalSupply === undefined || shares === 0n}>
                 {totalSupply !== undefined && shares > 0n ? formatBps(redemptionShareBps(shares, totalSupply)) : null}

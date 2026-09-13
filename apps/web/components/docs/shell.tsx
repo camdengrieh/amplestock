@@ -7,6 +7,7 @@ import * as React from 'react'
 
 import {DocBlock} from './blocks'
 import {Kicker} from '@/components/ledger/primitives'
+import {PoweredByUniswap} from '@/components/ledger/powered-by-uniswap'
 import {Select} from '@/components/ui/select'
 import {useDocsFigures} from '@/hooks/use-docs-figures'
 import {headingId} from '@/lib/docs/blocks'
@@ -62,6 +63,7 @@ export function DocsShell({page}: {page: DocsPage}) {
         <Kicker className="mb-3.5">{page.kicker}</Kicker>
         <h1 className="text-[clamp(34px,4vw,56px)] font-light leading-none tracking-[-0.035em]">{page.title}</h1>
         <p className="mt-5 max-w-[62ch] text-[20px] leading-[1.5] text-dim">{page.lede}</p>
+        {page.attribution === 'uniswap-cca' ? <PoweredByUniswap className="mt-5" /> : null}
         <div role="presentation" className="mb-2 mt-9 h-0.5 bg-ink" />
 
         {page.blocks.map((block, i) => (

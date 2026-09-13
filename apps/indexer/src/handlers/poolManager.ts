@@ -30,7 +30,7 @@ import {ampsToUsd18, realisedLvrAmps} from '../lib/flywheel'
 import {decodeSwapFee} from '../lib/fee'
 import {cellKey, creditKey, dayKey, dayStart, eventId, poolKey} from '../lib/ids'
 import {amountsForLiquidity, clampInt, priceX18FromSqrt, to18} from '../lib/math'
-import {STATE, getState, updateFlywheelDay, updateSummary, type Db} from '../lib/store'
+import {STATE, getState, markNavMoved, updateFlywheelDay, updateSummary, type Db} from '../lib/store'
 import {jsonRecord} from '../lib/json'
 
 /** `ampsFeeBps` at launch (`Constants.AMPS_FEE_BPS_DEFAULT`), used until the hook tells us otherwise. */
@@ -177,6 +177,9 @@ ponder.on('PoolManager:Swap', async ({event, context}) => {
   const id = poolKey(event.args.id)
   const pool = await context.db.find(schema.pool, {id})
   if (pool === null) return
+  // A swap in one of our own pools moves what the vault's positions decompose into, so a NAV fall
+  // after it has an explanation and is not the `nav-drift` case.
+  await markNavMoved(context.db, event.block.number)
 
   const ampsFeeBps = clampInt((await getState(context.db, STATE.ampsFeeBps)) ?? BigInt(AMPS_FEE_BPS_DEFAULT))
   const pRefX18 = (await getState(context.db, STATE.pRefX18)) ?? 0n

@@ -23,6 +23,7 @@ import {decodeBytes32String} from '../lib/bytes32'
 import {eventId} from '../lib/ids'
 import {changeBps} from '../lib/math'
 import {recordParameter} from '../lib/parameters'
+import {markNavMoved} from '../lib/store'
 
 const tokenKey = (token: `0x${string}`) => token.toLowerCase() as `0x${string}`
 
@@ -139,6 +140,8 @@ ponder.on('FeedRegistry:FeedRegistryParameterChanged', async ({event, context}) 
 })
 
 ponder.on('ChainlinkAggregator:AnswerUpdated', async ({event, context}) => {
+  // A new answer reprices the basket, so the next checkpoint's NAV move is explained.
+  await markNavMoved(context.db, event.block.number)
   await context.db.insert(schema.feedAnswer).values({
     id: eventId(event.block.number, event.log.logIndex),
     blockNumber: event.block.number,

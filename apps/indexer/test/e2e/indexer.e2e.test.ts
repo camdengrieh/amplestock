@@ -415,10 +415,11 @@ describe.skipIf(!enabled)('the indexer over a real chain', () => {
     expect(BigInt(compound.workValueUsd18 as string)).toBeGreaterThan(0n)
   })
 
-  it('counts the redemption as two burns and never twice', async () => {
-    // `redeemProRata` emits `Burn(shares, "redeem")` beside `Burn(inventoryBurned,
-    // "redeemInventory")`, so summing the `Burn` events *is* the supply reduction. `Redeem` no
-    // longer moves the supply itself, and the reconciliation above is what proves it: the
+  it('counts the redemption as burns and never twice', async () => {
+    // `redeemProRata` emits `Burn(shares, "redeem")`, and revision 8 defers the vault's own slice:
+    // the released inventory is burned by the *next* checkpoint as `Burn(amount,
+    // "redeemInventory")`. Either way, summing the `Burn` events *is* the supply reduction —
+    // `Redeem` never moves the supply itself, and the reconciliation above is what proves it: the
     // event-derived supply matches `Amps.totalSupply()` at every checkpoint.
     const burns = (await indexer.get('/api/burns')) as {burns: Json[]; total: string}
     const reasons = burns.burns.map((b) => b.reason as string)
