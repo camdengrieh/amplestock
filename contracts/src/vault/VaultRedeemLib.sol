@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IAmps} from "../interfaces/IAmps.sol";
 import {IAmpsVault} from "../interfaces/IAmpsVault.sol";
 import {PoolStateLib} from "../lib/PoolStateLib.sol";
 import {Constants} from "../types/Constants.sol";
@@ -28,9 +29,11 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 ///      §7), and the I14 bytecode/`vm.accesses` proof has to follow the link. A library that the redemption path
 ///      reaches must therefore contain **no** reference to the oracle gate, the feed registry, the pool registry,
 ///      the guardian, the standby vault, a freeze timestamp, a pause flag or any price — and this one does not.
-///      It imports four things: the PoolManager interface, v4's own maths, `PoolStateLib` (which reads the
-///      PoolManager and nothing else) and `Constants`. There is no `IOracleGate`, no `IFeedRegistry`, no
-///      `IPoolRegistry` and no `IMarketReference` import in this file, by construction, and
+///      It imports five things: the PoolManager interface, v4's own maths, `PoolStateLib` (which reads the
+///      PoolManager and nothing else), `Constants`, and `IAmps` — the share token itself, for the inventory-burn
+///      stream's `burn`, which is the same call the redemption already makes for the redeemer's own shares. There
+///      is no `IOracleGate`, no `IFeedRegistry`, no `IPoolRegistry` and no `IMarketReference` import in this file,
+///      by construction, and
 ///      `test/unit/GuardSymmetry.t.sol` asserts the storage-level consequence: no slot holding one of those
 ///      pointers is read during a redemption, in the vault **or** in any library it delegate-calls.
 ///
@@ -168,6 +171,262 @@ library VaultRedeemLib {
     }
 
     // -------------------------------------------------------------------------------------------------------------
+    // The inventory-burn stream (§12.3 ruling U, resolved 2026-09-13)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // **What this replaces.** `redeemProRata` used to burn the inventory it released — the ladder AMPS the unwind
+    // freed plus `floor(inventory x shares / T)` — in the same transaction, immediately after paying the redeemer.
+    // The burn lowers `T`, and `T` is the denominator the *next* redemption divides by, so a holder who split one
+    // exit into slices was dividing by a number its own earlier slices had shrunk: 300 AMPS taken in 60 slices
+    // returned ~2.9% more than the same 300 taken at once, monotone in the split count (ruling U).
+    //
+    // **Why "defer it to the next checkpoint" was not the fix.** `checkpoint()` is permissionless and unpaid, by
+    // design — the whole protocol depends on anyone being able to refresh NAV. A redeemer could therefore call it
+    // between slices and get the identical lift one transaction later.
+    //
+    // **The stream.** The amount is queued instead, and released linearly over
+    // `Constants.REDEEM_BURN_STREAM_SECONDS`. Every path that recomputes NAV settles the accrued portion first
+    // (`AmpsVault._checkpoint`), and so does a redemption, so the burn still lands — it simply cannot land inside
+    // the sequence that earned it. Two consequences are the point of the design: slices inside one block see
+    // `elapsed == 0` and therefore no lift at all, and a slice a day later has already paid the fee on every
+    // earlier slice. The remaining difference between one shot and n slices is the redemption fee's own
+    // arithmetic, which is a few basis points and favours nobody in particular.
+    //
+    // The three values live at hashed slots beside {LIVE_CELLS_SLOT}, for the same reason: §1.1's numbered layout
+    // ends at slot 20, `test/unit/VaultLayout.t.sol` asserts that slots 21 upward stay empty, and state written on
+    // the redemption path has to keep that true. They are here rather than in `VaultPlacementLib` because the
+    // redemption path must reach them without touching anything gated.
+    //
+    // **The schedule is one straight line, whatever the settle frequency.** `windowStart` is the opening of the
+    // current window and `windowStart + D` is the instant the queue is fully burned; `lastSettle` is where the
+    // line was last evaluated. A settlement takes `pending x (now - lastSettle) / (end - lastSettle)` — the
+    // remaining amount over the remaining time — so settling hourly for 24 hours burns exactly what settling once
+    // at the end burns, and a keeper cannot slow the burn down by calling it often. Queueing more restarts the
+    // window for the *combined* amount rather than stacking a second schedule, which is what keeps these three
+    // numbers enough to describe the whole state.
+
+    /// @dev `keccak256("amplestocks.vault.pendingInventoryBurn")` — AMPS wei queued for the stream and not yet
+    ///      burned.
+    uint256 internal constant PENDING_BURN_SLOT = uint256(keccak256("amplestocks.vault.pendingInventoryBurn"));
+
+    /// @dev `keccak256("amplestocks.vault.burnStreamStart")` — the timestamp the current window opened at. Only a
+    ///      queue moves it; a settlement does not, so `burnStreamStart() + REDEEM_BURN_STREAM_SECONDS` is the
+    ///      instant the pending amount is fully burned and the dApp can show it as a deadline.
+    uint256 internal constant BURN_STREAM_START_SLOT = uint256(keccak256("amplestocks.vault.burnStreamStart"));
+
+    /// @dev `keccak256("amplestocks.vault.burnStreamLastSettle")` — where the line was last evaluated. Both a
+    ///      queue and a settlement move it.
+    uint256 internal constant BURN_STREAM_LAST_SETTLE_SLOT =
+        uint256(keccak256("amplestocks.vault.burnStreamLastSettle"));
+
+    /// @notice AMPS wei queued by redemptions and not yet burned.
+    /// @return amount The pending amount.
+    function pendingInventoryBurn() internal view returns (uint256 amount) {
+        uint256 slot = PENDING_BURN_SLOT;
+        assembly ("memory-safe") {
+            amount := sload(slot)
+        }
+    }
+
+    /// @notice When the current stream window opened. Zero before the first redemption.
+    /// @dev The pending amount is fully burned at `burnStreamStart() + Constants.REDEEM_BURN_STREAM_SECONDS`.
+    /// @return openedAt The window's opening.
+    function burnStreamStart() internal view returns (uint256 openedAt) {
+        uint256 slot = BURN_STREAM_START_SLOT;
+        assembly ("memory-safe") {
+            openedAt := sload(slot)
+        }
+    }
+
+    /// @notice When the stream was last evaluated — by a settlement or by a queue.
+    /// @return settledAt The last settlement.
+    function burnStreamLastSettle() internal view returns (uint256 settledAt) {
+        uint256 slot = BURN_STREAM_LAST_SETTLE_SLOT;
+        assembly ("memory-safe") {
+            settledAt := sload(slot)
+        }
+    }
+
+    /// @notice What {settleBurnStream} would burn if it ran right now.
+    ///
+    /// @dev `due = now >= end ? pending : pending x (now - lastSettle) / (end - lastSettle)`, with
+    ///      `end = windowStart + REDEEM_BURN_STREAM_SECONDS`, capped at the vault's idle AMPS balance.
+    ///
+    /// @dev **Why "remaining over remaining" rather than `pending x elapsed / D`.** The naive form restarts the
+    ///      clock on every settlement, which turns a linear stream into a geometric decay: settled hourly it
+    ///      retires ~63% of the amount in a day instead of all of it, and the residue never quite reaches zero.
+    ///      Taking the remaining amount over the remaining time puts every settlement back on the same straight
+    ///      line to `end`, so the burn completes on schedule however often it is settled — and a caller who
+    ///      settles more often cannot slow it down, which matters because `checkpoint()` is permissionless.
+    ///
+    /// @dev The idle cap is what makes the stream safe against the one state it cannot control: the vault's AMPS
+    ///      inventory is spendable — `place` commits it to ladders — so the queue can outrun the balance. Capping
+    ///      at the balance means the stream burns what it can and keeps owing the rest, which
+    ///      {pendingInventoryBurn} still reports and which the next settlement retires as inventory comes back
+    ///      (a compound's buyback, a bond, the next rollout). Excluding the queue from `VaultPlacementLib`'s own
+    ///      inventory bound would stop the shortfall arising at all; it was measured at 76 B against that
+    ///      library's 67 B of EIP-170 headroom and does not fit, so the shortfall is carried here instead.
+    /// @param amps The AMPS token.
+    /// @return due The amount a settlement would burn.
+    function burnStreamDue(address amps) public view returns (uint256 due) {
+        uint256 pending = pendingInventoryBurn();
+        if (pending == 0) return 0;
+
+        uint256 end = burnStreamStart() + Constants.REDEEM_BURN_STREAM_SECONDS;
+        if (block.timestamp >= end) {
+            due = pending;
+        } else {
+            uint256 lastSettle = burnStreamLastSettle();
+            // `lastSettle <= now < end` always: both are written to `block.timestamp` and `end` is in the future.
+            due = FullMath.mulDiv(pending, block.timestamp - lastSettle, end - lastSettle);
+        }
+
+        uint256 idle = IERC20(amps).balanceOf(address(this));
+        if (due > idle) due = idle;
+    }
+
+    /// @notice Burns the accrued portion of the stream and records the settlement.
+    ///
+    /// @dev Called first thing by `AmpsVault._checkpoint` — so every compound, bond, placement, genesis step and
+    ///      permissionless `checkpoint()` drains it — and first thing by `AmpsVault.redeemProRata`, so a redemption
+    ///      is measured against a supply the stream has already been settled into. It is a no-op when nothing is
+    ///      pending, which is the state the protocol is in except in the day after a redemption.
+    ///
+    /// @dev Reads and writes three hashed slots and the AMPS balance, and calls `IAmps.burn`, which the ungated
+    ///      path already does for the redeemer's own shares. No gate, no registry, no feed, no price:
+    ///      `GuardSymmetry`'s step-4 storage proof is untouched.
+    ///
+    /// @dev **`burnStreamStart` is not touched here.** The window's deadline is a property of the queue, not of
+    ///      who happened to settle it, so a settlement moves only `lastSettle` and the schedule stays the same
+    ///      straight line to `burnStreamStart() + REDEEM_BURN_STREAM_SECONDS`.
+    /// @param amps The AMPS token.
+    /// @return burned The amount actually burned, which is zero whenever the vault holds no idle AMPS.
+    function settleBurnStream(address amps) public returns (uint256 burned) {
+        uint256 pending = pendingInventoryBurn();
+        if (pending == 0) return 0;
+
+        burned = burnStreamDue(amps);
+        _setBurnStreamLastSettle(block.timestamp);
+        if (burned == 0) return 0;
+
+        // `pending` falls by what was *burned*, never by what was merely due: an amount the idle balance could not
+        // cover is still owed, so `pendingInventoryBurn() == queued - drained` holds at every instant
+        // (`invariant_r8_pendingBurnIsQueuedMinusDrained`).
+        _setPendingInventoryBurn(pending - burned);
+        IAmps(amps).burn(address(this), burned);
+        emit IAmpsVault.Burn(burned, bytes32("redeemInventory"));
+    }
+
+    /// @notice Settles the stream and returns the supply that is left, in one call.
+    ///
+    /// @dev `AmpsVault.redeemProRata` needs exactly this pair and nothing else — settle, then read `T` — and
+    ///      fusing them here rather than making the vault do both keeps two external calls out of a contract that
+    ///      has 168 B of EIP-170 headroom. The ordering is the point: `T` must be read *after* the settlement, so
+    ///      that a redemption divides by the supply the burn has already left behind and `previewRedeem` (which
+    ///      settles the same amount in arithmetic) cannot drift from it.
+    /// @param amps The AMPS token.
+    /// @return supply `T` after the settlement.
+    function settleAndSupply(address amps) public returns (uint256 supply) {
+        settleBurnStream(amps);
+        return IERC20(amps).totalSupply();
+    }
+
+    /// @notice The whole of `AmpsVault.previewRedeem`, in one call.
+    ///
+    /// @dev **Why the vault does not assemble this itself.** The preview is four steps — settle the stream in
+    ///      arithmetic, read `T`, walk the ladder, run the pro-rata — and each one made from `AmpsVault` is an
+    ///      external call with its own calldata encoding. Reached from here they are internal jumps inside one
+    ///      library, which costs the vault one call instead of four and buys back the EIP-170 headroom revision 8
+    ///      spent on the stream.
+    ///
+    /// @dev **`shares` is clamped to the post-settlement supply.** The mutating path gets that bound for free — a
+    ///      redeemer can never hold more than `T`, and the settlement runs before any balance is touched — but a
+    ///      view has no such bound, and `previewRedeem(totalSupply())`, which the solvency property GL-22 asks for,
+    ///      would otherwise divide by a smaller number than it multiplies by and report a payout larger than the
+    ///      vault can free.
+    ///
+    /// @dev The amount the settlement would burn is passed as `addedAmps`, which is the one term {redemption}
+    ///      nets out of the AMPS inventory before taking the pro-rata slice — exactly the state the mutating path
+    ///      will be in when it runs the same arithmetic one line later.
+    /// @param ladder The vault's per-pool placement records.
+    /// @param pools The vault's own `PoolKey` list.
+    /// @param assetIndex The vault's 1-based asset index.
+    /// @param assets The vault's registered non-AMPS assets, in registration order.
+    /// @param poolManager The Uniswap v4 PoolManager.
+    /// @param amps The AMPS token.
+    /// @param shares The AMPS wei being previewed.
+    /// @param redeemFeeBps The redemption fee, in bps.
+    /// @return result The token list, the net amounts, the claim/idle split of each and the inventory released.
+    function preview(
+        mapping(PoolId => PlacementRecord[]) storage ladder,
+        PoolKey[] storage pools,
+        mapping(address => uint256) storage assetIndex,
+        address[] storage assets,
+        address poolManager,
+        address amps,
+        uint256 shares,
+        uint16 redeemFeeBps
+    ) public view returns (Redemption memory result) {
+        uint256 due = burnStreamDue(amps);
+        uint256 supply = IERC20(amps).totalSupply() - due;
+        if (shares > supply) shares = supply;
+
+        (uint256[] memory released, uint256 releasedAmps) =
+            previewUnwind(ladder, pools, assetIndex, assets.length, poolManager, shares, supply);
+        result = redemption(
+            assets, poolManager, amps, shares, supply, redeemFeeBps, released, new uint256[](0), releasedAmps, due
+        );
+    }
+
+    /// @notice Queues `amount` into the stream, settling whatever had accrued first and restarting the window for
+    ///         the combined amount.
+    ///
+    /// @dev The settle-first ordering is what makes the queue safe to call from anywhere: restarting the window
+    ///      with an unsettled balance still in it would push an already-accrued burn back out, and a redeemer who
+    ///      redeemed once an hour could keep the stream permanently at zero elapsed.
+    ///
+    /// @dev A new queue **restarts one window for the whole pending amount** rather than stacking a second
+    ///      schedule beside the first. Three slots cannot describe two schedules, and a per-queue schedule would
+    ///      need unbounded state on the one path that must stay bounded. The cost is that a later redemption
+    ///      re-dates the earlier one's remainder by at most one window; the benefit is that
+    ///      `burnStreamStart() + D` is always the instant the whole queue is gone, which is the figure the dApp
+    ///      shows and the only one a holder needs.
+    /// @param amps The AMPS token.
+    /// @param amount The AMPS wei to queue.
+    /// @return burned What the settlement that preceded the queue burned.
+    function queueInventoryBurn(address amps, uint256 amount) public returns (uint256 burned) {
+        burned = settleBurnStream(amps);
+        if (amount == 0) return burned;
+        _setPendingInventoryBurn(pendingInventoryBurn() + amount);
+        _setBurnStreamStart(block.timestamp);
+        _setBurnStreamLastSettle(block.timestamp);
+    }
+
+    /// @dev Writes the pending amount.
+    function _setPendingInventoryBurn(uint256 value) private {
+        uint256 slot = PENDING_BURN_SLOT;
+        assembly ("memory-safe") {
+            sstore(slot, value)
+        }
+    }
+
+    /// @dev Writes the window's opening.
+    function _setBurnStreamStart(uint256 value) private {
+        uint256 slot = BURN_STREAM_START_SLOT;
+        assembly ("memory-safe") {
+            sstore(slot, value)
+        }
+    }
+
+    /// @dev Writes the last settlement.
+    function _setBurnStreamLastSettle(uint256 value) private {
+        uint256 slot = BURN_STREAM_LAST_SETTLE_SLOT;
+        assembly ("memory-safe") {
+            sstore(slot, value)
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
     // Types
     // -------------------------------------------------------------------------------------------------------------
 
@@ -177,13 +436,14 @@ library VaultRedeemLib {
     /// @param amounts The net amount of each, after `redeemFeeBps`.
     /// @param fromClaims The part of each payout taken out of the vault's ERC-6909 claims.
     /// @param fromIdle The part of each payout taken out of an idle ERC-20 balance.
-    /// @param inventoryBurned AMPS wei released from the vault's own inventory and burned.
+    /// @param inventoryReleased AMPS wei released from the vault's own inventory, queued into the burn stream
+    ///        rather than burned in the redemption's own transaction (ruling U; {queueInventoryBurn}).
     struct Redemption {
         address[] tokens;
         uint256[] amounts;
         uint256[] fromClaims;
         uint256[] fromIdle;
-        uint256 inventoryBurned;
+        uint256 inventoryReleased;
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -393,8 +653,9 @@ library VaultRedeemLib {
     ///
     /// @dev **The reserve is sized per asset** (audit fix, 2026-09-09). It used to be a flat 700,000 whose own
     ///      NatSpec claimed it covered "every asset the protocol can register", and it did not: the claims-only
-    ///      unlock does one ERC-6909 `transfer` per asset at ~27.5k cold, so it needs ~900k at 32 assets and
-    ///      ~1.8M at 66. The fallback therefore ran out of gas in precisely the case it exists for — a hostile
+    ///      unlock does one ERC-6909 `transfer` per asset at ~27.5k cold, so it needs ~900k at 32 assets and about
+    ///      27.5k x `Constants.MAX_COLLATERALS` at the registry's ceiling (~1.8M when that ceiling was 66, ~1.0M at
+    ///      the measured cap of 36). The fallback therefore ran out of gas in precisely the case it exists for — a hostile
     ///      constituent that burns the first attempt — and the *structurally ungated* redemption reverted, which
     ///      is the one outcome the whole three-fallback design is built to make impossible. The reserve is now
     ///      `REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS x tokens.length + REDEEM_PAYOUT_RESERVE_FIXED_GAS`, and when the
@@ -569,16 +830,21 @@ library VaultRedeemLib {
     ///      `floor(L x shares / supply)` of its liquidity.
     ///
     /// @dev **The vault's own AMPS inventory does not take `keepBps`, and the NatSpec used to say it did** (audit
-    ///      lead, 2026-09-09). The burn is
+    ///      lead, 2026-09-09). The figure is
     ///      ```
-    ///      inventoryBurned = floor(inventory x shares / supply) + releasedAmps
+    ///      inventoryReleased = floor(inventory x shares / supply) + releasedAmps
     ///      ```
-    ///      with **no** `(BPS - redeemFeeBps)` factor: the whole pro-rata slice is burned rather than
+    ///      with **no** `(BPS - redeemFeeBps)` factor: the whole pro-rata slice is released rather than
     ///      `keepBps` of it. That is deliberate and it is the protocol-favourable direction — the fee on a
     ///      redemption is value the *remaining* holders keep, and inventory AMPS is worth zero in `A` by I5, so
-    ///      burning the larger number lowers `T` and raises NAV per share for them instead of leaving a retained
+    ///      retiring the larger number lowers `T` and raises NAV per share for them instead of leaving a retained
     ///      slice in a place where it is not counted. `previewRedeem` computes the identical expression, so the
     ///      preview and the payout still agree to the wei; only the sentence describing them was wrong.
+    ///
+    /// @dev **The figure is queued, not burned** (revision 8, ruling U). The arithmetic above is unchanged; what
+    ///      changed is what `AmpsVault.redeemProRata` does with the answer. It calls {queueInventoryBurn} instead
+    ///      of `IAmps.burn`, so `T` does not move inside the redeeming transaction and a split exit cannot divide
+    ///      by a denominator its own earlier slices shrank. See the stream section above.
     ///
     /// @dev Reads balances only: no oracle, no gate, no registry, no price.
     ///
@@ -594,7 +860,10 @@ library VaultRedeemLib {
     ///        balances are already the pre-unwind ones and nothing is netted.
     /// @param releasedAmps Position principal freed on the AMPS side.
     /// @param addedAmps Everything the unwind added to the vault's AMPS holdings, principal plus realised fees.
-    /// @return result The token list, the net amounts, the claim/idle split of each and the inventory burn.
+    ///        `previewRedeem` passes the amount the stream is about to burn here instead, for the same reason: it
+    ///        is AMPS the pro-rata base must not see, because the mutating path will have retired it before this
+    ///        arithmetic runs.
+    /// @return result The token list, the net amounts, the claim/idle split of each and the inventory released.
     function redemption(
         address[] storage assets,
         address poolManager,
@@ -628,7 +897,7 @@ library VaultRedeemLib {
         uint256 inventory = IERC20(amps).balanceOf(address(this))
             + IPoolManager(poolManager).balanceOf(address(this), Currency.wrap(amps).toId());
         if (addedAmps != 0) inventory = inventory > addedAmps ? inventory - addedAmps : 0;
-        result.inventoryBurned = FullMath.mulDiv(inventory, shares, supply) + releasedAmps;
+        result.inventoryReleased = FullMath.mulDiv(inventory, shares, supply) + releasedAmps;
     }
 
     /// @dev One asset's slice of a redemption.
@@ -794,9 +1063,10 @@ library VaultRedeemLib {
 
         subLiveCells(closed);
 
-        // §12 ruling F. The whole AMPS claim becomes an idle ERC-20 balance so {redemption}'s pro-rata slice of
-        // the vault's inventory can actually be burned; the slice itself is `floor(inventory x shares / T)`, not
-        // the claim, so a dust redemption still burns dust.
+        // §12 ruling F. The whole AMPS claim becomes an idle ERC-20 balance so that {redemption}'s pro-rata slice
+        // of the vault's inventory is something the burn stream can actually retire — {settleBurnStream} burns an
+        // ERC-20 balance and cannot burn a claim. The slice itself is `floor(inventory x shares / T)`, not the
+        // claim, so a dust redemption still queues dust.
         uint256 ampsClaim = pm.balanceOf(address(this), Currency.wrap(amps).toId());
         if (ampsClaim != 0) {
             pm.burn(address(this), Currency.wrap(amps).toId(), ampsClaim);

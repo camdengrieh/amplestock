@@ -29,8 +29,13 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
     uint256 public mintedVesting;
     /// @notice AMPS wei burned from redeemers.
     uint256 public burnedShares;
-    /// @notice AMPS wei burned from the vault's released inventory.
+    /// @notice AMPS wei the **inventory-burn stream has actually retired**, which is what `totalSupply` has
+    ///         already moved by. It is derived from the stream's own state rather than from the preview, because
+    ///         since revision 8 (ruling U) a redemption queues its release and the burn lands over the next 24
+    ///         hours: `drained = pendingBefore + released - pendingAfter` across every action that can settle.
     uint256 public burnedInventory;
+    /// @notice AMPS wei redemptions have queued into the stream, settled or not.
+    uint256 public queuedInventory;
     /// @notice Set the moment any action lowers NAV/share (I8).
     bool public navEverFell;
     /// @notice How many actions actually did something, so the invariants can prove the run was not empty.
@@ -83,13 +88,13 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         uint256 amount = bound(shares, 1, balance);
 
         uint256 navBefore = VAULT.previewNavPerShareX18();
-        (,, uint256 inventoryBurned) = VAULT.previewRedeem(amount);
+        (,, uint256 inventoryReleased) = VAULT.previewRedeem(amount);
 
         vm.prank(HOLDER);
         VAULT.redeemProRata(amount, HOLDER);
 
         burnedShares += amount;
-        burnedInventory += inventoryBurned;
+        queuedInventory += inventoryReleased;
         _record(navBefore);
     }
 
@@ -120,9 +125,16 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         _record(navBefore);
     }
 
-    /// @dev Records the action and whether it lowered NAV/share.
+    /// @dev Records the action, what the inventory-burn stream has retired so far, and whether the action lowered
+    ///      NAV/share.
+    /// @dev `drained = queued - pending` by construction: {VaultRedeemLib-settleBurnStream} decrements `pending`
+    ///      by exactly what it burned, so the stream's own state is the ledger and no action has to be told that
+    ///      it settled. Every action here can settle — `bond`, `checkpointAfter`, `touch` and `donate` all reach
+    ///      `_checkpoint`, and `redeem` settles on entry — which is why this is computed once, here, rather than
+    ///      per action.
     function _record(uint256 navBefore) private {
         ++actionCount;
+        burnedInventory = queuedInventory - VAULT.pendingInventoryBurn();
         if (VAULT.previewNavPerShareX18() < navBefore) navEverFell = true;
     }
 }
@@ -147,12 +159,26 @@ contract AmpsVaultInvariantTest is AmpsVaultFixture {
 
     /// @notice I3 and I10: `totalSupply` moves only through the vault's mint and burn, and after the genesis latch
     ///         the only mint path is `mintVesting`.
+    /// @dev The inventory term is what the **stream has actually retired**, not what redemptions released: since
+    ///      revision 8 (ruling U) the two differ by `pendingInventoryBurn()` at every instant.
     function invariant_I3_I10_supplyMovesOnlyThroughTheVault() public view {
         assertEq(
             amps.totalSupply(),
             Constants.S0 + handler.mintedVesting() - handler.burnedShares() - handler.burnedInventory(),
-            "S0 + vesting mints - redeemed shares - burned inventory"
+            "S0 + vesting mints - redeemed shares - drained inventory"
         );
+    }
+
+    /// @notice **Ruling U's ledger.** The pending queue is exactly what redemptions released less what the stream
+    ///         has burned — nothing accumulates that no `Burn("redeemInventory")` accounted for, and nothing is
+    ///         burned that no redemption queued.
+    function invariant_r8_pendingBurnIsQueuedMinusDrained() public view {
+        assertEq(
+            vault.pendingInventoryBurn(),
+            handler.queuedInventory() - handler.burnedInventory(),
+            "pendingInventoryBurn == queued - drained"
+        );
+        assertLe(handler.burnedInventory(), handler.queuedInventory(), "the stream never burns more than it was given");
     }
 
     /// @notice I5: every AMPS leg is worth zero, because AMPS can never be an asset.
@@ -219,7 +245,8 @@ contract AmpsVaultInvariantTest is AmpsVaultFixture {
         assertEq(handler.actionCount(), 5, "all five actions landed");
         assertGt(handler.mintedVesting(), 0, "the bond minted");
         assertGt(handler.burnedShares(), 0, "the redemption burned");
-        assertGt(handler.burnedInventory(), 0, "and released inventory burned with it");
+        assertGt(handler.queuedInventory(), 0, "the redemption queued its released inventory");
+        assertGt(handler.burnedInventory(), 0, "and the checkpoint ten minutes later drained part of the stream");
         assertFalse(handler.navEverFell(), "none of them lowered NAV/share");
     }
 }

@@ -114,8 +114,12 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     uint256 public mintedVesting;
     /// @notice AMPS wei burned from redeemers.
     uint256 public burnedShares;
-    /// @notice AMPS wei burned from the vault's released inventory during redemptions.
+    /// @notice AMPS wei the 24-hour inventory-burn stream has actually retired (revision 8, ruling U). It is
+    ///         `queuedInventory - VAULT.pendingInventoryBurn()` — the stream decrements `pending` by exactly what
+    ///         it burned, so its own state is the ledger and every action that can settle is covered at once.
     uint256 public burnedInventory;
+    /// @notice AMPS wei redemptions released into the stream, settled or not.
+    uint256 public queuedInventory;
     /// @notice AMPS wei claimed out of vesting positions.
     uint256 public claimedVesting;
     /// @notice Set the moment a non-market-move action lowers NAV/share (I8).
@@ -203,6 +207,11 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
         uint256 navBefore = _nav();
         _;
         ++actionCount;
+        // Revision 8, ruling U. Every action here can settle the inventory-burn stream — `bond`, `warp` +
+        // `checkpoint`, `touch` and the redemption itself all reach `AmpsVault._checkpoint` or settle on entry —
+        // so what the stream has actually retired is recomputed once, here, from the stream's own state:
+        // `settleBurnStream` decrements `pending` by exactly what it burned, so `queued - pending` is the ledger.
+        burnedInventory = queuedInventory - VAULT.pendingInventoryBurn();
         _checkReference();
         uint256 navAfter = _nav();
         if (!marketMove && navBefore != 0 && navAfter != 0 && navAfter < navBefore) {
@@ -288,7 +297,8 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice Redeems a random fraction of this handler's AMPS and checks I23 exactly: every non-AMPS balance
-    ///         pays `floor(floor(b x shares / T) x (BPS - fee) / BPS)` and the released inventory is burned.
+    ///         pays `floor(floor(b x shares / T) x (BPS - fee) / BPS)` and the released inventory is queued into
+    ///         the 24-hour burn stream (revision 8, ruling U).
     /// @param fraction The fraction of the handler's balance to redeem, in bps.
     function redeem(uint256 fraction) external action("redeem", false) {
         uint256 balance = AMPS.balanceOf(address(this));
@@ -301,29 +311,41 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
         uint256 count = VAULT.assetCount();
 
         address[] memory tokens = new address[](count);
-        uint256[] memory expected = new uint256[](count);
+        uint256[] memory vaultBefore = new uint256[](count);
         uint256[] memory heldBefore = new uint256[](count);
         for (uint256 i; i < count; ++i) {
             tokens[i] = VAULT.assetAt(i);
             heldBefore[i] = IERC20(tokens[i]).balanceOf(address(this));
-            uint256 vaultHeld = _heldByVault(tokens[i]);
-            expected[i] = (((vaultHeld * shares) / supply) * keepBps) / Constants.BPS;
+            vaultBefore[i] = _heldByVault(tokens[i]);
         }
-        uint256 expectedBurn = (AMPS.balanceOf(address(VAULT)) * shares) / supply;
+        uint256 ampsBefore = AMPS.balanceOf(address(VAULT));
+        uint256 pendingBefore = VAULT.pendingInventoryBurn();
 
         try VAULT.redeemProRata(shares, address(this)) returns (address[] memory paid, uint256[] memory amounts) {
+            // Revision 8, ruling U. The redemption settles the accrued portion of the inventory-burn stream
+            // *before* it reads `T`, so the basis is the post-settlement supply and the post-settlement AMPS
+            // balance. The drain is not predicted here — it is read back off `totalSupply`, which moved by exactly
+            // `shares + drained` — and the pro-rata arithmetic is then recomputed against the basis the vault
+            // actually used, which is what keeps this an independent check of I23 rather than a copy of the view.
+            uint256 drained = supply - AMPS.totalSupply() - shares;
+            uint256 basis = supply - drained;
+            uint256 expectedRelease = ((ampsBefore - drained) * shares) / basis;
+
             burnedShares += shares;
-            burnedInventory += expectedBurn;
+            queuedInventory += expectedRelease;
             ++redeemCount;
 
             if (paid.length != count) redemptionEverInexact = true;
             for (uint256 i; i < count && i < paid.length; ++i) {
-                if (paid[i] != tokens[i] || amounts[i] != expected[i]) redemptionEverInexact = true;
-                if (IERC20(tokens[i]).balanceOf(address(this)) != heldBefore[i] + expected[i]) {
+                uint256 expected = (((vaultBefore[i] * shares) / basis) * keepBps) / Constants.BPS;
+                if (paid[i] != tokens[i] || amounts[i] != expected) redemptionEverInexact = true;
+                if (IERC20(tokens[i]).balanceOf(address(this)) != heldBefore[i] + expected) {
                     redemptionEverInexact = true;
                 }
             }
-            if (AMPS.totalSupply() != supply - shares - expectedBurn) redemptionEverInexact = true;
+            if (VAULT.pendingInventoryBurn() != pendingBefore - drained + expectedRelease) {
+                redemptionEverInexact = true;
+            }
             _checkSwept();
         } catch {}
     }

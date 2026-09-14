@@ -333,7 +333,8 @@ contract Phase2IntegrationTest is Phase2Fixture {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice I23, exactly: a redemption pays `floor(floor(b x shares / T) x (BPS - fee) / BPS)` of every non-AMPS
-    ///         balance, burns `floor(inventory x shares / T)` of the vault's own AMPS, and leaves the fee behind.
+    ///         balance, **queues** `floor(inventory x shares / T)` of the vault's own AMPS into the 24-hour burn
+    ///         stream (revision 8, ruling U), and leaves the fee behind.
     function test_d_redemptionIsExactlyProRataLessTheFee() public {
         // A bond first, so the vault holds three different assets with three different decimals.
         bondAs(ALICE, NVDA, 0.05e18, 0);
@@ -352,11 +353,11 @@ contract Phase2IntegrationTest is Phase2Fixture {
             vaultBefore[i] = heldBalance(tokens[i]);
             expected[i] = ((vaultBefore[i] * shares / supply) * keepBps) / Constants.BPS;
         }
-        uint256 expectedBurn = amps.balanceOf(address(vault)) * shares / supply;
+        uint256 expectedRelease = amps.balanceOf(address(vault)) * shares / supply;
 
-        (address[] memory previewTokens, uint256[] memory previewAmounts, uint256 previewBurn) =
+        (address[] memory previewTokens, uint256[] memory previewAmounts, uint256 previewRelease) =
             vault.previewRedeem(shares);
-        assertEq(previewBurn, expectedBurn, "the preview burns what the payout implies");
+        assertEq(previewRelease, expectedRelease, "the preview releases what the payout implies");
 
         vm.prank(BOB);
         (address[] memory paidTokens, uint256[] memory paidAmounts) = vault.redeemProRata(shares, BOB);
@@ -370,7 +371,10 @@ contract Phase2IntegrationTest is Phase2Fixture {
             assertEq(heldBalance(tokens[i]), vaultBefore[i] - expected[i], "the fee stays in the vault");
         }
 
-        assertEq(amps.totalSupply(), supply - shares - expectedBurn, "T falls by more than `shares` (I23)");
+        // Ruling U: the release is queued, so `T` falls by exactly `shares` here and by the release over the day
+        // that follows, through the `Burn(amount, "redeemInventory")` the stream emits as it drains.
+        assertEq(amps.totalSupply(), supply - shares, "T falls by exactly `shares` in the transaction (I23)");
+        assertEq(vault.pendingInventoryBurn(), expectedRelease, "and the release is queued into the stream");
         assertEq(amps.balanceOf(BOB), 500e18 - shares, "the redeemer's shares are gone");
         assertSweepClean("d/redeem");
     }

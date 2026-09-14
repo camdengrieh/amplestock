@@ -12,7 +12,7 @@ import {ConstituentConfig, ConstituentStatus, InclusionRecord, PoolClass, PoolCo
 ///
 /// @dev **The set is dynamic (Decision 19).** The 30 launch names are a starting point, not a fixture: the 7-day
 ///      timelock can {addConstituent}, {retireConstituent}, {reinstateConstituent} and {reconfigureConstituent} up
-///      to `MAX_CONSTITUENTS` = 64. Every action emits an event, records its inputs, and **leaves NAV/share
+///      to `MAX_CONSTITUENTS` = 34 (the redemption gas budget expressed in constituents; `Constants.sol`). Every action emits an event, records its inputs, and **leaves NAV/share
 ///      unchanged** — invariant I37 asserts that no lifecycle action moves NAV/share by more than rounding dust or
 ///      moves a counter-asset anywhere except into the same pool's bids or into idle claims.
 ///
@@ -305,7 +305,7 @@ interface IPoolRegistry {
     // Hard bands
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @notice Hard ceiling on the constituent set. 64.
+    /// @notice Hard ceiling on the constituent set. 34 — `MAX_LIVE_CELLS / 14` pools less the two entry pools.
     /// @return value The bound.
     function MAX_CONSTITUENTS() external view returns (uint16 value);
 

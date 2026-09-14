@@ -282,10 +282,12 @@ contract VaultHostileTokenTest is AmpsVaultFixture {
     ///
     /// @dev The reserve held back from the first attempt used to be a flat 700,000, whose own NatSpec claimed it
     ///      covered every registerable asset. It did not: the fallback unlock does one ERC-6909 `transfer` per
-    ///      asset at ~27.5k cold, so it needs ~900k at 32 assets and ~1.8M at 66. The fallback is deliberately
+    ///      asset at ~27.5k cold, so it needs ~900k at 32 assets and ~27.5k x `Constants.MAX_COLLATERALS` at the
+    ///      registry's ceiling (~1.8M when that ceiling was 66, ~1.0M at the measured 36). The fallback is deliberately
     ///      *not* `try`-wrapped — it moves balances the vault is known to hold and calls no token — so running out
     ///      of gas inside it reverts the whole redemption, and the redemption is the one entry point nothing may
-    ///      stop (§7). The reserve now scales with the list it has to walk.
+    ///      stop (§7). The reserve now scales with the list it has to walk, so the ceiling it has to cover is
+    ///      `Constants.MAX_COLLATERALS` — `MAX_CONSTITUENTS + 2` — whatever that cap is set to.
     function test_r09_theClaimsFallbackIsAffordableAt32Assets() public {
         _registerExtraConstituents(28);
         assertEq(vault.assetCount(), 32, "a full constituent set plus the two entry counters");
@@ -293,9 +295,12 @@ contract VaultHostileTokenTest is AmpsVaultFixture {
     }
 
     /// @notice And at the registry's own ceiling: `MAX_CONSTITUENTS` plus the two entry counters.
+    /// @dev Symbolic in the cap, not in a literal: revision 8 lowered `MAX_CONSTITUENTS` from 64 to the measured
+    ///      34, and this test has to follow the constant rather than be re-typed each time it moves.
     function test_r09_theClaimsFallbackIsAffordableAtTheRegistryCeiling() public {
-        _registerExtraConstituents(62);
-        assertEq(vault.assetCount(), 66, "MAX_CONSTITUENTS + WETH + USDG");
+        // The fixture already carries two constituents plus the two entry counters.
+        _registerExtraConstituents(Constants.MAX_CONSTITUENTS - 2);
+        assertEq(vault.assetCount(), uint256(Constants.MAX_CONSTITUENTS) + 2, "MAX_CONSTITUENTS + WETH + USDG");
         _assertEveryAssetIsPaidAsAClaim();
     }
 

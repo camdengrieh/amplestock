@@ -617,6 +617,14 @@ library VaultPlacementLib {
         // `CurrencyNotSettled`, and the fix that would actually help is to place `amount - buckets` rather than to
         // refuse `amount` — which changes what every caller gets and belongs with a placement-shape revision.
         uint256 available = IPoolManager(poolManager).balanceOf(address(this), currency.toId()) + _probeBalance(token);
+        // **AMPS queued for the inventory-burn stream is not subtracted here, and the shortfall is carried**
+        // (revision 8, ruling U). Excluding `VaultRedeemLib.pendingInventoryBurn()` from the ask side's bound
+        // would stop a ladder being laid out of AMPS the stream is owed, and it was measured: the branch costs
+        // 76 B and this library has 67 B of EIP-170 headroom, so it does not fit and is not taken. The
+        // consequence is bounded and already handled on the other side — `settleBurnStream` caps every drain at
+        // the vault's idle AMPS balance, so a placement that outruns the queue leaves the shortfall pending and
+        // the stream retires it as inventory comes back (a compound's buyback, a bond, the next rollout). It
+        // cannot be lost and it cannot make a settlement revert. Revisit whenever this library gains room.
         if (amount > available) revert InsufficientInventory(amount, available);
 
         PlaceParams memory params = PlaceParams({

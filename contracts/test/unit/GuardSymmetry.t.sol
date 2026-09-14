@@ -425,7 +425,11 @@ contract GuardSymmetryTest is AmpsVaultFixture {
 
         assertEq(weth.balanceOf(ALICE), wethNet, "exactly (1 - fee) x shares / T of the WETH");
         assertEq(usdg.balanceOf(ALICE), usdgNet, "exactly (1 - fee) x shares / T of the USDG");
-        assertLt(amps.totalSupply(), supply - 500e18, "and the inventory burn still happened");
+        // Revision 8, ruling U: the released inventory is queued into the 24-hour burn stream instead of being
+        // burned here, so `T` falls by exactly `shares` in this transaction and the accretion lands over the day
+        // that follows. The floor is still ungated, which is what this test is about.
+        assertEq(amps.totalSupply(), supply - 500e18, "T fell by exactly the redeemer's shares");
+        assertGt(vault.pendingInventoryBurn(), 0, "and the released inventory was queued into the stream");
     }
 
     /// @notice The same, with the gate pointer itself replaced by a contract that reverts on every call.

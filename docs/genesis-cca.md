@@ -321,11 +321,17 @@ revert `GateNotHealthy`.
 | `startDelayHours`, `durationHours`, `claimDelayHours` | the block schedule. Defaults 24 / 72 / 0 |
 | `usdg.enabled`, `eth.enabled` | whether each leg runs. Disabling one returns its tranche as unsold |
 | `usdg.tickSpacing`, `eth.tickSpacing` | Q96 price granularity. 1% of the floor; upstream's minimum is 2 |
-| `usdg.requiredCurrencyRaised`, `eth.requiredCurrencyRaised` | graduation, in currency raw units |
+| `usdg.requiredCurrencyRaised` | graduation for the USDG leg, in USDG raw units. **2,500 USDG** — about half this leg's $5,000 floor raise (decided 2026-09-13). Env `AMPS_AUCTION_USDG_REQUIRED` |
+| `eth.requiredUsd18` | graduation for the ETH leg **as a dollar figure**, 18 decimals. **$2,500**, the same bar. `06a` converts it to WETH wei with `mulDiv(requiredUsd18, 1e18, ethUsdX18)` — the same derivation `AmpsGenesis.createAuctions` uses for the ETH floor — whenever `eth.requiredCurrencyRaised` is `0` |
+| `eth.requiredCurrencyRaised` | the manual override for the ETH leg, in WETH wei. `0` means "derive it from `requiredUsd18`"; a non-zero value here or in `AMPS_AUCTION_ETH_REQUIRED` wins outright. At ETH/USD = 2,500 the derived figure is 1 WETH |
 | `usdg.validationHook`, `eth.validationHook` | `IValidationHook` for geo-blocking or an allowlist, or zero |
 | `usdg.salt`, `eth.salt` | CREATE2 salts |
 | `usdg.steps`, `eth.steps` | `[{mps, blocks}]`. A single `{0,0}` asks `06a` for a flat schedule |
 | `fallback.p0X18`, `fallback.seedWeth`, `fallback.seedUsdg` | the founders' seed, used only when nothing graduates |
+
+The accepted parameter set, in one line: canonical factory, **24 h** start delay, **72 h** duration, **0 h**
+claim delay, **1%** tick spacing on each floor, **no validation hook**, the flat schedule with the increasing
+tail, and a **$2,500 per leg** graduation bar (2,500 USDG; `$2,500` of ETH, derived at `ethUsdX18`).
 
 Tranche sizes are **not** here — they are `Constants` and `genesisMint` refuses anything else — and
 neither is the floor price.

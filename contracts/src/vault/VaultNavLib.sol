@@ -491,6 +491,16 @@ library VaultNavLib {
     ///      leaving one wei on it. Each leg is therefore a bounded low-level call whose failure is ignored — an
     ///      unmovable idle balance stays behind on the old vault, which by I12 is dust and is in any case
     ///      unreachable *wherever* it sits, since the token itself is what refuses to move it.
+    ///
+    /// @dev **A pending inventory-burn stream does not migrate, and does not need to** (revision 8, ruling U).
+    ///      `VaultRedeemLib.pendingInventoryBurn` is a hashed slot on the *old* vault, and this function moves the
+    ///      idle AMPS the stream would have burned to the standby. What is left behind is a number with nothing to
+    ///      burn: `settleBurnStream` caps every drain at the old vault's own idle balance, so once the AMPS has
+    ///      gone the pending figure is inert and further settlements are no-ops. It is also NAV-neutral in both
+    ///      directions — inventory AMPS is worth zero in `A` (I5), and the supply the burn would have removed
+    ///      stays outstanding on a token the standby now controls. `AmpsVault.emergencyMigrate`'s own unwind
+    ///      queues nothing: the queue is written by `redeemProRata` and by nothing else, so the migration's
+    ///      `ACTION_UNWIND` cannot add to the figure (`test_r8_migrationDoesNotQueueABurn`).
     /// @param assets The vault's registered non-AMPS assets.
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param ampsToken The AMPS token, evacuated alongside them.

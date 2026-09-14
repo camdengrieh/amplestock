@@ -810,8 +810,8 @@ contract PoolRegistryTest is PoolRegistryFixture {
         registry.addConstituent(params);
     }
 
-    /// @notice The set is hard-capped at 64 names, retired ones included: ids are never reused, so the cap binds
-    ///         on ids issued rather than on the live count.
+    /// @notice The set is hard-capped at `Constants.MAX_CONSTITUENTS` names, retired ones included: ids are never
+    ///         reused, so the cap binds on ids issued rather than on the live count.
     function test_addConstituent_maxConstituents() public {
         MockStockToken[] memory extra = new MockStockToken[](Constants.MAX_CONSTITUENTS);
         for (uint256 i; i < Constants.MAX_CONSTITUENTS; ++i) {
@@ -820,8 +820,8 @@ contract PoolRegistryTest is PoolRegistryFixture {
             params.token = address(extra[i]);
             _addWith(params);
         }
-        assertEq(registry.constituentCount(), Constants.MAX_CONSTITUENTS, "64 registered");
-        assertEq(registry.activeConstituentCount(), Constants.MAX_CONSTITUENTS, "64 active");
+        assertEq(registry.constituentCount(), Constants.MAX_CONSTITUENTS, "MAX_CONSTITUENTS registered");
+        assertEq(registry.activeConstituentCount(), Constants.MAX_CONSTITUENTS, "MAX_CONSTITUENTS active");
 
         MockStockToken overflow = new MockStockToken("One too many", "OVER");
         IPoolRegistry.AddConstituentParams memory last = _addParams(0);
@@ -833,7 +833,7 @@ contract PoolRegistryTest is PoolRegistryFixture {
         // Retiring one does not free its id, so the set stays full.
         vm.prank(TIMELOCK);
         registry.retireConstituent(1);
-        assertEq(registry.activeConstituentCount(), Constants.MAX_CONSTITUENTS - 1, "63 active");
+        assertEq(registry.activeConstituentCount(), Constants.MAX_CONSTITUENTS - 1, "one fewer active");
         vm.prank(TIMELOCK);
         vm.expectRevert(abi.encodeWithSelector(IPoolRegistry.ConstituentSetFull.selector, Constants.MAX_CONSTITUENTS));
         registry.addConstituent(last);
@@ -1410,9 +1410,13 @@ contract PoolRegistryTest is PoolRegistryFixture {
         assertEq(cap30, 3000, "n = 30 cap");
         assertEq(floor30, 166, "n = 30 floor");
 
-        (uint16 floor64, uint16 cap64) = lens.weightBoundsFor(64);
-        assertEq(cap64, 3000, "n = 64 cap");
-        assertEq(floor64, 78, "n = 64 floor");
+        // The cap's own count, symbolically: revision 8 moved `MAX_CONSTITUENTS` from 64 to 34 and this row has
+        // to follow the constant. `cap = max(3000, ceilDiv(10000, n))`, `floor = min(500, 10000 / (2n))`.
+        (uint16 floorCap, uint16 capCap) = lens.weightBoundsFor(Constants.MAX_CONSTITUENTS);
+        assertEq(capCap, 3000, "n = MAX_CONSTITUENTS cap");
+        assertEq(
+            floorCap, uint16(Constants.BPS / (2 * uint256(Constants.MAX_CONSTITUENTS))), "n = MAX_CONSTITUENTS floor"
+        );
 
         // The cap is a ceiling division, so three names can each hold 3334 and cover the whole index.
         (, uint16 cap3) = lens.weightBoundsFor(3);

@@ -134,10 +134,14 @@ interface IAmpsVault {
     /// @param owner The redeemer.
     /// @param to The recipient.
     /// @param shares AMPS wei burned from the redeemer.
-    /// @param inventoryBurned Additional AMPS wei burned because it was released from the vault's own inventory,
-    ///        which is why `totalSupply` falls by more than `shares` and the redemption is accretive.
+    /// @param inventoryReleased Additional AMPS wei released from the vault's own inventory and **queued** into
+    ///        the 24-hour inventory-burn stream, not burned in this transaction (revision 8, ruling U). It is
+    ///        still the amount the redemption retires from supply; `totalSupply` falls by it over the day that
+    ///        follows, through the `Burn(amount, "redeemInventory")` the stream emits as it drains, and
+    ///        {pendingInventoryBurn} is what has not drained yet. `totalSupply` falls by exactly `shares` in this
+    ///        transaction, plus whatever the stream settled on entry.
     /// @param feeBps The redemption fee applied.
-    event Redeem(address indexed owner, address indexed to, uint256 shares, uint256 inventoryBurned, uint16 feeBps);
+    event Redeem(address indexed owner, address indexed to, uint256 shares, uint256 inventoryReleased, uint16 feeBps);
 
     /// @notice Emitted when `AmpsBonds` settles a bonded deposit into an ERC-6909 claim.
     /// @param collateral The deposited token.
@@ -158,9 +162,14 @@ interface IAmpsVault {
     event VestingMinted(address indexed to, uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every AMPS burn the vault performs, whatever the cause.
+    /// @dev `bytes32("redeemInventory")` is the **stream's** drain rather than a redemption's own effect
+    ///      (revision 8, ruling U): it is emitted by whichever call settles the stream — a redemption, a
+    ///      checkpoint, a compound, a bond, a placement — and the sum of those drains over a day equals the
+    ///      `Redeem.inventoryReleased` figures that queued them. `bytes32("redeem")` is still the redeemer's own
+    ///      shares, burned in the redeeming transaction.
     /// @param amount The AMPS wei burned.
-    /// @param reason A short identifier: `bytes32("redeemInventory")`, `bytes32("compoundBurn")`,
-    ///        `bytes32("buybackBurn")`.
+    /// @param reason A short identifier: `bytes32("redeem")`, `bytes32("redeemInventory")`,
+    ///        `bytes32("compoundBurn")`, `bytes32("buybackBurn")`.
     event Burn(uint256 amount, bytes32 reason);
 
     /// @notice Emitted on every ladder placement. **Phase 3.**
@@ -465,14 +474,37 @@ interface IAmpsVault {
 
     /// @notice What {redeemProRata} would pay for `shares` right now.
     /// @dev Reads balances only — no oracle, no gate, no price. Never reverts for a live vault.
+    /// @dev The preview settles the inventory-burn stream in arithmetic exactly as the payout settles it in
+    ///      storage, so the two agree to the wei even with a stream in flight. `shares` above the supply that
+    ///      settlement leaves behind is clamped to it: no holder can ever redeem more, and an unclamped view
+    ///      would divide by a smaller number than it multiplies by.
     /// @param shares AMPS wei to redeem.
     /// @return tokens The assets that would be paid.
     /// @return amounts The raw amounts, parallel to `tokens`, net of `redeemFeeBps`.
-    /// @return inventoryBurned Additional AMPS wei that would be burned from released inventory.
+    /// @return inventoryReleased Additional AMPS wei that would be released from inventory and **queued** into the
+    ///         24-hour burn stream — the figure {Redeem} reports and the amount {pendingInventoryBurn} would rise
+    ///         by. It is not burned in the redeeming transaction (revision 8, ruling U).
     function previewRedeem(uint256 shares)
         external
         view
-        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned);
+        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryReleased);
+
+    /// @notice AMPS wei released by past redemptions that the burn stream has not yet retired.
+    /// @dev The stream releases it linearly over `Constants.REDEEM_BURN_STREAM_SECONDS` from
+    ///      {burnStreamStart}, and every path that recomputes NAV — `checkpoint`, `touch`, a bond, a compound, a
+    ///      placement, the next redemption — burns the accrued portion, capped at the vault's idle AMPS balance.
+    ///      It is disclosure: it is never part of `A` (I5) and never subtracted from the NAV denominator (I6).
+    /// @return amount The pending amount, in AMPS wei.
+    function pendingInventoryBurn() external view returns (uint256 amount);
+
+    /// @notice When the current inventory-burn window opened. Zero before the first redemption.
+    /// @dev **`burnStreamStart() + Constants.REDEEM_BURN_STREAM_SECONDS` is the deadline**: the whole of
+    ///      {pendingInventoryBurn} is burned by then. Only a redemption moves this — a settlement does not — so
+    ///      the deadline does not slide as keepers checkpoint, and the schedule is one straight line to it
+    ///      whatever the settlement frequency. A later redemption restarts one window for the *combined* pending
+    ///      amount rather than opening a second schedule beside the first.
+    /// @return timestamp The window's opening, as a Unix timestamp.
+    function burnStreamStart() external view returns (uint256 timestamp);
 
     /// @notice The creator fee in force at `timestamp`, in bps of sell volume.
     /// @dev `creatorBps(t) = 100 bp x max(0, 1 - (t - genesis) / 30 days)`, monotone non-increasing and exactly
@@ -744,14 +776,26 @@ interface IAmpsVault {
     ///         less `redeemFeeBps`. **Structurally ungated and permissionless.**
     ///
     /// @dev The exact procedure, in order (I23):
+    ///        0. settle the accrued portion of the inventory-burn stream, so `T` below is the supply the stream
+    ///           has already been settled into;
     ///        1. burn `shares` from `msg.sender` **first**;
     ///        2. remove exactly `floor(L_p x shares / T)` liquidity from every position (Phase 3; no positions
     ///           exist in Phase 2);
     ///        3. pay `floor(b x shares / T) x (1 - redeemFeeBps / 10_000)` of every non-AMPS idle balance, ERC-6909
     ///           claim and released position amount;
-    ///        4. burn the AMPS released from the vault's own inventory in step 2, so `T` falls by **more** than
-    ///           `shares` and the redemption is accretive to everyone who did not redeem;
+    ///        4. **queue** the AMPS released from the vault's own inventory in step 2 into the 24-hour burn
+    ///           stream, reported as {Redeem}'s `inventoryReleased` and readable as {pendingInventoryBurn};
     ///        5. the withheld fee stays in the vault as backing.
+    ///
+    /// @dev **Step 4 used to be a burn, and ruling U is why it is not** (revision 8). Burning the released
+    ///      inventory in the redeeming transaction lowered `T` — the denominator the next redemption divides by —
+    ///      inside a sequence a single redeemer controls, so 300 AMPS taken in 60 slices returned ~2.9% more than
+    ///      the same 300 taken at once. Deferring the burn "to the next checkpoint" would have removed nothing,
+    ///      because `checkpoint()` is permissionless and the same redeemer could call it between slices. The burn
+    ///      is therefore rate-limited: the amount is queued and released linearly over
+    ///      `Constants.REDEEM_BURN_STREAM_SECONDS`, slices inside one block see none of it, and the redemption
+    ///      stays as accretive as it ever was — a day later. `totalSupply` still falls by exactly `shares` in this
+    ///      transaction (plus whatever step 0 settled), which is what an indexer should expect from the `Redeem`.
     ///
     /// @dev No netting, no substitution, no oracle read, no gate read, no reentrancy on a hostile Stock Token
     ///      (shares are burned before any transfer out, and the transient lock is still taken — the lock is not a
@@ -778,6 +822,10 @@ interface IAmpsVault {
     ///      `1e18 / VIRTUAL_SHARES` = $0.001, and `PoolRegistry` anchors every pool it opens at {pRefX18},
     ///      substituting $1.00 only while that word is still zero — so one permissionless call in the launch
     ///      window would have opened every pool registered afterwards a thousandfold below NAV, permanently.
+    /// @dev It also drains the accrued portion of the inventory-burn stream before it recomputes anything, and so
+    ///      does every other path that checkpoints. That is how a redemption's queued burn actually lands, and it
+    ///      is why the drain is *not* something a redeemer can schedule: calling this between slices settles the
+    ///      same `elapsed / D` fraction the next slice would have settled anyway (revision 8, ruling U).
     /// @return snapshot The checkpoint written.
     function checkpoint() external returns (Checkpoint memory snapshot);
 

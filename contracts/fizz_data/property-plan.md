@@ -39,8 +39,8 @@
 | GL-25 | property_noShareInflationGrief | **[MANDATORY V-06]** one whole collateral unit always quotes non-zero AMPS on a quotable market | HIGH_LEVEL | EXPLORATORY | — | HIGH |
 | GL-26 | property_disclosureNeverReverts | every view answers under donation / freeze / paused beacon / stale feed | HIGH_LEVEL | SHOULD-HOLD | `LadderPositionValuer` "Never gated, never reverting" (ruling 7); fix-log wave-1 #2/#3, wave-2 #2 | HIGH |
 | GL-27 | property_theFloorIsAlwaysOpen | a 1-wei redemption by a holder always succeeds and burns supply | HIGH_LEVEL | SHOULD-HOLD | plan I14; `redeemProRata` NatSpec (`AmpsVault.sol:826-834`); `GuardSymmetry.t.sol` | HIGH |
-| GL-28 | property_redemptionIsNotSplittableForProfit | previewRedeem(a)+previewRedeem(b) <= previewRedeem(a+b), per asset and inventory | HIGH_LEVEL | SHOULD-HOLD | superadditivity of floor over the x-ray I-9 payout formula | HIGH |
-| GL-29 | property_previewRedeemIsMonotone | more shares never pays less of any asset, never burns less inventory | VARIABLE_TRANSITION | SHOULD-HOLD | every term is a round-down mulDiv linear in shares; x-ray I-9 | MEDIUM |
+| GL-28 | property_redemptionIsNotSplittableForProfit | previewRedeem(a)+previewRedeem(b) <= previewRedeem(a+b), per asset and `inventoryReleased`; rev-8 also closes the realised split (ruling U's 24 h burn stream) | HIGH_LEVEL | SHOULD-HOLD | superadditivity of floor over the x-ray I-9 payout formula | HIGH |
+| GL-29 | property_previewRedeemIsMonotone | more shares never pays less of any asset, never releases less inventory (`inventoryReleased`) | VARIABLE_TRANSITION | SHOULD-HOLD | every term is a round-down mulDiv linear in shares; x-ray I-9 | MEDIUM |
 | GL-30 | property_noFreeRoundTripOnTheQuoter | quoted buy-then-sell in one pool returns strictly less than it cost | HIGH_LEVEL | EXPLORATORY | — | HIGH |
 | GL-31 | property_noUnfundedActorValueGain | actorValue(a) <= basis + harness-minted value, for every actor | HIGH_LEVEL | EXPLORATORY | — | HIGH |
 | GL-32 | property_cumulativeKeeperBleedBounded | Σ NAV/share lost to keeper upkeep <= 100 bp of the NAV high-water | VARIABLE_TRANSITION | EXPLORATORY | — | HIGH |
@@ -107,7 +107,7 @@
 | SP-07 | property_quoteMatchesBond | issued <= quote.ampsOut in the same block after checkpoint, rescaled by the NAV basis the bond's own checkpoint moved (L-1) | HIGH_LEVEL | SHOULD-HOLD | `AmpsBonds._quote:829` ("pricing arithmetic shared with `bond`"); x-ray X-7 | ampsBonds_quoteMatchesBond (new) | HIGH |
 | SP-08 | property_bondSurplusReachesHolders | collateral consumed ⇒ AMPS issued >= minAmpsOut; revert keeps collateral (surplus-to-NAV is SP-05's identity) | HIGH_LEVEL | EXPLORATORY | — | ampsBonds_bond* | MEDIUM |
 | SP-09 | property_claimMovesOnlyTheShellsAmps | supply flat, fields frozen, claimed += paid, shell −paid, pending cleared | STATE_TRANSITION | SHOULD-HOLD | `AmpsBonds.sol:563-569`, `:576-591`; `Amps.mint/burn` onlyVault (`Amps.sol:34`) | ampsBonds_claim*, ampsBonds_claimAll* | HIGH |
-| SP-10 | property_redemptionBurnIsExact | supply −(shares + inventoryBurned); caller −shares | STATE_TRANSITION | SHOULD-HOLD | plan I23; burns at `AmpsVault.sol:848`/`:882` with supply read at `:845`; x-ray I-9 | ampsVault_redeemProRata* | HIGH |
+| SP-10 | property_redemptionBurnIsExact | supply −(shares + drained); pendingInventoryBurn +(inventoryReleased − drained); caller −shares | STATE_TRANSITION | SHOULD-HOLD | plan I23 + §12.3 ruling U; `Amps.burn(msg.sender, shares)` in `redeemProRata` and `Amps.burn(this, burned)` in `VaultRedeemLib.settleBurnStream` are the only two supply writes, with supply read after the settle; x-ray I-9 | ampsVault_redeemProRata* | HIGH |
 | SP-11 | property_previewIsThePayout | per asset, recipient gain (ERC-20 + claim) == previewRedeem, and <= held | HIGH_LEVEL | SHOULD-HOLD | `AmpsVault.previewRedeem:555-557`; `VaultRedeemLib.previewUnwind:808-811`; fix-log wave 4 | ampsVault_redeemProRata* | HIGH |
 | SP-12 | property_onlyTheCallersOwnPosition | redeem burns only msg.sender's shares; claim touches only their positions | STATE_TRANSITION | SHOULD-HOLD | `burn(msg.sender, shares)` (`AmpsVault.sol:848`); `AmpsBonds.claim` NatSpec; plan I38 | ampsVault_redeemProRata*, ampsBonds_claim*, adversary_crossUserRedeem (new) | HIGH |
 | SP-13 | property_redemptionIsAccretive | shares >= 1e12 with a fee ⇒ nav non-decreasing; zero fee ⇒ <= 2 bp | VARIABLE_TRANSITION | SHOULD-HOLD | fix-log wave 4 on the inventory burn ("the protocol-favourable direction"); plan I5, I23 | ampsVault_redeemProRata* | HIGH |
@@ -192,7 +192,8 @@
 | dayIssuedGhost | uint256 | ampsBonds_bond | GL-08 |
 | previewTokens | address[] | ampsVault_redeemProRata* (pre-call preview) | SP-11 |
 | previewAmounts | uint256[] | ampsVault_redeemProRata* (pre-call preview) | SP-11 |
-| previewInventoryBurned | uint256 | ampsVault_redeemProRata* (pre-call preview) | SP-10 |
+| previewInventoryReleased | uint256 | ampsVault_redeemProRata* (pre-call preview) | SP-10 |
+| queuedInventory | uint256 | ampsVault_redeemProRata* (campaign total released into the burn stream) | SP-10, GL-03 |
 | lastRedeemTokens | address[] | ampsVault_redeemProRata* (return value) | SP-14 |
 | lastRedeemAmounts | uint256[] | ampsVault_redeemProRata* (return value) | SP-14 |
 | lastCompoundBurned | uint256 | ampsVault_compound (return value) | SP-24 |
@@ -363,7 +364,7 @@
 | ampsVault_compound | YES | lastCompoundBurned, lastPlaced, lastBoughtBackAmps, burnedCells, burnedAmpsTotal, boughtBackAmpsTotal, creatorAmpsGain/creatorPaidUsd18, potPaidRaw/payRing, cumulativeBleedUsd18, tickAtPlacement, navClass = PLACEMENT | SP-01, SP-17, SP-18, SP-19, SP-20, SP-21, SP-23, SP-24, SP-25, SP-26, SP-27, SP-29, SP-30, SP-31 |
 | ampsVault_rollout | YES | lastPlaced, rolloutMovedInWindow/rolloutWindowStart, potPaidRaw/payRing, cumulativeBleedUsd18, tickAtPlacement, navClass = PLACEMENT | SP-01, SP-17, SP-19, SP-20, SP-21, SP-26, SP-27, SP-28, SP-29, SP-30, SP-31 |
 | ampsVault_deployBonded | YES | lastPlaced, potPaidRaw/payRing, cumulativeBleedUsd18, tickAtPlacement, navClass = PLACEMENT | SP-01, SP-17, SP-19, SP-20, SP-21, SP-26, SP-27, SP-29, SP-30, SP-31 |
-| ampsVault_redeemProRata (+_clamped/_full/_dust) | YES | burnedTotal, previewTokens/previewAmounts/previewInventoryBurned (pre-call), lastRedeemTokens/lastRedeemAmounts, ampsHolders.add(to), livenessReverts, navClass = REDEEM | SP-01, SP-10, SP-11, SP-12, SP-13, SP-14, SP-15, SP-16 (full only), SP-27, SP-60 (full only), SP-63 |
+| ampsVault_redeemProRata (+_clamped/_full/_dust) | YES | burnedTotal (realised burns only), queuedInventory, previewTokens/previewAmounts/previewInventoryReleased (pre-call), lastRedeemTokens/lastRedeemAmounts, ampsHolders.add(to), livenessReverts, navClass = REDEEM | SP-01, SP-10, SP-11, SP-12, SP-13, SP-14, SP-15, SP-16 (full only), SP-27, SP-60 (full only), SP-63 |
 | ampsVault_secondary (place leg) | YES | lastPlaced, lastBoughtBackAmps, bidPlacedRaw, tickAtPlacement, cumulativeBleedUsd18, navClass = PLACEMENT | SP-01, SP-17, SP-18, SP-19, SP-20, SP-21, SP-22, SP-23, SP-26, SP-27 |
 | ampsVault_secondary (setter legs) | YES | navClass = MANAGEMENT | SP-01, SP-58 |
 | ampsVault_secondary (withdrawRetiredBids leg) | YES | bidWithdrawnRaw, navClass = PLACEMENT | SP-01, SP-17, SP-26, SP-27 |

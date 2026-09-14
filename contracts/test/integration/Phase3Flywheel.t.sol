@@ -622,10 +622,16 @@ contract Phase3FlywheelTest is Phase3Fixture {
             before[i] = IERC20(vault.assetAt(i)).balanceOf(ALICE);
         }
 
+        uint256 pendingBefore = vault.pendingInventoryBurn();
+        (,, uint256 released) = vault.previewRedeem(redeemShares);
         vm.prank(ALICE);
         (address[] memory tokens, uint256[] memory amounts) = vault.redeemProRata(redeemShares, ALICE);
         assertEq(tokens.length, amounts.length, "one amount per asset");
         assertLe(amps.totalSupply(), supplyBeforeRedeem - redeemShares, "the redeemer's shares are gone");
+        // Revision 8, ruling U: the released inventory is queued into the 24-hour burn stream rather than burned
+        // here, so the accretion it represents reaches the holders who stayed over the day that follows.
+        uint256 drained = supplyBeforeRedeem - amps.totalSupply() - redeemShares;
+        assertEq(vault.pendingInventoryBurn(), pendingBefore - drained + released, "the release was queued");
         for (uint256 i; i < tokens.length; ++i) {
             assertEq(
                 IERC20(tokens[i]).balanceOf(ALICE) - before[i], amounts[i], "and the payout landed, asset by asset"

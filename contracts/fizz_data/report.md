@@ -412,11 +412,24 @@ No TODOs remain in `Base.sol`, `Snapshots.sol`, or any handler file.
 
 ## Next Steps
 
-1. **Confirm the SP-33 correction with the next campaign.** Campaign 5's one failure (154 passed / 1 failed) is the router's documented dust sweep landing on a recipient who was also the caller; the property now counts the swept balance separately. The correction is in the tree but has not been fuzzed since, so the next run is its confirmation — every earlier correction held on its first re-run.
+> **Revision 8 (2026-09-13): steps 1 and 3 are closed by owner decision.** Step 3's two standing leads are
+> **accepted** rather than worked, each with an indexer alert as its monitoring: **L-1** (the convergence step) is
+> accepted with the `nav-drift` alert — a `NavCheckpoint` more than 1 bp below the previous one with no `Bond`,
+> `Redeem`, `Placement`, `Compound`, `Swap` or feed update between them — and **SP-14** (the reference-vs-pool
+> valuation gap) is accepted with 25 bp kept as the ceiling and the `redeem-gap` alert using the same 25 bp as its
+> critical threshold (10 bp warning). Step 1's SP-33 correction is confirmed: the Foundry replay set is 10/10.
+> The redemption properties were restated in the same pass for revision 8's inventory-burn stream (§12.3 ruling U):
+> a redemption **queues** the inventory it releases instead of burning it, so SP-10 now asserts
+> `supply −(shares + drained)` and `pendingInventoryBurn +(inventoryReleased − drained)` separately, and GL-28 /
+> GL-29 read `inventoryReleased`. NAV per share is unchanged and stays fully diluted. See
+> `contracts/PROPERTIES.md`.
+
+1. **Confirm the SP-33 correction with the next campaign.** **Accepted and confirmed, 2026-09-13.** Campaign 5's one failure (154 passed / 1 failed) is the router's documented dust sweep landing on a recipient who was also the caller; the property now counts the swept balance separately. The correction is in the tree but has not been fuzzed since, so the next run is its confirmation — every earlier correction held on its first re-run.
 
 2. **Harness false positives — all ten are already corrected in the tree; there is nothing outstanding to fix.** SP-18 (`==` → `≤`), SP-35 (bound by `ghosts.hookDonated`), SP-05 (I27 identity on the bond's own basis; preview NAV leg dropped), SP-20 (skip no-work calls; mirror the guard's bounded feed probe), GL-47 (drop the `<= lastTruncatedTick` clause), SP-43/SP-42 (skip a refused second leg), SP-07 (rescale the quote by the observed basis ratio), SP-04 (add the `CollateralForwarded` term to the vault leg), SP-45/SP-46 (arm only when `previewRedeem`'s counter does not exceed the payment), SP-33 (count the router's sweep to its caller separately). The campaign-3 corrections held through campaigns 4 and 5; the campaign-4 corrections held through campaign 5.
 
-3. **Work the two standing leads (highest-value item in this report).** L-1: decide whether `LadderPositionValuer` should decompose at the *current* reference or the checkpoint should iterate to the fixed point — until then `navPerShareX18` is one convergence step behind its own limit, and every property that compares a stored NAV to a freshly-checkpointed one needs a state-dependent tolerance, which is not a bound. SP-14: decide whether the reference-vs-pool valuation gap should be reconciled or whether 25 bp is the right accepted ceiling.
+3. **Work the two standing leads.** **Both accepted by the owner, 2026-09-13**, with the indexer alerts above as
+   the monitoring rather than a code change; the original text stands as the description of what was accepted. L-1: decide whether `LadderPositionValuer` should decompose at the *current* reference or the checkpoint should iterate to the fixed point — until then `navPerShareX18` is one convergence step behind its own limit, and every property that compares a stored NAV to a freshly-checkpointed one needs a state-dependent tolerance, which is not a bound. SP-14: decide whether the reference-vs-pool valuation gap should be reconciled or whether 25 bp is the right accepted ceiling.
 
 4. **No LOW-confidence properties exist**, so nothing needs rescuing from a stub. The 29 MEDIUM entries are listed above with their reasons; the four worth strengthening first are:
    - **GL-77** — make it live up to its name: compare `quoteExactIn`'s output against the hook's realized output on the same block, not just the two refusal views against each other.

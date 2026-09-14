@@ -62,9 +62,20 @@ contract Phase2InvariantTest is Phase2Fixture {
         assertEq(
             amps.totalSupply(),
             Constants.S0 + handler.mintedVesting() - handler.burnedShares() - handler.burnedInventory(),
-            "S0 + bond mints - redeemed shares - burned inventory"
+            "S0 + bond mints - redeemed shares - drained inventory"
         );
         assertEq(amps.vault(), address(vault), "and the vault is still the only minter");
+    }
+
+    /// @notice **Ruling U's ledger** (revision 8). The queue is exactly what redemptions released less what the
+    ///         24-hour stream has burned: nothing accumulates that no drain accounted for, and no drain happens
+    ///         that no redemption queued.
+    function invariant_r8_pendingBurnIsQueuedMinusDrained() public view {
+        assertEq(
+            vault.pendingInventoryBurn(),
+            handler.queuedInventory() - handler.burnedInventory(),
+            "pendingInventoryBurn == queued - drained"
+        );
     }
 
     /// @notice I30: every AMPS bought through a bond is in `totalSupply` from the instant of purchase and sits on

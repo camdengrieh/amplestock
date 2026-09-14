@@ -20,7 +20,9 @@
 #
 # WHAT IT ASSERTS, with `cast`, against the chain the scripts left behind:
 #   * `S0` = 20,000 AMPS split 1,000 / 10,000 / 9,000, and the auction tranche inside two real auctions
-#   * both auctions bid out at the $1.00 floor, settled by a permissionless `AmpsGenesis.settle()`
+#   * both auctions bid out at the $1.00 floor, settled by a permissionless `AmpsGenesis.settle()`. The bids
+#     below (5,000 USDG and 2 ETH) clear the accepted graduation bars of 2,500 USDG and $2,500 of ETH — 1 WETH
+#     at the fixture's ETH/USD of 2,500, derived by `06a` from `eth.requiredUsd18` — several times over
 #   * `P_ref` = `P0` = $1.00 and NAV/share = raised / S0 = $0.50 — the fully diluted launch of decision 14
 #   * 32 pools registered *after* settlement, so every one of them opens at `P0`
 #   * 30 active constituents, 30 bond markets
