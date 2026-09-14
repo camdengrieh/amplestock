@@ -48,16 +48,31 @@ export interface JobContext {
 const addressOf = (context: JobContext, name: string): `0x${string}` =>
   (context.contracts[name]?.address as `0x${string}` | undefined) ?? (ZERO as `0x${string}`)
 
-const read = async <T>(
+export const read = async <T>(
   context: JobContext,
   address: `0x${string}`,
   abi: unknown,
   functionName: string,
   args: unknown[] = [],
+  /**
+   * Pin the read to a block instead of taking the event's own.
+   *
+   * Only one caller needs it and it needs it badly: the `redeem-gap` check reads
+   * `previewRedeem(shares)` at `blockNumber - 1`, because at the redemption's own block the shares
+   * are already burned and the positions already unwound, so the preview would describe a vault
+   * the redeemer never had a claim on.
+   */
+  blockNumber?: bigint,
 ): Promise<T | undefined> => {
   if (address === ZERO) return undefined
   try {
-    return (await context.client.readContract({abi, address, functionName, args})) as T
+    return (await context.client.readContract({
+      abi,
+      address,
+      functionName,
+      args,
+      ...(blockNumber === undefined ? {} : {blockNumber}),
+    })) as T
   } catch {
     return undefined
   }

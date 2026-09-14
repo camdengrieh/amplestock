@@ -48,30 +48,25 @@ contract BunniRoundingGrindTest is Phase3Fixture {
         }
     }
 
-    /// @notice **BUG (economic, no stated invariant broken).** Splitting one redemption into `n` pieces extracts
-    ///         materially *more* than redeeming the same shares once, and the gain grows with `n`.
+    /// @notice **Ruling U, closed** (revision 8). Splitting one redemption into `n` pieces used to extract
+    ///         materially *more* than redeeming the same shares once, and the gain grew with `n`. It no longer
+    ///         does: 2,000 AMPS in sixty slices and 2,000 AMPS in one shot come out within a few basis points of
+    ///         each other, and the residue is the redemption fee's own superadditivity rather than a strategy.
     ///
-    /// @dev **Cause.** `redeemProRata` pays `(1 - redeemFeeBps) * shares / T` of every balance, burns the
-    ///      redeemer's `shares`, **and** burns the ladder inventory AMPS the unwind released (I23). `T` therefore
-    ///      falls by more than `shares`, which is exactly what makes NAV/share rise on every redemption. A
-    ///      redeemer who splits their exit re-reads the *raised* NAV on every subsequent slice and so captures a
-    ///      share of the POL inventory burn that a single-shot redeemer leaves to everyone else. Nothing here
-    ///      breaks I8, I11 or I23 - NAV/share is still monotone non-decreasing for the holders who stay, and every
-    ///      slice pays the same proportional 1% fee - but the redemption floor is not split-neutral, and a large
-    ///      holder exiting in pieces is strictly better off than one exiting at once.
+    /// @dev **What the bug was.** `redeemProRata` paid `(1 - redeemFeeBps) * shares / T` of every balance, burned
+    ///      the redeemer's `shares`, **and** burned the ladder inventory AMPS the unwind released (I23), all in the
+    ///      same transaction. `T` therefore fell by more than `shares`, which is what makes NAV/share rise on
+    ///      every redemption — and a redeemer who split their exit re-read the *raised* NAV on every subsequent
+    ///      slice, capturing a share of the POL inventory burn that a single-shot redeemer leaves to everyone
+    ///      else. Nothing broke I8, I11 or I23; the floor simply was not split-neutral.
     ///
-    /// @dev **Repro.** {test_BUG_splittingARedemptionExtractsMoreThanDoingItOnce} below: 2,000 AMPS — 10% of
-    ///      `S0` — in one shot against the same 2,000 AMPS in sixty slices, from the identical state, with the
-    ///      gain logged per split count. The gain is smaller than revision 6's at the same *fraction* of supply,
-    ///      because the POL tranche whose burn drives it is 45% of `S0` rather than 95%; the shape is unchanged.
-    ///
-    /// @dev **Fix shape** (not applied - `contracts/src/**` is out of scope for this suite). Either price the
-    ///      whole redemption against the supply read at its start (which is what `redeemProRata` already does
-    ///      *within* one call and what a sequence defeats), or stop burning the released inventory into the same
-    ///      denominator the payout divides by - e.g. hold the released inventory as a claim and burn it on the
-    ///      next `compound`, so the NAV lift lands after the redemption rather than inside a sequence of them. The
-    ///      second is the smaller change and keeps I23's "burns the released inventory" true, one block later.
-    function test_BUG_splittingARedemptionExtractsMoreThanDoingItOnce() public {
+    /// @dev **What was applied.** The second of the two fix shapes this file named — "stop burning the released
+    ///      inventory into the same denominator the payout divides by" — in its rate-limited form. Holding the
+    ///      release for "the next `compound`" would not have been enough, because `checkpoint()` is permissionless
+    ///      and a redeemer can call it between slices; the release is therefore queued and streamed out linearly
+    ///      over `Constants.REDEEM_BURN_STREAM_SECONDS`. Slices in one block settle nothing at all, so the lift a
+    ///      splitter used to capture is not there to capture. `docs/phase3-state-model.md` §12.3 ruling U.
+    function test_r8_splittingARedemptionNoLongerExtractsMore() public {
         uint256 shares = 2000e18; // 10% of `S0`; the vault's idle POL after the genesis ladders is 2,520
         uint256[4] memory splits = [uint256(1), 5, 20, 60];
         uint256[4] memory proceeds;
@@ -88,10 +83,12 @@ contract BunniRoundingGrindTest is Phase3Fixture {
             vm.revertToState(snapshot);
         }
 
-        assertGt(proceeds[1], proceeds[0], "five slices already beat one");
-        assertGt(proceeds[2], proceeds[1], "twenty beat five");
-        assertGt(proceeds[3], proceeds[2], "sixty beat twenty");
-        assertGe(proceeds[3] * 100 / proceeds[0], 101, "and the advantage is a whole percent, not rounding dust");
+        // 25 bp of slack against the 100+ bp advantage this test used to assert. Anything above it would mean the
+        // stream had stopped rate-limiting the burn.
+        for (uint256 s = 1; s < splits.length; ++s) {
+            uint256 gap = proceeds[s] > proceeds[0] ? proceeds[s] - proceeds[0] : proceeds[0] - proceeds[s];
+            assertLe(gap * 10_000 / proceeds[0], 25, "splitting is worth at most 25 bp");
+        }
     }
 
     /// @notice The same grind against the ladder: a dust redemption removes `floor(L * shares / T)` from every

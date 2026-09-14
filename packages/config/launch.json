@@ -389,7 +389,25 @@
       "mechanism": "Uniswap Continuous Clearing Auction v2.1.0",
       "raisedAtFloorUsd": 10000,
       "navPerShareAtFloorUsd": 0.5,
-      "premiumAtFloorBps": 10000
+      "premiumAtFloorBps": 10000,
+      "graduationMinimum": {
+        "raisedUsd": 5000,
+        "soldAmps": 5000,
+        "navPerShareUsd": 0.25,
+        "premiumBps": 30000
+      },
+      "terms": {
+        "factory": "canonical",
+        "factoryAddress": "0x000000001F26a0044BaA66024e7b6599c61963F8",
+        "startDelayHours": 24,
+        "durationHours": 72,
+        "claimDelayHours": 0,
+        "tickSpacingBps": 100,
+        "graduationUsdPerLeg": 2500,
+        "graduationUsdgRaw": "2500000000",
+        "validationHook": "none",
+        "schedule": "flat, increasing tail"
+      }
     },
     "fallbackSeed": {
       "totalUsd": 20000,
@@ -398,6 +416,7 @@
       "usdgRaw": "10000000000",
       "wethWei": "4000000000000000000",
       "launchPriceUsd": 1,
+      "premiumBps": 0,
       "entryPools": [
         "AMPS/WETH",
         "AMPS/USDG"
@@ -505,7 +524,7 @@
       "totalPools": 32,
       "spokePools": 30,
       "entryPools": 2,
-      "maxConstituents": 64,
+      "maxConstituents": 34,
       "hookFlags": "0x38C0"
     },
     "governance": {

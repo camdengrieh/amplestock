@@ -417,24 +417,34 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(heldBalance(address(usdg)), SEED_USDG - usdgNet, "same for USDG");
     }
 
-    /// @notice The released inventory is burned too, so `T` falls by more than `shares`.
-    function test_redeem_burnsReleasedInventory() public {
+    /// @notice **Revision 8, ruling U.** The released inventory is *queued* into the 24-hour burn stream rather
+    ///         than burned in the redeeming transaction: `T` falls by exactly `shares`, `pendingInventoryBurn`
+    ///         rises by the figure the preview reported, and the whole of it is burned once the window elapses.
+    function test_r8_redeem_queuesReleasedInventoryIntoTheStream() public {
         runGenesis();
         giveShares(ALICE, 500e18);
 
         uint256 supply = amps.totalSupply();
         uint256 inventory = amps.balanceOf(address(vault));
-        uint256 expectedBurn = (inventory * 500e18) / supply;
+        uint256 expectedRelease = (inventory * 500e18) / supply;
 
-        (,, uint256 previewBurn) = vault.previewRedeem(500e18);
-        assertEq(previewBurn, expectedBurn, "preview agrees");
+        (,, uint256 previewRelease) = vault.previewRedeem(500e18);
+        assertEq(previewRelease, expectedRelease, "preview agrees");
 
         vm.prank(ALICE);
         vault.redeemProRata(500e18, ALICE);
 
-        assertEq(amps.totalSupply(), supply - 500e18 - expectedBurn, "T falls by shares plus inventory");
-        assertLt(amps.totalSupply(), supply - 500e18, "strictly more than the shares burned");
-        assertEq(amps.balanceOf(address(vault)), inventory - expectedBurn, "inventory shrank pro rata");
+        assertEq(amps.totalSupply(), supply - 500e18, "T falls by exactly the redeemer's shares");
+        assertEq(vault.pendingInventoryBurn(), expectedRelease, "and the released inventory is queued, not burned");
+        assertEq(vault.burnStreamStart(), block.timestamp, "the window started now");
+        assertEq(amps.balanceOf(address(vault)), inventory, "the inventory is still on the vault");
+
+        // A full window later the stream retires all of it, and only then does `T` fall by the released amount.
+        vm.warp(block.timestamp + Constants.REDEEM_BURN_STREAM_SECONDS);
+        vault.checkpoint();
+        assertEq(vault.pendingInventoryBurn(), 0, "the stream drained");
+        assertEq(amps.totalSupply(), supply - 500e18 - expectedRelease, "T fell by shares plus inventory, a day on");
+        assertEq(amps.balanceOf(address(vault)), inventory - expectedRelease, "inventory shrank pro rata");
     }
 
     /// @notice Redemption is accretive to everyone who did not redeem (I8).
@@ -1051,10 +1061,10 @@ contract AmpsVaultTest is AmpsVaultFixture {
 
     /// @notice Before genesis there is no supply, so the redemption preview is all zeroes rather than a revert.
     function test_previewRedeemBeforeGenesis() public view {
-        (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned) = vault.previewRedeem(1e18);
+        (address[] memory tokens, uint256[] memory amounts, uint256 inventoryReleased) = vault.previewRedeem(1e18);
         assertEq(tokens.length, 0, "no assets are registered yet");
         assertEq(amounts.length, 0, "and nothing would be paid");
-        assertEq(inventoryBurned, 0, "and nothing would burn");
+        assertEq(inventoryReleased, 0, "and nothing would be released");
     }
 
     /// @notice With no gate wired the vault is healthy by default, which is how it is reachable before the gate

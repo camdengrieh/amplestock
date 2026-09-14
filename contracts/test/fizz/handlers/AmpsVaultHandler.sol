@@ -484,7 +484,8 @@ abstract contract AmpsVaultHandler is Properties {
 
         address[] memory tokens;
         uint256[] memory predicted;
-        (tokens, predicted, o.previewInventoryBurned) = _tryPreview(shares);
+        (tokens, predicted, o.previewInventoryReleased) = _tryPreview(shares);
+        o.pendingBurnBefore = vault.pendingInventoryBurn();
         uint256[] memory recipBefore = _holdingsOf(tokens, to);
         uint256[] memory ampsBefore = _actorAmps();
         uint256[] memory callerBefore = to == actor ? new uint256[](0) : _holdingsOf(tokens, actor);
@@ -498,12 +499,17 @@ abstract contract AmpsVaultHandler is Properties {
         snapshotAfter();
 
         // ── ghosts ──
+        o.pendingBurnAfter = vault.pendingInventoryBurn();
         ghosts.previewTokens = tokens;
         ghosts.previewAmounts = predicted;
-        ghosts.previewInventoryBurned = o.previewInventoryBurned;
+        ghosts.previewInventoryReleased = o.previewInventoryReleased;
         ghosts.lastRedeemTokens = paidTokens;
         ghosts.lastRedeemAmounts = paidAmounts;
-        ghosts.burnedTotal += shares + o.previewInventoryBurned;
+        // Revision 8, ruling U: only the **realised** burn goes into the ledger GL-03 checks against the token.
+        // The release is queued, so what actually left the supply is the redeemer's shares plus the portion of
+        // the stream this call settled — which is `queued - pending`, the stream's own bookkeeping.
+        ghosts.queuedInventory += o.previewInventoryReleased;
+        ghosts.burnedTotal += shares + (o.pendingBurnBefore + o.previewInventoryReleased - o.pendingBurnAfter);
         noteAmpsHolder(to);
 
         // ── specific properties ──
@@ -569,6 +575,7 @@ abstract contract AmpsVaultHandler is Properties {
         o.lastPlacementAfter = vault.lastPlacementAt(poolId);
         o.navAfter = _tryNavPerShare();
         o.vaultAmpsAfter = heldBalance(address(amps));
+        o.pendingBurnAfter = vault.pendingInventoryBurn();
 
         PlacementRecord[] memory ladderAfter = ladderOf(poolId);
         property_mintAttribution(supplyBefore, amps.totalSupply(), 0);
@@ -668,6 +675,7 @@ abstract contract AmpsVaultHandler is Properties {
         o.above = above;
         o.navBefore = _tryNavPerShare();
         o.vaultAmpsBefore = heldBalance(address(amps));
+        o.pendingBurnBefore = vault.pendingInventoryBurn();
         o.lastPlacementBefore = vault.lastPlacementAt(poolId);
     }
 
@@ -709,7 +717,7 @@ abstract contract AmpsVaultHandler is Properties {
     function _tryPreview(uint256 shares)
         private
         view
-        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned)
+        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryReleased)
     {
         try vault.previewRedeem(shares) returns (address[] memory t, uint256[] memory a, uint256 b) {
             return (t, a, b);

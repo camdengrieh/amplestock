@@ -537,7 +537,7 @@ describe('supply movements', () => {
     await run(
       'AmpsVault:Redeem',
       makeEvent({
-        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryBurned: 5n * WAD, feeBps: 100},
+        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryReleased: 5n * WAD, feeBps: 100},
         blockNumber: 101n,
         logIndex: 2,
       }),
@@ -547,6 +547,39 @@ describe('supply movements', () => {
     expect(summary!.netSupplyChange).toBe(-105n * WAD)
     expect(summary!.burnedAllTotal).toBe(105n * WAD)
     expect(summary!.redeemedSharesTotal).toBe(100n * WAD)
+    expect(db.rows(schema.burnEvent).map((b) => b.reason)).toEqual(['redeem', 'redeemInventory'])
+  })
+
+  it('records the released inventory as released, not as burned in the same transaction', async () => {
+    // Revision 8 defers the burn: `redeemProRata` releases the vault's own AMPS out of the cells it
+    // crossed and the *next* checkpoint burns it. Total supply falls by exactly `shares` here.
+    await run(
+      'AmpsVault:Burn',
+      makeEvent({args: {amount: 100n * WAD, reason: REASON('redeem')}, blockNumber: 101n, logIndex: 0}),
+      context,
+    )
+    await run(
+      'AmpsVault:Redeem',
+      makeEvent({
+        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryReleased: 5n * WAD, feeBps: 100},
+        blockNumber: 101n,
+        logIndex: 1,
+      }),
+      context,
+    )
+    const [redemption] = db.rows(schema.redemption)
+    expect(redemption!.inventoryReleased).toBe(5n * WAD)
+    const summary = await db.find(schema.vaultSummary, {id: 'singleton'})
+    expect(summary!.netSupplyChange).toBe(-100n * WAD)
+
+    // …and the queued burn lands later, on its own, as an ordinary `Burn`.
+    await run(
+      'AmpsVault:Burn',
+      makeEvent({args: {amount: 5n * WAD, reason: REASON('redeemInventory')}, blockNumber: 140n, logIndex: 0}),
+      context,
+    )
+    const after = await db.find(schema.vaultSummary, {id: 'singleton'})
+    expect(after!.netSupplyChange).toBe(-105n * WAD)
     expect(db.rows(schema.burnEvent).map((b) => b.reason)).toEqual(['redeem', 'redeemInventory'])
   })
 
@@ -563,7 +596,7 @@ describe('supply movements', () => {
     await run(
       'AmpsVault:Redeem',
       makeEvent({
-        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryBurned: 5n * WAD, feeBps: 100},
+        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryReleased: 5n * WAD, feeBps: 100},
         blockNumber: 101n,
         logIndex: 0,
       }),
@@ -573,6 +606,219 @@ describe('supply movements', () => {
     expect(redemption!.navPerShareX18).toBe(2n * WAD)
     expect(redemption!.grossUsd18).toBe(200n * WAD)
     expect(redemption!.feeUsd18).toBe(2n * WAD)
+  })
+})
+
+describe('the redeem-gap alert (SP-14)', () => {
+  /** One priced asset the vault pays out in, with an accepted Chainlink answer. */
+  async function pricedToken(answerUsd8: bigint, decimals = 18): Promise<void> {
+    await db.insert(schema.feed).values({
+      id: TOKEN.toLowerCase(),
+      token: TOKEN,
+      aggregator: ADDRESSES.FeedRegistry,
+      previousAggregator: null,
+      heartbeat: 3_600,
+      thresholdBps: 50,
+      minAnswerUsd8: 0n,
+      maxAnswerUsd8: 0n,
+      answerUsd8,
+      updatedAt: 0n,
+      roundId: 0n,
+      standardProxy: true,
+      lastBlock: 0n,
+    })
+    await db.insert(schema.tokenIndex).values({id: TOKEN.toLowerCase(), constituentId: 7, poolId: POOL_ID})
+    await db.insert(schema.constituent).values({
+      id: '7',
+      constituentId: 7,
+      token: TOKEN,
+      symbol: 'NVDA',
+      decimals,
+      poolId: POOL_ID,
+      status: 1,
+      statusLabel: 'ACTIVE',
+      targetWeightBps: 500,
+      rolloutWeightBps: 0,
+      marketId: 0,
+      feed: null,
+      addedAt: 0n,
+      addedBlock: 0n,
+      retiredAt: null,
+      reinstatedAt: null,
+      freezeUntil: 0n,
+      uiMultiplierX18: WAD,
+      newUiMultiplierX18: 0n,
+      effectiveAt: 0n,
+      oraclePaused: false,
+      tokenPaused: false,
+      vaultBlocked: false,
+      lastPolledBlock: 0n,
+      answerUsd8,
+      answerUpdatedAt: 0n,
+    })
+  }
+
+  /** A redemption of 100 shares at NAV $1.00 and a 1% fee: $99 owed. */
+  async function redeem(ctx: TestContext): Promise<void> {
+    await run(
+      'AmpsVault:NavCheckpoint',
+      makeEvent({
+        args: {navPerShareX18: WAD, totalAssetsUsd18: 5_000n * WAD, totalSupply: 5_000n * WAD},
+        blockNumber: 100n,
+        logIndex: 0,
+      }),
+      ctx,
+    )
+    await run(
+      'AmpsVault:Redeem',
+      makeEvent({
+        args: {owner: CALLER, to: CALLER, shares: 100n * WAD, inventoryReleased: 5n * WAD, feeBps: 100},
+        blockNumber: 101n,
+        logIndex: 0,
+      }),
+      ctx,
+    )
+  }
+
+  it('stays quiet when the realised payout meets the NAV basis', async () => {
+    await pricedToken(100_000_000n) // $1.00, 8 decimals
+    // 99 tokens at $1.00 is exactly the $99 the NAV basis owes.
+    const ctx = makeContext({...READS, previewRedeem: [[TOKEN], [99n * WAD], 5n * WAD]}, db)
+    await redeem(ctx)
+    const [redemption] = db.rows(schema.redemption)
+    expect(redemption!.gapPriced).toBe(true)
+    expect(redemption!.expectedUsd18).toBe(99n * WAD)
+    expect(redemption!.realisedUsd18).toBe(99n * WAD)
+    expect(redemption!.gapBps).toBe(0)
+    expect(db.rows(schema.alert).filter((a) => a.kind === 'redeem-gap')).toHaveLength(0)
+  })
+
+  it('warns past 10 bp and pages past 25 — the accepted ceiling', async () => {
+    await pricedToken(100_000_000n)
+    // $98.70 against $99.00: 30 bp short, which is above SP-14's accepted 25 bp ceiling.
+    const ctx = makeContext({...READS, previewRedeem: [[TOKEN], [987n * WAD / 10n], 5n * WAD]}, db)
+    await redeem(ctx)
+    const [redemption] = db.rows(schema.redemption)
+    expect(redemption!.gapBps).toBe(30)
+    const [alert] = db.rows(schema.alert).filter((a) => a.kind === 'redeem-gap')
+    expect(alert!.severity).toBe('critical')
+    expect(alert!.subject).toBe(CALLER)
+  })
+
+  it('records nothing and raises nothing when an asset cannot be priced', async () => {
+    // No feed row at all: the payout is unpriceable, and an unpriceable payout is not a zero gap.
+    const ctx = makeContext({...READS, previewRedeem: [[TOKEN], [1n * WAD], 5n * WAD]}, db)
+    await redeem(ctx)
+    const [redemption] = db.rows(schema.redemption)
+    expect(redemption!.gapPriced).toBe(false)
+    expect(redemption!.gapBps).toBe(0)
+    expect(db.rows(schema.alert).filter((a) => a.kind === 'redeem-gap')).toHaveLength(0)
+  })
+
+  it('says nothing when the preview itself could not be read', async () => {
+    await pricedToken(100_000_000n)
+    const ctx = makeContext({...READS, previewRedeem: new Error('reverted')}, db)
+    await redeem(ctx)
+    const [redemption] = db.rows(schema.redemption)
+    expect(redemption!.gapPriced).toBe(false)
+    expect(db.rows(schema.alert).filter((a) => a.kind === 'redeem-gap')).toHaveLength(0)
+  })
+})
+
+describe('the nav-drift alert (L-1)', () => {
+  const checkpoint = (navX18: bigint, blockNumber: bigint) =>
+    makeEvent({
+      args: {navPerShareX18: navX18, totalAssetsUsd18: 5_000n * WAD, totalSupply: 5_000n * WAD},
+      blockNumber,
+      logIndex: 0,
+    })
+
+  it('raises a warning when NAV falls with nothing between the two checkpoints', async () => {
+    await run('AmpsVault:NavCheckpoint', checkpoint(WAD, 100n), context)
+    await run('AmpsVault:NavCheckpoint', checkpoint((WAD * 9_990n) / 10_000n, 200n), context)
+    const [alert] = db.rows(schema.alert).filter((a) => a.kind === 'nav-drift')
+    expect(alert!.severity).toBe('warning')
+    expect(alert!.subject).toBe('200')
+  })
+
+  it('stays quiet when something happened that is allowed to move NAV', async () => {
+    await run('AmpsVault:NavCheckpoint', checkpoint(WAD, 100n), context)
+    await run(
+      'AmpsVault:Redeem',
+      makeEvent({
+        args: {owner: CALLER, to: CALLER, shares: 1n * WAD, inventoryReleased: 0n, feeBps: 100},
+        blockNumber: 150n,
+        logIndex: 0,
+      }),
+      context,
+    )
+    await run('AmpsVault:NavCheckpoint', checkpoint((WAD * 9_000n) / 10_000n, 200n), context)
+    expect(db.rows(schema.alert).filter((a) => a.kind === 'nav-drift')).toHaveLength(0)
+  })
+
+  it('stays quiet on a rise, and on a fall inside the 1 bp bound', async () => {
+    await run('AmpsVault:NavCheckpoint', checkpoint(WAD, 100n), context)
+    await run('AmpsVault:NavCheckpoint', checkpoint(WAD * 2n, 200n), context)
+    await run('AmpsVault:NavCheckpoint', checkpoint(WAD * 2n - (WAD * 2n) / 10_000n, 300n), context)
+    expect(db.rows(schema.alert).filter((a) => a.kind === 'nav-drift')).toHaveLength(0)
+  })
+})
+
+describe('the auction price series', () => {
+  it('records a ClearingPriceUpdated as a point, so the series is dense between checkpoints', async () => {
+    await run(
+      'GenesisAuctionUsdg:CheckpointUpdated',
+      makeEvent({
+        args: {blockNumber: 12_000n, clearingPriceQ96: Q96, cumulativeMps: 2_500_000},
+        blockNumber: 12_000n,
+        logIndex: 0,
+        address: ADDRESSES.GenesisAuctionUsdg,
+      }),
+      context,
+    )
+    await run(
+      'GenesisAuctionUsdg:ClearingPriceUpdated',
+      makeEvent({
+        args: {blockNumber: 12_050n, clearingPriceQ96: Q96 * 2n},
+        blockNumber: 12_050n,
+        logIndex: 0,
+        address: ADDRESSES.GenesisAuctionUsdg,
+      }),
+      context,
+    )
+    const rows = db.rows(schema.auctionCheckpoint)
+    expect(rows).toHaveLength(2)
+    expect(rows.map((r) => r.clearingPriceQ96)).toEqual([Q96, Q96 * 2n])
+    // The price-only log carries no issuance figure, so it inherits the last one the leg recorded
+    // rather than claiming zero.
+    expect(rows[1]!.cumulativeMps).toBe(2_500_000n)
+    expect(rows.every((r) => r.leg === 'usdg')).toBe(true)
+  })
+
+  it('lets a full checkpoint in the same block win over a price-only log', async () => {
+    await run(
+      'GenesisAuctionEth:ClearingPriceUpdated',
+      makeEvent({
+        args: {blockNumber: 12_100n, clearingPriceQ96: Q96},
+        blockNumber: 12_100n,
+        logIndex: 4,
+        address: ADDRESSES.GenesisAuctionEth,
+      }),
+      context,
+    )
+    await run(
+      'GenesisAuctionEth:ClearingPriceUpdated',
+      makeEvent({
+        args: {blockNumber: 12_100n, clearingPriceQ96: Q96 * 3n},
+        blockNumber: 12_100n,
+        logIndex: 4,
+        address: ADDRESSES.GenesisAuctionEth,
+      }),
+      context,
+    )
+    const rows = db.rows(schema.auctionCheckpoint)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.clearingPriceQ96).toBe(Q96 * 3n)
   })
 })
 

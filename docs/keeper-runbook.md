@@ -371,9 +371,15 @@ Expected on a busy day: `dailyCeilingUsd18` starts at $25 and the window is a ro
 
 At `MAX_LIVE_CELLS` the bountied paths **merge into existing cells and leave the remainder idle** rather than
 revert (§12 ruling E), so the call still stamps the cooldown and still pays a tip while doing a fraction of the
-work. The keeper stops before the vault does (`cell-budget`). This is the constraint on growing the constituent
-set past ~36 pools at the launch ladder shape; the answer is coarser ladders or a migration with a larger
-budget, not a keeper change.
+work. The keeper stops before the vault does (`cell-budget`).
+
+The constraint on growing the constituent set is now **the cap itself**, not this budget: revision 8 lowered
+`MAX_CONSTITUENTS` to **34**, which is what the redemption gas budget proves — 512 live cells at 14 per fully
+laddered pool is 36 pools, less the two entry pools. 34 constituents is 36 pools at the launch ladder shape, so a
+registry that is full is also a cell budget that is full, and the two limits bind together by construction rather
+than by coincidence. Growing past it is a migration with a larger budget or a coarser ladder, and neither is a
+keeper change. The keeper reports `amps_keeper_live_cells` against `amps_keeper_live_cell_budget`; the gap
+between them is the headroom, and it does not grow.
 
 ### A pointer moved
 

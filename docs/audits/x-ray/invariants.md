@@ -263,9 +263,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 > A redemption pays `net_j = floor(floor(b_j × shares / supply) + released_j) × (BPS − redeemFeeBps) / BPS)` per asset, with `supply` read before the burn.
 
-**Derivation** — Δ-pair + ordering: `uint256 supply = IAmps(_AMPS).totalSupply();` at `AmpsVault.sol:845` precedes `IAmps(_AMPS).burn(msg.sender, shares)` at `:848`, and the same `supply` is threaded into `VaultRedeemLib.redemption` (`AmpsVault.sol:872`) whose arithmetic is `VaultRedeemLib.sol:668`.
+**Derivation** — Δ-pair + ordering: `redeemProRata` settles the inventory-burn stream, then reads `uint256 supply = IAmps(_AMPS).totalSupply();` before `IAmps(_AMPS).burn(msg.sender, shares)`, and threads that same `supply` into `VaultRedeemLib.redemption`, whose arithmetic is `VaultRedeemLib._payout`.
 
 **If violated** — reading `supply` after the burn would let a redemption inflate its own pro-rata share.
+
+**Restated for revision 8 (ruling U, 2026-09-13)** — the released inventory `floor(inventory × shares / supply) + releasedAmps` is no longer burned inside the redeeming transaction. It is queued into a 24-hour stream (`VaultRedeemLib.queueInventoryBurn`) and burned linearly out of it by whichever call settles next, which removes the split-redemption advantage the old in-transaction burn created: `totalSupply` falls by exactly `shares` plus whatever the same call settled on entry, and `AmpsVault.pendingInventoryBurn()` is the remainder. The per-asset payout formula above is unchanged; `Redeem`'s fourth field and `previewRedeem`'s third return are renamed `inventoryReleased` to say so.
 
 ---
 

@@ -12,7 +12,7 @@ function preview() {
   return buildRedeemPreview({
     shares: WAD,
     redeemFeeBps: 100,
-    inventoryBurned: 2n * WAD,
+    inventoryReleased: 2n * WAD,
     tokens: [WETH, USDG, NVDA],
     amounts: [990_000_000_000_000_000n, 1_980_000_000_000_000_000n, 2_970_000_000_000_000_000n],
     meta: (token) => ({symbol: token === WETH ? 'WETH' : token === USDG ? 'USDG' : 'NVDA', decimals: 18}),
@@ -35,10 +35,13 @@ describe('RedeemPreviewTable', () => {
     expect(screen.getByText(/Fee \(1\.00%\)/)).toBeInTheDocument()
   })
 
-  it('discloses the inventory AMPS burned alongside, and why supply falls by more', () => {
+  it('discloses the released inventory as a burn in flight, not one this transaction makes', () => {
     render(<RedeemPreviewTable preview={preview()} />)
-    expect(screen.getByText(/Inventory AMPS burned alongside/)).toBeInTheDocument()
-    expect(screen.getByText(/total supply falls by more than you redeem/i)).toBeInTheDocument()
+    expect(screen.getByText(/Inventory AMPS released, burned over 24 hours/)).toBeInTheDocument()
+    // Revision 8 releases rather than burns, and the release then drains over a day.
+    expect(screen.getByText(/24-hour linear stream/i)).toBeInTheDocument()
+    expect(screen.getByText(/falls by exactly what you redeem now/i)).toBeInTheDocument()
+    expect(screen.queryByText(/total supply falls by more than you redeem/i)).not.toBeInTheDocument()
   })
 
   it('prompts rather than rendering an empty table', () => {

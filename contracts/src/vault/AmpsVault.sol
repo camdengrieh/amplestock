@@ -555,19 +555,31 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @inheritdoc IAmpsVault
     /// @dev Includes the position term from Phase 3: what a pro-rata unwind would free out of the ladder, priced
     ///      exactly as v4 itself would free it, so the preview and the payout agree to the wei.
+    /// @dev **The burn stream is settled in the preview too** (revision 8). {redeemProRata} drains the accrued
+    ///      portion of the inventory-burn stream before it reads `T`, so a preview that did not would divide by a
+    ///      supply the payout will not use and pay a different number. The whole preview — the settlement in
+    ///      arithmetic, the supply read, the ladder walk and the pro-rata — is one call into
+    ///      {VaultRedeemLib-preview}: four external calls from here would not fit EIP-170, and inside the library
+    ///      they are internal jumps.
     function previewRedeem(uint256 shares)
         external
         view
-        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryBurned)
+        returns (address[] memory tokens, uint256[] memory amounts, uint256 inventoryReleased)
     {
-        uint256 supply = IAmps(_AMPS).totalSupply();
-        (uint256[] memory released, uint256 releasedAmps) = VaultRedeemLib.previewUnwind(
-            ladderAt, _poolKeys(), _assetIndex, _assets.length, _POOL_MANAGER, shares, supply
+        VaultRedeemLib.Redemption memory result = VaultRedeemLib.preview(
+            ladderAt, _poolKeys(), _assetIndex, _assets, _POOL_MANAGER, _AMPS, shares, _redeemFeeBps
         );
-        VaultRedeemLib.Redemption memory result = VaultRedeemLib.redemption(
-            _assets, _POOL_MANAGER, _AMPS, shares, supply, _redeemFeeBps, released, new uint256[](0), releasedAmps, 0
-        );
-        return (result.tokens, result.amounts, result.inventoryBurned);
+        return (result.tokens, result.amounts, result.inventoryReleased);
+    }
+
+    /// @inheritdoc IAmpsVault
+    function pendingInventoryBurn() external view returns (uint256 amount) {
+        return VaultRedeemLib.pendingInventoryBurn();
+    }
+
+    /// @inheritdoc IAmpsVault
+    function burnStreamStart() external view returns (uint256 timestamp) {
+        return VaultRedeemLib.burnStreamStart();
     }
 
     /// @inheritdoc IAmpsVault
@@ -841,8 +853,14 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (shares == 0) revert ZeroAmount();
         if (to == address(0)) revert ZeroAddress();
 
-        // `T` is read once, before the burn, so a redemption cannot inflate its own share.
-        uint256 supply = IAmps(_AMPS).totalSupply();
+        // Ruling U, and `T` in the same call. {VaultRedeemLib-settleAndSupply} drains whatever the inventory-burn
+        // stream has accrued since it was last settled and *then* reads `T`, so this redemption divides by the
+        // supply the stream has already been settled into and `previewRedeem` — which settles the same amount in
+        // arithmetic — cannot drift from it. `T` is still read once, before the redeemer's burn, so a redemption
+        // cannot inflate its own share. The settlement reads three hashed slots and the vault's own AMPS balance
+        // and burns through `IAmps.burn`, which this path already does for the redeemer's own shares two lines
+        // below: no gate, no registry, no feed, no price, and `GuardSymmetry.t.sol`'s step-4 proof is untouched.
+        uint256 supply = VaultRedeemLib.settleAndSupply(_AMPS);
 
         // Effects before interactions: the redeemer's shares are gone before a single asset moves.
         IAmps(_AMPS).burn(msg.sender, shares);
@@ -878,12 +896,13 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // no token can block, and the best-effort idle leg outside the unlock. See {VaultRedeemLib-payout}.
         VaultRedeemLib.payout(_POOL_MANAGER, tokens, result.fromClaims, result.fromIdle, to);
 
-        if (result.inventoryBurned != 0) {
-            IAmps(_AMPS).burn(address(this), result.inventoryBurned);
-            emit Burn(result.inventoryBurned, bytes32("redeemInventory"));
-        }
+        // Ruling U again, and the half that matters: the released inventory is **queued**, not burned. Burning it
+        // here would lower `T` inside a sequence the redeemer controls, which is exactly the split advantage the
+        // ruling is about; the stream above hands it back to every holder over
+        // `Constants.REDEEM_BURN_STREAM_SECONDS` instead, and a slice taken in the same block sees none of it.
+        if (result.inventoryReleased != 0) VaultRedeemLib.queueInventoryBurn(_AMPS, result.inventoryReleased);
 
-        emit Redeem(msg.sender, to, shares, result.inventoryBurned, _redeemFeeBps);
+        emit Redeem(msg.sender, to, shares, result.inventoryReleased, _redeemFeeBps);
         _sweepClean();
     }
 
@@ -1327,6 +1346,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // Phase 3: unwind the ladder first. Liquidity left in v4 positions owned by a denylisted vault would be
         // unreachable by the standby, and the removal itself cannot be blocked — the hook carries no
         // `BEFORE_REMOVE_LIQUIDITY` bit (I18) and the released counter never leaves the PoolManager.
+        //
+        // **This unwind queues nothing into the inventory-burn stream, and cannot** (revision 8, ruling U):
+        // `VaultRedeemLib.queueInventoryBurn` is called from {redeemProRata} and from nowhere else, so the
+        // migration's `ACTION_UNWIND` — which removes *everything*, `shares == supply == 1` — moves the AMPS to
+        // the vault's idle balance and stops there. `VaultNavLib.evacuate` then hands that balance to the
+        // standby; see its NatSpec for what happens to a stream that was already pending.
         if (_poolKeys().length != 0) {
             _setUnlockAction(VaultRedeemLib.ACTION_UNWIND);
             pm.unlock(abi.encode(_AMPS, uint256(1), uint256(1)));
@@ -1354,7 +1379,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         uint256 navBefore;
         bool bounded;
         try this.assetsUsd18Of(address(this)) returns (uint256 assetsBefore) {
-            navBefore = _navPerShare(assetsBefore);
+            (navBefore,) = _navPerShare(assetsBefore);
             bounded = navBefore != 0;
         } catch {}
         if (!bounded) {
@@ -1377,7 +1402,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // for one, and the check is a disclosure rather than the thing that makes the migration safe.
         uint256 navAfter;
         try this.assetsUsd18Of(standby) returns (uint256 assetsAfter) {
-            navAfter = _navPerShare(assetsAfter);
+            (navAfter,) = _navPerShare(assetsAfter);
             if (bounded) {
                 uint256 floor =
                     FullMath.mulDiv(navBefore, Constants.BPS - Constants.MIGRATION_BLEED_BPS_MAX, Constants.BPS);
@@ -1494,26 +1519,35 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      no shares for `A` to be per. Reporting zero keeps `PoolRegistry`'s "`pRefX18() == 0` means no
     ///      checkpoint yet, anchor at $1.00" fallback true by construction. {checkpoint} and {touch} already
     ///      refuse before {genesis}, so this is the belt to that pair of braces.
-    function _navPerShare(uint256 assetsUsd18) private view returns (uint256) {
-        uint256 supply = IAmps(_AMPS).totalSupply();
-        if (supply == 0) return 0;
-        return FullMath.mulDiv(assetsUsd18 + 1, Constants.WAD, supply + Constants.VIRTUAL_SHARES);
+    /// @dev It returns `T` alongside the price because {_checkpoint} needs both and reading `totalSupply` twice
+    ///      in one frame is an external call this contract has no EIP-170 room for. Callers that want only the
+    ///      price drop the second return.
+    function _navPerShare(uint256 assetsUsd18) private view returns (uint256 nav, uint256 supply) {
+        supply = IAmps(_AMPS).totalSupply();
+        if (supply == 0) return (0, 0);
+        nav = FullMath.mulDiv(assetsUsd18 + 1, Constants.WAD, supply + Constants.VIRTUAL_SHARES);
     }
 
     /// @dev NAV/share recomputed from live balances, positions included: what {previewNavPerShareX18} returns and
     ///      what every Phase 3 entry point captures as `navBefore` for R1.
-    function _previewNav() private view returns (uint256) {
+    function _previewNav() private view returns (uint256 nav) {
         (uint256 assetsUsd18,) = VaultNavLib.totalAssetsUsd18(_sources(), _assetList(), address(this), true);
-        return _navPerShare(assetsUsd18);
+        (nav,) = _navPerShare(assetsUsd18);
     }
 
     /// @dev Recomputes `A`, NAV/share, `P_mkt` and `P_ref` and writes the two checkpoint words (section 5).
+    /// @dev **The inventory-burn stream is drained first** (revision 8, ruling U). Every compound, bond,
+    ///      placement, genesis step and the permissionless `checkpoint()` land here, so the accrued portion of a
+    ///      redemption's queued burn is retired on whichever of them comes first and the NAV this function writes
+    ///      is measured on the supply that is left. Draining after the walk would checkpoint a `T` the same
+    ///      transaction had already moved.
     function _checkpoint() private returns (Checkpoint memory snapshot) {
+        VaultRedeemLib.settleBurnStream(_AMPS);
         VaultNavLib.Sources memory src = _sources();
         (uint256 assetsUsd18, bool unconfirmed) = VaultNavLib.totalAssetsUsd18(src, _assetList(), address(this), true);
-        uint256 supply = IAmps(_AMPS).totalSupply();
-        // The one formula, from the one place: {previewNavPerShareX18} and the checkpoint can never disagree.
-        uint256 nav = _navPerShare(assetsUsd18);
+        // The one formula, from the one place: {previewNavPerShareX18} and the checkpoint can never disagree. `T`
+        // comes back with it, read after the settlement above and only once.
+        (uint256 nav, uint256 supply) = _navPerShare(assetsUsd18);
 
         (uint256 pMkt, bool usable) = VaultNavLib.marketPrice(src);
         uint32 last = _checkpointTimestamp;

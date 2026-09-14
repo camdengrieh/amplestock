@@ -3901,6 +3901,13 @@ export const ampsVaultAbi = [
   {
     type: 'function',
     inputs: [],
+    name: 'burnStreamStart',
+    outputs: [{ name: 'timestamp', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
+    inputs: [],
     name: 'checkpoint',
     outputs: [
       {
@@ -4256,6 +4263,13 @@ export const ampsVaultAbi = [
   },
   {
     type: 'function',
+    inputs: [],
+    name: 'pendingInventoryBurn',
+    outputs: [{ name: 'amount', internalType: 'uint256', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     inputs: [
       { name: 'poolId', internalType: 'PoolId', type: 'bytes32' },
       { name: 'above', internalType: 'bool', type: 'bool' },
@@ -4308,7 +4322,7 @@ export const ampsVaultAbi = [
     outputs: [
       { name: 'tokens', internalType: 'address[]', type: 'address[]' },
       { name: 'amounts', internalType: 'uint256[]', type: 'uint256[]' },
-      { name: 'inventoryBurned', internalType: 'uint256', type: 'uint256' },
+      { name: 'inventoryReleased', internalType: 'uint256', type: 'uint256' },
     ],
     stateMutability: 'view',
   },
@@ -4904,7 +4918,7 @@ export const ampsVaultAbi = [
         indexed: false,
       },
       {
-        name: 'inventoryBurned',
+        name: 'inventoryReleased',
         internalType: 'uint256',
         type: 'uint256',
         indexed: false,

@@ -44,13 +44,17 @@ export function Nav({className}: {className?: string}) {
 }
 
 /**
- * The design's mobile tab bar: four tabs across the foot of the screen, `min-height:52px`, the
- * current one filled and the rest divided by hairlines.
+ * The design's mobile tab bar: tabs across the foot of the screen, `min-height:52px`, the current
+ * one filled and the rest divided by hairlines.
  *
- * Four, not nine — the design picks the four a person on a phone actually reaches for and leaves the
- * rest to the Menu. `Buy` is the design's first tab; `Vault`, `Redeem` and `Docs` follow it.
+ * Five, not nine — the design picks the ones a person on a phone actually reaches for and leaves
+ * the rest to the Menu. `Auction` leads, then the design's own four: `Buy`, `Vault`, `Redeem`,
+ * `Docs`. Auction is here **unconditionally**, not only while the genesis phase is live: the phase
+ * is a chain read, this component renders in the app frame on every page including the ones that
+ * make no chain reads at all, and a tab bar whose contents move under a reader as a query resolves
+ * is worse than one tab they can ignore. After settlement the page is still the launch record.
  */
-const TAB_HREFS = ['/buy', '/vault', '/redeem', '/docs'] as const
+const TAB_HREFS = ['/auction', '/buy', '/vault', '/redeem', '/docs'] as const
 
 export function MobileTabBar() {
   const pathname = usePathname()
@@ -61,7 +65,7 @@ export function MobileTabBar() {
     <nav
       aria-label="Primary"
       data-testid="mobile-tabs"
-      className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-4 border-t border-ink bg-paper md:hidden"
+      className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 border-t border-ink bg-paper md:hidden"
     >
       {tabs.map((tab) => {
         const active = pathname === tab.href || pathname.startsWith(`${tab.href}/`)
@@ -71,7 +75,7 @@ export function MobileTabBar() {
             href={tab.href}
             aria-current={active ? 'page' : undefined}
             className={cn(
-              'flex min-h-[52px] items-center justify-center font-mono text-[9px] uppercase tracking-[0.14em]',
+              'flex min-h-[52px] items-center justify-center px-1 text-center font-mono text-[9px] uppercase leading-[1.2] tracking-[0.08em]',
               active ? 'bg-fill text-onfill' : 'border-l border-hair text-dim first:border-l-0',
             )}
           >

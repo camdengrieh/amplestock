@@ -133,6 +133,9 @@ test('supply arithmetic matches the revision-7 genesis split', () => {
   assert.equal(s.perSpokeSeedAmps, (s.polAmps * 100) / 10_000)
 })
 
+/** `P0 / NAV - 1`, in bps, derived rather than written down twice. */
+const premiumBps = (p0Usd: number, navUsd: number): number => Math.round((p0Usd / navUsd - 1) * 10_000)
+
 test('the auction sells half of S0 in two legs at a $1.00 floor', () => {
   const a = config.launchParameters.auction
   const s = config.launchParameters.supply
@@ -143,11 +146,49 @@ test('the auction sells half of S0 in two legs at a $1.00 floor', () => {
   assert.equal(a.totalAmps * 2, s.s0Amps, 'half the supply is sold')
   assert.equal(a.legs, 2)
   assert.equal(a.floorPriceUsd, 1.0)
-  // A full clear at the floor: raised = tranche x floor, NAV/share = raised / S0 (fully diluted,
-  // Decision 14), premium = P0 / NAV - 1. All three are arithmetic, not assumptions.
   assert.equal(a.raisedAtFloorUsd, a.totalAmps * a.floorPriceUsd)
+})
+
+test('NAV per share at launch divides by the WHOLE supply, inventory included', () => {
+  const a = config.launchParameters.auction
+  const s = config.launchParameters.supply
+  // Decision 14 stands: the divisor is `S0`, which is what `AmpsVault._checkpoint` divides by.
+  // The 9,000-AMPS POL tranche counts, and is backed by nothing until it sells — which is exactly
+  // what the premium below discloses.
   assert.equal(a.navPerShareAtFloorUsd, a.raisedAtFloorUsd / s.s0Amps)
-  assert.equal(a.premiumAtFloorBps, Math.round((a.floorPriceUsd / a.navPerShareAtFloorUsd - 1) * 10_000))
+  assert.equal(a.navPerShareAtFloorUsd, 0.5)
+  assert.equal(a.premiumAtFloorBps, premiumBps(a.floorPriceUsd, a.navPerShareAtFloorUsd))
+  assert.equal(a.premiumAtFloorBps, 10_000)
+})
+
+test('the graduation minimum is about half the floor raise, and prices out at a higher premium', () => {
+  const a = config.launchParameters.auction
+  const g = a.graduationMinimum
+  const s = config.launchParameters.supply
+  assert.equal(g.raisedUsd, a.terms.graduationUsdPerLeg * a.legs, '2,500 a leg, both legs')
+  assert.equal(g.soldAmps, g.raisedUsd / a.floorPriceUsd, 'at the floor, a dollar buys an AMPS')
+  assert.equal(g.navPerShareUsd, g.raisedUsd / s.s0Amps, 'the same S0 divides a half-sized raise')
+  assert.equal(g.navPerShareUsd, 0.25)
+  // Half the raise against the whole supply is a *higher* premium, not a lower one.
+  assert.equal(g.premiumBps, premiumBps(a.floorPriceUsd, g.navPerShareUsd))
+  assert.equal(g.premiumBps, 30_000)
+  assert.ok(g.premiumBps > a.premiumAtFloorBps, 'a smaller raise discloses a larger premium')
+})
+
+test('the auction terms are the recommended set the operator actually sets', () => {
+  const t = config.launchParameters.auction.terms
+  assert.equal(t.factory, 'canonical')
+  assert.ok(isAddress(t.factoryAddress), 'the factory address must be an address')
+  assert.equal(getAddress(t.factoryAddress), t.factoryAddress, 'and EIP-55 checksummed')
+  assert.equal(t.startDelayHours, 24)
+  assert.equal(t.durationHours, 72)
+  assert.equal(t.claimDelayHours, 0)
+  assert.equal(t.tickSpacingBps, 100, '1% of the floor of each leg')
+  assert.equal(t.graduationUsdPerLeg, 2_500)
+  assert.equal(t.graduationUsdgRaw, 2_500_000_000n, '2,500 USDG at 6 decimals')
+  // No on-chain validation hook: the dApp's geo-block is a front-end control and binds no contract.
+  assert.equal(t.validationHook, 'none')
+  assert.equal(t.schedule, 'flat, increasing tail')
 })
 
 test('the founders seed survives only as the non-graduation fallback', () => {
@@ -158,10 +199,14 @@ test('the founders seed survives only as the non-graduation fallback', () => {
   assert.equal(seed.ethUsd, seed.usdgUsd, 'the fallback seed is 50/50')
   assert.equal(seed.launchPriceUsd, 1.0)
   // $20,000 against 20,000 AMPS fully diluted is NAV/share $1.00 — the pre-revision-7 launch,
-  // scaled to the new S0. These are the raw amounts `script/config/genesis.json` approves.
+  // scaled to the new S0 — so P0 and NAV are the same number and the premium is exactly zero.
   assert.equal(seed.totalUsd / s.s0Amps, seed.launchPriceUsd)
+  assert.equal(seed.premiumBps, premiumBps(seed.launchPriceUsd, seed.totalUsd / s.s0Amps))
+  assert.equal(seed.premiumBps, 0)
   assert.equal(seed.usdgRaw, 10_000_000_000n, '10,000 USDG at 6 decimals')
   assert.equal(seed.wethWei, 4n * 10n ** 18n, '4 WETH')
+  // The tranche returns to the vault as inventory; nobody is named to receive it.
+  assert.equal('seedRecipient' in seed, false, 'there is no seedRecipient on this path')
 })
 
 test('every start value sits inside its hard band', () => {
@@ -233,6 +278,10 @@ test('the pool set is 30 spokes + 2 entry pools on one hook', () => {
   assert.equal(p.spokePools + p.entryPools, p.totalPools)
   assert.equal(p.totalPools, 32)
   assert.ok(p.spokePools <= p.maxConstituents, 'launch set exceeds MAX_CONSTITUENTS')
+  // Decision 4: the cap is what the redemption gas budget proves, not a round number.
+  // MAX_LIVE_CELLS / cells-per-pool - the two entry pools = 512 / 14 - 2 = 34.
+  assert.equal(p.maxConstituents, 34)
+  assert.equal(p.spokePools + p.entryPools, 32, 'the launch shape sits well inside the cap')
 })
 
 test('chain ids and endpoints are the ones the plan verified', () => {

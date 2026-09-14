@@ -66,3 +66,6 @@ contracts/crytic-export/
 contracts/fizz_data/corpus_*/
 contracts/fizz_data/logs_*/
 contracts/fizz_data/crytic-export/
+
+# Temporary config variants written by the script tests (removed by the test; kept out of the tree if one aborts)
+contracts/script/config/*.tmp.json

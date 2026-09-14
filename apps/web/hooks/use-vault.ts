@@ -34,6 +34,8 @@ const VAULT_READS = [
   'previewNavPerShareX18',
   'totalAssetsUsd18',
   'inventoryAmps',
+  'pendingInventoryBurn',
+  'burnStreamStart',
   'redeemFeeBps',
   'REDEEM_FEE_BPS_MAX',
   'genesisTimestamp',
@@ -92,6 +94,23 @@ export function useVaultSnapshot() {
     previewNavPerShareX18: value<bigint>('previewNavPerShareX18'),
     totalAssetsUsd18: value<bigint>('totalAssetsUsd18'),
     inventoryAmps: value<bigint>('inventoryAmps'),
+    /**
+     * `pendingInventoryBurn()` — AMPS released by a redemption and not yet burned.
+     *
+     * Revision 8 defers the burn and spreads it: `redeemProRata` releases the vault's own AMPS out
+     * of the cells it crosses and leaves it idle, and it is then burned on a **24-hour linear
+     * stream** (`REDEEM_BURN_STREAM_SECONDS`) that every checkpoint and every redemption settles.
+     * So this is what is still owed to the sink, not what will burn in one step: it falls
+     * continuously as the stream is drained and rises whenever another redemption adds to it.
+     */
+    pendingInventoryBurn: value<bigint>('pendingInventoryBurn'),
+    /**
+     * `burnStreamStart()` — the timestamp the current stream began at.
+     *
+     * The stream restarts whenever a redemption adds to the queue, so this is the clock the 24
+     * hours are counted from, not the first redemption ever. Zero means nothing is queued.
+     */
+    burnStreamStart: num('burnStreamStart'),
     /** Live, always. The launch value moves and this interface never writes it down. */
     redeemFeeBps: num('redeemFeeBps'),
     /** The ceiling hardcoded in the vault; governance cannot widen it. */

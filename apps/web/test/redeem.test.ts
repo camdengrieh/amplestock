@@ -31,7 +31,7 @@ describe('buildRedeemPreview', () => {
     const preview = buildRedeemPreview({
       shares: WAD,
       redeemFeeBps: 100,
-      inventoryBurned: 2n * WAD,
+      inventoryReleased: 2n * WAD,
       tokens: [WETH, USDG, NVDA],
       amounts: [990n, 1_980n, 2_970n],
       meta,
@@ -41,14 +41,14 @@ describe('buildRedeemPreview', () => {
     expect(preview.lines[0]!.amount).toBe(990n)
     expect(preview.lines[0]!.grossAmount).toBe(1_000n)
     expect(preview.lines[0]!.feeAmount).toBe(10n)
-    expect(preview.inventoryBurned).toBe(2n * WAD)
+    expect(preview.inventoryReleased).toBe(2n * WAD)
   })
 
   it('pays in every asset the vault holds — no netting and no substitution', () => {
     const preview = buildRedeemPreview({
       shares: WAD,
       redeemFeeBps: 100,
-      inventoryBurned: 0n,
+      inventoryReleased: 0n,
       tokens: [WETH, USDG, NVDA],
       amounts: [0n, 1n, 2n],
       meta,
@@ -59,7 +59,7 @@ describe('buildRedeemPreview', () => {
 
   it('refuses a mismatched preview rather than pairing the wrong amounts with the wrong assets', () => {
     expect(() =>
-      buildRedeemPreview({shares: WAD, redeemFeeBps: 100, inventoryBurned: 0n, tokens: [WETH, USDG], amounts: [1n], meta}),
+      buildRedeemPreview({shares: WAD, redeemFeeBps: 100, inventoryReleased: 0n, tokens: [WETH, USDG], amounts: [1n], meta}),
     ).toThrow(/mismatched/)
   })
 })

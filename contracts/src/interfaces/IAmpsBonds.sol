@@ -357,7 +357,7 @@ interface IAmpsBonds {
     /// @return value The bound.
     function COEFFICIENT_X18_MAX() external view returns (uint64 value);
 
-    /// @notice Hard ceiling on the collateral set. `MAX_CONSTITUENTS + 2` == 66.
+    /// @notice Hard ceiling on the collateral set. `MAX_CONSTITUENTS + 2` == 36.
     /// @return value The bound.
     function MAX_COLLATERALS() external view returns (uint16 value);
 

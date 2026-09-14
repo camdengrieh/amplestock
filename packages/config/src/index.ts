@@ -224,7 +224,7 @@ export interface LaunchConstituent {
 /**
  * The 30 launch spokes (Decision 2). This is the launch set, **not** a fixed set: `PoolRegistry`
  * can add, retire, reinstate and reconfigure constituents under the 7-day timelock, up to
- * `MAX_CONSTITUENTS` = 64.
+ * `MAX_CONSTITUENTS` = 34 — the redemption gas budget's own answer, not a round number.
  *
  * Addresses and feeds that are `null` were not resolvable from the sources available offline; they
  * are resolved in Phase 0 from `https://api.robinhood.com/rhj/assets` and the Chainlink Reference
@@ -452,9 +452,10 @@ export const launchParameters = {
    *
    * `navPerShareAtFloorUsd` is arithmetic on the two figures above, not a promise: at a full clear
    * at the floor the auctions raise $10,000 against a fully diluted `S0` of 20,000, so NAV/share
-   * opens at $0.50 and the launch premium is 100%. It is **disclosed, not smoothed** — the vault
-   * keeps 45% of the supply as inventory backed by nothing until it sells, and every ask that fills
-   * at or above `P0` raises the backing.
+   * opens at $0.50 and the launch premium is 100% (Decision 14 stands — the denominator is the
+   * **whole** supply, protocol-held inventory included). It is **disclosed, not smoothed** — the
+   * vault keeps 45% of the supply as inventory backed by nothing until it sells, and every ask that
+   * fills at or above `P0` raises the backing.
    */
   auction: {
     /** Both legs together: `Constants.AUCTION_SHARES`. */
@@ -476,15 +477,58 @@ export const launchParameters = {
     navPerShareAtFloorUsd: 0.5,
     /** `P0 / NAV - 1` at a full clear at the floor. Disclosed, never smoothed. */
     premiumAtFloorBps: 10_000,
+    /**
+     * The smallest launch that graduates: `graduationUsdPerLeg` on each leg, so 2,500 USDG and
+     * $2,500 of ETH. 5,000 AMPS sold for $5,000, against the same `S0`.
+     *
+     * The premium is *higher* at the minimum, not lower, and that is the point of writing it down:
+     * a half-sized raise divides by the same whole supply, so NAV/share opens at a quarter of the
+     * floor and `P0` sits 300% above it. It is a disclosure figure for the launch announcement.
+     */
+    graduationMinimum: {
+      raisedUsd: 5_000,
+      soldAmps: 5_000,
+      /** `5,000 / 20,000`. */
+      navPerShareUsd: 0.25,
+      premiumBps: 30_000,
+    },
+    /**
+     * The auction terms the operator sets (revision 8, decided). These are the schedule and the
+     * bars, never the price or the size: `AmpsGenesis.createAuctions` computes the floor and
+     * refuses any allocation but the constants. The authority for the deployment is
+     * `contracts/script/config/genesis.json`; this is its human mirror.
+     */
+    terms: {
+      /** The canonical `ContinuousClearingAuctionFactory`, same address on every chain that has it. */
+      factory: 'canonical',
+      factoryAddress: '0x000000001F26a0044BaA66024e7b6599c61963F8',
+      /** Blocks between `createAuctions` and the first issuance block. */
+      startDelayHours: 24,
+      /** The bidding window. 2,592,000 blocks at the chain's 100 ms. */
+      durationHours: 72,
+      /** Between `endBlock` and claiming. Zero: a bid that has been exited can be claimed at once. */
+      claimDelayHours: 0,
+      /** Tick spacing as a fraction of each leg's own floor, in bps. 100 bp = 1%. */
+      tickSpacingBps: 100,
+      /** The graduation bar per leg, in USD: 2,500 USDG and $2,500 of ETH at the feed's price. */
+      graduationUsdPerLeg: 2_500,
+      /** 2,500 USDG at 6 decimals — the USDG leg's bar in its own raw units. */
+      graduationUsdgRaw: 2_500_000_000n,
+      /** No `IValidationHook`: the dApp's geo-block is a front-end control and binds no contract. */
+      validationHook: 'none',
+      /** A flat per-block issuance schedule with the increasing tail `06a_GenesisAuction` builds. */
+      schedule: 'flat, increasing tail',
+    },
   },
   /**
    * The founders' seed, kept **only** as the non-graduation fallback.
    *
-   * If neither auction reaches its `requiredCurrencyRaised`, bidders refund in full through the
-   * auctions themselves, `AmpsGenesis.settle()` returns the whole tranche to the vault and calls
-   * nothing, and the timelock runs `AmpsVault.genesisPlace` with `p0X18 = 1e18` out of this seed —
-   * the pre-revision-7 launch exactly, pools opening at $1.00. It is scaled to `S0`: $20,000
-   * against 20,000 AMPS is NAV/share $1.00, the same price the floor would have cleared at.
+   * If neither auction reaches its graduation bar, bidders refund in full through the auctions
+   * themselves, `AmpsGenesis.settle()` returns the whole tranche to the vault as inventory and
+   * calls nothing, and the timelock runs `AmpsVault.genesisPlace` with `p0X18 = 1e18` out of this
+   * seed — the pre-revision-7 launch exactly, pools opening at $1.00. It is scaled to `S0`: $20,000
+   * against 20,000 AMPS is NAV/share $1.00, the same price the floor would have cleared at, so the
+   * premium on this path is zero rather than a number to disclose.
    *
    * `contracts/script/config/genesis.json`'s `fallback.seedUsdg` / `fallback.seedWeth` carry the
    * raw amounts the script approves; these are the human figures behind them.
@@ -499,6 +543,8 @@ export const launchParameters = {
     wethWei: 4n * WAD,
     /** `p0X18` on the fallback path, and therefore NAV/share at a $20,000 seed against `S0`. */
     launchPriceUsd: 1.0,
+    /** `P0 / NAV - 1` on this path: the seed prices the whole supply at par with itself. */
+    premiumBps: 0,
     entryPools: ['AMPS/WETH', 'AMPS/USDG'],
   },
   /**
@@ -600,8 +646,13 @@ export const launchParameters = {
     totalPools: 32,
     spokePools: 30,
     entryPools: 2,
-    /** `PoolRegistry` hard cap on constituents. */
-    maxConstituents: 64,
+    /**
+     * `PoolRegistry` hard cap on constituents (revision 8, Decision 4: the cap is what the
+     * redemption gas budget proves). `MAX_LIVE_CELLS` is 512 and a full pool costs 14 live cells,
+     * so 512 / 14 = 36 pools, less the two entry pools = 34 constituents. It is not a round number
+     * because it is not a preference.
+     */
+    maxConstituents: 34,
     /** Hook permission flags: the hook's mined address must end in these bits. */
     hookFlags: '0x38C0',
   },

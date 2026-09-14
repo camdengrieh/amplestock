@@ -123,6 +123,59 @@ test('Auction reads both legs and explains the mechanism', async ({page}) => {
   await expect(page.getByTestId('bids-usdg')).toContainText('Connect a wallet')
 })
 
+test('Auction says whose auction it is, in the heading and at the settlement', async ({page}) => {
+  await page.goto('/auction')
+  const mark = page.getByTestId('powered-by-uniswap').first()
+  await expect(mark).toContainText('Powered by Uniswap Continuous Clearing Auction v2.1.0 · MIT')
+  await expect(mark.getByRole('link', {name: /Continuous Clearing Auction/})).toHaveAttribute(
+    'href',
+    'https://github.com/Uniswap/continuous-clearing-auction',
+  )
+  // The settlement panel carries it too: the auctions it settles are not ours either.
+  await expect(page.getByTestId('powered-by-uniswap-settlement')).toBeVisible()
+  // …and the explainer keeps the version aside it already had.
+  await expect(page.getByTestId('auction-explainer')).toContainText('Uniswap CCA v2.1.0')
+  await expect(page.getByTestId('auction-explainer')).toContainText('Amplestocks did not write this auction')
+  // Text only — no third-party logo asset is shipped, and the trademark is not ours to use.
+  await expect(page.getByTestId('powered-by-uniswap').first().locator('img, svg')).toHaveCount(0)
+})
+
+test('Auction offers the approval the USDG leg needs and the checkpoint that refreshes the price', async ({page}) => {
+  await page.goto('/auction')
+  // The ERC-20 leg has an allowance row and an approve button; with no wallet both say why.
+  const approve = page.getByTestId('auction-approve-usdg')
+  await expect(approve).toBeVisible()
+  await expect(page.getByTestId('auction-approve-button-usdg')).toBeVisible()
+  await expect(approve).toContainText('Connect a wallet')
+  // The native leg needs no approval at all and must not grow one.
+  await expect(page.getByTestId('auction-approve-eth')).toHaveCount(0)
+  // `checkpoint()` is a write, so the price is as of a block and the surface offers to advance it.
+  const refresh = page.getByTestId('auction-refresh-usdg')
+  await expect(refresh).toContainText('Priced as of block 12340')
+  await expect(page.getByTestId('auction-checkpoint-usdg')).toBeVisible()
+  await expect(refresh).toContainText('Connect a wallet')
+})
+
+test('Auction renders the indexed history and the public book, and degrades the rest', async ({page}) => {
+  await page.goto('/auction')
+  // The clearing-price series comes from `auction_checkpoint` — three USDG points, rising.
+  const history = page.getByTestId('clearing-history-usdg')
+  await expect(history).toBeVisible()
+  await expect(history).toContainText('3 checkpoints')
+  await expect(history).toContainText('USDG')
+  // The ETH leg has its own two points and is not the USDG leg's series.
+  await expect(page.getByTestId('clearing-history-eth')).toContainText('2 checkpoints')
+  // The public book is everybody's bids, not only the reader's.
+  const book = page.getByTestId('bid-book-usdg')
+  await expect(book).toBeVisible()
+  await expect(book).toContainText('#2')
+  await expect(book).toContainText('#1')
+  await expect(book).toContainText('2,500 USDG')
+  // Bids from the other leg do not leak into this one.
+  await expect(book).not.toContainText('#3')
+  await expect(page.getByTestId('bid-book-eth')).toContainText('2 ETH')
+})
+
 test('Auction settlement reads the genesis adapter and discloses the premium', async ({page}) => {
   await page.goto('/auction')
   const settlement = page.getByTestId('auction-settlement')
@@ -130,7 +183,7 @@ test('Auction settlement reads the genesis adapter and discloses the premium', a
   // The phase comes from the adapter, not from adding the two auctions up.
   await expect(page.getByTestId('genesis-phase-note')).toContainText('Settled')
   // $10,000 raised against S₀ = 20,000 is NAV/share $0.50 at a P₀ of $1.00: a 100% premium, and it
-  // is printed as a premium rather than smoothed away or called a discount.
+  // is printed as a premium rather than smoothed away or called a discount. Decision 14 stands.
   await expect(settlement).toContainText('$1.000000')
   await expect(settlement).toContainText('$10,000')
   await expect(settlement).toContainText('$0.5000')
@@ -168,7 +221,12 @@ test('Redeem previews the payout per asset at NAV minus the live fee', async ({p
   await expect(page.getByTestId('redeem-surface')).toContainText('2.50%')
   await page.getByTestId('redeem-amount').fill('1')
   await expect(page.getByTestId('redeem-preview')).toContainText('WETH')
-  await expect(page.getByTestId('redeem-preview')).toContainText('Inventory AMPS burned alongside')
+  // Revision 8 releases the inventory rather than burning it in the redemption, and it then leaves
+  // the supply on a 24-hour linear stream. The copy must not go on saying supply falls by more
+  // than the amount redeemed in this transaction.
+  await expect(page.getByTestId('redeem-preview')).toContainText('Inventory AMPS released, burned over 24 hours')
+  await expect(page.getByTestId('redeem-preview')).toContainText('24-hour linear stream')
+  await expect(page.getByTestId('redeem-preview')).not.toContainText('burned alongside')
 })
 
 test('Vault shows NAV, weights against targets, the gate per pool and a free checkpoint', async ({page}) => {
@@ -251,6 +309,10 @@ test('the docs auction page reads both auctions and refuses to invent the gradua
   // Live settlement figures, resolved from the adapter — none of them typed into the page.
   await expect(page.getByTestId('docs-article')).toContainText('$0.5000')
   await expect(page.getByTestId('docs-article')).toContainText('2,000 AMPS')
+  // And the page says whose auction it is, in its header.
+  await expect(page.getByTestId('docs-article')).toContainText(
+    'Powered by Uniswap Continuous Clearing Auction v2.1.0 · MIT',
+  )
 })
 
 test('the docs sidebar collapses to a select on a narrow viewport', async ({page}) => {

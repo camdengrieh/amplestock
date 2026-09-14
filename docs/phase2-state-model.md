@@ -326,17 +326,26 @@ claim  (structurally ungated)
 
 redeem  (structurally ungated)
   holder -> vault.redeemProRata(shares, to)
-    lock; T = Amps.totalSupply()                       read once, before the burn
-    Amps.burn(msg.sender, shares)                      effects before interactions
+    lock; VaultRedeemLib.settleBurnStream(AMPS)        ruling U: drain the accrued part of the 24 h inventory-burn
+                                                      stream FIRST, so `T` below is post-settlement
+                                                      -> Burn(burned, "redeemInventory") when non-zero
+    T = Amps.totalSupply()                             read once, before the burn
+    Amps.burn(msg.sender, shares)                      effects before interactions -> Burn(shares, "redeem")
     for each pool (Phase 3): remove floor(L_p * shares / T) from every PlacementRecord
     for each asset j != AMPS: pay floor(b_j * shares / T) * (BPS - redeemFeeBps) / BPS
       -- redeemFeeBps: 250 bp at launch (revision 6 raised it from 100), governed at 48 h, hard cap 500
-    burn the AMPS released from the vault's own inventory   -> T falls by MORE than `shares`
+    queueInventoryBurn(floor(inventory * shares / T) + releasedAmps)
+      -- QUEUED, not burned (revision 8, ruling U): `T` falls by exactly `shares` in this transaction, and the
+         queue is burned linearly over REDEEM_BURN_STREAM_SECONDS = 24 h by whichever call settles next
+         (checkpoint, touch, a bond, a compound, any placement, the next redemption). Burning it here let a
+         redeemer split one exit into slices and divide by a denominator its own earlier slices had shrunk.
+      -- pendingInventoryBurn() is the remainder; burnStreamStart() + 24 h is the deadline
     payout (VaultRedeemLib.payout): try the ERC-20 unlock under gasleft() - REDEEM_PAYOUT_RESERVE_GAS, per asset
       take{gas: 4 x STOCK_TOKEN_PROBE_GAS} -> claim on refusal; on ANY failure (a hostile transfer opening a
       foreign delta included) a second claims-only unlock pays every claim part; idle ERC-20 parts after the
       unlock, best-effort and capped (an unmovable idle wei is not paid)
-    emit Redeem, Burn("redeemInventory"); sweepClean (per token: sync + capped transfer outside any unlock, then
+    emit Redeem(owner, to, shares, inventoryReleased, feeBps); sweepClean
+                                                     (per token: sync + capped transfer outside any unlock, then
                                                           a try-wrapped per-token unlock for settle + mint;
                                                           `SweepResidue` instead of a revert)
     -- no gate read, no oracle, no guardian, no pause; a paused or denylisting constituent is paid

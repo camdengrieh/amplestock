@@ -74,7 +74,8 @@ describe('when settle() may be called', () => {
 describe('launch arithmetic', () => {
   it('divides the raise by the WHOLE supply, inventory included', () => {
     // The launch parameters' own worked example: a full clear at the $1.00 floor raises $10,000
-    // against S0 = 20,000, so NAV/share opens at $0.50.
+    // against S0 = 20,000, so NAV/share opens at $0.50. Decision 14 stands: the divisor is the
+    // whole supply, the 9,000-AMPS POL tranche included.
     const s0 = launchParameters.supply.s0
     const raised = BigInt(launchParameters.auction.raisedAtFloorUsd) * WAD
     expect(launchNavPerShareX18({raisedUsd18: raised, totalSupply: s0})).toBe(WAD / 2n)
@@ -85,7 +86,13 @@ describe('launch arithmetic', () => {
   it('prices the premium as P₀ over NAV, less one', () => {
     // $1.00 against $0.50 is 100%, which is what `premiumAtFloorBps` records.
     expect(launchPremiumBps({p0X18: WAD, navPerShareX18: WAD / 2n})).toBe(launchParameters.auction.premiumAtFloorBps)
+    // The graduation minimum: half the raise against the same S₀ is $0.25, so 300% — a *larger*
+    // premium, which is the thing about it worth writing down.
+    const g = launchParameters.auction.graduationMinimum
+    expect(launchPremiumBps({p0X18: WAD, navPerShareX18: WAD / 4n})).toBe(g.premiumBps)
+    expect(g.premiumBps).toBeGreaterThan(launchParameters.auction.premiumAtFloorBps)
     // The fallback launch seeds P0 = $1.00 against NAV of exactly $1.00: zero, not "about zero".
+    expect(launchPremiumBps({p0X18: WAD, navPerShareX18: WAD})).toBe(launchParameters.fallbackSeed.premiumBps)
     expect(launchPremiumBps({p0X18: WAD, navPerShareX18: WAD})).toBe(0)
     // A zero P0 is "not settled" or "nothing graduated", not a price of zero.
     expect(launchPremiumBps({p0X18: 0n, navPerShareX18: WAD})).toBeUndefined()

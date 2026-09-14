@@ -10,8 +10,10 @@ import {
   AuctionExplainer,
   AuctionHeadline,
   AuctionSchedule,
+  ClearingPriceHistory,
   MyBidsTable,
   PhaseTag,
+  PublicBidBook,
   SettlementPanel,
   type SettleAction,
   type UsdRate,
@@ -22,10 +24,12 @@ import {TxButton, TxError, TxSuccess} from '@/components/common/tx'
 import {Value} from '@/components/common/value'
 import {AmountField} from '@/components/ledger/amount-field'
 import {Callout, Kicker, RowGroup, SectionHead} from '@/components/ledger/primitives'
+import {PoweredByUniswap} from '@/components/ledger/powered-by-uniswap'
 import {Label} from '@/components/ui/label'
 import {Tabs, TabsList, TabsTrigger} from '@/components/ui/tabs'
 import {useAuction, useMyBids, useRequiredDemand, useUsdgUsd, type AuctionState} from '@/hooks/use-auction'
 import {useGenesis, type GenesisState} from '@/hooks/use-genesis'
+import {bidsOfLeg, checkpointsOfLeg, useGenesisIndex, type GenesisIndex} from '@/hooks/use-genesis-index'
 import {useRegistrySummary} from '@/hooks/use-registry'
 import {useTx} from '@/hooks/use-tx'
 import {useVaultSnapshot} from '@/hooks/use-vault'
@@ -70,6 +74,8 @@ export function AuctionSurface() {
   const vault = useVaultSnapshot()
   const registry = useRegistrySummary()
   const settle = useSettleGenesis(genesis)
+  // History and the public book only. Everything a bidder acts on above is a chain read.
+  const index = useGenesisIndex()
 
   const ampsToken = contract('amps')
   const supply = useReadContract({
@@ -99,6 +105,7 @@ export function AuctionSurface() {
           title="Auction"
           lede="The entry-pool AMPS tranche is sold through a Continuous Clearing Auction. The currency raised becomes the entry pools’ bid liquidity, and the final clearing price becomes the launch reference price."
         />
+        <PoweredByUniswap />
         <NotDeployed what="The genesis auction" />
         <AuctionExplainer />
       </div>
@@ -112,6 +119,7 @@ export function AuctionSurface() {
         title="Auction"
         lede="The entry-pool AMPS tranche is sold through a Continuous Clearing Auction — one uniform clearing price, a fixed per-block issuance schedule, and a full refund if it does not graduate."
       />
+      <PoweredByUniswap className="-mt-8" />
 
       <Callout
         title="What this auction decides"
@@ -135,6 +143,7 @@ export function AuctionSurface() {
           key={key}
           auction={key === 'usdg' ? usdg : eth}
           label={AUCTION_LABEL[key]}
+          index={index}
           {...(blockNumber !== undefined ? {blockNumber} : {})}
           usd={
             key === 'usdg'
@@ -209,23 +218,132 @@ function useSettleGenesis(genesis: GenesisState): SettleAction {
   }
 }
 
+/**
+ * The ERC-20 allowance the USDG leg needs, and the `approve` that supplies it.
+ *
+ * `submitBid` pulls the currency out of the bidder's own wallet — there is no router and no
+ * Permit2 in this path — so an ERC-20 leg needs an allowance to the **auction itself** before the
+ * bid can even be simulated. The ETH leg needs none: native ether rides along as the call's value,
+ * which is why the whole hook disables itself when `currencyIsNative`.
+ *
+ * The approval is for the amount typed in, not for `type(uint256).max`. An unbounded allowance to
+ * a contract that is going to be finished in 72 hours is a standing risk bought for one saved
+ * transaction, and this surface does not make that trade on a reader's behalf.
+ */
+function useBidApproval(auction: AuctionState, amount: bigint | null) {
+  const {address, isConnected} = useAccount()
+  const enabled =
+    !auction.currencyIsNative &&
+    auction.address !== undefined &&
+    auction.currency !== undefined &&
+    address !== undefined
+
+  const allowanceQuery = useReadContract({
+    ...(enabled ? {address: auction.currency as Address} : {}),
+    abi: erc20Abi,
+    functionName: 'allowance',
+    ...(enabled ? {args: [address as Address, auction.address as Address] as const} : {}),
+    query: {enabled, refetchInterval: 12_000},
+  })
+  const allowance = allowanceQuery.data as bigint | undefined
+
+  const needsApproval = amount !== null && amount > 0n && (allowance ?? 0n) < amount
+
+  const simulation = useSimulateContract({
+    ...(enabled ? {address: auction.currency as Address} : {}),
+    abi: erc20Abi,
+    functionName: 'approve',
+    ...(enabled && amount !== null && amount > 0n
+      ? {args: [auction.address as Address, amount] as const}
+      : {}),
+    query: {enabled: enabled && isConnected && needsApproval},
+  })
+
+  const blockedReason = !enabled
+    ? auction.currencyIsNative
+      ? 'The ETH leg needs no approval: native ether is sent as the call’s value.'
+      : 'Connect a wallet to simulate this.'
+    : amount === null || amount <= 0n
+      ? 'Enter the amount you intend to commit — the approval is for that amount and no more.'
+      : !needsApproval
+        ? 'The auction already has an allowance for this amount.'
+        : undefined
+
+  const tx = useTx({
+    simulation: simulation.data,
+    simulationError: simulation.error,
+    isSimulating: simulation.isLoading,
+    ...(blockedReason ? {blockedReason} : {}),
+    onSuccess: () => void allowanceQuery.refetch(),
+  })
+
+  return {
+    allowance,
+    needsApproval,
+    ...(blockedReason ? {blockedReason} : {}),
+    tx,
+    onClick: () => void tx.send(),
+  }
+}
+
+/**
+ * `checkpoint()` on one auction: the permissionless price refresh.
+ *
+ * Every figure the surface reads off an auction is "as of the last checkpoint", because the
+ * contract computes the clearing price lazily and only writes it when somebody pays to. The call
+ * takes no arguments, moves nobody's bid and pays nothing out; it only advances the book to the
+ * current block. Offering it is what makes "Priced as of block N" actionable rather than an
+ * apology.
+ */
+function useCheckpointAuction(auction: AuctionState) {
+  const {isConnected} = useAccount()
+
+  const blockedReason = !isConnected
+    ? 'Connect a wallet to simulate this. checkpoint() is permissionless — anyone may send it.'
+    : auction.address === undefined
+      ? 'This auction has no address on this chain.'
+      : auction.phase === 'upcoming'
+        ? 'The auction has not started, so there is no price to advance yet.'
+        : undefined
+
+  const simulation = useSimulateContract({
+    ...(auction.address ? {address: auction.address} : {}),
+    abi: ccaAbi,
+    functionName: 'checkpoint',
+    args: [] as const,
+    query: {enabled: auction.address !== undefined && isConnected && blockedReason === undefined},
+  })
+
+  const tx = useTx({
+    simulation: simulation.data,
+    simulationError: simulation.error,
+    isSimulating: simulation.isLoading,
+    ...(blockedReason ? {blockedReason} : {}),
+  })
+
+  return {tx, ...(blockedReason ? {blockedReason} : {}), onClick: () => void tx.send()}
+}
+
 type PendingAction =
   | {kind: 'bid'}
   | {kind: 'exit'; bidId: bigint}
   | {kind: 'exitPartial'; bidId: bigint}
   | {kind: 'claim'; bidId: bigint}
 
-/** One auction: headline, schedule, book, the bid form, and this wallet's own bids. */
+/** One auction: headline, schedule, book, the bid form, this wallet's own bids, and the index. */
 export function AuctionPanel({
   auction,
   label,
   blockNumber,
   usd,
+  index,
 }: {
   auction: AuctionState
   label: string
   blockNumber?: bigint
   usd: UsdRate
+  /** `/api/genesis`: the public book and the clearing-price series. History only. */
+  index?: GenesisIndex
 }) {
   const {address, isConnected} = useAccount()
   const bids = useMyBids(auction)
@@ -357,6 +475,9 @@ export function AuctionPanel({
         })
       : null
 
+  const approval = useBidApproval(auction, amount)
+  const refresh = useCheckpointAuction(auction)
+
   return (
     <section data-testid={`auction-${auction.key}`}>
       <div className="flex flex-wrap items-end justify-between gap-x-8 gap-y-3">
@@ -381,6 +502,43 @@ export function AuctionPanel({
           {...(blockSeconds !== undefined ? {blockTimeSeconds: blockSeconds} : {})}
           usd={usd}
         />
+      </div>
+
+      {/*
+       * `checkpoint()` is a write, not a view, so every figure above is as of the block printed
+       * beside the clearing price. Advancing it is permissionless and costs only gas, so the
+       * surface offers it rather than leaving a reader to wonder how stale the price is.
+       */}
+      <div
+        className="mt-5 flex flex-wrap items-center gap-4 border-b border-rule py-3.5"
+        data-testid={`auction-refresh-${auction.key}`}
+      >
+        <span className="font-mono text-[12px] text-dim">
+          {auction.lastCheckpointedBlock === undefined
+            ? 'Priced as of an unknown block'
+            : `Priced as of block ${auction.lastCheckpointedBlock.toString()}`}
+        </span>
+        <span className="max-w-[62ch] text-[13px] leading-normal text-dim">
+          Anyone may advance the auction’s checkpoint. It changes no bid and takes no fee; it only brings the
+          clearing price up to the current block.
+        </span>
+        <div className="ml-auto">
+          <TxButton
+            phase={refresh.tx.phase}
+            label="Refresh price"
+            {...(refresh.blockedReason ? {blockedReason: refresh.blockedReason} : {})}
+            onClick={refresh.onClick}
+            data-testid={`auction-checkpoint-${auction.key}`}
+          />
+        </div>
+      </div>
+      {refresh.tx.hash ? (
+        <div className="mt-5">
+          <TxSuccess hash={refresh.tx.hash} explorerUrl={explorerTxUrl(activeChainId, refresh.tx.hash)} />
+        </div>
+      ) : null}
+      <div className="mt-5">
+        <TxError error={refresh.tx.error} />
       </div>
 
       <div className="mt-12 grid gap-x-14 gap-y-12 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
@@ -438,8 +596,40 @@ export function AuctionPanel({
                   >
                     <span className="text-dim">{auction.currencyIsNative ? 'Call value' : 'Allowance'}</span>
                   </FieldRow>
+                  {auction.currencyIsNative ? null : (
+                    <FieldRow
+                      label={`Allowance to the auction (${auction.currencySymbol ?? '—'})`}
+                      hint="Approved to the auction itself, not to a router: submitBid pulls the currency straight out of your wallet. Approved for this amount only, never unbounded."
+                    >
+                      <Value unavailable={approval.allowance === undefined || auction.currencyDecimals === undefined}>
+                        {approval.allowance !== undefined && auction.currencyDecimals !== undefined
+                          ? `${formatAmount(approval.allowance, auction.currencyDecimals)} ${auction.currencySymbol ?? ''}`
+                          : null}
+                      </Value>
+                    </FieldRow>
+                  )}
                 </RowGroup>
               </div>
+
+              {auction.currencyIsNative ? null : (
+                <div className="mt-[26px] space-y-5" data-testid={`auction-approve-${auction.key}`}>
+                  <TxButton
+                    phase={approval.tx.phase}
+                    label={
+                      approval.needsApproval
+                        ? `Approve ${amountText || ''} ${auction.currencySymbol ?? ''}`.replace(/\s+/g, ' ').trim()
+                        : `${auction.currencySymbol ?? 'The currency'} is approved`
+                    }
+                    {...(approval.blockedReason ? {blockedReason: approval.blockedReason} : {})}
+                    onClick={approval.onClick}
+                    data-testid={`auction-approve-button-${auction.key}`}
+                  />
+                  <TxError error={approval.tx.error} />
+                  {approval.tx.hash ? (
+                    <TxSuccess hash={approval.tx.hash} explorerUrl={explorerTxUrl(activeChainId, approval.tx.hash)} />
+                  ) : null}
+                </div>
+              )}
             </>
           ) : (
             <div className="mt-[26px]">
@@ -512,6 +702,39 @@ export function AuctionPanel({
             onExitPartial={(bidId) => setAction({kind: 'exitPartial', bidId})}
             onClaim={(bidId) => setAction({kind: 'claim', bidId})}
           />
+        </div>
+      </div>
+
+      <div className="mt-[52px] grid gap-x-14 gap-y-12 lg:grid-cols-2">
+        <div>
+          <SectionHead
+            title="Clearing price over the window"
+            note="Every checkpoint this leg has had, from the indexer. The headline above is the chain read and stays the authority; this is the history a single read cannot give."
+            aside="Indexed"
+          />
+          <div className="mt-6">
+            <ClearingPriceHistory
+              auction={auction}
+              {...(index ? {checkpoints: checkpointsOfLeg(index.checkpoints, auction.key)} : {})}
+              {...(index ? {unavailable: index.unavailable, configured: index.configured} : {unavailable: true})}
+              {...(index?.reason ? {reason: index.reason} : {})}
+            />
+          </div>
+        </div>
+        <div>
+          <SectionHead
+            title="The public book"
+            note="Every bid the indexer has seen in this leg, not only your own. The auction emits them and anybody can read them; nothing here prices anything."
+            aside="Indexed"
+          />
+          <div className="mt-6">
+            <PublicBidBook
+              auction={auction}
+              {...(index ? {bids: bidsOfLeg(index.bids, auction.key)} : {})}
+              {...(index ? {unavailable: index.unavailable, configured: index.configured} : {unavailable: true})}
+              {...(index?.reason ? {reason: index.reason} : {})}
+            />
+          </div>
         </div>
       </div>
 

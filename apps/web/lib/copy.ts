@@ -260,6 +260,10 @@ export const AUCTION_COPY: readonly {title: string; body: string}[] = [
     title: 'What the clearing price becomes',
     body: 'The final clearing price becomes the launch reference price the vault starts from. From that point the reference is floored at NAV per share and rate-limited upward, and the market price is whatever the pools say it is.',
   },
+  {
+    title: 'Amplestocks did not write this auction',
+    body: 'Both legs are Uniswap’s Continuous Clearing Auction v2.1.0, MIT-licensed, deployed by Uniswap’s own canonical factory. Every price, tick, fill and refund on this page is that contract’s arithmetic and not ours, and the source is linked from the mark at the top of the page. Amplestocks writes what happens to the proceeds afterwards, and nothing about how they are raised.',
+  },
 ] as const
 
 /** The line the footer carries above everything else. */

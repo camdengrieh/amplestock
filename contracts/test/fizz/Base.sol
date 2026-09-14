@@ -150,7 +150,11 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math, Phase3Fixture {
         // ── redemption ─────────────────────────────────────────────────────────────────────────────────────────
         address[] previewTokens;
         uint256[] previewAmounts;
-        uint256 previewInventoryBurned;
+        /// @dev What the last `previewRedeem` said the redemption would **release** into the 24-hour
+        ///      inventory-burn stream (revision 8, ruling U). It is queued, not burned, at the redemption.
+        uint256 previewInventoryReleased;
+        /// @dev AMPS wei redemptions have released into the stream over the whole campaign.
+        uint256 queuedInventory;
         address[] lastRedeemTokens;
         uint256[] lastRedeemAmounts;
         // ── placement, compound and the creator slice ──────────────────────────────────────────────────────────

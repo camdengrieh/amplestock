@@ -6,6 +6,7 @@ import {IAmpsVault} from "../src/interfaces/IAmpsVault.sol";
 import {IFeedRegistry} from "../src/interfaces/IFeedRegistry.sol";
 import {Constants} from "../src/types/Constants.sol";
 import {Gov} from "./lib/Gov.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {Script} from "forge-std/Script.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 import {console2} from "forge-std/console2.sol";
@@ -100,7 +101,8 @@ contract GenesisAuction is Script {
     /// @notice One leg's configuration, before it becomes an `IAmpsGenesis.AuctionSpec`.
     /// @param enabled Whether the leg runs at all.
     /// @param tickSpacing The Q96 price granularity.
-    /// @param requiredCurrencyRaised The graduation threshold, in currency raw units.
+    /// @param requiredCurrencyRaised The graduation threshold, in currency raw units. The ETH leg's is derived
+    ///        from `eth.requiredUsd18` at `ethUsdX18` when the config leaves this at zero; see {loadConfig}.
     /// @param validationHook The bid validation hook, or zero.
     /// @param salt The CREATE2 salt.
     /// @param stepMps The per-block rates, parallel to `stepBlocks`. Empty or all-zero asks for a flat schedule.
@@ -300,8 +302,16 @@ contract GenesisAuction is Script {
     /// @param w The addresses, for the optional ETH/USD feed read.
     /// @return cfg The configuration.
     function loadConfig(Wiring memory w) public view returns (LaunchConfig memory cfg) {
-        string memory json = vm.readFile(GENESIS_PATH);
+        return loadConfigFrom(w, vm.readFile(GENESIS_PATH));
+    }
 
+    /// @notice {loadConfig} on the contents of a file the caller has already read, so a rehearsal can hand in a
+    ///         variant of `genesis.json` without touching the process environment, which every test in a forge run
+    ///         shares and which `vm.setEnv` therefore races on.
+    /// @param w The addresses, for the optional ETH/USD feed read.
+    /// @param json The file's contents.
+    /// @return cfg The configuration.
+    function loadConfigFrom(Wiring memory w, string memory json) public view returns (LaunchConfig memory cfg) {
         uint256 blockMs = vm.envOr("AMPS_BLOCK_MS", json.readUint(".blockMs"));
         if (blockMs == 0) blockMs = BLOCK_MS_DEFAULT;
         uint256 startDelay = vm.envOr("AMPS_AUCTION_START_DELAY_HOURS", json.readUint(".startDelayHours"));
@@ -323,6 +333,21 @@ contract GenesisAuction is Script {
 
         cfg.usdgLeg = _leg(json, ".usdg", "AMPS_AUCTION_USDG_ENABLED", "AMPS_AUCTION_USDG_REQUIRED");
         cfg.ethLeg = _leg(json, ".eth", "AMPS_AUCTION_ETH_ENABLED", "AMPS_AUCTION_ETH_REQUIRED");
+
+        // **The ETH leg's graduation bar is a dollar figure and the currency it is measured in is not.** The
+        // decision the owner took (2026-09-13) is "about half the floor raise, per leg", i.e. $2,500; expressing
+        // that in WETH wei means fixing an ETH/USD price, and the one that matters is the price at *creation*,
+        // which is the same `ethUsdX18` `AmpsGenesis.createAuctions` derives the ETH floor from. So the config
+        // carries the dollars and this derives the wei, by the same `mulDiv`, rather than leaving a number that
+        // silently means something different every time ETH moves. A non-zero `requiredCurrencyRaised` — from the
+        // file or from `AMPS_AUCTION_ETH_REQUIRED` — is the manual override and wins outright.
+        if (cfg.ethLeg.requiredCurrencyRaised == 0) {
+            uint256 requiredUsd18 = vm.parseUint(json.readString(".eth.requiredUsd18"));
+            if (requiredUsd18 != 0) {
+                cfg.ethLeg.requiredCurrencyRaised =
+                    uint128(FullMath.mulDiv(requiredUsd18, Constants.WAD, cfg.ethUsdX18));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------------------------

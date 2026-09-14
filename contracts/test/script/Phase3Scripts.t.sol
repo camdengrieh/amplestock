@@ -790,6 +790,65 @@ contract Phase3Scripts is V4TestBase {
     }
 
     // -----------------------------------------------------------------------------------------------------------
+    // The accepted CCA parameters (revision 8)
+    // -----------------------------------------------------------------------------------------------------------
+
+    /// @notice `script/config/genesis.json` carries the parameter set the owner accepted on 2026-09-13, and `06a`
+    ///         reads it: 24 h start delay, 72 h duration, 0 h claim delay, no validation hook, the flat-schedule
+    ///         sentinel, **2,500 USDG** on the USDG leg and **$2,500 of ETH** on the ETH leg — the latter carried
+    ///         as a dollar figure and converted at the creation-time `ethUsdX18`, exactly as the ETH floor is.
+    function test_r8_loadConfigTakesTheAcceptedCcaParameters() public {
+        // `loadConfig` reads ETH/USD off the feed registry when the file leaves `ethUsdX18` at zero.
+        testnetScript.installFeedsOnly(_core(), assets);
+
+        GenesisAuction.LaunchConfig memory cfg = auctionScript.loadConfig(_auctionWiring());
+
+        assertEq(cfg.ethUsdX18, ETH_USD_X18, "ETH/USD came off the feed");
+        assertEq(cfg.usdgLeg.requiredCurrencyRaised, 2500e6, "the USDG leg graduates at 2,500 USDG");
+        assertEq(
+            cfg.ethLeg.requiredCurrencyRaised,
+            (2500e18 * 1e18) / ETH_USD_X18,
+            "and the ETH leg at $2,500 of ETH, derived at ethUsdX18"
+        );
+        assertEq(cfg.ethLeg.requiredCurrencyRaised, 1e18, "which is 1 WETH at ETH/USD = 2,500");
+
+        assertTrue(cfg.usdgLeg.enabled && cfg.ethLeg.enabled, "both legs run");
+        assertEq(cfg.usdgLeg.validationHook, address(0), "no validation hook on the USDG leg");
+        assertEq(cfg.ethLeg.validationHook, address(0), "nor on the ETH leg");
+        assertEq(cfg.usdgLeg.stepMps.length, 1, "the flat-schedule sentinel is what the file carries");
+        assertEq(cfg.usdgLeg.stepMps[0], 0, "a single {mps: 0, blocks: 0} entry");
+
+        // 24 h / 72 h / 0 h at 100 ms blocks, which is 36,000 blocks an hour.
+        assertEq(uint256(cfg.startBlock) - block.number, 24 * 36_000, "24 h start delay");
+        assertEq(uint256(cfg.endBlock) - cfg.startBlock, 72 * 36_000, "72 h duration");
+        assertEq(cfg.claimBlock, cfg.endBlock, "0 h claim delay");
+    }
+
+    /// @notice An explicit `requiredCurrencyRaised` on the ETH leg is the manual override and wins outright over
+    ///         the dollar figure — the derivation only fills in a zero.
+    /// @dev The override is exercised through a variant of the file rather than through `AMPS_AUCTION_ETH_REQUIRED`:
+    ///      `vm.setEnv` writes the *process* environment, which every test in a forge run shares, so an env-driven
+    ///      version raced with the derivation test above on CI's two-core runner (the reset landed between the
+    ///      write and the read). The env override rides the same `envOr` fallback as the file value and needs no
+    ///      separate exercise.
+    function test_r8_anExplicitEthRequirementOverridesTheDerivation() public {
+        testnetScript.installFeedsOnly(_core(), assets);
+
+        string memory original = vm.readFile("./script/config/genesis.json");
+        string memory tmp = "./script/config/genesis.r8-override.tmp.json";
+        vm.writeFile(tmp, original);
+        vm.writeJson('"3000000000000000000"', tmp, ".eth.requiredCurrencyRaised");
+        string memory variant = vm.readFile(tmp);
+        vm.removeFile(tmp);
+
+        GenesisAuction.LaunchConfig memory cfg = auctionScript.loadConfigFrom(_auctionWiring(), variant);
+        assertEq(cfg.ethLeg.requiredCurrencyRaised, 3e18, "the explicit value is taken as-is, not re-derived");
+
+        cfg = auctionScript.loadConfigFrom(_auctionWiring(), original);
+        assertEq(cfg.ethLeg.requiredCurrencyRaised, 1e18, "and the file's zero derives 1 WETH at ETH/USD = 2,500");
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------------------------------------------
 
@@ -868,7 +927,8 @@ contract Phase3Scripts is V4TestBase {
         });
     }
 
-    /// @dev A 600-block auction window starting 10 blocks out, with a graduation bar both legs clear.
+    /// @dev A 600-block auction window starting 10 blocks out, with the accepted graduation bars — 2,500 USDG and
+    ///      1 WETH ($2,500 at `ETH_USD_X18`) — which both legs clear when the tranches sell out at the floor.
     function _launchConfig() private view returns (GenesisAuction.LaunchConfig memory cfg) {
         cfg.ethUsdX18 = ETH_USD_X18;
         cfg.startBlock = uint64(block.number + 10);
@@ -879,7 +939,7 @@ contract Phase3Scripts is V4TestBase {
         cfg.usdgLeg = GenesisAuction.LegConfig({
             enabled: true,
             tickSpacing: (uint256(1e6) * (uint256(1) << 96)) / 1e18 / 100,
-            requiredCurrencyRaised: 1000e6,
+            requiredCurrencyRaised: 2500e6,
             validationHook: address(0),
             salt: bytes32(uint256(1)),
             stepMps: new uint24[](0),
@@ -888,7 +948,7 @@ contract Phase3Scripts is V4TestBase {
         cfg.ethLeg = GenesisAuction.LegConfig({
             enabled: true,
             tickSpacing: (((uint256(1) << 96) * uint256(1e18)) / ETH_USD_X18) / 100,
-            requiredCurrencyRaised: 0.4e18,
+            requiredCurrencyRaised: 1e18,
             validationHook: address(0),
             salt: bytes32(uint256(2)),
             stepMps: new uint24[](0),

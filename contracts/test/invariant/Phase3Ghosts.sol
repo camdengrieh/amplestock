@@ -112,6 +112,11 @@ contract Phase3Ghosts {
 
     /// @dev `totalSupply` as it stood when the current action opened.
     uint256 internal supplyAtOpen;
+    /// @dev `AmpsVault.pendingInventoryBurn()` at the action's open. Revision 8 (ruling U): any action that
+    ///      checkpoints settles the 24-hour inventory-burn stream, so the supply delta {close} attributes is a
+    ///      mint or a burn **net of** a burn that belongs to a redemption made earlier in the campaign. The fall
+    ///      in the queue is exactly what the stream burned, and {close} undoes it before attributing the rest.
+    uint256 internal pendingBurnAtOpen;
 
     /// @dev The rolling 24-hour rollout window this campaign tracks itself, mirroring the vault's.
     uint256 internal rolloutWindowStart;
@@ -168,6 +173,7 @@ contract Phase3Ghosts {
         ++actionsAttempted;
         actionCount[name] += 1;
         supplyAtOpen = AMPS.totalSupply();
+        pendingBurnAtOpen = VAULT.pendingInventoryBurn();
         // I26: the rotation credit is transient, so it is zero at the start of every transaction, always.
         if (HOOK.rotationCredit(ROUTER) != 0) creditEverLeaked = true;
         // I13: the hook holds nothing, ever.
@@ -186,9 +192,20 @@ contract Phase3Ghosts {
             quoterEverReverted = true;
         }
 
+        // Revision 8, ruling U. `_checkpoint` settles the inventory-burn stream, so a bond that mints and a
+        // compound that burns can also carry a drain that belongs to a redemption several actions ago. Undo the
+        // drain before attributing the rest, and book it as the burn it is: `mintedObserved` must stay exactly
+        // `mintedVesting`, and `S0 + mintedObserved - burnedTotal` must stay `totalSupply`. A drain the action's
+        // own queue more than offsets reads as zero here, which is safe — the queue moves no supply, so the
+        // unattributed part lands in `burnedTotal` through the plain delta below.
+        uint256 pendingNow = VAULT.pendingInventoryBurn();
+        uint256 drained = pendingBurnAtOpen > pendingNow ? pendingBurnAtOpen - pendingNow : 0;
+
         uint256 supplyNow = AMPS.totalSupply();
-        if (supplyNow < supplyAtOpen) burnedTotal += supplyAtOpen - supplyNow;
-        else mintedObserved += supplyNow - supplyAtOpen;
+        uint256 adjusted = supplyNow + drained;
+        if (adjusted < supplyAtOpen) burnedTotal += supplyAtOpen - adjusted;
+        else mintedObserved += adjusted - supplyAtOpen;
+        burnedTotal += drained;
 
         uint256 cells = VAULT.liveCells();
         if (cells > maxLiveCellsSeen) maxLiveCellsSeen = cells;

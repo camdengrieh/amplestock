@@ -160,9 +160,20 @@ export const FIGURES = {
   cfgPolTranche: {label: 'Protocol-owned liquidity', source: 'config', from: 'launchParameters.supply.polWei'},
   cfgEntryPoolAsks: {label: 'Ask ladder per entry pool', source: 'config', from: 'launchParameters.supply.entryPoolWeiEach'},
   cfgSpokeSeedAmps: {label: 'Seed ask per spoke', source: 'config', from: 'launchParameters.supply.perSpokeSeedWei'},
-  /** What a full clear at the floor implies. Arithmetic on the two rows above, not a forecast. */
+  /** What a full clear at the floor implies. Arithmetic on the rows above, not a forecast. */
   cfgNavAtFloor: {label: 'NAV per share at a floor clear', source: 'config', from: 'launchParameters.auction.navPerShareAtFloorUsd'},
   cfgPremiumAtFloor: {label: 'Premium at a floor clear', source: 'config', from: 'launchParameters.auction.premiumAtFloorBps'},
+  /** The smallest launch that graduates: the bar on each leg, and what it prices out at. */
+  cfgGraduationPerLeg: {label: 'Graduation bar per leg', source: 'config', from: 'launchParameters.auction.terms.graduationUsdPerLeg'},
+  cfgNavAtGraduation: {label: 'NAV per share at the graduation minimum', source: 'config', from: 'launchParameters.auction.graduationMinimum.navPerShareUsd'},
+  cfgPremiumAtGraduation: {label: 'Premium at the graduation minimum', source: 'config', from: 'launchParameters.auction.graduationMinimum.premiumBps'},
+  /** The auction terms the operator sets: the schedule and the bars, never the price or the size. */
+  cfgAuctionStartDelay: {label: 'Start delay', source: 'config', from: 'launchParameters.auction.terms.startDelayHours'},
+  cfgAuctionDuration: {label: 'Bidding window', source: 'config', from: 'launchParameters.auction.terms.durationHours'},
+  cfgAuctionClaimDelay: {label: 'Claim delay', source: 'config', from: 'launchParameters.auction.terms.claimDelayHours'},
+  cfgAuctionTickSpacing: {label: 'Tick spacing', source: 'config', from: 'launchParameters.auction.terms.tickSpacingBps'},
+  cfgAuctionValidationHook: {label: 'Validation hook', source: 'config', from: 'launchParameters.auction.terms.validationHook'},
+  cfgFallbackLaunchPrice: {label: 'Fallback launch price', source: 'config', from: 'launchParameters.fallbackSeed.launchPriceUsd'},
   cfgFallbackSeed: {label: 'Fallback seed', source: 'config', from: 'launchParameters.fallbackSeed.totalUsd'},
   cfgTotalPools: {label: 'Pools at launch', source: 'config', from: 'launchParameters.pools.totalPools'},
   cfgSpokePools: {label: 'Spokes at launch', source: 'config', from: 'launchParameters.pools.spokePools'},

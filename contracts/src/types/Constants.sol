@@ -132,6 +132,28 @@ library Constants {
     /// @notice Hard ceiling of `redeemFeeBps`. 5%. There is no floor: governance may set it to zero.
     uint16 internal constant REDEEM_FEE_BPS_MAX = 500;
 
+    /// @notice The window the released-inventory burn is streamed over: 24 hours (`docs/phase3-state-model.md`
+    ///         §12.3 ruling U, resolved 2026-09-13).
+    ///
+    /// @dev **Why the burn is a stream and not a burn** (revision 8). `redeemProRata` computes the same inventory
+    ///      figure it always did — the ladder AMPS the unwind released plus `floor(inventory x shares / T)` — but
+    ///      it no longer burns it in the same transaction. Burning it there lowered `T` *inside* the sequence a
+    ///      redeemer controls, so a holder who split one exit into slices divided by a denominator its own earlier
+    ///      slices had shrunk and extracted up to ~2.9% more than the same exit taken at once (ruling U). Deferring
+    ///      the burn "to the next checkpoint" would have removed nothing: `checkpoint()` is permissionless, so the
+    ///      same redeemer could call it between slices. The amount is therefore **queued** and released linearly
+    ///      over this window, on one straight line from the redemption to `burnStreamStart() + D`: a slice sees
+    ///      only the fraction of the line that has actually elapsed, and slices inside one block see none of it at
+    ///      all, so the split advantage collapses to the streamed fraction and is exactly zero within a block.
+    ///      Settling more often does not slow the line down and cannot be used to hold the burn back.
+    ///
+    /// @dev **There is no setter.** A governable window would be a lever over the one path that must not have any:
+    ///      `VaultRedeemLib.settleBurnStream` is reached from the ungated redemption floor, and a parameter read
+    ///      there is a slot governance could use to stall it. 24 hours is long enough that a split is worthless
+    ///      (the fee alone dominates at every practical slice count) and short enough that the accretion the burn
+    ///      represents lands within a day of the redemption that earned it.
+    uint32 internal constant REDEEM_BURN_STREAM_SECONDS = ONE_DAY;
+
     /// @notice The creator fee at genesis: 100 bp of sell volume, carved out of `ampsFeeBps`, never added on top.
     /// @dev The whole schedule is immutable. There is no setter, no band and no governance path that can extend,
     ///      restart or enlarge it; only the current `creator` may reassign the destination address.
@@ -225,6 +247,8 @@ library Constants {
     uint16 internal constant H_SESSION_BPS_MAX = 1000;
 
     /// @notice Hard ceiling on the number of bond collaterals: `MAX_CONSTITUENTS` plus WETH and USDG.
+    /// @dev It is symbolic on purpose — it has followed {MAX_CONSTITUENTS} through every revision of the cap and
+    ///      must keep doing so, because the two entry pools are exactly the difference between the two figures.
     uint16 internal constant MAX_COLLATERALS = MAX_CONSTITUENTS + 2;
 
     // -------------------------------------------------------------------------------------------------------------
@@ -678,15 +702,23 @@ library Constants {
     /// @notice The vault-wide budget of **live** ladder cells (records with non-zero liquidity), summed over every
     ///         pool. 512.
     /// @dev This is what keeps `redeemProRata` executable in one transaction, which is the whole of the redemption
-    ///      floor's promise. Redemption removes `floor(L_p x shares / T)` from every live cell and the placement
-    ///      suite measures ~46k gas per live cell, so 512 cells is ~23.5M gas: inside Arbitrum's 32M per-transaction
-    ///      cap with a quarter in reserve for the idle-asset payouts and the burn. Every path that would open a
-    ///      *new* cell checks the budget first: `place` (timelock or registry) reverts with `CellBudgetExceeded`;
-    ///      the permissionless bountied paths (`compound`, `rollout`, `deployBonded`) merge into cells that already
-    ///      exist and leave the remainder idle rather than revert. At the launch shape (14 cells per pool: ten asks
-    ///      plus four bids) the budget admits ~36 pools, so a registry that grows toward `MAX_CONSTITUENTS` must
-    ///      either coarsen its ladders or raise this constant through a vault migration, and Phase 0 must confirm
-    ///      the chain's `MaxTxGasLimit` before either is decided.
+    ///      floor's promise. Redemption removes `floor(L_p x shares / T)` from every live cell, and
+    ///      `test/unit/VaultRedeem.t.sol` measures both halves of the budget on a fully occupied fixture:
+    ///      `test_e_gasPerLiveCellFitsTheRedemptionBudget` the marginal cost of a cell, and
+    ///      `test_r8_constituentCostAtTheCapFitsTheRedemptionBudget` the marginal cost of a constituent (one more
+    ///      pool to walk and one more asset to pay). The bound they assert together is
+    ///      `perCell x MAX_LIVE_CELLS + perConstituent x (MAX_CONSTITUENTS + 2) + fixed <= 24M`, inside Arbitrum's
+    ///      32M per-transaction cap with a quarter in reserve.
+    ///
+    ///      Every path that would open a *new* cell checks the budget first: `place` (timelock or registry) reverts
+    ///      with `CellBudgetExceeded`; the permissionless bountied paths (`compound`, `rollout`, `deployBonded`)
+    ///      merge into cells that already exist and leave the remainder idle rather than revert.
+    ///
+    ///      At the launch shape — `LADDER_DOUBLINGS_DEFAULT + SEED_HALVINGS_DEFAULT == 14` cells per pool: ten asks
+    ///      plus four bids — the budget admits 36 pools, of which two are the entry pools. That is where
+    ///      {MAX_CONSTITUENTS} comes from, and `test_r8_constituentCapIsTiedToTheLiveCellBudget` asserts the tie
+    ///      rather than leaving it to a comment. Raising either figure needs the redemption budget re-measured and
+    ///      a vault migration, and Phase 0 must confirm the chain's `MaxTxGasLimit` before either is decided.
     uint32 internal constant MAX_LIVE_CELLS = 512;
 
     /// @notice The `salt` every vault position at the PoolManager is opened with: `bytes32(0)`, everywhere, for
@@ -719,7 +751,19 @@ library Constants {
     // -------------------------------------------------------------------------------------------------------------
 
     /// @notice Hard ceiling on the constituent set. Ids are 1-based, so valid ids are `[1, MAX_CONSTITUENTS]`.
-    uint16 internal constant MAX_CONSTITUENTS = 64;
+    /// @dev **The cap is the redemption gas budget, expressed in constituents** (revision 8; §12 ruling E closed).
+    ///      It was 64, a round number nothing measured: at the launch shape every pool carries
+    ///      `LADDER_DOUBLINGS_DEFAULT + SEED_HALVINGS_DEFAULT == 14` live cells, so 64 constituents plus the two
+    ///      entry pools would need 924 live cells and {MAX_LIVE_CELLS} admits 512 — a registry filled to its own
+    ///      documented ceiling could not have opened its ladders, and `place` would have been reverting
+    ///      `CellBudgetExceeded` long before anybody noticed the two constants disagreed.
+    ///
+    ///      `512 / 14 == 36` pools, less the `AMPS/WETH` and `AMPS/USDG` entry pools, is 34, and
+    ///      `test_r8_constituentCapIsTiedToTheLiveCellBudget` asserts exactly that arithmetic so the two constants
+    ///      can never drift apart again. `test_e_gasPerLiveCellFitsTheRedemptionBudget` and
+    ///      `test_r8_constituentCostAtTheCapFitsTheRedemptionBudget` measure the other half — that a redemption at
+    ///      `MAX_LIVE_CELLS` live cells and `MAX_COLLATERALS` assets fits in one transaction.
+    uint16 internal constant MAX_CONSTITUENTS = 34;
 
     /// @notice The launch constituent set size (Decision 2). Not a bound: the registry starts here and moves.
     uint16 internal constant LAUNCH_CONSTITUENTS = 30;

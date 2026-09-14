@@ -761,7 +761,13 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      (`VaultRedeemLib._payout:663-671`, `previewUnwind:849-864`, `redemption:631`).
     /// @param seed Chooses the two halves.
     function property_redemptionIsNotSplittableForProfit(uint256 seed) public {
+        // Revision 8: `previewRedeem` measures against the supply the redemption's own settlement of the
+        // inventory-burn stream will leave behind, and clamps `shares` to it. Drawing the two halves out of
+        // `T - pendingInventoryBurn()` — a lower bound on that supply, since the drain is capped at what is
+        // pending — keeps `a + b` inside it, which is the range over which floor superadditivity is the claim.
         uint256 supply = amps.totalSupply();
+        uint256 pending = vault.pendingInventoryBurn();
+        supply = supply > pending ? supply - pending : 0;
         if (supply < 4) return;
         uint256 a = clampBetween(seed, 1, supply / 2);
         uint256 b = clampBetween(uint256(keccak256(abi.encode(seed, "GL-28"))), 1, supply / 2);
@@ -770,7 +776,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         (address[] memory tb, uint256[] memory ab, uint256 ib) = vault.previewRedeem(b);
         (address[] memory tc, uint256[] memory ac, uint256 ic) = vault.previewRedeem(a + b);
 
-        lte(ia + ib, ic, "GL-28: splitting a redemption burns less inventory");
+        lte(ia + ib, ic, "GL-28: splitting a redemption releases less inventory");
         if (ta.length != tb.length || ta.length != tc.length) return;
         for (uint256 i; i < ta.length; ++i) {
             if (ta[i] != tb[i] || ta[i] != tc[i]) continue;
@@ -793,7 +799,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         (address[] memory ts, uint256[] memory as_, uint256 is_) = vault.previewRedeem(small);
         (address[] memory tl, uint256[] memory al, uint256 il) = vault.previewRedeem(large);
 
-        lte(is_, il, "GL-29: more shares burned less inventory");
+        lte(is_, il, "GL-29: more shares released less inventory");
         if (ts.length != tl.length) return;
         for (uint256 i; i < ts.length; ++i) {
             if (ts[i] != tl[i]) continue;
@@ -2034,11 +2040,11 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      chost branch.
     /// @param seed Chooses the market probed.
     function property_zeroInputsAreSafe(uint256 seed) public {
-        (, uint256[] memory amounts, uint256 inventoryBurned) = vault.previewRedeem(0);
+        (, uint256[] memory amounts, uint256 inventoryReleased) = vault.previewRedeem(0);
         for (uint256 i; i < amounts.length; ++i) {
             eq(amounts[i], 0, "GL-74: previewRedeem(0) pays something");
         }
-        eq(inventoryBurned, 0, "GL-74: previewRedeem(0) burns inventory");
+        eq(inventoryReleased, 0, "GL-74: previewRedeem(0) releases inventory");
 
         vm.prank(actor);
         (bool ok,) = address(vault).call(abi.encodeWithSignature("redeemProRata(uint256,address)", uint256(0), actor));
@@ -2470,7 +2476,9 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     struct RedeemObs {
         uint16 feeBps;
         uint256 shares;
-        uint256 previewInventoryBurned;
+        uint256 previewInventoryReleased;
+        uint256 pendingBurnBefore;
+        uint256 pendingBurnAfter;
         uint256 supplyBefore;
         uint256 supplyAfter;
         uint256 callerAmpsBefore;
@@ -2492,6 +2500,12 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         uint256 navAfter;
         uint256 vaultAmpsBefore;
         uint256 vaultAmpsAfter;
+        /// @dev `pendingInventoryBurn()` either side of the call. Every placement checkpoints on exit and a
+        ///      checkpoint settles the 24-hour inventory-burn stream (revision 8, ruling U), so a placement can
+        ///      move the vault's AMPS for a reason that has nothing to do with the placement. The drop in the
+        ///      queue is exactly what the stream burned, and SP-18 nets it out.
+        uint256 pendingBurnBefore;
+        uint256 pendingBurnAfter;
         /// @dev The vault guard's fair tick as of the call's entry (`_requireConverged` captures its inputs
         ///      once, so the exit check compares the post-call tick against this, not against a post-call recompute).
         int24 fairBefore;
@@ -2704,18 +2718,32 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     // ―――――――――――――――――――――― Redemption ――――――――――――――――――――――
 
-    /// @notice SP-10: a redemption burns exactly the shares it was given plus the inventory it released.
-    /// @dev SHOULD-HOLD — plan I23; `burn(msg.sender, shares)` (`AmpsVault.sol:848`) and
-    ///      `burn(address(this), inventoryBurned)` (`:882`) are the only two supply writes (x-ray I-9).
+    /// @notice SP-10: a redemption burns exactly the shares it was given plus whatever the inventory-burn stream
+    ///         settled on the way in, and queues what it released.
+    /// @dev SHOULD-HOLD — plan I23 and §12.3 ruling U. `burn(msg.sender, shares)` in `AmpsVault.redeemProRata` and
+    ///      `burn(address(this), burned)` in `VaultRedeemLib.settleBurnStream` are the only two supply writes on
+    ///      this path (x-ray I-9). Since revision 8 the released inventory is **queued** rather than burned, so
+    ///      the two halves are asserted separately: supply falls by `shares + drained`, and the queue rises by the
+    ///      preview's `inventoryReleased` less that same drain. `drained` is derived from the queue rather than
+    ///      from a log, so the property is the same under Foundry and under Medusa.
     /// @param o The redemption observation.
     function property_redemptionBurnIsExact(RedeemObs memory o) internal {
         gte(o.callerAmpsBefore, o.callerAmpsAfter, "SP-10: the redeemer's AMPS rose across its own redemption");
         eq(o.callerAmpsBefore - o.callerAmpsAfter, o.shares, "SP-10: the redeemer did not burn exactly `shares`");
         gte(o.supplyBefore, o.supplyAfter, "SP-10: a redemption raised totalSupply");
+
+        uint256 drained = o.pendingBurnBefore + o.previewInventoryReleased >= o.pendingBurnAfter
+            ? o.pendingBurnBefore + o.previewInventoryReleased - o.pendingBurnAfter
+            : type(uint256).max;
         eq(
             o.supplyBefore - o.supplyAfter,
-            o.shares + o.previewInventoryBurned,
-            "SP-10: supply did not fall by shares + inventoryBurned"
+            o.shares + drained,
+            "SP-10: supply did not fall by shares + the drain the redemption settled"
+        );
+        eq(
+            o.pendingBurnAfter + drained,
+            o.pendingBurnBefore + o.previewInventoryReleased,
+            "SP-10: pendingInventoryBurn did not rise by the preview's inventoryReleased"
         );
     }
 
@@ -2837,6 +2865,10 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      directly rather than inferring the weights back out of liquidity.
     /// @param o The placement observation.
     function property_placementConservesInventoryAndShape(PlaceObs memory o) internal {
+        // Revision 8, ruling U: the placement's own exit checkpoint settles the inventory-burn stream, which burns
+        // AMPS out of the vault for a reason that is not the placement. The queue's fall is exactly what it burned.
+        uint256 drained = o.pendingBurnBefore > o.pendingBurnAfter ? o.pendingBurnBefore - o.pendingBurnAfter : 0;
+
         if (o.above) {
             lte(o.vaultAmpsAfter, o.vaultAmpsBefore, "SP-18: an ask placement raised the vault's AMPS");
             // `Placed.amountPlaced` reports the per-cell *split*, and what each cell loses to liquidity rounding
@@ -2845,11 +2877,15 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             // large fraction of a dust-sized placement (30,833 wei of 281,576).
             lte(
                 o.vaultAmpsBefore - o.vaultAmpsAfter,
-                o.placed,
-                "SP-18: the vault's AMPS fell by more than what was placed"
+                o.placed + drained,
+                "SP-18: the vault's AMPS fell by more than what was placed plus the stream's drain"
             );
         } else {
-            eq(o.vaultAmpsAfter, o.vaultAmpsBefore, "SP-18: a bid placement moved the vault's AMPS");
+            eq(
+                o.vaultAmpsAfter + drained,
+                o.vaultAmpsBefore,
+                "SP-18: a bid placement moved the vault's AMPS beyond the burn stream's drain"
+            );
         }
     }
 

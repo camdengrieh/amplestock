@@ -724,12 +724,41 @@ ends up holding is burned or re-placed. The vault never calls `poolManager.swap(
 
 ### 3.10 How redemption removes liquidity
 
-`redeemProRata` reads `T = Amps.totalSupply()` **before** the burn, burns the redeemer's shares, then removes
-exactly `floor(L_p * shares / T)` from every `PlacementRecord` in every registered pool inside one `ACTION_UNWIND`
-unlock (I23). Released counter assets join the pro-rata payout net of `redeemFeeBps`; released inventory AMPS is
-burned, so `T` falls by more than `shares`. Bounded work: 32 pools x 24 cells = 768 `modifyLiquidity` calls worst
-case. A Phase 3 gas test must measure the worst reachable redemption and assert it fits one block (decision 7);
-the mitigation is never a gate, a rate limit or an instalment on the floor.
+`redeemProRata` **settles the inventory-burn stream first**, then reads `T = Amps.totalSupply()` **before** the
+burn, burns the redeemer's shares, then removes exactly `floor(L_p * shares / T)` from every `PlacementRecord` in
+every registered pool inside one `ACTION_UNWIND` unlock (I23). Released counter assets join the pro-rata payout net
+of `redeemFeeBps`. Bounded work: 32 pools x 24 cells = 768 `modifyLiquidity` calls worst case. A Phase 3 gas test
+must measure the worst reachable redemption and assert it fits one block (decision 7); the mitigation is never a
+gate, a rate limit or an instalment on the floor.
+
+**Released inventory is queued, not burned** (revision 8, §12.3 ruling U resolved). The figure is unchanged —
+`inventoryReleased = floor(inventory * shares / T) + releasedAmps`, inventory being the vault's idle AMPS plus its
+AMPS ERC-6909 claim — but `redeemProRata` calls `VaultRedeemLib.queueInventoryBurn` instead of `IAmps.burn`:
+
+```
+pendingInventoryBurn += inventoryReleased        hashed slot, beside liveCells
+burnStreamStart       = now                      the deadline is start + REDEEM_BURN_STREAM_SECONDS (24 h)
+burnStreamLastSettle  = now
+```
+
+and every path that recomputes NAV — `checkpoint`, `touch`, a bond, a compound, any placement, the next redemption
+— settles it first:
+
+```
+end    = burnStreamStart + D
+due    = now >= end ? pending : pending * (now - lastSettle) / (end - lastSettle)
+burned = min(due, idle ERC-20 AMPS)              -> Burn(burned, "redeemInventory"); pending -= burned
+```
+
+The schedule is one straight line to `end` however often it is settled, so settling more often neither slows the
+burn down nor speeds it up, and `burnStreamStart` moves only when a redemption queues more (restarting one window
+for the combined amount). `T` therefore falls by exactly `shares` inside a redemption, plus whatever that same call
+settled on entry; the accretion the burn represents still reaches the holders who stayed, a day later. A placement
+may ladder idle AMPS the stream is still owed — excluding the queue from `VaultPlacementLib`'s inventory bound was
+measured at 76 B against 67 B of EIP-170 headroom and does not fit — so the drain is capped at the vault's idle
+balance and the shortfall stays pending until inventory comes back. It cannot be lost and it cannot make a
+settlement revert. `emergencyMigrate`'s `ACTION_UNWIND` queues nothing — only `redeemProRata` writes the queue — and a pending figure
+left on a migrated-from vault is inert, because every drain is capped at that vault's own idle balance.
 
 ---
 
@@ -1323,8 +1352,8 @@ this section wins over the earlier text where they differ.
 | B | **Ruling 8 superseded.** The counter side of a burnt-back cell is *not* re-placed at `[lower, alignDown(tick)]` (a fraction of a cell is invisible to the valuer, so R1 would revert the `compound` that created it). It is held as an ERC-6909 claim and re-enters the ladder in step 7 of the same `compound` as a proper grid bid below the tick. |
 | C | **Genesis price is grid-aligned.** §3.3's seed bids at cells `-4..-1` require the opening price to sit exactly on the grid origin: `initializePool` uses `TickMath.getSqrtPriceAtTick(gridBaseTick)` with `gridBaseTick` the spacing-aligned tick nearest the intended price (the launch price is therefore the aligned price nearest `P0`, within one tick spacing). Sidedness is checked in exact v4 terms — an ask needs `sqrtPriceX96 <= getSqrtPriceAtTick(lowerTick)`, a bid needs `sqrtPriceX96 >= getSqrtPriceAtTick(upperTick)` — so at the aligned opening price cell 0 holds pure AMPS and cell -1 pure counter, and the seed bids land at `-1..-4` as specified. **Revision 7 makes the grid origin the auctions' clearing price**: `05_Registry` runs after `AmpsGenesis.settle()` and `PoolRegistry._openPool` anchors at `AmpsVault.pRefX18()`, which is `P0` rather than the $1.00 fallback that applies only while that word is zero (`docs/genesis-cca.md` §5). |
 | D | **The vault consumes `ILadderPolicy.weights`, not `propose`**, because the grid already fixes every bucket bound; a policy that reverts or answers badly falls back to `LadderLib`. The ladder is clipped to the grid rather than reverting `OffGrid` when a pool has run most of the way up. |
-| E | **A vault-wide live-cell budget bounds redemption gas.** `redeemProRata` costs ~46k gas per live cell (measured: 2.20M for 48 cells over four pools). At the launch shape (14 cells per pool) 32 pools are ~20.5M and every grid cell occupied (24 x 32) is ~35M, which does not fit a 32M transaction. `Constants.MAX_LIVE_CELLS = 512` (~23.5M) is enforced at every new-cell opening: `place` reverts `CellBudgetExceeded`; `compound`/`rollout`/`deployBonded` merge into existing cells and leave the remainder idle. `IAmpsVault.liveCells()` exposes the count. Consequence for Decision 19: at 14 cells per pool the budget admits ~36 pools, so growing toward `MAX_CONSTITUENTS = 64` needs coarser ladders or a migration with a larger budget, and Phase 0 must read the chain's `MaxTxGasLimit`. **This narrows a user decision and is raised to the user.** |
-| F | **Redemption burns the AMPS claim slice too.** `inventoryBurned` covers the vault's AMPS ERC-20 balance and its AMPS ERC-6909 claim (a merge-add can leave a small claim); the claim is taken inside the redemption `unlock` and burned with the rest. |
+| E | **A vault-wide live-cell budget bounds redemption gas. Decided 2026-09-13: `MAX_CONSTITUENTS = 34`.** `redeemProRata` costs ~46k gas per live cell (measured: 2.20M for 48 cells over four pools). At the launch shape (14 cells per pool) 32 pools are ~20.5M and every grid cell occupied (24 x 32) is ~35M, which does not fit a 32M transaction. `Constants.MAX_LIVE_CELLS = 512` (~23.5M) is enforced at every new-cell opening: `place` reverts `CellBudgetExceeded`; `compound`/`rollout`/`deployBonded` merge into existing cells and leave the remainder idle. `IAmpsVault.liveCells()` exposes the count. **The consequence for Decision 19 is now the cap itself.** At `LADDER_DOUBLINGS_DEFAULT + SEED_HALVINGS_DEFAULT = 14` cells per pool the budget admits `512 / 14 = 36` pools, of which two are the entry pools — so `MAX_CONSTITUENTS` is **34**, not the 64 it was, and `MAX_COLLATERALS` follows at 36. The old 64 was a round number nothing measured: a registry filled to it would have needed 924 live cells and could not have opened its own ladders. `VaultRedeem.t.sol::test_r8_constituentCapIsTiedToTheLiveCellBudget` asserts the arithmetic tie and `::test_r8_constituentCostAtTheCapFitsTheRedemptionBudget` measures the per-constituent term (one more pool on the unwind's walk, one more asset on the payout) so that `perCell x MAX_LIVE_CELLS + perConstituent x (MAX_CONSTITUENTS + 2) + fixed <= 24M` is a bound rather than an estimate. Growing past 34 needs a larger budget and a vault migration, and Phase 0 must read the chain's `MaxTxGasLimit`. |
+| F | **Redemption counts the AMPS claim slice too.** `inventoryReleased` covers the vault's AMPS ERC-20 balance and its AMPS ERC-6909 claim (a merge-add can leave a small claim); the claim is taken inside the redemption `unlock` so that the burn stream, which burns an ERC-20 balance, can retire it. Since revision 8 (ruling U) it is queued rather than burned in the same transaction. |
 
 Gas of the placement paths at the worst reachable state in the fixture: `place` 2.2–3.0M, `compound` 1.0–3.3M, `rollout` 1.1–2.9M, `deployBonded` 1.5–2.4M, `emergencyMigrate` with a full ladder unwind ~2.1M for four pools (~16M for 32). The bounty for v1 reports a flat `$1` gas allowance (`BountyPot._quote` caps at `gasCostUsd18 x gasCapMultiple`, so `0` would pay nothing); the Phase 4 keeper reports measured gas.
 
@@ -1359,7 +1388,7 @@ several numbers and wordings above; where they differ, this section wins.
 | R | **`PoolRegistry.setIndexWeights` requires the vector to sum to exactly `BPS`**; an even 30-name split cannot, so the launch scripts register every name at 500 bp and assign the residue explicitly when the real vector is set. |
 | S | **Test hazard.** solc hoists `TIMESTAMP`/`NUMBER` as loop-invariant, so `vm.roll(block.number + 1)` inside a warping loop rolls once and silently freezes `TruncatedOracleLib`'s per-block truncation anchor. Fixtures advance the clock through `vm.getBlockTimestamp()`/`vm.getBlockNumber()` (`Phase3Fixture.advance()`). |
 | T | **I11's ghost is checked ex market moves**: `A` decomposes positions at the previous checkpoint's reference (I7) and every placement checkpoints on exit, so previews before and after a placement are computed at different references; the handler compares them only when `P_ref` came out where it went in, and `checkpoint()` is classified as a market move. |
-| U | **Open finding, raised to the user (economic, no stated invariant broken):** because `redeemProRata` burns the released ladder inventory as well as the redeemer's shares (I23), every redemption lifts NAV/share for whoever redeems next, including the same redeemer's next slice: 300 AMPS redeemed in one shot returns 148.50 USDG, in 60 slices 152.76 (+2.9%), monotone in the split count. The effect scales with inventory's share of supply and shrinks as inventory sells; the figures above were measured at the pre-revision-7 launch shape, where inventory was 95% of `S0`. Revision 7 sells half the supply at auction and leaves 45% as inventory, so the same asymmetry is roughly half as large at launch — smaller, not gone, and the ruling still stands until the user rules. Candidate fixes: return released inventory AMPS to idle inventory instead of burning it (redemption becomes split-neutral apart from the 1% fee, at the cost of Decision 14's accretion-on-exit), or defer the burn to a rate-limited stream. Decision pending; the current behaviour stands until the user rules. |
+| U | **Resolved 2026-09-13 — a 24-hour inventory-burn stream.** The finding: because `redeemProRata` burned the released ladder inventory as well as the redeemer's shares (I23), every redemption lifted NAV/share for whoever redeemed next, *including the same redeemer's next slice* — 300 AMPS in one shot returned 148.50 USDG, in 60 slices 152.76 (+2.9%), monotone in the split count. The owner ruled for a deferred burn, and the deferral had to be **rate-limited** rather than "until the next checkpoint": `checkpoint()` is permissionless and unpaid by design, so a redeemer could have called it between slices and taken the identical lift one transaction later. `redeemProRata` therefore computes the same figure and **queues** it (`VaultRedeemLib.queueInventoryBurn`, two hashed slots beside `liveCells` plus a last-settle stamp, `Constants.REDEEM_BURN_STREAM_SECONDS = 24 h`, no setter); every path that recomputes NAV settles the accrued portion out of the vault's idle AMPS with `Burn(amount, "redeemInventory")`. Slices inside one block settle nothing, so the split advantage is exactly zero within a block and at most a few basis points of the fee's own superadditivity over a day (`BunniRoundingGrind.t.sol::test_r8_splittingARedemptionNoLongerExtractsMore`, 25 bp bound; `VaultRedeem.t.sol::test_r8_u_splittingARedemptionNoLongerExtractsMore`, 10 bp at 300 AMPS). ABI: `Redeem`'s fourth field and `previewRedeem`'s third return become `inventoryReleased`; new views `pendingInventoryBurn()` and `burnStreamStart()`. NAV per share stays **fully diluted** (Decision 14; the circulating-supply denominator of revision 8's first draft was withdrawn by the owner on the same day). |
 | V | **Fixed.** `TruncatedOracleLib.MAX_CARDINALITY = 64` with one observation per distinct second lost TWAP coverage on any pool trading in more than 63 distinct seconds inside the window (70 writes 3 s apart left 189 s of coverage), which turned the hub into `WATCHDOG` under ordinary trading. The library now advances an exact head accumulator on every write and commits a ring slot only every `MIN_INSERT_INTERVAL = ceil(7200 / 63) = 115 s`, so a full ring spans 7,245 s (the widest governable window) and coverage is bounded below for every governed `twapWindow`; consults interpolate between exact endpoints with an error at most ~0.4% of the I25 budget; zero new storage (the three head fields fill the existing scalar slot); `afterSwap` fell from 39,815 to 31,755 gas, and the hook was re-mined (`script/config/hook.json`). |
 
 

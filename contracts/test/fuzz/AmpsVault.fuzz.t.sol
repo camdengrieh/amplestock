@@ -11,7 +11,8 @@ import {AmpsVaultFixture} from "../mocks/AmpsVaultFixture.sol";
 ///          - NAV/share is monotone non-decreasing **ex market moves** (I8, and the vault half of I27);
 ///          - NAV/share is finite and non-zero in every reachable state (I22);
 ///          - a redemption pays exactly `floor(b x shares / T) x (1 - redeemFeeBps / BPS)` of every asset (I23);
-///          - a redemption drops `totalSupply` by more than `shares`, because the released inventory burns too.
+///          - a redemption drops `totalSupply` by `shares` plus whatever the 24-hour inventory-burn stream
+///            settled on the way in, and raises `pendingInventoryBurn` by what it released (revision 8, ruling U).
 contract AmpsVaultFuzzTest is AmpsVaultFixture {
     /// @dev Actions, one per fuzzed byte.
     uint8 internal constant ACTION_BOND = 0;
@@ -59,7 +60,8 @@ contract AmpsVaultFuzzTest is AmpsVaultFixture {
         }
     }
 
-    /// @notice A redemption of any size pays exactly pro rata and burns strictly more supply than it retires.
+    /// @notice A redemption of any size pays exactly pro rata, burns exactly `shares` plus whatever the
+    ///         inventory-burn stream had accrued, and queues the rest.
     /// @param shares The AMPS wei to redeem.
     function testFuzz_redeemIsExactlyProRata(uint128 shares) public {
         uint256 amount = uint256(shares) % 2000e18 + 1;
@@ -141,7 +143,8 @@ contract AmpsVaultFuzzTest is AmpsVaultFixture {
             uint256 gross = (heldBalance(token) * shares) / supply;
             expected[i] = (gross * (Constants.BPS - vault.redeemFeeBps())) / Constants.BPS;
         }
-        (,, uint256 inventoryBurned) = vault.previewRedeem(shares);
+        (,, uint256 inventoryReleased) = vault.previewRedeem(shares);
+        uint256 pendingBefore = vault.pendingInventoryBurn();
 
         vm.prank(ALICE);
         (address[] memory tokens, uint256[] memory paid) = vault.redeemProRata(shares, BOB);
@@ -150,7 +153,10 @@ contract AmpsVaultFuzzTest is AmpsVaultFixture {
             assertEq(tokens[i], vault.assetAt(i), "asset order is the registration order");
             assertEq(paid[i], expected[i], "floor(b x shares / T) x (1 - fee) exactly (I23)");
         }
-        assertEq(amps.totalSupply(), supply - shares - inventoryBurned, "supply fell by shares plus inventory");
+        // Revision 8, ruling U: the release is queued into the 24-hour stream, so supply falls by `shares` plus
+        // whatever the stream settled on the way in, and the queue rises by the preview's figure less that drain.
+        uint256 drained = pendingBefore + inventoryReleased - vault.pendingInventoryBurn();
+        assertEq(amps.totalSupply(), supply - shares - drained, "supply fell by shares plus the settled drain");
         assertLe(amps.totalSupply(), supply - shares, "and never by less than the shares burned");
     }
 

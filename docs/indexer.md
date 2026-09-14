@@ -86,7 +86,7 @@ enums are stored as the on-chain ordinal *and* a decoded label.
 | `ref_checkpoint` | event | `pRefX18`, `pMktX18`, `rateLimited`, `navFloored`, the NAV in force, the premium |
 | `share_point` | block | shares by class: `totalSupply`, `inventory`, `vesting`, `bondUnvested`, `circulating` — four classes and a total, because revision 6 removed the staked class and `circulating` is `totalSupply - inventory - vesting - bondUnvested` |
 | `vault_summary` | singleton | the Vault page in one row: live NAV/`P_ref`/`P_mkt`/premium, shares by class (three, not four — there is no staked class), cumulative fees **in each currency**, the creator's cumulative take in each currency, cumulative burned, bond issuance, redemptions, net supply change |
-| `redemption` | event | `owner`, `to`, `shares`, `inventoryBurned`, `feeBps`, the NAV it paid at, gross and fee in USD |
+| `redemption` | event | `owner`, `to`, `shares`, `inventoryReleased` (**released, not burned here** — revision 8 drains it to the sink on a 24-hour linear stream that every checkpoint and every redemption settles), `feeBps`, the NAV it paid at, gross and fee in USD, and the `redeem-gap` measurement: `expectedUsd18` (the NAV basis net of fee), `realisedUsd18` (`previewRedeem` at `blockNumber - 1`, valued at the indexed feed answers), `gapBps` and `gapPriced` |
 | `burn_event` | event | `amount`, the raw `bytes32` reason and its decoded label |
 | `vesting_mint` | event | the team `VestingWallet` draws |
 
@@ -358,10 +358,59 @@ indexer.
 | `corporate-action` | `warning` | a `uiMultiplier` step past `DIVIDEND_STEP_BPS_MAX`, or a constituent frozen for a corporate action |
 | `genesis` | `critical` | `AmpsGenesis.Settled` with neither leg graduated: nothing was sold, the whole auction tranche went back to the vault and **the launch did not happen**. The vault stays shut, every bidder has money to reclaim from the auctions themselves, and the fallback needs a governance proposal with a 7-day delay |
 | `genesis` | `warning` | `ClearingPricesDiverged`: both legs graduated and their implied prices sit further apart than the vault's own `refDivergenceBps`. Disclosure rather than a failure — the USDG price is used regardless, because it is the only one denominated in the unit `P_ref` is quoted in — but the ETH/USD price the proposal carried and the market's own ETH bid do not tell the same story about what AMPS is worth |
+| `redeem-gap` | `warning` | a redemption paid more than **10 bp** under its NAV basis (see below) |
+| `redeem-gap` | `critical` | more than **25 bp** under it — SP-14's accepted ceiling, and the point at which "known rounding" stops being the explanation |
+| `nav-drift` | `warning` | a `NavCheckpoint` whose NAV/share is more than 1 bp below the previous one with no `Bond`, `Redeem`, `Placement`, `Compound`, pool `Swap` or feed `AnswerUpdated` between the two (see below) |
 | `sweep-residue` | `warning` | `AmpsVault.SweepResidue`: the exit sweep could not fold a token's idle balance into the vault's ERC-6909 claims, so the token is paused, denylisting the vault or unreadable. Disclosure, not a breach — the residue stays part of the vault's holdings, is valued in `A` and is paid out by redemption — so it pages one step below the denylist alarm that would raise the same fact if it could see the issuer's call |
 
 The denylist alarm also has its own table, `denylist_alarm`, served at `/api/alerts/denylist`, which
 records the detection method, the decoded account list and whether it touched a protocol address.
+
+### Monitoring the accepted fuzz leads
+
+Two fuzz findings were **accepted and documented** rather than fixed (revision 8, decision 6), on
+the condition that each gets an indexer alert. These are those alerts. Neither is an incident
+detector: each one watches a bound that the protocol is known to sit inside, and pages when it
+stops sitting inside it.
+
+**`redeem-gap` — SP-14, the pro-rata rounding slack.** A redemption removes
+`floor(L_p × shares / T)` from every position and pays `floor(b × shares / T)` of every balance,
+each rounding down in the vault's favour, so the realised payout sits a hair under
+`shares × NAV/share × (1 − fee)`. The fuzz lead established a ceiling of 25 bp for that slack and
+the owner accepted it; anything beyond it is not rounding.
+
+The check runs on every `Redeem`, and the measurement is the awkward part:
+
+- `Redeem` carries no per-asset payouts, so the realised side comes from `previewRedeem(shares)`.
+- It is read at **`blockNumber − 1`**, pinned. At the redemption's own block the shares are burned
+  and the positions unwound, so the preview would describe a vault the redeemer never had a claim
+  on.
+- The returned amounts are valued at the answers the protocol last accepted for each token — the
+  same valuation every other USD figure in this index uses — with the decimals from the
+  `constituent` row where there is one and a cached `decimals()` read otherwise, because the vault
+  also pays out WETH and USDG, which are collateral rather than constituents.
+- A token the index cannot price makes the whole comparison meaningless rather than smaller, so the
+  row records `gapPriced = false` and **no alert is raised**: an unpriceable payout is not a zero
+  gap. An overshoot is recorded as zero for the same reason — a payout above the basis is an
+  artefact of the indexer's own feed snapshot, not something a redeemer can complain about.
+
+Both figures and the gap land on the `redemption` row whether or not they breached, so the slack can
+be read as a distribution rather than only as a page.
+
+**The deferred burn is a stream, so the sink arrives in pieces.** `redeemProRata` no longer burns the
+vault's own released AMPS in the redemption: it queues it, and `REDEEM_BURN_STREAM_SECONDS` (24 h)
+of linear drain is settled by every checkpoint and by every redemption. Each settlement is its own
+`Burn(amount, "redeemInventory")`, so the `Burn` handler's running supply is correct without
+knowing anything about the stream, and `burn_event` shows the drain as the several small burns it
+actually is rather than one large one. A `redemption` row's `inventoryReleased` is therefore what
+was *added to the queue* at that block, not what left the supply in it.
+
+**`nav-drift` — L-1, the convergence step.** NAV/share falling between two checkpoints with nothing
+between them that is allowed to move it. `Bond`, `Redeem`, `Placement`, `Compound` and a pool `Swap`
+move the assets; a feed `AnswerUpdated` moves their price. The indexer sets a flag on each of those
+and clears it at every checkpoint, so the predicate is exactly "NAV fell by more than 1 bp and the
+flag is clear". `warning`, not `critical`: it is a disclosure about a bound the owner accepted, and
+the number it describes is one basis point.
 
 ---
 
@@ -464,6 +513,10 @@ Three field names changed with revision 6 and are worth stating, because a consu
 compiles and renders nothing: `creatorPaidTotal` → **`creatorPaidAmpsTotal`** (with `creatorPaidCounterUsd18`
 beside it, since the creator is now paid in kind out of every currency); `paidTotal` → **`paidAmpsTotal`** plus
 **`paidCounterUsd18`** on the creator-fee endpoint; and `fillBps` → **`filledBps`** on every ladder cell.
+
+Revision 8 changes one more: `redemption.inventoryBurned` → **`inventoryReleased`**, and the meaning changes with
+the name — the vault releases that AMPS rather than burning it in the redemption, and it then leaves the supply on
+a 24-hour linear stream (§5). Beside it the row gained the four `redeem-gap` columns.
 `apps/web/lib/indexer/types.ts` is a transcription of these envelopes, so the web types and this table are checked
 against each other by `apps/web/test/indexer.test.ts` rather than by convention.
 
