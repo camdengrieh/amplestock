@@ -49,8 +49,9 @@ The coverage signal for those contracts is (1) the aggregate `branches` counter 
 | Campaign 3 | 29,722 |
 | Campaign 4 | 29,347 |
 | **Campaign 5 (this report)** | **29,588** |
+| Campaign 6 (2026-09-14, the merged revision-8 tree `31ca10c`) | 29,223 |
 
-The counter rose from 17k with handlers only to ~29.6k once the 141 properties and the sixteen adversarial handlers were in place; it has been flat within ~1.5% across campaigns 3–5.
+The counter rose from 17k with handlers only to ~29.6k once the 141 properties and the sixteen adversarial handlers were in place; it has been flat within ~1.5% across campaigns 3–6.
 
 Coverage profile caveat: the fuzz run uses the default profile with via-IR only on `src/vault/*`, `src/bonds/*`, `src/hook/*` (per-path `compilation_restrictions` in `foundry.toml`). `setup_fuzz_profile.sh` was deliberately not run — a `[profile.fuzz]` drops those per-path restrictions and pushes `AmpsVault` past EIP-170.
 
@@ -75,11 +76,12 @@ Coverage profile caveat: the fuzz run uses the default profile with via-IR only 
 - **Total calls**: 29,221 at the last logged tick (9m33s of 10m; Medusa prints no final total)
 - **Branches hit**: 29,588
 - **Corpus size**: 488
+- **Campaign 6 (2026-09-14)**: a sixth 600 s run on the merged revision-8 tree (`31ca10c`, the inventory-burn stream, the 34-constituent cap and the auction parameters) — see the history table and sub-section 12
 - **Violations found**: 1 — Medusa's final summary (printed at 14:03 UTC, after a three-hour post-run phase): 154 tests passed, 1 failed (`ampsRouter_buy_dust` → SP-33, triaged as a harness statement in sub-section 11 below)
 
 Wrapper: the fizz skill's Medusa runner (`node <skill>/scripts/run_medusa.js contracts --meta-dir fizz_data --timeout 600`) — 4 workers, `testLimit 0`, `callSequenceLength 100`, `blockGasLimit 2e9`, `transactionGasLimit 7e8`, slither off, `shrinkLimit 20` for this run. Setup gas is 617M per sequence, so every shrink replay redeploys the whole world; that is why call counts are low for a 600 s budget and why `shrinkLimit` was walked down 1,000 → 200 → 50 → 20 across the campaigns. The corpus carried over between campaigns.
 
-### Campaign history (five runs; campaign 5 is the one described above)
+### Campaign history (six runs; campaign 5 is the one described above, campaign 6 the revision-8 confirmation)
 
 | Campaign | Calls | Sequences / corpus | Branches | Result | Disposition |
 |---|---|---|---|---|---|
@@ -88,6 +90,7 @@ Wrapper: the fizz skill's Medusa runner (`node <skill>/scripts/run_medusa.js con
 | 3 (2026-09-11 12:22–17:28 UTC) | 16,850 | 1,705 seq / corpus 528 | 29,722 | 152 passed / 3 failed | GL-47, SP-43, SP-07; wrapper rc 7 — the 10-minute fuzz was followed by ~5 h of shrinking, so `shrinkLimit` → 50 |
 | 4 (2026-09-12 03:15–06:26 UTC) | 20,979 | 2,173 seq / corpus 461 | 29,347 | 153 passed / 2 failed | SP-04, SP-46; the three campaign-3 corrections held; wrapper rc 7, 11,495 s wall, so `shrinkLimit` → 20 |
 | **5 (2026-09-12 10:20 UTC; fuzzing 10:55–11:05)** | **29,221** (last logged tick) | corpus 488 | **29,588** | **154 passed / 1 failed** | SP-33 (sub-section 11); the two campaign-4 corrections and the three campaign-3 corrections held; wrapper rc 7, 13,401 s wall of which ~3 h was Medusa's silent post-run phase with nothing left to shrink |
+| 6 (2026-09-14 16:16 UTC chain start; fuzzing ≈16:48–16:58 after Medusa's ~30-minute compile; wrapper rc 7 at 19:53, 13,025 s wall of which ~3 h was the post-run phase) | 7,043 (last logged tick, 9m23s; throughput a quarter of campaign 5's on a busier box) | corpus 416 | 29,223 | 153 passed / 2 failed | SP-24 and SP-14 (sub-section 12), both the revision-8 stream's settlement inside the call, read by the harness as the call's own effect; the SP-33 correction of campaign 5 and every earlier correction held; `shrinkLimit` 20 |
 
 Medusa's summary arrived at 14:03 UTC, three hours after fuzzing ended: `154 test(s) passed, 1 test(s) failed`, the failure being `AssertEqFail("Invalid: 7582330171670898!=7582330148723767, reason: SP-33: the recipient's gain is not the reported out")` on the 76-call sequence Worker 3 had shrunk at 7m38s (`fizz_data/corpus_medusa/test_results/`, archived with the log beside the earlier campaigns'). The per-tick `failures` counter stayed at 0 throughout this run as it did in campaign 4, so that counter is not the test-failure count; the summary is. The post-run phase (one thread at full CPU, nothing written) is the same phase that accounted for most of campaigns 3 and 4's wall time; it is Medusa's, not the harness's, and a shorter corpus does not shorten it.
 
@@ -204,6 +207,16 @@ The sub-sections below are the **eleven distinct root causes triaged across camp
 - **Reproducing sequence**: 76 calls ending in `ampsRouter_buy_dust(uint256,uint256)` (archived at `campaign5-test_results/…-c9408368….json`). A revert-tolerant Foundry replay of the sequence, pinned to Medusa's base block and timestamp, passes — the router held no dust at that point under Foundry — so the sequence is archived, not replayed.
 - **Fix applied**: the observation records the router's balance of the output asset before and after; when the recipient is the caller the expected gain is `reportedOut + swept`, otherwise `reportedOut` (the sweep goes to the caller, not the recipient)
 - **Foundry repro**: `N/A` — sequence archived; the corrected suite passes 10/10 under Foundry
+
+#### 12. SP-24 and SP-14 — the burn stream's settlement inside the call (campaign 6, the merged revision-8 tree)
+- **Properties violated**: `property_compoundBurnIsExact` (SP-24) on `ampsVault_compound_clamped`; `property_redemptionPaysAtMostProRata` (SP-14) on `ampsVault_redeemProRata_clamped`
+- **Guarantee**: SP-24 `SHOULD-HOLD`; SP-14 `EXPLORATORY`
+- **Assertions**: `AssertEqFail("Invalid: 117057219420101126772!=0, reason: SP-24: supply did not fall by exactly the reported burn")` (a second instance at 19,509,282,286,625,851 wei); `AssertLteFail("Invalid: 16938819423726404865>16935561774100168260 failed, reason: SP-14: a redemption paid more than pro rata")` — 1.9 bp above the 25 bp-slacked bound
+- **Root cause**: revision 8 (ruling U) turned the redemption's inventory burn into a 24-hour stream that **every** `_checkpoint()` and every redemption settles first. The SP-24 sequence shrank to three calls: a redemption that queues ~117 AMPS, then a `compound` 6.8 days later whose checkpoint burns the whole overdue queue before it reads the supply, so the supply fell by the compound's own burn *plus* 117.06 AMPS. The SP-14 sequence is the same settlement inside the redemption itself: `settleAndSupply` burns the accrued stream before pricing, the payout divides by the settled supply, and the harness's slice divided by the supply it read before the call (~27 bp lower after a large queued burn). Neither is a protocol behaviour the design forbids; both are the harness measuring the call's effect on a supply that the stream moved.
+- **Severity assessment**: `test harness false positive` (both). The same denominator effect *inside the contract* — `AmpsVault._afterPlacement` comparing a pre-settlement `navBefore` with a post-settlement `navAfter` — is finding 1 of `amplestock-pashov-ai-audit-report-20260914-161900.md`, fixed in the fifth remediation wave.
+- **Reproducing sequences**: SP-24, 3 calls (`property_totalIssuedMonotone` → `ampsVault_redeemProRata_clamped` at block 20,027,604 → `ampsVault_compound_clamped` at block 20,080,933) and a 33-call sibling; SP-14, 60 calls ending in `ampsVault_redeemProRata_clamped`; all three archived under `campaign6-test_results/`.
+- **Fix applied** (fifth remediation wave, same pull request): SP-24 expects `burned + (pendingBefore − pendingAfter)`, the stream's own settlement read from `pendingInventoryBurn()` around the call; SP-14 divides the slice by the settled supply, `supplyBefore − (pendingBurnBefore + previewInventoryReleased − pendingBurnAfter)`, with the 25 bp slack unchanged.
+- **Foundry repro**: `N/A` — the corrected properties are re-run by the suite (`forge test --match-path 'test/fizz/*'`)
 
 ### Standing leads for human review
 
@@ -417,7 +430,7 @@ No TODOs remain in `Base.sol`, `Snapshots.sol`, or any handler file.
 > accepted with the `nav-drift` alert — a `NavCheckpoint` more than 1 bp below the previous one with no `Bond`,
 > `Redeem`, `Placement`, `Compound`, `Swap` or feed update between them — and **SP-14** (the reference-vs-pool
 > valuation gap) is accepted with 25 bp kept as the ceiling and the `redeem-gap` alert using the same 25 bp as its
-> critical threshold (10 bp warning). Step 1's SP-33 correction is confirmed: the Foundry replay set is 10/10.
+> critical threshold (10 bp warning). Step 1's SP-33 correction is confirmed: the Foundry replay set is 10/10, and campaign 6 (2026-09-14, the merged revision-8 tree) ran 600 s without it recurring; campaign 6's own two violations are the stream's settlement inside the call, read by the harness as the call's effect (sub-section 12), corrected in the fifth remediation wave.
 > The redemption properties were restated in the same pass for revision 8's inventory-burn stream (§12.3 ruling U):
 > a redemption **queues** the inventory it releases instead of burning it, so SP-10 now asserts
 > `supply −(shares + drained)` and `pendingInventoryBurn +(inventoryReleased − drained)` separately, and GL-28 /
