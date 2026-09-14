@@ -302,8 +302,16 @@ contract GenesisAuction is Script {
     /// @param w The addresses, for the optional ETH/USD feed read.
     /// @return cfg The configuration.
     function loadConfig(Wiring memory w) public view returns (LaunchConfig memory cfg) {
-        string memory json = vm.readFile(GENESIS_PATH);
+        return loadConfigFrom(w, vm.readFile(GENESIS_PATH));
+    }
 
+    /// @notice {loadConfig} on the contents of a file the caller has already read, so a rehearsal can hand in a
+    ///         variant of `genesis.json` without touching the process environment, which every test in a forge run
+    ///         shares and which `vm.setEnv` therefore races on.
+    /// @param w The addresses, for the optional ETH/USD feed read.
+    /// @param json The file's contents.
+    /// @return cfg The configuration.
+    function loadConfigFrom(Wiring memory w, string memory json) public view returns (LaunchConfig memory cfg) {
         uint256 blockMs = vm.envOr("AMPS_BLOCK_MS", json.readUint(".blockMs"));
         if (blockMs == 0) blockMs = BLOCK_MS_DEFAULT;
         uint256 startDelay = vm.envOr("AMPS_AUCTION_START_DELAY_HOURS", json.readUint(".startDelayHours"));

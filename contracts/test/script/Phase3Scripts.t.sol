@@ -798,9 +798,6 @@ contract Phase3Scripts is V4TestBase {
     ///         sentinel, **2,500 USDG** on the USDG leg and **$2,500 of ETH** on the ETH leg — the latter carried
     ///         as a dollar figure and converted at the creation-time `ethUsdX18`, exactly as the ETH floor is.
     function test_r8_loadConfigTakesTheAcceptedCcaParameters() public {
-        // `vm.setEnv` writes the *process* environment, which every test in the run shares and which the override
-        // test below uses; pin it to the "derive it" zero here so this test does not depend on the order.
-        vm.setEnv("AMPS_AUCTION_ETH_REQUIRED", "0");
         // `loadConfig` reads ETH/USD off the feed registry when the file leaves `ethUsdX18` at zero.
         testnetScript.installFeedsOnly(_core(), assets);
 
@@ -829,18 +826,26 @@ contract Phase3Scripts is V4TestBase {
 
     /// @notice An explicit `requiredCurrencyRaised` on the ETH leg is the manual override and wins outright over
     ///         the dollar figure — the derivation only fills in a zero.
+    /// @dev The override is exercised through a variant of the file rather than through `AMPS_AUCTION_ETH_REQUIRED`:
+    ///      `vm.setEnv` writes the *process* environment, which every test in a forge run shares, so an env-driven
+    ///      version raced with the derivation test above on CI's two-core runner (the reset landed between the
+    ///      write and the read). The env override rides the same `envOr` fallback as the file value and needs no
+    ///      separate exercise.
     function test_r8_anExplicitEthRequirementOverridesTheDerivation() public {
         testnetScript.installFeedsOnly(_core(), assets);
-        vm.setEnv("AMPS_AUCTION_ETH_REQUIRED", "3000000000000000000");
 
-        GenesisAuction.LaunchConfig memory cfg = auctionScript.loadConfig(_auctionWiring());
-        assertEq(cfg.ethLeg.requiredCurrencyRaised, 3e18, "the env override is taken as-is, not re-derived");
+        string memory original = vm.readFile("./script/config/genesis.json");
+        string memory tmp = "./script/config/genesis.r8-override.tmp.json";
+        vm.writeFile(tmp, original);
+        vm.writeJson('"3000000000000000000"', tmp, ".eth.requiredCurrencyRaised");
+        string memory variant = vm.readFile(tmp);
+        vm.removeFile(tmp);
 
-        // `vm.setEnv` writes the *process* environment and every test in this run shares it, so put it back to
-        // the zero that means "derive it" before leaving.
-        vm.setEnv("AMPS_AUCTION_ETH_REQUIRED", "0");
-        cfg = auctionScript.loadConfig(_auctionWiring());
-        assertEq(cfg.ethLeg.requiredCurrencyRaised, 1e18, "and zero puts the derivation back");
+        GenesisAuction.LaunchConfig memory cfg = auctionScript.loadConfigFrom(_auctionWiring(), variant);
+        assertEq(cfg.ethLeg.requiredCurrencyRaised, 3e18, "the explicit value is taken as-is, not re-derived");
+
+        cfg = auctionScript.loadConfigFrom(_auctionWiring(), original);
+        assertEq(cfg.ethLeg.requiredCurrencyRaised, 1e18, "and the file's zero derives 1 WETH at ETH/USD = 2,500");
     }
 
     // -----------------------------------------------------------------------------------------------------------
