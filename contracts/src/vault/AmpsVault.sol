@@ -9,7 +9,6 @@ import {Constants} from "../types/Constants.sol";
 import {
     AlreadyInitialized,
     GateNotHealthy,
-    NavBleedExceeded,
     NotBonds,
     NotCreator,
     NotGuardian,
@@ -102,17 +101,14 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @dev The gas ceiling on each of the three calls this contract makes to the oracle gate pointer: `state(0)`,
     ///      `protocolFreezeUntil()` and `poke()`. See {_requireGate} for why they are bounded low-level calls at
-    ///      all rather than typed `try`s.
+    ///      all rather than typed `try`s, and `Constants.GATE_READ_GAS` for why the number is what it is.
     ///
-    ///      **Why it is this large.** The cap is a griefing bound, not a budget: it exists so a mis-pointed or
-    ///      hostile gate cannot consume the caller's whole allowance and turn "fail open" into "fail out of gas".
-    ///      A real `OracleGate.state(0)` is not cheap — it makes several bounded probes of its own (the feed
-    ///      registry, the market reference and the registry, each itself capped at `STOCK_TOKEN_PROBE_GAS`) and
-    ///      reads the freeze, watchdog and divergence state — so anything tight enough to be a budget would make
-    ///      the *healthy* gate read as absent, which is the failure mode with real consequences: the gate would
-    ///      silently stop refusing. 1,500,000 is far above the honest cost and far below a block, and by EIP-150
-    ///      the caller keeps a 1/64th of its remaining gas whatever the callee does with the rest.
-    uint256 private constant GATE_READ_GAS = 1_500_000;
+    ///      **It is read from `Constants` rather than restated** (audit fix wave 5, finding 7). The same figure
+    ///      bounds `VaultNavLib.referenceOverridden`'s `snapshotByPool` and the per-pool `checkPlacement` the
+    ///      placement and rollout paths make, and the per-pool call had drifted to a *different* number —
+    ///      400,000, below what an honest gate can spend against an upgraded Stock Token that burns its probes.
+    ///      One home for the number is what stops the two ever disagreeing again.
+    uint256 private constant GATE_READ_GAS = Constants.GATE_READ_GAS;
 
     /// @dev {_requireGate}'s three refusal sets. Placement is section 7 step 2's four states; management drops
     ///      `DEGRADED` from them; bonds drops `WATCHDOG` as well. See {_requirePlaceable}, {_requireManageable}
@@ -232,8 +228,19 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     /// @dev slot 13 — the rollout policy. Pointer-upgradeable (7 d). Phase 3.
     address private _rolloutPolicy;
 
-    /// @dev slot 14 — the pre-registered standby vault (14-day timelock).
+    /// @dev slot 14 [0..159] — the pre-registered standby vault (14-day tier).
     address private _standbyVault;
+    /// @dev slot 14 [160..191] — when {setStandbyVault} registered it, packed into the same word's free upper
+    ///      bits so the layout of section 1.1 gains no slot.
+    ///
+    ///      **Why the stamp exists** (audit lead wave 5, L-3). `Constants.TIMELOCK_STANDBY_SECONDS` is 14 days
+    ///      and no contract read it: the standby's tier was enforced by the governance *documents* and by the
+    ///      timelock's own 48-hour `minDelay`, so the address a no-delay guardian call hands five `onlyVault`
+    ///      roles and the whole estate to was reachable with two days of notice. {emergencyMigrate} reads the
+    ///      stamp and refuses until the tier has elapsed, which puts the 14 days on chain where the tier is
+    ///      claimed. Packing it beside the pointer is deliberate: a standby vault is written against the slot
+    ///      *numbers*, and the upper 96 bits of slot 14 were free.
+    uint32 private _standbyRegisteredAt;
 
     /// @dev slot 15 [0..127] — AMPS wei moved by rollout in the current window. Phase 3.
     uint128 private _rolloutMoved24h;
@@ -285,12 +292,32 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      upward stay empty.
     bool private _navUnconfirmed;
 
-    /// @dev slot 21 [8..255] — declared, not implied. Solidity packs from the low end of a slot, so without this
-    ///      filler the 20-byte `genesis` pointer below would fit beside `_navUnconfirmed`'s single byte and take
-    ///      slot 21 rather than slot 22 — while {VaultNavLib.setPointer}, which writes pointers by slot *number*,
-    ///      wrote slot 22. The pointer would then read back as `address(0)` for ever. The filler is never read or
-    ///      written; it exists so that the layout the comments describe is the layout the compiler emits.
-    uint248 private _reservedSlot21;
+    /// @dev slot 21 [8..135] — `T` as the last {_checkpoint} read it, i.e. the supply the `A` in
+    ///      `_navPerShareX18` was divided by.
+    ///
+    ///      **Why it is stored** (audit lead wave 5, L-7). {spokeWeightBps} answers
+    ///      `PoolRegistry.currentWeightBps`, which is the numerator of the bond discount's index-deficit term and
+    ///      of the rollout schedule, and it needs `A`. Re-deriving `A` live would cost ~150k gas per valued pool
+    ///      — about 5M at 32 pools, far beyond the bounded probe the registry reads this through, so the read
+    ///      would succeed in a fixture and silently fail in production — so it is reconstructed from the
+    ///      checkpoint as `navPerShareX18 x (T + VIRTUAL_SHARES)`. That reconstruction used the **live**
+    ///      `totalSupply()`, and every burn and vesting mint between checkpoints therefore biased every spoke's
+    ///      weight: the burn stream alone moves `T` continuously for a day after any redemption. Recording the
+    ///      checkpoint's own `T` makes the two halves of the product the same checkpoint's, and it is one
+    ///      `SLOAD` instead of an external `totalSupply()` — cheaper than what it replaces, in gas and in
+    ///      bytecode.
+    ///
+    ///      It shares slot 21 with {_navUnconfirmed}, which {_checkpoint} already writes, so the pair costs one
+    ///      `SSTORE` rather than two. `uint128` is ~3.4e38 wei against a launch supply of 2e22.
+    uint128 private _checkpointSupply;
+
+    /// @dev slot 21 [136..255] — declared, not implied. Solidity packs from the low end of a slot, so without this
+    ///      filler the 20-byte `genesis` pointer below would fit beside `_navUnconfirmed` and `_checkpointSupply`
+    ///      and take slot 21 rather than slot 22 — while {VaultNavLib.setPointer}, which writes pointers by slot
+    ///      *number*, wrote slot 22. The pointer would then read back as `address(0)` for ever. The filler is
+    ///      never read or written; it exists so that the layout the comments describe is the layout the compiler
+    ///      emits.
+    uint120 private _reservedSlot21;
 
     /// @dev slot 22 — the `AmpsGenesis` adapter. Set-once through {setPolicyPointer}, before {genesisMint}, and
     ///      frozen with the rest of the wiring by {genesisPlace}.
@@ -503,12 +530,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev The arithmetic is {VaultNavLib-premiumX18}: a pure function over two words this contract hands in.
+    ///      It moved there when this contract went past EIP-170 on the wave-5 fixes, and nothing about it changed.
     function premiumX18() external view returns (uint256 value) {
-        uint256 nav = _navPerShareX18;
-        if (nav == 0) return 0;
-        uint256 ref = _pRefX18;
-        if (ref <= nav) return 0;
-        return FullMath.mulDiv(ref - nav, Constants.WAD, nav);
+        return VaultNavLib.premiumX18(_navPerShareX18, _pRefX18);
     }
 
     /// @inheritdoc IAmpsVault
@@ -526,8 +551,13 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // `A` as last checkpointed: `navPerShareX18 x (T + VIRTUAL_SHARES)`, the inverse of {_navPerShare} up to the
         // `+ 1` wei. One multiplication instead of the ~150k-gas-per-pool walk `totalAssetsUsd18` would cost, so the
         // registry's bounded probe of this view succeeds at 32 pools exactly as it does in a two-pool fixture.
+        //
+        // **Both halves are the same checkpoint's** (audit lead wave 5, L-7). `T` is `_checkpointSupply`, written
+        // beside the NAV it belongs to, not the live `totalSupply()`: burns and vesting mints between checkpoints
+        // used to bias every spoke weight — and the inventory-burn stream moves `T` continuously for a day after
+        // any redemption — which fed straight into the bond discount's deficit term and the rollout schedule.
         uint256 total =
-            FullMath.mulDiv(_navPerShareX18, IAmps(_AMPS).totalSupply() + Constants.VIRTUAL_SHARES, Constants.WAD);
+            FullMath.mulDiv(_navPerShareX18, uint256(_checkpointSupply) + Constants.VIRTUAL_SHARES, Constants.WAD);
         return VaultNavLib.spokeWeightBps(_sources(), total, address(this), constituentId);
     }
 
@@ -583,15 +613,11 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev The schedule is {VaultNavLib-creatorBpsAt}, which is the same arithmetic
+    ///      `VaultPlacementLib._creatorBps` applies when it actually pays, so the dApp's figure and the split's
+    ///      can never disagree. It moved there when this contract went past EIP-170 on the wave-5 fixes.
     function creatorBpsAt(uint256 timestamp) external view returns (uint16 bps) {
-        uint256 start = _genesisTimestamp;
-        if (start == 0 || timestamp <= start) return Constants.CREATOR_FEE_BPS;
-        uint256 elapsed = timestamp - start;
-        if (elapsed >= Constants.CREATOR_DECAY_SECONDS) return 0;
-        return uint16(
-            (uint256(Constants.CREATOR_FEE_BPS) * (Constants.CREATOR_DECAY_SECONDS - elapsed))
-                / Constants.CREATOR_DECAY_SECONDS
-        );
+        return VaultNavLib.creatorBpsAt(_genesisTimestamp, timestamp);
     }
 
     /// @inheritdoc IAmpsVault
@@ -900,9 +926,24 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // here would lower `T` inside a sequence the redeemer controls, which is exactly the split advantage the
         // ruling is about; the stream above hands it back to every holder over
         // `Constants.REDEEM_BURN_STREAM_SECONDS` instead, and a slice taken in the same block sees none of it.
-        if (result.inventoryReleased != 0) VaultRedeemLib.queueInventoryBurn(_AMPS, result.inventoryReleased);
+        //
+        // **And the AMPS-side fees the removal realised go with it** (audit lead wave 5, L-13). `addedAmps` is
+        // principal plus the `feesAccrued` v4 hands over whenever a position's liquidity is modified, and
+        // `releasedAmps` is the principal alone, so the difference is fee AMPS — the one fee realisation in the
+        // protocol that does not pass `VaultPlacementLib`'s split, because this library may not reference a
+        // contract that knows what a gate is. It used to be swept to the vault's idle balance and become ask
+        // inventory the ladder could sell again, which is the one thing revision 6's ruling BG forbids on every
+        // other path ("the AMPS side of every fee is burned in full"). Queueing it burns it instead. The creator
+        // takes no slice of this sliver — there is no way to pay one from here — so the whole of it is burned,
+        // which is the protocol-favourable direction and the same one the unconditional burn takes elsewhere.
+        //
+        // `previewRedeem` cannot know it: a `view` cannot ask v4 what fees a removal would realise. Its third
+        // return therefore stays the pro-rata release, and this — the number {Redeem} reports and the number
+        // `pendingInventoryBurn()` rises by — is that plus the realised fees.
+        uint256 queued = result.inventoryReleased + (addedAmps - releasedAmps);
+        if (queued != 0) VaultRedeemLib.queueInventoryBurn(_AMPS, queued);
 
-        emit Redeem(msg.sender, to, shares, result.inventoryReleased, _redeemFeeBps);
+        emit Redeem(msg.sender, to, shares, queued, _redeemFeeBps);
         _sweepClean();
     }
 
@@ -1071,15 +1112,21 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     }
 
     /// @inheritdoc IAmpsVault
+    /// @dev **`currency0` must be AMPS** (audit lead wave 5, L-15). Every Amplestocks pool is `AMPS/<counter>` in
+    ///      that order, and the whole vault rests on it: `redeemProRata`'s unwind `take`s `currency0` as the AMPS
+    ///      to release, `VaultPlacementLib._placeLadder` reads `currency1` as the counter an ask is sold for, `A`
+    ///      values `currency1` alone (I5), and {_registerAsset} below silently drops `currency0` because it
+    ///      expects it to be AMPS. `PoolRegistry` already orders the pair, so this is one cheap revert on the
+    ///      invariant the vault cannot survive being wrong about rather than a check it delegates.
     function initializePool(PoolKey calldata key, uint160 sqrtPriceX96) external locked returns (PoolId poolId) {
         _requireManageable();
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
+        if (Currency.unwrap(key.currency0) != _AMPS) revert NotAmpsPool(Currency.unwrap(key.currency0));
 
         // §12 ruling C: every pool opens exactly on a spacing-aligned tick, which is what makes it open on its
         // own grid origin and what puts the genesis asks at cells 0..9 and the seed bids at -1..-4. The snap is at
         // most half a tick spacing, so the launch price is the aligned price nearest the intended one.
-        IPoolManager(_POOL_MANAGER)
-            .initialize(key, VaultPlacementLib.alignedOpeningPrice(sqrtPriceX96, key.tickSpacing));
+        IPoolManager(_POOL_MANAGER).initialize(key, VaultNavLib.alignedOpeningPrice(sqrtPriceX96, key.tickSpacing));
         poolId = key.toId();
 
         // The vault's own pool list, so that `redeemProRata` can reach every position it owns without ever
@@ -1104,7 +1151,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function place(PoolId poolId, bool above, uint256 amount) external locked returns (uint256 placed) {
         if (msg.sender != _TIMELOCK && msg.sender != _registry) revert NotTimelock(msg.sender);
         _requirePlaceable();
-        uint256 navBefore = _previewNav();
+        uint256 navBefore = _beforePlacement();
         placed = VaultPlacementLib.place(
             ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, above, amount, bytes32("place"), true
         );
@@ -1116,7 +1163,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function compound(PoolId poolId) external locked returns (uint256 ampsFees, uint256 burned) {
         uint256 gasStart = gasleft();
         _requirePlaceable();
-        uint256 navBefore = _previewNav();
+        uint256 navBefore = _beforePlacement();
         (ampsFees, burned) =
             VaultPlacementLib.compound(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, poolId, gasStart);
         _afterPlacement(navBefore);
@@ -1127,7 +1174,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function rollout(uint16 constituentId) external locked returns (uint256 moved) {
         uint256 gasStart = gasleft();
         _requirePlaceable();
-        uint256 navBefore = _previewNav();
+        uint256 navBefore = _beforePlacement();
         moved = VaultRolloutLib.rollout(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
     }
@@ -1138,7 +1185,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function deployBonded(uint16 constituentId) external locked returns (uint256 placed) {
         uint256 gasStart = gasleft();
         _requirePlaceable();
-        uint256 navBefore = _previewNav();
+        uint256 navBefore = _beforePlacement();
         placed = VaultRolloutLib.deployBonded(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId, gasStart);
         _afterPlacement(navBefore);
     }
@@ -1149,7 +1196,7 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     function withdrawRetiredBids(uint16 constituentId) external locked returns (uint256 amountMoved) {
         if (msg.sender != _registry) revert NotRegistry(msg.sender);
         _requirePlaceable();
-        uint256 navBefore = _previewNav();
+        uint256 navBefore = _beforePlacement();
         amountMoved =
             VaultRolloutLib.withdrawRetiredBids(ladderAt, _lastPlacementAt, _POOL_MANAGER, _AMPS, constituentId);
         _afterPlacement(navBefore);
@@ -1305,10 +1352,16 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      call the guardian makes under duress and with no timelock behind it; an EOA or a mistyped address
     ///      there is unrecoverable — the roles are `onlyVault`, so nobody can hand them back. The check is the
     ///      same one {setPolicyPointer} already makes for every pointer the vault calls.
+    /// @dev **The registration is stamped, and {emergencyMigrate} reads the stamp** (audit lead wave 5, L-3).
+    ///      `Constants.TIMELOCK_STANDBY_SECONDS` is the 14-day tier the governance documents give this address,
+    ///      and until now no contract read it: the only on-chain delay in front of the estate was the timelock's
+    ///      own 48-hour `minDelay`. Re-registering restarts the clock, which is the point — a fresh standby is a
+    ///      fresh 14 days — and the guardian's no-delay migration is what the tier is protecting.
     function setStandbyVault(address standby) external locked onlyTimelock {
         _requireManageable();
         if (standby.code.length == 0) revert ZeroAddress();
         _standbyVault = standby;
+        _standbyRegisteredAt = uint32(block.timestamp);
         emit StandbyVaultRegistered(standby);
     }
 
@@ -1339,6 +1392,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         if (msg.sender != _GUARDIAN) revert NotGuardian(msg.sender);
         address registered = _standbyVault;
         if (standby == address(0) || standby != registered) revert NotStandbyVault(standby, registered);
+        // The standby's own 14-day tier, on chain (audit lead wave 5, L-3). `Constants.TIMELOCK_STANDBY_SECONDS`
+        // was read by no contract, so the address this hands the estate to needed only the timelock's 48-hour
+        // `minDelay`. The stamp is written by {setStandbyVault}; a re-registration restarts the clock.
+        uint32 registeredAt = _standbyRegisteredAt;
+        uint256 readyAt = uint256(registeredAt) + Constants.TIMELOCK_STANDBY_SECONDS;
+        if (block.timestamp < readyAt) revert StandbyNotMatured(registeredAt, readyAt);
         if (!VaultNavLib.migrationPredicate(_registry, address(this))) revert MigrationPredicateNotMet();
 
         IPoolManager pm = IPoolManager(_POOL_MANAGER);
@@ -1400,14 +1459,26 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // The relaxed R1 bound, enforced only when the standby can actually be priced. A dead feed must never stand
         // between the guardian and an evacuation: in Phase 2 there are no positions to bleed, every claim moves one
         // for one, and the check is a disclosure rather than the thing that makes the migration safe.
+        //
+        // **`navAfter` counts what stayed behind, because what stayed behind has not leaked** (audit fix wave 5,
+        // finding 6). `navBefore` above counts the vault's idle ERC-20 balances; `VaultNavLib.evacuate` moves
+        // them with a best-effort transfer that the *denylisting token which triggered this migration* refuses;
+        // and the bound then compared a "before" that included the stranded balance with an "after" that did not.
+        // An issuer who blocks the vault and leaves 0.5% of `A` on it as an idle balance — which it can mint —
+        // therefore made the 50 bp bound revert the evacuation it had itself provoked, which is the one outcome
+        // this path exists to make impossible. The two sides now measure the same estate: the standby's holdings
+        // plus whatever is still on this shell. It is not a claim that the stranded balance is *recoverable* —
+        // `VaultNavLib.evacuate` names every wei of it with `SweepResidue`, per token, which is the disclosure —
+        // only that the migration did not lose it.
+        uint256 stranded;
+        try this.assetsUsd18Of(address(this)) returns (uint256 left) {
+            stranded = left;
+        } catch {}
+
         uint256 navAfter;
         try this.assetsUsd18Of(standby) returns (uint256 assetsAfter) {
-            (navAfter,) = _navPerShare(assetsAfter);
-            if (bounded) {
-                uint256 floor =
-                    FullMath.mulDiv(navBefore, Constants.BPS - Constants.MIGRATION_BLEED_BPS_MAX, Constants.BPS);
-                if (navAfter < floor) revert NavBleedExceeded(navBefore, navAfter, Constants.MIGRATION_BLEED_BPS_MAX);
-            }
+            (navAfter,) = _navPerShare(assetsAfter + stranded);
+            if (bounded) VaultNavLib.requireBleedBound(navBefore, navAfter, Constants.MIGRATION_BLEED_BPS_MAX);
         } catch {
             emit MigrationBleedUnchecked(bytes32("navAfter"));
         }
@@ -1475,13 +1546,41 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         }
     }
 
+    /// @dev The pre-read all five Phase 3 entry points take, and the first half of R1.
+    ///
+    /// @dev **The stream is settled before `navBefore` is measured** (audit fix wave 5, finding 1). `navBefore`
+    ///      came from {_previewNav}, which divides by the live `totalSupply()`, while `navAfter` comes from
+    ///      {_checkpoint}, whose **first** statement settles the redemption burn stream and burns AMPS. The two
+    ///      sides of the 2 bp post-condition were therefore divided by different supplies, and any pending stream
+    ///      — which any redemption queues, and which then drains over a day — widened the admitted bleed by
+    ///      `burned / T`: 5.9x the bound an hour after a 5% redemption, 63x six hours after a 10% one, 251x at
+    ///      the end of the window, on all five entry points, three of them permissionless. Settling here puts both
+    ///      readings on the post-settlement supply; `_checkpoint`'s own settle then finds nothing due, so the
+    ///      burn still happens exactly once and R1 measures the placement and nothing else.
+    ///
+    /// @dev It is one private helper rather than two statements in each forwarder because this contract has 329 B
+    ///      of EIP-170 headroom and five copies of the settle would not fit.
+    /// @return navBefore NAV per share on the post-settlement supply.
+    function _beforePlacement() private returns (uint256 navBefore) {
+        VaultRedeemLib.settleBurnStream(_AMPS);
+        return _previewNav();
+    }
+
     /// @dev The R1 post-condition and the exit sweep, shared by all five Phase 3 entry points. `_checkpoint()`
     ///      recomputes `A` at the *previous* reference price, so `navBefore` and `navAfter` are measured on the
     ///      same basis and a placement is judged on what it moved, never on what the market did (I11).
+    ///
+    /// @dev **The pre-genesis latch is here, once** (audit fix wave 5, finding 9). `checkpoint()` and `touch()`
+    ///      refuse before genesis with {NotInitialized} — writing `checkpointTimestamp`/`checkpointBlock` over a
+    ///      supply that has no `A` behind it removes the `StaleCheckpoint` backstop {depositBonded} documents,
+    ///      and `PoolRegistry` anchors every pool it opens at a `pRefX18()` the same call would have written. The
+    ///      five placement forwarders reached the same `_checkpoint()` through here without it, and with the gate
+    ///      pointer deliberately unset in that window an unprivileged call could stamp it. One site covers all
+    ///      five, which is what the vault's remaining headroom allows and what makes the rule impossible to
+    ///      forget on a sixth.
     function _afterPlacement(uint256 navBefore) private {
-        uint256 navAfter = _checkpoint().navPerShareX18;
-        uint256 floor = FullMath.mulDiv(navBefore, Constants.BPS - Constants.PLACEMENT_BLEED_BPS_MAX, Constants.BPS);
-        if (navAfter < floor) revert NavBleedExceeded(navBefore, navAfter, Constants.PLACEMENT_BLEED_BPS_MAX);
+        if (!_initialized) revert NotInitialized();
+        VaultNavLib.requireBleedBound(navBefore, _checkpoint().navPerShareX18, Constants.PLACEMENT_BLEED_BPS_MAX);
         _sweepClean();
     }
 
@@ -1568,6 +1667,10 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
         // Slot 21: whether the `A` just written was priced off a held-back or stale answer for any asset. A later
         // checkpoint against a confirmed answer clears it, so the flag always describes the live checkpoint.
         _navUnconfirmed = unconfirmed;
+        // Slot 21, beside it and in the same `SSTORE`: the supply this NAV was measured against, so
+        // {spokeWeightBps} can reconstruct *this* checkpoint's `A` rather than mixing it with a live `T` that
+        // burns and vesting mints have moved since.
+        _checkpointSupply = uint128(supply);
 
         emit NavCheckpoint(nav, assetsUsd18, supply);
         emit RefCheckpoint(pRef, pMkt, rateLimited, navFloored);
@@ -1629,8 +1732,20 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
     ///      market — the haircut `h_session` widens instead — so the management policy above would be *stricter*
     ///      than the design, not safer: it would shut the markets every weekend. Only a corporate-action freeze, a
     ///      guardian freeze and the divergence breaker close a market, which is exactly what
-    ///      `IOracleGate.checkBond` enforces on the `AmpsBonds` side. This check mirrors it as defence in depth: a
-    ///      buggy or replaced bonds shell still cannot deposit or mint through a closed market.
+    ///      `IOracleGate.checkBond` enforces on the `AmpsBonds` side.
+    ///
+    /// @dev **What this actually covers, and what it does not** (audit lead wave 5, L-4; NatSpec correction, no
+    ///      code change). The three policies above all read `state(0)`, the **protocol-wide** snapshot, and
+    ///      `OracleGate._snapshot` takes `constituentId == 0` to mean "no constituent, no pool": layers C (feed
+    ///      staleness), D (corporate actions) and E (per-pool divergence) are skipped entirely, so
+    ///      `gate.feedStale`, `gate.corporateFreeze` and `gate.diverged` are all false by construction and the
+    ///      `DIVERGED` term in this function's refusal set is **unreachable** through it. What remains reachable
+    ///      at id 0 is the guardian's protocol freeze (`SCHEDULED_FREEZE`), layer A's watchdog and the
+    ///      reference-integrity `REF_DIVERGED`. The per-constituent defence — a frozen name, a corporate action,
+    ///      a diverged spoke — is `AmpsBonds`'s own `IOracleGate.checkBond(constituentId)`, which is where the id
+    ///      is known; this check is a protocol-wide backstop in front of it, not a second copy of it. The phrase
+    ///      "defence in depth" in the older wording overstated the overlap: a buggy or replaced bonds shell is
+    ///      stopped here only by a protocol-wide condition.
     function _requireBondsHealthy() private view {
         _requireGate(POLICY_BONDS);
     }
@@ -1712,11 +1827,12 @@ contract AmpsVault is IAmpsVault, IUnlockCallback {
 
     /// @dev Adds `token` to the NAV/redemption enumeration. AMPS is never an asset (I5), and re-registration is a
     ///      no-op so the list can never carry a duplicate.
+    /// @dev **The list is capped at `Constants.MAX_COLLATERALS`** (audit lead wave 5, L-6). That is the figure
+    ///      `test/unit/VaultRedeem.t.sol` asserts the structurally ungated redemption floor fits one transaction
+    ///      at, and it had three writers and no reader. The refusal is here and in
+    ///      {VaultNavLib-genesisSettle}'s own copy, which are between them every way an asset can enter.
     function _registerAsset(address token) private {
-        if (token == address(0) || token == _AMPS) return;
-        if (_assetIndex[token] != 0) return;
-        _assets.push(token);
-        _assetIndex[token] = _assets.length;
+        VaultNavLib.registerAsset(_assets, _assetIndex, _AMPS, token);
     }
 
     /// @dev Every governed numeric setter funnels through here: one band check, one {OutOfBand} revert site and

@@ -631,7 +631,11 @@ contract Phase3FlywheelTest is Phase3Fixture {
         // Revision 8, ruling U: the released inventory is queued into the 24-hour burn stream rather than burned
         // here, so the accretion it represents reaches the holders who stayed over the day that follows.
         uint256 drained = supplyBeforeRedeem - amps.totalSupply() - redeemShares;
-        assertEq(vault.pendingInventoryBurn(), pendingBefore - drained + released, "the release was queued");
+        // A lower bound since audit wave 5's lead L-13: the queue is the pro-rata release plus the AMPS-side fees
+        // the unwind realised, and the pools have traded by this point in the journey.
+        assertGe(
+            vault.pendingInventoryBurn(), pendingBefore - drained + released, "the release was queued, and the fees"
+        );
         for (uint256 i; i < tokens.length; ++i) {
             assertEq(
                 IERC20(tokens[i]).balanceOf(ALICE) - before[i], amounts[i], "and the payout landed, asset by asset"

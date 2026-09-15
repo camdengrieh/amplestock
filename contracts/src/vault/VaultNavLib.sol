@@ -15,7 +15,9 @@ import {PriceLib} from "../lib/PriceLib.sol";
 import {Constants} from "../types/Constants.sol";
 import {
     AlreadyInitialized,
+    CollateralSetFull,
     LengthMismatch,
+    NavBleedExceeded,
     NotContract,
     SpokeUnpriceable,
     ZeroAddress,
@@ -56,10 +58,11 @@ library VaultNavLib {
     // Gas ceilings on the untrusted reads (audit fixes 18 and its wave-2 completion)
     // -------------------------------------------------------------------------------------------------------------
 
-    /// @dev Ceiling on each read of the oracle gate. It mirrors `AmpsVault.GATE_READ_GAS` and exists for the same
-    ///      reason: the cap is a griefing bound, not a budget. `OracleGate.snapshotByPool` makes several bounded
-    ///      probes of its own, so anything tight enough to be a budget would make an *honest* gate read as absent.
-    uint256 private constant GATE_READ_GAS = 1_500_000;
+    /// @dev Ceiling on each read of the oracle gate. Read from `Constants` rather than restated, so that every
+    ///      call into the gate anywhere in the protocol carries the same bound (audit fix wave 5, finding 7): the
+    ///      cap is a griefing bound, not a budget, and `OracleGate.snapshotByPool` makes several bounded probes of
+    ///      its own, so anything tight enough to be a budget would make an *honest* gate read as absent.
+    uint256 private constant GATE_READ_GAS = Constants.GATE_READ_GAS;
 
     /// @dev Ceiling on each read of the feed registry (`latestAnswer`, `feedStatus`). The real registry walks a
     ///      config, an accepted answer, a pending answer and a session, and every one of those is itself a bounded
@@ -70,6 +73,22 @@ library VaultNavLib {
     ///      observation ring, which is bounded by its own cardinality.
     uint256 private constant MARKET_READ_GAS = 400_000;
 
+    /// @dev Ceiling on each read of the position valuer (`valuePool`). `LadderPositionValuer` walks one pool's
+    ///      canonical grid — at most `Constants.GRID_CELLS` `extsload`s plus the v4 decomposition arithmetic —
+    ///      which is a few tens of thousands of gas; the budget is an order of magnitude above that and well
+    ///      below a block, which is all a cap on a governance-installed pointer is for.
+    ///
+    /// @dev **It is the last unbounded typed read in `A`** (audit lead wave 5, L-11). `valuePool` was called as
+    ///      `IPositionValuer(...).valuePool(...)` at three sites with no gas bound and no hand-decode, so a
+    ///      valuer that reverted, answered short or simply looped bricked `totalAssetsUsd18` — and with it
+    ///      `checkpoint()`, every bond (`depositBonded` checkpoints first), every placement's R1 bound and the
+    ///      realised index weight — until a 7-day pointer change could land. Every other pointer this file reads
+    ///      is a bounded `staticcall` whose answer is read as words; this one now is too.
+    uint256 private constant VALUER_READ_GAS = 400_000;
+
+    /// @dev The number of static words a well-formed `valuePool` answer returns: `amount0` and `amount1`.
+    uint256 private constant VALUER_WORDS = 2;
+
     /// @dev The number of static words a well-formed `GateSnapshot` returns. Thirteen value-typed fields, so the
     ///      tuple is encoded in place with no offset and word `n` is field `n`.
     uint256 private constant GATE_SNAPSHOT_WORDS = 13;
@@ -78,6 +97,11 @@ library VaultNavLib {
     ///      `age`, `maxAgeSeconds`, `fresh`, `live`, `unconfirmed`, `configured`. `fresh` is word 5 and
     ///      `unconfirmed` word 7, which is what {_feedHeldBack} reads.
     uint256 private constant FEED_STATUS_WORDS = 9;
+
+    /// @dev The number of static words a well-formed `latestAnswer` returns: `answerUsd8`, `updatedAt`, `fresh`.
+    ///      It is the interface's own shape, and it is the length the placement path has always required: see
+    ///      {answer} for why the two readers must agree on it.
+    uint256 private constant FEED_ANSWER_WORDS = 3;
 
     /// @notice Everything the read side needs from the vault, gathered into one argument so the ABI of these
     ///         functions does not change when a pointer is added.
@@ -146,9 +170,19 @@ library VaultNavLib {
 
             if (withPositions && hasPool && src.positionValuer != address(0) && src.pRefPrevX18 != 0) {
                 uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, token, decimals);
-                if (sqrtPriceRefX96 != 0) {
-                    (, uint256 amount1) = IPositionValuer(src.positionValuer).valuePool(poolId, sqrtPriceRefX96);
-                    balance += amount1;
+                // **A position that cannot be priced is flagged, not silently dropped** (audit lead wave 5,
+                // L-11). Both branches used to contribute zero and say nothing, so `A` could fall by a
+                // constituent's whole ladder — an unreadable feed answer for the pool's counter, a valuer that
+                // reverts or answers short — while the checkpoint recorded itself as confirmed and `AmpsBonds`
+                // priced its floor off it. The term is still dropped, because valuing a position at a price the
+                // protocol does not trust is the worse answer, but the checkpoint now carries `unconfirmed` and
+                // the bond shell refuses on it exactly as it does for a held-back feed.
+                if (sqrtPriceRefX96 == 0) {
+                    unconfirmed = true;
+                } else {
+                    (, uint256 amount1, bool valued) = _valuePool(src.positionValuer, poolId, sqrtPriceRefX96);
+                    if (valued) balance += amount1;
+                    else unconfirmed = true;
                 }
             }
 
@@ -224,8 +258,12 @@ library VaultNavLib {
 
         uint256 balance = IPoolManager(src.poolManager).balanceOf(holder, Currency.wrap(config.token).toId())
             + _idleBalance(config.token, holder);
-        (, uint256 amount1) = IPositionValuer(src.positionValuer)
-            .valuePool(IPoolRegistry(src.registry).poolIdOf(constituentId), sqrtPriceRefX96);
+        (, uint256 amount1, bool valued) =
+            _valuePool(src.positionValuer, IPoolRegistry(src.registry).poolIdOf(constituentId), sqrtPriceRefX96);
+        // A valuer that cannot answer is the fourth unpriceable branch and takes the same exit as the other
+        // three: refusing here is what leaves `PoolRegistry.currentWeightBps`'s own `targetWeightBps` fail-safe
+        // standing, where a reported zero would be read as the *largest* deficit the formula admits.
+        if (!valued) revert SpokeUnpriceable(constituentId, bytes32("valuer"));
         balance += amount1;
         if (balance == 0) return 0;
 
@@ -258,9 +296,35 @@ library VaultNavLib {
             if (!hasPool) continue;
             uint160 sqrtPriceRefX96 = _referenceSqrtPrice(src, assets[i], decimals);
             if (sqrtPriceRefX96 == 0) continue;
-            (uint256 amount0,) = IPositionValuer(src.positionValuer).valuePool(poolId, sqrtPriceRefX96);
+            (uint256 amount0,,) = _valuePool(src.positionValuer, poolId, sqrtPriceRefX96);
             amount += amount0;
         }
+    }
+
+    /// @dev One bounded, hand-decoded `valuePool`. The answer is two static words, so it is read as two words:
+    ///      a valuer that reverts, that has no code, that answers short or that burns {VALUER_READ_GAS} is
+    ///      "cannot value", never a revert in the caller's frame. See {VALUER_READ_GAS} for why.
+    /// @param valuer The position valuer; the caller has already checked it is non-zero.
+    /// @param poolId The pool to value.
+    /// @param sqrtPriceRefX96 The reference sqrt price positions are decomposed at (I7).
+    /// @return amount0 The AMPS side, or zero.
+    /// @return amount1 The counter side, or zero.
+    /// @return valued Whether the answer can be believed.
+    function _valuePool(address valuer, PoolId poolId, uint160 sqrtPriceRefX96)
+        private
+        view
+        returns (uint256 amount0, uint256 amount1, bool valued)
+    {
+        (bool ok, bytes memory returndata) = valuer.staticcall{gas: VALUER_READ_GAS}(
+            abi.encodeCall(IPositionValuer.valuePool, (poolId, sqrtPriceRefX96))
+        );
+        if (!ok || returndata.length < VALUER_WORDS * 32) return (0, 0, false);
+        assembly ("memory-safe") {
+            let head := add(returndata, 0x20)
+            amount0 := mload(head)
+            amount1 := mload(add(head, 0x20))
+        }
+        valued = true;
     }
 
     /// @notice `P_mkt`: the `AMPS/USDG` hub's truncated TWAP, converted to USD through `PriceLib` and the hub
@@ -501,6 +565,14 @@ library VaultNavLib {
     ///      stays outstanding on a token the standby now controls. `AmpsVault.emergencyMigrate`'s own unwind
     ///      queues nothing: the queue is written by `redeemProRata` and by nothing else, so the migration's
     ///      `ACTION_UNWIND` cannot add to the figure (`test_r8_migrationDoesNotQueueABurn`).
+    /// @dev **What stays behind is named** (audit fix wave 5, finding 6). The idle leg is the one a denylisting
+    ///      issuer can refuse, and until now the refusal was silent: `emergencyMigrate` asserts nothing about the
+    ///      sweep, and the guardian had no on-chain record of which token kept how much. Each leg therefore
+    ///      re-probes the balance afterwards and emits {IAmpsVault-SweepResidue} for whatever did not move —
+    ///      the same event, with the same meaning, that `VaultRedeemLib.sweepClean` uses for a balance it could
+    ///      not absorb. It is also the disclosure the bleed bound now leans on: `emergencyMigrate` measures
+    ///      `navAfter` over the standby **plus** what stayed on the old shell, because a balance that did not
+    ///      move has not leaked, and this is what says where it is.
     /// @param assets The vault's registered non-AMPS assets.
     /// @param poolManager The Uniswap v4 PoolManager.
     /// @param ampsToken The AMPS token, evacuated alongside them.
@@ -512,12 +584,23 @@ library VaultNavLib {
             address token = assets[i];
             uint256 claim = pm.balanceOf(address(this), Currency.wrap(token).toId());
             if (claim != 0) pm.transfer(standby, Currency.wrap(token).toId(), claim);
-            _tryMoveIdle(token, standby);
+            _moveIdleOrDisclose(token, standby);
         }
 
         uint256 ampsClaim = pm.balanceOf(address(this), Currency.wrap(ampsToken).toId());
         if (ampsClaim != 0) pm.transfer(standby, Currency.wrap(ampsToken).toId(), ampsClaim);
-        _tryMoveIdle(ampsToken, standby);
+        _moveIdleOrDisclose(ampsToken, standby);
+    }
+
+    /// @dev {_tryMoveIdle} plus the disclosure: whatever is still on the old vault afterwards is named with
+    ///      {IAmpsVault-SweepResidue}. The re-probe is what makes the event honest about a partial move and about
+    ///      a token whose `transfer` answered `true` and moved nothing.
+    /// @param token The asset.
+    /// @param to The standby vault.
+    function _moveIdleOrDisclose(address token, address to) private {
+        _tryMoveIdle(token, to);
+        uint256 left = _idleBalance(token, address(this));
+        if (left != 0) emit IAmpsVault.SweepResidue(token, left);
     }
 
     /// @notice The five `onlyVault` role handovers `AmpsVault.emergencyMigrate` performs, in one place.
@@ -637,14 +720,22 @@ library VaultNavLib {
     ///      (success, zero bytes, and the decode of that empty buffer reverts here), returndata shorter than the
     ///      declared tuple, or a third word that is neither 0 nor 1 — each of which is a `Panic` no `catch` can
     ///      reach, in the read `checkpoint()`, `depositBonded` and every placement depend on. Only the first word
-    ///      is needed, so only the first word is required and it is read as a word.
+    ///      is *used*, so only the first word is decoded, and it is decoded as a word.
+    ///
+    /// @dev **The length required is the interface's, 96 bytes** (audit lead wave 5, L-12). It used to be 32,
+    ///      while `VaultPlacementLib._answer` — the same registry, the same selector — has always required 96.
+    ///      Two readers with two acceptance rules is a disagreement waiting to be exploited: a registry that
+    ///      answers with one word is *trusted by NAV* and *read as absent by placements*, so `A` prices a
+    ///      constituent off an answer the placement path will not anchor to, and the divergence check the
+    ///      placement path would have run is skipped. `IFeedRegistry.latestAnswer` returns three static words;
+    ///      anything shorter is not that function's answer, whoever is asking.
     /// @param feeds The feed registry.
     /// @param token The asset.
     /// @return answerUsd8 The answer, or zero.
     function answer(address feeds, address token) public view returns (uint256 answerUsd8) {
         (bool ok, bytes memory returndata) =
             feeds.staticcall{gas: FEED_READ_GAS}(abi.encodeCall(IFeedRegistry.latestAnswer, (token)));
-        if (!ok || returndata.length < 32) return 0;
+        if (!ok || returndata.length < FEED_ANSWER_WORDS * 32) return 0;
         return _firstWord(returndata);
     }
 
@@ -692,6 +783,120 @@ library VaultNavLib {
         }
         tokens[count] = IPoolRegistry(registry).poolConfig(IPoolRegistry(registry).hubPoolId()).counter;
         tokens[uint256(count) + 1] = IPoolRegistry(registry).poolConfig(IPoolRegistry(registry).wethPoolId()).counter;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Three small vault reads that no longer fit in the vault (audit wave 5)
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // `AmpsVault` went 143 B past EIP-170 on this wave's nine findings, and these three are the pieces of it that
+    // are pure arithmetic over values the vault hands in: no storage, no pointer, nothing that has to be read in
+    // the vault's own frame. Moving them is what paid for the fixes; the rules they implement are unchanged and
+    // their NatSpec travelled with them.
+
+    /// @notice `premium = (P_ref - navPerShare) / navPerShare`, floored at zero. Backs `AmpsVault.premiumX18`.
+    /// @param navX18 The checkpointed NAV per share.
+    /// @param refX18 The checkpointed reference price.
+    /// @return value The premium, 18 decimals, or zero when the reference is at or below NAV.
+    function premiumX18(uint256 navX18, uint256 refX18) public pure returns (uint256 value) {
+        if (navX18 == 0 || refX18 <= navX18) return 0;
+        return FullMath.mulDiv(refX18 - navX18, Constants.WAD, navX18);
+    }
+
+    /// @notice `creatorBps(t) = CREATOR_FEE_BPS x max(0, 1 - (t - genesis) / CREATOR_DECAY_SECONDS)`: the
+    ///         immutable schedule, monotone non-increasing and exactly zero from day 30 (I31). Backs
+    ///         `AmpsVault.creatorBpsAt`, and is the same arithmetic `VaultPlacementLib._creatorBps` applies on the
+    ///         collection path — the dApp and the split can therefore never disagree about the schedule.
+    /// @param genesisTimestamp When `genesisPlace` ran; zero before it.
+    /// @param timestamp The time to evaluate at.
+    /// @return bps The creator fee in force, in bps of volume.
+    function creatorBpsAt(uint32 genesisTimestamp, uint256 timestamp) public pure returns (uint16 bps) {
+        uint256 start = genesisTimestamp;
+        if (start == 0 || timestamp <= start) return Constants.CREATOR_FEE_BPS;
+        uint256 elapsed = timestamp - start;
+        if (elapsed >= Constants.CREATOR_DECAY_SECONDS) return 0;
+        return uint16(
+            (uint256(Constants.CREATOR_FEE_BPS) * (Constants.CREATOR_DECAY_SECONDS - elapsed))
+                / Constants.CREATOR_DECAY_SECONDS
+        );
+    }
+
+    /// @notice The R1 post-condition, in one place: `navAfter >= navBefore x (BPS - maxBleedBps) / BPS`.
+    ///
+    /// @dev Both callers are `AmpsVault`'s — `_afterPlacement` at `Constants.PLACEMENT_BLEED_BPS_MAX` (2 bp) and
+    ///      `emergencyMigrate` at `Constants.MIGRATION_BLEED_BPS_MAX` (50 bp) — and they used to carry a copy of
+    ///      the same `mulDiv` and the same revert each. One copy is smaller and, more usefully, makes it
+    ///      impossible for the two bounds to drift into different arithmetic.
+    /// @param navBefore NAV per share before the operation.
+    /// @param navAfter NAV per share after it.
+    /// @param maxBleedBps The bound, in bps.
+    function requireBleedBound(uint256 navBefore, uint256 navAfter, uint16 maxBleedBps) public pure {
+        if (navAfter < FullMath.mulDiv(navBefore, Constants.BPS - maxBleedBps, Constants.BPS)) {
+            revert NavBleedExceeded(navBefore, navAfter, maxBleedBps);
+        }
+    }
+
+    /// @notice {_registerAsset}, reachable from the vault.
+    /// @dev `AmpsVault._registerAsset` is now a one-line forwarder to this, so the rule — AMPS is never an asset,
+    ///      a duplicate is a no-op, and the list stops at `Constants.MAX_COLLATERALS` — has one implementation
+    ///      rather than two that have to be kept in step. Every writer reaches it: `initializePool` and
+    ///      `depositBonded` through the vault, `genesisSettle` directly.
+    /// @param assets The vault's registered non-AMPS assets.
+    /// @param assetIndex The vault's 1-based asset index.
+    /// @param ampsToken The AMPS token, which is never an asset.
+    /// @param token The asset to register.
+    function registerAsset(
+        address[] storage assets,
+        mapping(address token => uint256 index) storage assetIndex,
+        address ampsToken,
+        address token
+    ) public {
+        _registerAsset(assets, assetIndex, ampsToken, token);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // The grid origin
+    // -------------------------------------------------------------------------------------------------------------
+    //
+    // This lives here rather than in `VaultPlacementLib`, which is where it was written and where its callers'
+    // invariants are, for one reason: that library is 34 B over EIP-170 after audit wave 5 and this one has ten
+    // kilobytes free. It is pure arithmetic over `PriceLib` with no placement state in it, `AmpsVault`
+    // reaches it exactly once — from `initializePool` — and the move is a one-word change at that call site.
+    // `docs/phase3-state-model.md` §12 ruling C is still the normative statement.
+
+    /// @notice The pool price every Amplestocks pool is opened at: the sqrt price of the greatest spacing-aligned
+    ///         tick at or below the intended one (§12 ruling C).
+    ///
+    /// @dev **Why the vault aligns the opening price rather than trusting the caller.** The canonical grid's
+    ///      origin is `alignUp(openingTick)`, and §3.3's cell indices — genesis asks at `m = 0..9`, seed bids at
+    ///      `m = -1..-4` — only come out when the pool opens *exactly* on that origin. Off it the cell containing
+    ///      the opening price is neither a pure-AMPS range nor a pure-counter one, so I9 forfeits it and the seed
+    ///      bids fall a whole doubling lower than the launch parameters intend.
+    ///
+    ///      `PriceLib.ampsPerCounterToSqrtPriceX96` cannot land on a tick boundary — the target is one value in
+    ///      2^96 — so the alignment has to be an explicit snap, and it belongs here rather than in `PoolRegistry`
+    ///      because the vault is what the grid invariants are asserted against and it must hold for every pool
+    ///      ever opened, including ones a future registry opens.
+    ///
+    /// @dev **Down, not to the nearest, and the reason is R1.** `LadderPositionValuer` decomposes every position
+    ///      at `sqrtPrice(P_ref / P_counter)` (I7), not at the pool's price. Snapping *up* would put the grid
+    ///      origin — and therefore the top seed-bid cell's upper bound — above the reference, so the valuer would
+    ///      split that cell and write its AMPS half off at zero (I5); at genesis that is ~0.5% of the largest bid
+    ///      bucket, about 7 bp of `A`, and the seed placement would revert on the 2 bp bleed bound. Snapping down
+    ///      puts every bid cell strictly below the reference, where it is valued as pure counter.
+    ///
+    ///      The residue of the same asymmetry lands on the first *ask* cell, which straddles the reference by at
+    ///      most one tick spacing and is credited with a phantom counter side worth up to ~10 bp of `A` at the
+    ///      genesis vector. It is an over-statement, so it cannot trip R1, it is strictly smaller than what any
+    ///      ordinary market move produces under the same I7 rule, and it decays as `P_ref` tracks the pool.
+    /// @param sqrtPriceX96 The intended opening price.
+    /// @param tickSpacing The pool's tick spacing.
+    /// @return aligned The sqrt price of the greatest aligned tick at or below it.
+    function alignedOpeningPrice(uint160 sqrtPriceX96, int24 tickSpacing) public pure returns (uint160 aligned) {
+        return
+            PriceLib.tickToSqrtPriceX96(
+                PriceLib.alignTick(PriceLib.sqrtPriceX96ToTick(sqrtPriceX96), tickSpacing, false)
+            );
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -812,6 +1017,14 @@ library VaultNavLib {
     /// @dev Adds `token` to the NAV/redemption enumeration. AMPS is never an asset (I5), and re-registration is a
     ///      no-op so the list can never carry a duplicate. The vault's own `_registerAsset` is the same rule; this
     ///      copy exists because {genesisSettle} writes the list from inside the library.
+    ///
+    /// @dev **The list has a ceiling, and it is enforced here** (audit lead wave 5, L-6). `Constants`
+    ///      `MAX_COLLATERALS` is the figure `test/unit/VaultRedeem.t.sol` asserts the structurally ungated
+    ///      redemption floor fits one transaction at, and it had three writers and no reader: `genesisSettle`
+    ///      walks a `params.tokens` array of unbounded length, and the vault's own copy is reached from
+    ///      `initializePool` and `depositBonded`. A list past the cap makes the floor's own gas proof false —
+    ///      and the floor may not be gated, rate-limited or split to make it fit — so the refusal belongs at the
+    ///      one place a new asset can enter.
     function _registerAsset(
         address[] storage assets,
         mapping(address token => uint256 index) storage assetIndex,
@@ -822,6 +1035,7 @@ library VaultNavLib {
             return;
         }
         if (assetIndex[token] != 0) return;
+        if (assets.length >= Constants.MAX_COLLATERALS) revert CollateralSetFull(Constants.MAX_COLLATERALS);
         assets.push(token);
         assetIndex[token] = assets.length;
     }

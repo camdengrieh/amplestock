@@ -22,6 +22,7 @@ import {
     PlacementCooldown,
     PlacementDiverged,
     RolloutLimitExceeded,
+    SpokeUnpriceable,
     UnknownConstituent,
     UnknownPool,
     WrongSide
@@ -270,7 +271,10 @@ library VaultPlacementLib {
         // ladder *down*, never up through the reference.
         uint8 buckets =
             above ? ctx.ladderDoublings : (pool.config.constituentId == 0 ? ctx.seedHalvings : ctx.bondBidHalvings);
-        int24 anchor = _referenceTick(ctx, pool);
+        // See {_referenceTick} for why an ask refuses outright when the reference cannot be read while a bid
+        // keeps the live-tick fallback.
+        (int24 anchor, bool refKnown) = _referenceTick(ctx, pool);
+        if (above && !refKnown) revert SpokeUnpriceable(pool.config.constituentId, bytes32("refTick"));
 
         placed =
             _placeLadder(ladder, ctx, pool, poolManager, amps, above, amount, anchor, buckets, reason, strictBudget);
@@ -286,41 +290,6 @@ library VaultPlacementLib {
         // points therefore take the cooldown on the same fact, "did this call do any work", and not on two
         // different ones. A call that placed nothing and bought nothing back costs the pool nothing.
         if (placed != 0 || boughtBackAmps != 0) cooldown[poolId] = uint32(block.timestamp);
-    }
-
-    /// @notice The pool price every Amplestocks pool is opened at: the sqrt price of the greatest spacing-aligned
-    ///         tick at or below the intended one (§12 ruling C).
-    ///
-    /// @dev **Why the vault aligns the opening price rather than trusting the caller.** The canonical grid's
-    ///      origin is `alignUp(openingTick)`, and §3.3's cell indices — genesis asks at `m = 0..9`, seed bids at
-    ///      `m = -1..-4` — only come out when the pool opens *exactly* on that origin. Off it the cell containing
-    ///      the opening price is neither a pure-AMPS range nor a pure-counter one, so I9 forfeits it and the seed
-    ///      bids fall a whole doubling lower than the launch parameters intend.
-    ///
-    ///      `PriceLib.ampsPerCounterToSqrtPriceX96` cannot land on a tick boundary — the target is one value in
-    ///      2^96 — so the alignment has to be an explicit snap, and it belongs here rather than in `PoolRegistry`
-    ///      because the vault is what the grid invariants are asserted against and it must hold for every pool
-    ///      ever opened, including ones a future registry opens.
-    ///
-    /// @dev **Down, not to the nearest, and the reason is R1.** `LadderPositionValuer` decomposes every position
-    ///      at `sqrtPrice(P_ref / P_counter)` (I7), not at the pool's price. Snapping *up* would put the grid
-    ///      origin — and therefore the top seed-bid cell's upper bound — above the reference, so the valuer would
-    ///      split that cell and write its AMPS half off at zero (I5); at genesis that is ~0.5% of the largest bid
-    ///      bucket, about 7 bp of `A`, and the seed placement would revert on the 2 bp bleed bound. Snapping down
-    ///      puts every bid cell strictly below the reference, where it is valued as pure counter.
-    ///
-    ///      The residue of the same asymmetry lands on the first *ask* cell, which straddles the reference by at
-    ///      most one tick spacing and is credited with a phantom counter side worth up to ~10 bp of `A` at the
-    ///      genesis vector. It is an over-statement, so it cannot trip R1, it is strictly smaller than what any
-    ///      ordinary market move produces under the same I7 rule, and it decays as `P_ref` tracks the pool.
-    /// @param sqrtPriceX96 The intended opening price.
-    /// @param tickSpacing The pool's tick spacing.
-    /// @return aligned The sqrt price of the greatest aligned tick at or below it.
-    function alignedOpeningPrice(uint160 sqrtPriceX96, int24 tickSpacing) public pure returns (uint160 aligned) {
-        return
-            PriceLib.tickToSqrtPriceX96(
-                PriceLib.alignTick(PriceLib.sqrtPriceX96ToTick(sqrtPriceX96), tickSpacing, false)
-            );
     }
 
     /// @notice `compound(poolId)` in full: §3.6, steps 3 to 8.
@@ -414,8 +383,19 @@ library VaultPlacementLib {
         //    valuation `workValueUsd18` uses above, so the threshold and the bounty agree on what a compound was
         //    worth; below it the counter simply stays an ERC-6909 claim, where `A` values it (I5) and the next
         //    compound rolls it in with its own.
+        //    **And it anchors at the reference, like every other placement** (audit fix wave 5, finding 5). The
+        //    2026-09-09 fix made {place} anchor both sides at the reference tick and left this one passing
+        //    `pool.tick`. With the pool above a rate-limited or `REF_DIVERGED` reference — 1,000 to 2,600 ticks
+        //    is an ordinary rally — the top bid cell straddles `sqrtPrice(P_ref / P_counter)`, which is exactly
+        //    the price `LadderPositionValuer` decomposes every position at (I7), so the valuer writes the AMPS
+        //    half of that cell off at zero (I5), `A` falls by up to a third of the counter being re-laddered and
+        //    the 2 bp R1 post-condition reverts the permissionless upkeep path — the fee collection, the AMPS
+        //    burn and the buyback — in precisely the dislocated state it exists for. {_cells}' bid branch still
+        //    takes `min(fromAnchor, fromTick)`, so the live tick binds whenever it is the lower of the two: the
+        //    reference can only pull the bid ladder *down*, never up through itself.
         uint256 placed;
         if (counter != 0 && _counterValueUsd18(ctx, pool.config, counter) >= Constants.COMPOUND_PLACE_MIN_USD18) {
+            (int24 bidAnchor,) = _referenceTick(ctx, pool);
             placed = _placeLadder(
                 ladder,
                 ctx,
@@ -424,7 +404,7 @@ library VaultPlacementLib {
                 amps,
                 false,
                 counter,
-                pool.tick,
+                bidAnchor,
                 pool.config.constituentId == 0 ? ctx.seedHalvings : ctx.bondBidHalvings,
                 "compound",
                 false
@@ -535,8 +515,17 @@ library VaultPlacementLib {
         //    invent a verdict. The cap is therefore the whole fix — a bound on the gas a hostile gate can burn —
         //    and the call stays typed so `GateNotHealthy` still reaches the caller with its own reason. Its return
         //    value is discarded, so nothing here decodes returndata either.
+        //
+        //    **And the cap is the gate's own, not a composite read's** (audit fix wave 5, finding 7).
+        //    {COMPOSITE_READ_GAS} — 400,000 — is sized for a feed registry's `latestAnswer`. `checkPlacement`
+        //    runs `OracleGate`'s whole per-pool snapshot: four 50,000-gas probes inside the constituent's own
+        //    Stock Token, two feed reads and two TWAPs. An upgraded token that burns its probes therefore
+        //    starved an *honest* gate below that cap, and because this call refuses **by reverting** a starved
+        //    read is indistinguishable from a refusal: `place` and `compound` closed for that pool, permanently
+        //    and at the issuer's choosing. `Constants.GATE_READ_GAS` is the figure the protocol-wide read of the
+        //    same gate has always had, and it is now the only figure any gate call uses.
         if (ctx.oracleGate != address(0)) {
-            IOracleGate(ctx.oracleGate).checkPlacement{gas: Constants.COMPOSITE_READ_GAS}(poolId);
+            IOracleGate(ctx.oracleGate).checkPlacement{gas: Constants.GATE_READ_GAS}(poolId);
         }
 
         // 6. The 60-second per-pool cooldown.
@@ -568,7 +557,13 @@ library VaultPlacementLib {
         uint256 answerUsd8 = _answer(ctx.feedRegistry, config.counter);
         if (priceUsd18 == 0 || answerUsd8 == 0 || config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) return;
 
-        int24 fair = PriceLib.fairTick(priceUsd18, answerUsd8, config.counterDecimals, config.tickSpacing);
+        // The `OrZero` conversion, never the reverting one (audit lead wave 5, L-9): this function's contract is
+        // "skip when there is nothing to check against", and `PriceLib.fairTick` reverts `PriceOutOfTickRange` on
+        // an implied price outside the tick domain. Unreachable at launch decimals, but a latent revert of every
+        // placement behind a governance-installed feed answer is not the contract stated here.
+        (int24 fair, bool known) =
+            PriceLib.fairTickOrZero(priceUsd18, answerUsd8, config.counterDecimals, config.tickSpacing);
+        if (!known) return;
         (, int24 tick) = PoolStateLib.sqrtPriceAndTick(IExtsload(poolManager), poolId);
         int24 deviation = tick > fair ? tick - fair : fair - tick;
         if (deviation > Constants.PLACEMENT_DIVERGENCE_TICKS) {
@@ -606,11 +601,13 @@ library VaultPlacementLib {
         Currency currency = above ? pool.key.currency0 : pool.key.currency1;
         address token = above ? amps : Currency.unwrap(pool.key.currency1);
         // **The bound stays at `amount`, and the one-wei-per-cell slack above it is deliberate** (audit lead,
-        // 2026-09-09, considered and not taken). The lead is arithmetically right: on the ask side
-        // `LadderLib.liquidityForAmount0Above` **floors** the liquidity a bucket's AMPS buys and the PoolManager's
-        // `getAmount0Delta` then **ceils** what that liquidity costs, so a ladder can be owed up to one wei per
-        // cell more than the sum of its buckets. Tightening the check to `amount + buckets` does not make such a
-        // placement succeed — it makes it fail *earlier*, and it fails a great many placements that succeed today:
+        // 2026-09-09, considered and not taken; the arithmetic restated wave 5, L-17). The floor/ceil pair
+        // **cannot overshoot**: `liquidityForAmount0Above` floors the liquidity a bucket's AMPS buys, so the
+        // liquidity actually opened is at most what `amount` pays for, and `getAmount0Delta`'s ceiling then
+        // recovers at most the one wei the floor gave away — per cell, never more. So "up to one wei per cell"
+        // is a **bound**, and a conservative one: the two roundings are inverses and the residue is the
+        // quantisation of a single division, not an accumulation. What follows is why even that bound is not
+        // worth tightening the check for:
         // `rollout` places exactly what its harvest freed, and `deployBonded` places a constituent's whole idle
         // claim, so `available == amount` is the *ordinary* case on both paths, not the edge one. The residue is
         // one wei per cell against a bucket sized in whole tokens, it is caught by the settlement with
@@ -835,12 +832,23 @@ library VaultPlacementLib {
             // doubling: the grid origin is itself the opening tick snapped down, so a reference a single tick
             // spacing under it — one wei of `P_ref` movement is enough when the opening tick was exact — puts the
             // seed bids at `m = -2..-5` instead of the `m = -1..-4` §3.3 specifies, leaving no protocol bid within
-            // a factor of two of the market. Adding the spacing back before the floor undoes the first rounding
-            // and no more: the top bid cell's upper bound is then at most `tickSpacing` ticks above the exact
-            // reference, which is the same bounded, one-sided residue ruling AX already carries on the ask side,
-            // against a cell 6,900 ticks wide. What R10 is really about — a pool 1,000-2,600 ticks above `P_ref`
-            // whose bids used to anchor at `slot0.tick` — is untouched, because a tick spacing is nothing next to
-            // a doubling.
+            // a factor of two of the market. Adding the spacing back undoes the first rounding and no more: the
+            // top bid cell's upper bound is then at most `tickSpacing` ticks above the exact reference, which is
+            // the same bounded, one-sided residue ruling AX already carries on the ask side, against a cell 6,900
+            // ticks wide. What R10 is really about — a pool 1,000-2,600 ticks above `P_ref` whose bids used to
+            // anchor at `slot0.tick` — is untouched, because a tick spacing is nothing next to a doubling.
+            //
+            // **Removing the term was wave 5's lead L-8, and it was measured and not taken.** `_floorDiv(exact -
+            // base, w) - 1` off the *unaligned* reference makes `upper <= exact` unconditional and removes the
+            // ~0.86% of reference positions (`(exact - base) mod w` in `[w - tickSpacing, w)`) where the top bid
+            // cell straddles the reference by up to one spacing — worth ~0.6% of that one cell, because the
+            // straddled sliver is 60 ticks of a 6,960-tick range. It buys that by giving up a whole doubling
+            // whenever the reference sits *inside* one tick spacing below a boundary, and at genesis that is not
+            // a rare case but a systematic one: a pool opens at `alignDown(refTick)` (§12 ruling C), `P_mkt` is
+            // then that pool's own TWAP, and `tick -> price -> sqrtPrice -> tick` floors three times, so the
+            // reference round-trips to `gridBaseTick - 1` and the seed bids land at `m = -2..-5`.
+            // `script/11_GenesisPlacement.s.sol::assertLayout` catches it (`LayoutMismatch(hubPool, -5)` on the
+            // 32-pool pipeline). One tick of round-trip rounding may not cost a doubling, so the term stays.
             int256 fromAnchor = _floorDiv(int256(p.anchorTick) + int256(p.key.tickSpacing) - base, w) - 1;
             int256 fromTick = _floorDiv(int256(p.currentTick) - base, w) - 1;
             first = fromAnchor < fromTick ? fromAnchor : fromTick;
@@ -1130,6 +1138,45 @@ library VaultPlacementLib {
     ///      worth of a cell the price sits exactly on the floor of) is held as a claim — §3.5's own fallback for a
     ///      degenerate range — and re-enters the ladder in step 7 of the same `compound` as a proper grid bid.
     ///      Nothing leaves the pool's economy; only the prices it bids at are re-derived.
+    ///
+    /// @dev **A fully crossed bid is not burned, and the live-cell ratchet that follows is accepted** (audit
+    ///      finding 8, wave 5; the reading taken, with the arithmetic). The finding is that a bid cell the price
+    ///      has fallen all the way through — `record.above == false`, `pool.tick <= record.lowerTick`, so it holds
+    ///      only the AMPS the bid bought — is skipped by the first clause above and by the rollout harvest, never
+    ///      closes, and therefore ratchets the vault-wide live-cell count: `compound`'s bid re-ladder opens a new
+    ///      cell for every doubling of downward drift, and the cells behind it stay live.
+    ///
+    ///      The economics are **deliberate** and are not changed here. §3.4's symmetric-proceeds rule is that a
+    ///      v4 position converts in place — "a filled ask becomes the bid at exactly the prices that raised it",
+    ///      and `above` is "true while the cell is an ask, false once converted to a bid" — so a filled bid is
+    ///      the ask at exactly the prices that filled it, and the AMPS in it is inventory the pool will re-sell on
+    ///      the way back up rather than inventory the protocol bought back out of the market. §3.5 says so in
+    ///      terms ("a fully crossed bid is not a buyback either… burning it re-prices a real trade's proceeds —
+    ///      NAV-dilutive whenever the fill happened above NAV/share, and enough to breach R1 when valued at the
+    ///      checkpoint's reference"), it was already a finding once (finding 15, 2026-09-08) and its own lead was
+    ///      dispositioned as accepted under §10 ruling AZ. Burning here would undo three earlier decisions and
+    ///      reintroduce the R1 revert they were taken to remove.
+    ///
+    ///      **The budget arithmetic, stated rather than assumed.** The grid is `GRID_CELLS = 24` cells wide
+    ///      (`GRID_MIN_M = -8` to `GRID_MAX_M = 16`) and `_writeRecords` refuses a 25th record per pool, so the
+    ///      worst case is `24 x (MAX_CONSTITUENTS + 2) = 24 x 36 = 864` live cells against
+    ///      `Constants.MAX_LIVE_CELLS = 512`. That worst case needs every one of 36 pools to have drifted through
+    ///      its whole 24-cell grid with a `compound` at every doubling; the launch shape is 14 cells per pool
+    ///      (`LADDER_DOUBLINGS_DEFAULT + SEED_HALVINGS_DEFAULT`), i.e. 504, which is what `MAX_LIVE_CELLS` and
+    ///      `MAX_CONSTITUENTS` are derived from and what
+    ///      `test/unit/VaultRedeem.t.sol:test_r8_constituentCapIsTiedToTheLiveCellBudget` pins. What the budget
+    ///      being full costs is the **strict** path only: `place` reverts `CellBudgetExceeded` for a new cell,
+    ///      while the permissionless bountied paths merge into cells that already exist and leave the remainder
+    ///      idle (§12 ruling E), and `redeemProRata` — the path the budget exists to bound — is unaffected either
+    ///      way. Constituent seeding is a governance call that can always be preceded by a `compound` on the
+    ///      pools that have run away, which is what actually frees cells.
+    ///
+    ///      **And the accounting was verified, not assumed.** Every site that zeroes a record's liquidity —
+    ///      here, {VaultRolloutLib-withdrawRetiredBids}, `_harvestAsks` and `VaultRedeemLib.unwind` — counts the
+    ///      cell out through `VaultRedeemLib.subLiveCells` in the same statement, and `_executePlace` spends
+    ///      budget only on a cell that actually opened, so there is no cell whose liquidity has "rounded to zero"
+    ///      without being closed. The ratchet is live cells holding real inventory, which is the state the budget
+    ///      is meant to count.
     function _burnback(
         mapping(PoolId => PlacementRecord[]) storage ladder,
         Ctx memory ctx,
@@ -1548,12 +1595,23 @@ library VaultPlacementLib {
     /// @dev Arms the surge fee after a placement, so it cannot be sandwiched at the pre-placement fee. A hook that
     ///      refuses is treated as absent rather than as a reason to abandon the placement, exactly as a gate that
     ///      reverts is: the vault is immutable and the market reference is a pointer.
-    function _armSurge(Ctx memory ctx, PoolId poolId, bytes32 reason) private {
-        if (ctx.marketReference == address(0)) return;
-        try IAmpsHook(ctx.marketReference).armSurge{gas: Constants.MARKET_REFERENCE_WRITE_GAS}(
-            poolId, Constants.SURGE_MAX_BPS, reason
-        ) {}
-            catch {}
+    ///
+    /// @dev **A bounded low-level call, like its sibling {_resetHighWater}** (audit lead wave 5, L-14). This was
+    ///      the last typed `try` on the market-reference pointer in this file, and a typed `try` on a `void`
+    ///      external function does not do what it looks like it does: the compiler emits its own `extcodesize`
+    ///      screen *before* the call, so a codeless pointer reverts in this frame rather than reaching the
+    ///      `catch`. `setPolicyPointer` refuses a codeless replacement, so reaching that state takes a
+    ///      self-destructed hook — but the failure mode is the whole placement reverting, not the surge being
+    ///      skipped, and the sibling call two lines away has been hardened against exactly that since
+    ///      2026-09-07. The return value is discarded for the same reason it always was: a reference that will
+    ///      not arm the surge is treated as absent.
+    /// @return armed Whether the call returned. Every caller discards it; it is a return value so that discarding
+    ///         it is explicit rather than an unused local, which is the shape {_resetHighWater} already uses.
+    function _armSurge(Ctx memory ctx, PoolId poolId, bytes32 reason) private returns (bool armed) {
+        if (ctx.marketReference == address(0)) return false;
+        (armed,) = ctx.marketReference.call{gas: Constants.MARKET_REFERENCE_WRITE_GAS}(
+            abi.encodeCall(IAmpsHook.armSurge, (poolId, Constants.SURGE_MAX_BPS, reason))
+        );
     }
 
     /// @dev The live AMPS fee, from the hook: bounded, and never a reason to revert. The launch value stands in
@@ -1612,7 +1670,8 @@ library VaultPlacementLib {
     ///      not a rounding: it is the whole first cell.
     ///
     ///      A pool's grid origin is `alignDown(openingTick)` and its opening tick *is* its reference tick
-    ///      (§12 ruling C, {alignedOpeningPrice}), so at genesis the exact reference sits strictly **inside** cell
+    ///      (§12 ruling C, {VaultNavLib-alignedOpeningPrice}), so at genesis the exact reference sits strictly
+    ///      **inside** cell
     ///      `m = 0` — at `base + 35` in the hub, `base + 55` in the WETH pool. Anchoring at `alignUp` (or, which
     ///      is the same thing, at the unrounded tick) makes `_ceilDiv` return `1` instead of `0`, so the ask
     ///      ladder starts one whole **doubling** above the reference: no protocol-owned ask exists between `P_ref`
@@ -1623,7 +1682,8 @@ library VaultPlacementLib {
     ///      The grid cannot be moved to escape the choice. Snapping the *opening* up instead would put cell
     ///      `m = -1`'s upper bound above the reference, and `LadderPositionValuer` writes the AMPS half of a
     ///      straddled **bid** off at zero (I5), which is ~7 bp of `A` — a hard R1 revert on the genesis seed bids
-    ///      ({alignedOpeningPrice} documents exactly this). One side of the origin cell must straddle: the design
+    ///      ({VaultNavLib-alignedOpeningPrice} documents exactly this). One side of the origin cell must straddle:
+    ///      the design
     ///      picks the ask side, where the mis-valuation is an *over*-statement that cannot trip R1, over the bid
     ///      side, where it is an under-statement that does.
     ///
@@ -1633,12 +1693,35 @@ library VaultPlacementLib {
     ///      cell's range lies under the reference, and only the inventory sold in that sliver is affected.
     ///      `PriceLib.fairTick`'s five-argument form exists so the stricter reading is one argument away should
     ///      the orchestrator rule for it after weighing the cost above.
-    function _referenceTick(Ctx memory ctx, Pool memory pool) private view returns (int24 tick) {
+    ///
+    /// @dev **Both sides anchor at the same aligned tick, and the bid side's residue stays bounded by {_cells}'
+    ///      `+ tickSpacing` term** (audit lead wave 5, L-8: considered, measured and **not** taken). The lead
+    ///      proposed handing the bid side the *unaligned* reference tick and flooring it straight onto the
+    ///      doubling grid, which makes the top bid cell's upper bound at or below the exact reference
+    ///      unconditionally instead of at most one tick spacing above it. It was implemented and it fails
+    ///      `script/11_GenesisPlacement.s.sol`'s own §3.3 layout assertion at launch — see {_cells}' bid branch
+    ///      for the arithmetic — because a pool opens at `alignDown(refTick)`, `P_mkt` is then that pool's own
+    ///      TWAP and the reference round-trips through two flooring conversions to `gridBaseTick - 1`, which
+    ///      under the zero-tolerance rule costs a whole **doubling**: the seed bids land at `m = -2..-5`.
+    ///
+    /// @dev **An unreadable answer is reported, not papered over** (audit lead wave 5, L-9). The fallback to
+    ///      `pool.tick` is a *bid*-side fallback and always was: anchoring a bid at the live tick can only lay it
+    ///      below the market, which is where bids belong. Anchoring an **ask** there sells AMPS at whatever the
+    ///      pool currently says, which is exactly what I32 forbids and exactly what a counter feed can be pushed
+    ///      into by being made unreadable. {place} therefore refuses ask placements when `known` is false; the
+    ///      conversion itself is the `OrZero` form, so a price outside the tick domain is "unknown" rather than a
+    ///      revert of the whole placement.
+    /// @param ctx The gathered pointers.
+    /// @param pool The resolved pool.
+    /// @return anchorTick The spacing-aligned (floored) reference tick, or `pool.tick` when it cannot be read.
+    /// @return known Whether the reference could be read at all.
+    function _referenceTick(Ctx memory ctx, Pool memory pool) private view returns (int24 anchorTick, bool known) {
         uint256 answerUsd8 = _answer(ctx.feedRegistry, pool.config.counter);
-        if (ctx.pRefX18 == 0 || answerUsd8 == 0 || pool.config.counterDecimals > PriceLib.MAX_COUNTER_DECIMALS) {
-            return pool.tick;
+        if (ctx.pRefX18 != 0 && answerUsd8 != 0 && pool.config.counterDecimals <= PriceLib.MAX_COUNTER_DECIMALS) {
+            (anchorTick, known) =
+                PriceLib.fairTickOrZero(ctx.pRefX18, answerUsd8, pool.config.counterDecimals, pool.config.tickSpacing);
         }
-        return PriceLib.fairTick(ctx.pRefX18, answerUsd8, pool.config.counterDecimals, pool.config.tickSpacing);
+        if (!known) return (pool.tick, false);
     }
 
     /// @notice Pays one bountied job's keeper, with the work value the job **measured** and the gas the call
@@ -1778,6 +1861,21 @@ library VaultPlacementLib {
     ///      canonical grid's and are not negotiable (§3.2), which is why only the weight vector is asked for — a
     ///      policy cannot move a bucket, only re-weight one. A policy that reverts, answers with the wrong length
     ///      or answers with a vector that does not sum to 1e18 leaves `LadderLib` in charge.
+    ///
+    /// @dev **The answer is hand-decoded, not decoded by the compiler** (audit lead wave 5, L-2). This used to be
+    ///      a typed `try`, and a typed `try` decodes a *successful* call's returndata **in this frame**: the
+    ///      `catch` covers a policy that reverts and nothing else. A `uint256[]` return is a dynamic type, so the
+    ///      decoder checks an offset, a length and that the payload is inside the buffer, and every one of those
+    ///      checks is a `Panic` here rather than a caught refusal. A policy answering with empty bytes, with an
+    ///      offset past the end, with a length header that does not match the words that follow, or with a
+    ///      declared length of 2^255 therefore reverted `place`, `compound`, `rollout`, `deployBonded` and every
+    ///      genesis ladder — a pointer-upgradeable policy bricking the placement engine, which is precisely what
+    ///      the `try` was written to make impossible.
+    ///
+    ///      The shape a well-formed answer has is fixed and small, so it is checked by hand: exactly
+    ///      `64 + 32 x buckets` bytes, a head word of `0x20`, and a length word equal to `buckets`. Anything else
+    ///      — including a revert, no code, or a policy that burns its whole budget — falls through to
+    ///      `LadderLib.weights`, which is the same fallback every other malformed vector already took.
     function _weights(uint64 tiltX18, uint8 buckets) private view returns (uint256[] memory weightsX18) {
         if (buckets < LadderLib.MIN_BUCKETS) {
             weightsX18 = new uint256[](buckets);
@@ -1787,21 +1885,33 @@ library VaultPlacementLib {
 
         address policy = address(uint160(_word(SLOT_LADDER_POLICY)));
         if (policy != address(0)) {
-            try ILadderPolicy(policy).weights{gas: Constants.MARKET_REFERENCE_WRITE_GAS}(tiltX18, buckets) returns (
-                uint256[] memory proposed
-            ) {
-                if (proposed.length == buckets) {
-                    // **Summed outside checked arithmetic, with an explicit guard** (audit fix, 2026-09-08). This
-                    // body runs in *this* frame, not the callee's, so a `sum` that overflowed here reverted the
-                    // whole placement — the one thing the `try` exists to prevent — and a pointer-upgradeable
-                    // policy could therefore brick `compound`, `rollout` and every genesis ladder with a vector of
-                    // two enormous numbers. An overflow is simply a vector that does not sum to `WAD`, which is
-                    // already the answer for every other malformed vector: `LadderLib` takes over.
+            (bool ok, bytes memory returndata) = policy.staticcall{gas: Constants.MARKET_REFERENCE_WRITE_GAS}(
+                abi.encodeCall(ILadderPolicy.weights, (tiltX18, buckets))
+            );
+            uint256 count = buckets;
+            if (ok && returndata.length == 64 + 32 * count) {
+                uint256 head;
+                uint256 length;
+                assembly ("memory-safe") {
+                    head := mload(add(returndata, 0x20))
+                    length := mload(add(returndata, 0x40))
+                }
+                if (head == 0x20 && length == count) {
+                    // **Summed outside checked arithmetic, with an explicit guard** (audit fix, 2026-09-08). A
+                    // `sum` that overflowed would revert the whole placement — the one thing the fallback exists
+                    // to prevent — so an overflow is simply a vector that does not sum to `WAD`, which is already
+                    // the answer for every other malformed vector: `LadderLib` takes over.
+                    uint256[] memory proposed = new uint256[](count);
                     uint256 sum;
                     bool overflowed;
                     unchecked {
-                        for (uint256 i; i < buckets; ++i) {
-                            uint256 next = sum + proposed[i];
+                        for (uint256 i; i < count; ++i) {
+                            uint256 word;
+                            assembly ("memory-safe") {
+                                word := mload(add(returndata, add(0x60, mul(i, 0x20))))
+                            }
+                            proposed[i] = word;
+                            uint256 next = sum + word;
                             if (next < sum) {
                                 overflowed = true;
                                 break;
@@ -1811,7 +1921,7 @@ library VaultPlacementLib {
                     }
                     if (!overflowed && sum == Constants.WAD) return proposed;
                 }
-            } catch {}
+            }
         }
         return LadderLib.weights(tiltX18, buckets);
     }

@@ -76,7 +76,10 @@ slot 8     address marketReference                               pointer-upgrade
 slot 9-13  address oracleGate / feedRegistry / positionValuer /
            ladderPolicy / rolloutPolicy                          pointer-upgradeable (7 d); the last two are
                                                                  Phase 3, positionValuer is the zero-position stub
-slot 14  address standbyVault                          14-day timelock
+slot 14  address standbyVault              [  0..159]  14-day tier
+         uint32  standbyRegisteredAt        [160..191]  when setStandbyVault stamped it; emergencyMigrate refuses
+                                                        until registeredAt + TIMELOCK_STANDBY_SECONDS (wave-5
+                                                        lead L-3 — the tier was enforced by convention alone)
 slot 15  uint128 rolloutMoved24h           [  0..127]  Phase 3; decays linearly to zero over ONE_DAY
          uint32  rolloutWindowStart        [128..159]   re-stamped on every charge (rolling, not tumbling)
 slot 16  address[] assets                              enumeration for the NAV sum and for redeemProRata
@@ -85,7 +88,11 @@ slot 18  mapping(PoolId => PlacementRecord[]) ladder   Phase 3, 2 slots per buck
 slot 19  mapping(PoolId => uint32) lastPlacementAt     Phase 3, 60 s cooldown
 slot 20  uint256 deployThresholdUsd18                  the bonded-deployment dust guard (§10 ruling 15)
 slot 21  bool    navUnconfirmed            [  0..  7]  §12 ruling AS: any priced asset !fresh || unconfirmed
-         uint248 reserved filler           [  8..255]  declared, not implied — see below
+         uint128 checkpointSupply          [  8..135]  `T` as this checkpoint read it, so spokeWeightBps can
+                                                        reconstruct *this* checkpoint's `A` rather than mixing a
+                                                        checkpointed NAV with a live supply (wave-5 lead L-7);
+                                                        written in the same SSTORE as the flag beside it
+         uint120 reserved filler           [136..255]  declared, not implied — see below
 slot 22  address genesis                               the AmpsGenesis adapter. Set once through
                                                        setPolicyPointer, before genesisMint, and frozen by
                                                        genesisPlace with the other set-once pointers
@@ -95,7 +102,7 @@ slot 22  address genesis                               the AmpsGenesis adapter. 
 `genesis` pointer would sit beside `navUnconfirmed` in slot 21 while `VaultNavLib.setPointer` — which writes
 pointers *by slot number* — wrote slot 22. The getter would have read `address(0)` for ever, and `genesisMint`
 would have refused every proposal for a mismatch it could not explain. `VaultLayout.t.sol` pins slot 21 as the
-flag alone, slot 22 as the adapter, and 23 onwards as empty.
+flag and the checkpoint supply, slot 22 as the adapter, and 23 onwards as empty.
 
 Transient (EIP-1153), derived as `keccak256("amplestocks.vault.<name>")` and hard-coded:
 
@@ -220,7 +227,7 @@ slot 4   address vault                                   reassigned only by migr
 | `AmpsVault` | `setRedeemFeeBps` … `setSpokeSeedBps` | timelock | 48 h |
 | `AmpsVault` | `setPolicyPointer` / `setStandbyVault` | timelock | 7 d / 14 d |
 | `AmpsVault` | `setCreator` | current `creator` only | — |
-| `AmpsVault` | `emergencyMigrate` | guardian, predicate-gated | none |
+| `AmpsVault` | `emergencyMigrate` | guardian, predicate-gated | none — but the **standby** it names must be 14 days old (`StandbyNotMatured`, wave-5 lead L-3) |
 | `AmpsBonds` | `bond` | **P** | — |
 | `AmpsBonds` | `claim`, `claimAll` | **P, U** (position owner) | — |
 | `AmpsBonds` | `removeCollateral`, `setPolicy` | timelock | 7 d |
@@ -334,12 +341,22 @@ redeem  (structurally ungated)
     for each pool (Phase 3): remove floor(L_p * shares / T) from every PlacementRecord
     for each asset j != AMPS: pay floor(b_j * shares / T) * (BPS - redeemFeeBps) / BPS
       -- redeemFeeBps: 250 bp at launch (revision 6 raised it from 100), governed at 48 h, hard cap 500
-    queueInventoryBurn(floor(inventory * shares / T) + releasedAmps)
+    queueInventoryBurn(floor((inventory - pendingInventoryBurn) * shares / T) + releasedAmps + unwindAmpsFees)
       -- QUEUED, not burned (revision 8, ruling U): `T` falls by exactly `shares` in this transaction, and the
          queue is burned linearly over REDEEM_BURN_STREAM_SECONDS = 24 h by whichever call settles next
          (checkpoint, touch, a bond, a compound, any placement, the next redemption). Burning it here let a
          redeemer split one exit into slices and divide by a denominator its own earlier slices had shrunk.
-      -- pendingInventoryBurn() is the remainder; burnStreamStart() + 24 h is the deadline
+      -- the inventory base is NET of what the stream is already owed (wave-5 finding 4): AMPS an earlier
+         redemption queued is spoken for and is not the next redeemer's to slice. previewRedeem reaches the same
+         number from the pre-settlement side, so preview and payout stay wei-identical.
+      -- the AMPS-side fees the unwind realised are queued with it (wave-5 lead L-13). They are the one fee
+         realisation that cannot pass VaultPlacementLib's split — this path may not reach a library that knows
+         what a gate is — so the whole of them is burned rather than left as ask inventory. previewRedeem's third
+         return is the pro-rata figure alone: a view cannot ask v4 what fees a removal would realise.
+      -- pendingInventoryBurn() is the remainder; burnStreamStart() + 24 h is the deadline, and burnStreamStart is
+         the AMOUNT-WEIGHTED opening, so a queue of `a` against a pending `P` moves it by (now - start)*a/(P+a)
+         at most D*a/P seconds (wave-5 finding 2). A settlement the idle cap truncated does not advance the
+         last-settle stamp at all (wave-5 finding 3).
     payout (VaultRedeemLib.payout): try the ERC-20 unlock under gasleft() - REDEEM_PAYOUT_RESERVE_GAS, per asset
       take{gas: 4 x STOCK_TOKEN_PROBE_GAS} -> claim on refusal; on ANY failure (a hostile transfer opening a
       foreign delta included) a second claims-only unlock pays every claim part; idle ERC-20 parts after the
@@ -622,14 +639,25 @@ Two further deliberate deviations, both asserted in `GuardSymmetry.t.sol`:
 ## 8. Migration surface
 
 * **Standby vault.** `setStandbyVault(address)` — timelock, 14 days. Registering it moves nothing; a codeless
-  address is refused (re-audit lead).
+  address is refused (re-audit lead). **The 14 days is on chain since audit wave 5** (lead L-3): the setter stamps
+  `standbyRegisteredAt` in slot 14's free upper bits and `emergencyMigrate` reverts
+  `StandbyNotMatured(registeredAt, readyAt)` until `block.timestamp >= registeredAt +
+  Constants.TIMELOCK_STANDBY_SECONDS`. Before that the tier was enforced by the governance documents and by the
+  timelock's own 48-hour `minDelay` — i.e. by convention — for the address a no-delay guardian call hands five
+  `onlyVault` roles and the whole estate to. Re-registering restarts the clock, because a fresh standby is a fresh
+  fourteen days.
 * **Predicate.** `emergencyMigrate(standby)` is guardian-callable with no delay, and reverts with
   `MigrationPredicateNotMet` unless, checked on-chain at call time: `IStockToken(token).isBlocked(vault) == true`
   for at least one registered constituent, **or** a bounded 1-wei self-transfer probe reverts for at least two
   constituents. Every probe is a `staticcall`/`call` capped at `Constants.STOCK_TOKEN_PROBE_GAS`.
 * **What moves.** Per pool, inside one `unlock`: remove liquidity -> `take` as ERC-6909 claims -> transfer the
   claims PoolManager-internally to the standby vault -> the standby re-adds at the same ticks. The R1 bleed cap is
-  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call. The idle ERC-20 leg of `evacuate`
+  relaxed from 2 bp to `MIGRATION_BLEED_BPS_MAX` (50 bp) only inside this call, and **both sides of it measure the
+  same estate**: `navAfter` is taken over `assetsUsd18Of(standby) + assetsUsd18Of(vault)`, because a balance the
+  evacuation could not move has not leaked (wave-5 finding 6). An issuer who denylists the vault — which is what
+  unlocks the migration — and leaves a percent of `A` on it as an idle balance was otherwise able to make the
+  50 bp bound revert the evacuation it had itself provoked. What stayed behind is named per token with
+  `SweepResidue`, from inside `VaultNavLib.evacuate`. The idle ERC-20 leg of `evacuate`
   is a gas-capped best-effort transfer (re-audit finding 5), so a gas-burning constituent cannot starve the roles
   handed over after it.
 * **What follows in the same transaction.** `VaultNavLib.handover` moves **five** roles: `Amps.setVault`,

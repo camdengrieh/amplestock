@@ -214,7 +214,11 @@ The disclosure page.
   `totalSupply`, still inventory, and already spoken for. It is shown beside a "Burn stream" row
   built from `burnStreamStart()`: when the current window opened, and when the queue will be fully
   burned if nothing adds to it. A reader comparing supply across two days is owed the difference
-  between "nothing burned" and "the burn is in flight".
+  between "nothing burned" and "the burn is in flight". **`burnStreamStart()` is the
+  *amount-weighted* opening** (audit wave 5, finding 2), so a later redemption slides the deadline
+  only in proportion to what it adds — at most `24 h × added / pending` — rather than restarting the
+  whole window. The row can say so: a deadline that moves by minutes when someone redeems is the
+  schedule working, and one that jumped a full day for a dust redemption was the bug.
 - **Per-pool POL depth is published from the chain.** `LadderPositionValuer.amountsOf` decomposes
   the vault's grid cells at the same reference price the vault values `A` at, so the counter column
   is to the wei the term NAV credits that pool with, and the AMPS column is the unfilled ask

@@ -473,13 +473,21 @@ library VaultRolloutLib {
     }
 
     /// @dev The source side of §3.8: gate, cooldown and divergence, then the key and the live tick.
+    ///
+    /// @dev **The gate read is bounded** (audit fix wave 5, finding 7). This was the one `checkPlacement` in the
+    ///      protocol with **no** gas bound at all, so an `OracleGate` replacement that looped — or an honest gate
+    ///      whose per-pool snapshot an upgraded Stock Token starved — took the whole rollout frame with it rather
+    ///      than a bounded slice of it. The cap is `Constants.GATE_READ_GAS`, the same figure every other call
+    ///      into the gate now uses. The call stays typed: `checkPlacement` refuses **by reverting**, so
+    ///      `GateNotHealthy` has to reach the caller with its own reason and a hand-decoded probe would have to
+    ///      invent a verdict.
     function _gauntlet(mapping(PoolId => uint32) storage cooldown, address poolManager, PoolId poolId)
         private
         view
         returns (PoolKey memory key, int24 tick)
     {
         address gate = _addr(SLOT_ORACLE_GATE);
-        if (gate != address(0)) IOracleGate(gate).checkPlacement(poolId);
+        if (gate != address(0)) IOracleGate(gate).checkPlacement{gas: Constants.GATE_READ_GAS}(poolId);
 
         uint32 last = cooldown[poolId];
         if (last != 0 && block.timestamp < uint256(last) + Constants.PLACEMENT_COOLDOWN_SECONDS) {

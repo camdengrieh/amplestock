@@ -16,7 +16,7 @@ import {
     PlacementDiverged
 } from "../../src/types/Errors.sol";
 import {PlacementRecord} from "../../src/types/Types.sol";
-import {VaultPlacementLib} from "../../src/vault/VaultPlacementLib.sol";
+import {VaultNavLib} from "../../src/vault/VaultNavLib.sol";
 import {VaultRedeemLib} from "../../src/vault/VaultRedeemLib.sol";
 import {MockStockToken} from "../mocks/MockStockToken.sol";
 import {PlacementFixture} from "../mocks/PlacementFixture.sol";
@@ -168,7 +168,7 @@ contract VaultPlacementTest is PlacementFixture {
     /// @notice **The genesis cell indices of §3.3, exactly**: asks at `m = 0..9`, seed bids at `m = -1..-4`.
     ///
     /// @dev They only come out when the pool opens *on* its grid origin, which is what
-    ///      {VaultPlacementLib-alignedOpeningPrice} guarantees for every pool the vault has ever opened
+    ///      {VaultNavLib-alignedOpeningPrice} guarantees for every pool the vault has ever opened
     ///      (§12 ruling C): `slot0.sqrtPriceX96 == getSqrtPriceAtTick(gridBaseTick)`, so cell 0's lower bound and
     ///      cell -1's upper bound both sit exactly at the price — the first is a pure-AMPS range and the second a
     ///      pure-counter one, in exact v4 terms.
@@ -225,7 +225,7 @@ contract VaultPlacementTest is PlacementFixture {
 
         // The snap itself: an unaligned input comes back as the greatest aligned tick at or below it.
         assertEq(
-            VaultPlacementLib.alignedOpeningPrice(unaligned, TICK_SPACING),
+            VaultNavLib.alignedOpeningPrice(unaligned, TICK_SPACING),
             aligned,
             "the vault snaps every opening down onto the lattice"
         );

@@ -147,6 +147,16 @@ library Constants {
     ///      all, so the split advantage collapses to the streamed fraction and is exactly zero within a block.
     ///      Settling more often does not slow the line down and cannot be used to hold the burn back.
     ///
+    /// @dev **What a later queue does to the deadline: it moves it in proportion to what the queue adds** (audit
+    ///      fix wave 5, finding 2). `burnStreamStart` is the **amount-weighted opening** of the window, not the
+    ///      timestamp of the last redemption. Queueing `a` against a pending `P` at time `t` rewrites the opening
+    ///      to `start x P/(P + a) + t x a/(P + a)`, so the deadline `start + D` slides by
+    ///      `(t - start) x a/(P + a) <= D x a/(P + a)` — a dust queue moves it by dust and a queue that doubles
+    ///      the outstanding amount moves it half way. The old rule restarted the whole window for the combined
+    ///      amount, which let a few tens of wei of shares — the floor division's own threshold — push an
+    ///      arbitrarily large outstanding burn out by a full day, once per block, and turn this linear stream into
+    ///      an unbounded geometric tail.
+    ///
     /// @dev **There is no setter.** A governable window would be a lever over the one path that must not have any:
     ///      `VaultRedeemLib.settleBurnStream` is reached from the ungated redemption floor, and a parameter read
     ///      there is a slot governance could use to stall it. 24 hours is long enough that a split is worthless
@@ -397,6 +407,21 @@ library Constants {
     ///      jump rule adds at most two more plus the session arithmetic) and still bounds a hostile one, which is
     ///      all a cap on a governance-installed pointer is for.
     uint256 internal constant COMPOSITE_READ_GAS = 400_000;
+
+    /// @notice Gas forwarded to every call into the **oracle gate** pointer: `AmpsVault`'s three reads
+    ///         (`state(0)`, `protocolFreezeUntil()`, `poke()`), `VaultNavLib.referenceOverridden`'s
+    ///         `snapshotByPool`, and the per-pool `checkPlacement` the placement and rollout paths make.
+    ///
+    /// @dev **A griefing bound, not a budget, and it has to be the same number everywhere** (audit fix wave 5,
+    ///      finding 7). The per-pool `checkPlacement` used to be capped at {COMPOSITE_READ_GAS} — 400,000 — while
+    ///      the protocol-wide read of the same gate was given 1,500,000. `OracleGate`'s per-pool snapshot runs
+    ///      four 50,000-gas probes inside the constituent's own Stock Token plus two feed reads and two TWAPs, so
+    ///      the smaller cap was *below what an honest gate can spend* against an upgraded token that burns its
+    ///      probes: `checkPlacement` refuses by reverting, so a starved read is indistinguishable from a refusal
+    ///      and `place`/`compound` closed for that pool. One number for every gate call removes the asymmetry;
+    ///      1,500,000 is far above the honest cost and far below a block, and by EIP-150 the caller keeps a
+    ///      sixty-fourth of its remaining gas whatever the callee does with the rest.
+    uint256 internal constant GATE_READ_GAS = 1_500_000;
 
     /// @notice The largest `uiMultiplier()` step the hook treats as a dividend reinvestment rather than a corporate
     ///         action. 2%: above this the constituent is frozen instead of fee-captured.
@@ -922,11 +947,36 @@ library Constants {
     ///      constituent that burns the first attempt's whole allowance — and the structurally ungated redemption
     ///      reverted. `REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS x tokens.length + REDEEM_PAYOUT_RESERVE_FIXED_GAS`
     ///      keeps the same claim, honestly, at every list length.
-    uint256 internal constant REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS = 32_000;
+    ///
+    /// @dev **It covers the tail behind the fallback too, and it did not** (audit lead wave 5, L-10). The reserve
+    ///      was sized for the claims-only `unlock` alone — one cold ERC-6909 `transfer` per asset, ~27,500 — and
+    ///      `redeemProRata` does three more things *after* `payout` returns, every one of them inside the same
+    ///      frame: the best-effort idle leg, `VaultRedeemLib.queueInventoryBurn` (a settlement, up to three
+    ///      `SSTORE`s and an `IAmps.burn`), the `Redeem` log, and `sweepClean` over every registered asset. The
+    ///      per-asset figure is therefore the claim transfer plus the sweep's bounded balance probe (~3,000) and
+    ///      the `SweepResidue` a skipped or refused absorb emits (~2,000); the fixed figure is the second
+    ///      `unlock`'s own overhead plus the queue (~35,000) and the log. The absorb itself is **not** in here and
+    ///      must not be — it is up to ~650,000 an asset — which is what {SWEEP_ABSORB_MIN_GAS} is for.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS = 36_000;
 
-    /// @notice The fixed part of the claims-only fallback's gas reserve: the `unlock` itself and the loop around
-    ///         it, independent of how many assets are being paid.
-    uint256 internal constant REDEEM_PAYOUT_RESERVE_FIXED_GAS = 60_000;
+    /// @notice The fixed part of the claims-only fallback's gas reserve: the `unlock` itself, the loop around it,
+    ///         and the post-payout tail — the burn-stream queue, the `Redeem` log and the sweep's own frame —
+    ///         independent of how many assets are being paid. See
+    ///         {REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS} for the derivation.
+    uint256 internal constant REDEEM_PAYOUT_RESERVE_FIXED_GAS = 90_000;
+
+    /// @notice The smallest frame in which `VaultRedeemLib.sweepClean` will attempt an asset's **absorb**.
+    ///
+    /// @dev The sweep runs at the exit of every entry point, `redeemProRata` included. Probing an asset's balance
+    ///      costs ~3k; absorbing it is three bounded calls plus an `unlock`, which the caps admit up to ~650k of.
+    ///      On the redemption path that tail sits behind the gas reserve {REDEEM_PAYOUT_RESERVE_PER_ASSET_GAS}
+    ///      holds back, and sizing the reserve for `MAX_COLLATERALS` absorbs would hold back tens of millions of
+    ///      gas the redemption then could not spend on the unwind it actually needs. So the absorb is conditioned
+    ///      on the frame instead: below this it is skipped, the balance stays on the vault — where `A` still
+    ///      counts it and redemption still pays it out — and `IAmpsVault.SweepResidue` reports it exactly as it
+    ///      reports a balance a hostile token refused to move. An absorb is never *half* done: it is attempted
+    ///      with room to finish, or not attempted (audit lead wave 5, L-10).
+    uint256 internal constant SWEEP_ABSORB_MIN_GAS = 1_000_000;
 
     /// @notice The smallest frame in which the ERC-20 payout attempt is worth making at all.
     /// @dev Below `reserve + this`, `payout` skips straight to the claims-only unlock rather than spending the

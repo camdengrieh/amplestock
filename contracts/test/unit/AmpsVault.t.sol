@@ -973,6 +973,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vault.setPolicyPointer(bytes32("oracleGate"), address(0));
         vm.stopPrank();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert(abi.encodeWithSelector(IAmpsVault.NotStandbyVault.selector, address(0), address(0)));
         vault.emergencyMigrate(address(0));
@@ -1108,12 +1109,16 @@ contract AmpsVaultTest is AmpsVaultFixture {
     }
 
     /// @dev The `AMPS/USDG` entry pool key, ordered so the PoolManager accepts it.
+    /// @dev An `AMPS/<counter>` key in that order. {AmpsVault-initializePool} refuses any other `currency0` since
+    ///      audit wave 5's lead L-15, and v4 refuses a key whose currencies are out of order, so the ordering is
+    ///      asserted rather than assumed: this fixture's `AMPS` is a predicted CREATE address and sorts below
+    ///      `weth` only because of the order {deployVaultWorld} deploys them in. A future reordering should fail
+    ///      here, with a reason, rather than inside the PoolManager.
     function _entryKey() private view returns (PoolKey memory key) {
-        (address token0, address token1) =
-            address(usdg) < address(weth) ? (address(usdg), address(weth)) : (address(weth), address(usdg));
+        require(address(amps) < address(weth), "fixture: AMPS must sort below WETH for an entry key");
         key = PoolKey({
-            currency0: Currency.wrap(token0),
-            currency1: Currency.wrap(token1),
+            currency0: Currency.wrap(address(amps)),
+            currency1: Currency.wrap(address(weth)),
             fee: 3000,
             tickSpacing: 60,
             hooks: IHooks(address(0))
@@ -1130,6 +1135,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.prank(TIMELOCK);
         vault.setStandbyVault(STANDBY);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert(IAmpsVault.MigrationPredicateNotMet.selector);
         vault.emergencyMigrate(STANDBY);
@@ -1141,10 +1147,12 @@ contract AmpsVaultTest is AmpsVaultFixture {
         vm.prank(TIMELOCK);
         vault.setStandbyVault(STANDBY);
 
+        matureStandby();
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(NotGuardian.selector, ALICE));
         vault.emergencyMigrate(STANDBY);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert(abi.encodeWithSelector(IAmpsVault.NotStandbyVault.selector, BOB, STANDBY));
         vault.emergencyMigrate(BOB);
@@ -1168,6 +1176,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         uint256 stockClaim = claimOf(address(stock));
         uint256 pol = amps.balanceOf(address(vault));
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -1192,11 +1201,13 @@ contract AmpsVaultTest is AmpsVaultFixture {
 
         // One paused token is not enough: the predicate wants a pattern, not an incident.
         stock.pause();
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert(IAmpsVault.MigrationPredicateNotMet.selector);
         vault.emergencyMigrate(STANDBY);
 
         stock2.pause();
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the evacuation completed");
@@ -1216,6 +1227,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         assertEq(navBefore, 999_999_999_999_999_999, "NAV/share before");
 
         vm.recordLogs();
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -1247,6 +1259,7 @@ contract AmpsVaultTest is AmpsVaultFixture {
         feeds.setReverting(true);
 
         vm.recordLogs();
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
