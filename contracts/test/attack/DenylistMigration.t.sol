@@ -30,6 +30,7 @@ contract DenylistMigrationTest is Phase3Fixture {
 
     /// @notice The predicate is a real gate: without a denylisting, the guardian cannot migrate.
     function test_theGuardianCannotMigrateWithoutADenylisting() public {
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert(IAmpsVault.MigrationPredicateNotMet.selector);
         vault.emergencyMigrate(STANDBY);
@@ -60,6 +61,7 @@ contract DenylistMigrationTest is Phase3Fixture {
         _denylistTheVault(0);
         assertTrue(stocks[0].isBlocked(address(vault)), "the issuer has blocked the vault");
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -116,6 +118,7 @@ contract DenylistMigrationTest is Phase3Fixture {
         stocks[0].mint(address(vault), 1);
         _denylistTheVault(0);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -130,6 +133,7 @@ contract DenylistMigrationTest is Phase3Fixture {
         stocks[0].pause();
         stocks[1].pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the migration went through on the probe signal alone");
@@ -197,6 +201,7 @@ contract DenylistMigrationTest is Phase3Fixture {
         assertLt(tickOf(hubPool), before - 200, "the hub trades meaningfully below where the reference was set");
 
         _denylistTheVault(0);
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -216,6 +221,7 @@ contract DenylistMigrationTest is Phase3Fixture {
             address(vault), abi.encodeWithSignature("assetsUsd18Of(address)", STANDBY), abi.encode((held * 90) / 100)
         );
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectPartialRevert(NavBleedExceeded.selector);
         vault.emergencyMigrate(STANDBY);

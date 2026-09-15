@@ -280,6 +280,38 @@ library PriceLib {
         tick = alignTick(TickMath.getTickAtSqrtPrice(sqrtPriceX96), tickSpacing, roundUp);
     }
 
+    /// @notice {fairTick}, answering "no tick" instead of reverting when the implied pool price is out of the tick
+    ///         range.
+    ///
+    /// @dev **Why the `OrZero` form** (audit lead wave 5, L-9). Both callers on the placement path —
+    ///      `VaultPlacementLib._referenceTick` and `_requireConverged` — are written as "no usable answer means
+    ///      skip", and both reached the reverting {fairTick}. `PriceOutOfTickRange` is arithmetically unreachable
+    ///      at launch decimals, but a latent revert of `place`, `compound`, `rollout` and `deployBonded` behind a
+    ///      governance-installed feed answer is not the contract either function states. This is the same body
+    ///      with that one refusal answered rather than thrown, exactly as
+    ///      {ampsPerCounterToSqrtPriceX96OrZero} is for the sqrt price.
+    ///
+    /// @dev The tick that comes back is the spacing-aligned (floored) one, which is what both placement sides
+    ///      anchor at: the ask ladder ceils it onto the doubling grid (ruling AX) and the bid ladder floors it
+    ///      with one tick spacing added back, so that the bid side's rounding residue is the same size and shape
+    ///      as the ask side's rather than a whole doubling stricter (audit fix R10, 2026-09-09; lead L-8 of wave 5
+    ///      proposed removing that term and was measured and not taken — see `VaultPlacementLib._cells`).
+    /// @param pRefUsd18 The AMPS reference price in USD, 18 decimals. Must be non-zero.
+    /// @param counterPriceUsd8 The counter asset's Chainlink USD answer, 8 decimals. Must be non-zero.
+    /// @param counterDecimals The counter asset's ERC-20 decimals.
+    /// @param tickSpacing The pool's tick spacing.
+    /// @return tick The spacing-aligned (floored) fair tick; meaningless when `ok` is false.
+    /// @return ok Whether the price lies inside the tick range at all.
+    function fairTickOrZero(uint256 pRefUsd18, uint256 counterPriceUsd8, uint8 counterDecimals, int24 tickSpacing)
+        internal
+        pure
+        returns (int24 tick, bool ok)
+    {
+        uint160 sqrtPriceX96 = ampsPerCounterToSqrtPriceX96OrZero(pRefUsd18, counterPriceUsd8, counterDecimals);
+        if (sqrtPriceX96 == 0) return (0, false);
+        return (alignTick(TickMath.getTickAtSqrtPrice(sqrtPriceX96), tickSpacing, false), true);
+    }
+
     // -------------------------------------------------------------------------------------------------------------
     // Counter-asset valuation
     // -------------------------------------------------------------------------------------------------------------

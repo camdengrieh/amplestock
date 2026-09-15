@@ -316,7 +316,7 @@ revert `GateNotHealthy`.
 | Key | Meaning |
 |---|---|
 | `factory` | `ContinuousClearingAuctionFactory`. Canonical: `0x000000001F26a0044BaA66024e7b6599c61963F8`. Env `AMPS_CCA_FACTORY` |
-| `ethUsdX18` | ETH/USD, 18 decimals, at creation. `0` = read the vault's feed. Env `AMPS_ETH_USD_X18` |
+| `ethUsdX18` | ETH/USD, 18 decimals, at creation. `0` = read the vault's feed — and since audit wave 5 (lead L-16) the feed answer is used **only when the registry reports it `fresh`**: a stale but non-zero answer reads as zero and `06a_GenesisAuction.loadConfig` reverts `EthUsdUnavailable()` rather than pricing the ETH floor and the graduation bar off it. The operator's remedy is to set this key, or `AMPS_ETH_USD_X18`, which is read **before** the feed is consulted and therefore wins outright. Env `AMPS_ETH_USD_X18` |
 | `blockMs` / `AMPS_BLOCK_MS` | Robinhood Chain block time; every block figure is derived from it |
 | `startDelayHours`, `durationHours`, `claimDelayHours` | the block schedule. Defaults 24 / 72 / 0 |
 | `usdg.enabled`, `eth.enabled` | whether each leg runs. Disabling one returns its tranche as unsold |

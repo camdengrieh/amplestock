@@ -351,6 +351,10 @@ abstract contract AmpsVaultHandler is Properties {
         PlaceObs memory o = _placeBefore(id, true);
         o.vaultAmpsBefore = 0; // SP-18's ask leg is asserted on `place`, where the side is unambiguous
         uint256 supplyBefore = amps.totalSupply();
+        // SP-24: a `compound` settles the inventory-burn stream on the way in and again on the way out, and that
+        // burn is not the `burned` figure it returns. A compound never *queues*, so the queue's fall is exactly
+        // what the stream burned (fix-log wave 5).
+        uint256 pendingBurnBefore = vault.pendingInventoryBurn();
 
         uint256 ampsFees;
         uint256 burned;
@@ -373,7 +377,12 @@ abstract contract AmpsVaultHandler is Properties {
         o.lastPlacementAfter = vault.lastPlacementAt(id);
         o.navAfter = _tryNavPerShare();
         property_mintAttribution(supplyBefore, amps.totalSupply(), 0);
-        property_compoundBurnIsExact(supplyBefore, amps.totalSupply(), burned);
+        property_compoundBurnIsExact(
+            supplyBefore,
+            amps.totalSupply(),
+            burned,
+            pendingBurnBefore > vault.pendingInventoryBurn() ? pendingBurnBefore - vault.pendingInventoryBurn() : 0
+        );
         property_creatorSlicePerCompound(creatorBefore, amps.balanceOf(vault.creator()), ampsFees);
         property_placementBleedBound(o.navBefore, o.navAfter);
         property_sidednessAtPlacement(ladderBefore, ladderAfter, tickOf(id));
@@ -500,6 +509,15 @@ abstract contract AmpsVaultHandler is Properties {
 
         // ── ghosts ──
         o.pendingBurnAfter = vault.pendingInventoryBurn();
+        o.supplyAfter = amps.totalSupply();
+        // The stream's drain, from the supply rather than from the queue: `redeemProRata` burns the redeemer's
+        // shares and the settlement and nothing else, while the queue *also* rises by what this call added — and
+        // since lead L-13 that is the preview's release plus the AMPS-side fees the removal realised, which a
+        // `view` cannot predict (fix-log wave 5).
+        o.drained = o.supplyBefore - o.supplyAfter >= o.shares ? o.supplyBefore - o.supplyAfter - o.shares : 0;
+        o.queuedInventory = o.pendingBurnAfter + o.drained >= o.pendingBurnBefore
+            ? o.pendingBurnAfter + o.drained - o.pendingBurnBefore
+            : 0;
         ghosts.previewTokens = tokens;
         ghosts.previewAmounts = predicted;
         ghosts.previewInventoryReleased = o.previewInventoryReleased;
@@ -507,13 +525,13 @@ abstract contract AmpsVaultHandler is Properties {
         ghosts.lastRedeemAmounts = paidAmounts;
         // Revision 8, ruling U: only the **realised** burn goes into the ledger GL-03 checks against the token.
         // The release is queued, so what actually left the supply is the redeemer's shares plus the portion of
-        // the stream this call settled — which is `queued - pending`, the stream's own bookkeeping.
-        ghosts.queuedInventory += o.previewInventoryReleased;
-        ghosts.burnedTotal += shares + (o.pendingBurnBefore + o.previewInventoryReleased - o.pendingBurnAfter);
+        // the stream this call settled — `o.drained`, taken from the supply rather than from the preview, because
+        // since wave 5's lead L-13 the queue also rises by AMPS-side fees a `view` cannot predict.
+        ghosts.queuedInventory += o.queuedInventory;
+        ghosts.burnedTotal += shares + o.drained;
         noteAmpsHolder(to);
 
         // ── specific properties ──
-        o.supplyAfter = amps.totalSupply();
         o.callerAmpsAfter = amps.balanceOf(actor);
         o.navAfter = _tryNavPerShare();
         o.aAfter = _tryTotalAssets();

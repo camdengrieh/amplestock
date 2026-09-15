@@ -613,6 +613,7 @@ contract Phase2IntegrationTest is Phase2Fixture {
         vm.prank(TIMELOCK);
         vault.setStandbyVault(STANDBY);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectRevert();
         vault.emergencyMigrate(STANDBY);
@@ -630,6 +631,7 @@ contract Phase2IntegrationTest is Phase2Fixture {
         }
         uint256 polBefore = amps.balanceOf(address(vault));
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 

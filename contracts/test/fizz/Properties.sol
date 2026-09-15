@@ -2479,6 +2479,15 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         uint256 previewInventoryReleased;
         uint256 pendingBurnBefore;
         uint256 pendingBurnAfter;
+        /// @dev What the inventory-burn stream settled on the way in, derived from the **supply** rather than from
+        ///      the queue: `redeemProRata` burns the redeemer's shares and the settlement and nothing else, so
+        ///      `drained == (supplyBefore - supplyAfter) - shares` exactly. The queue cannot be used for it,
+        ///      because the queue also *rises* by what this call added — and since fix-log wave 5's lead L-13 that
+        ///      figure is the preview's `inventoryReleased` **plus** the AMPS-side fees the removal realised,
+        ///      which a `view` cannot predict.
+        uint256 drained;
+        /// @dev What this call actually queued: `pendingBurnAfter + drained - pendingBurnBefore`.
+        uint256 queuedInventory;
         uint256 supplyBefore;
         uint256 supplyAfter;
         uint256 callerAmpsBefore;
@@ -2732,18 +2741,21 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         eq(o.callerAmpsBefore - o.callerAmpsAfter, o.shares, "SP-10: the redeemer did not burn exactly `shares`");
         gte(o.supplyBefore, o.supplyAfter, "SP-10: a redemption raised totalSupply");
 
-        uint256 drained = o.pendingBurnBefore + o.previewInventoryReleased >= o.pendingBurnAfter
-            ? o.pendingBurnBefore + o.previewInventoryReleased - o.pendingBurnAfter
-            : type(uint256).max;
+        gte(o.supplyBefore - o.supplyAfter, o.shares, "SP-10: supply fell by less than the shares redeemed");
         eq(
             o.supplyBefore - o.supplyAfter,
-            o.shares + drained,
+            o.shares + o.drained,
             "SP-10: supply did not fall by shares + the drain the redemption settled"
         );
-        eq(
-            o.pendingBurnAfter + drained,
-            o.pendingBurnBefore + o.previewInventoryReleased,
-            "SP-10: pendingInventoryBurn did not rise by the preview's inventoryReleased"
+        // **A lower bound, and it has to be** (fix-log wave 5, lead L-13). The redemption queues the pro-rata
+        // release *plus* the AMPS-side fees the unwind realised, and `previewRedeem` is a `view`: it cannot ask v4
+        // what fees a removal would realise, so its third return is the pro-rata figure alone. The difference is
+        // fee AMPS the protocol burns instead of leaving as ask inventory the ladder could sell again, so "at
+        // least" is the honest statement; the old equality held only while that AMPS was silently kept.
+        gte(
+            o.queuedInventory,
+            o.previewInventoryReleased,
+            "SP-10: pendingInventoryBurn rose by less than the preview's inventoryReleased"
         );
     }
 
@@ -2810,9 +2822,17 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      2026-09-10 campaign measured a sell-then-redeem sequence paying ~2 bp above the fee-netted reference-basis
     ///      slice, far inside the 250 bp redemption fee. Growth past 25 bp is a lead for human review.
     /// @param o The redemption observation.
+    /// @dev **The slice divides by the *settled* supply, which is a harness correction rather than a protocol
+    ///      finding** (campaign 6; fix-log wave 5). `redeemProRata` settles the inventory-burn stream **before** it
+    ///      prices anything, so the denominator it actually divides by is `supplyBefore - drained`. Measured
+    ///      against the pre-settlement supply the slice is too small by `drained / T` and the property fires on a
+    ///      redemption that did nothing wrong — the larger the pending stream, the louder. `o.drained` is derived
+    ///      from the supply rather than from the queue, so lead L-13's fee queueing does not disturb it.
     function property_redemptionPaysAtMostProRata(RedeemObs memory o) internal {
         if (o.aBefore == 0 || o.supplyBefore == 0 || o.aAfter >= o.aBefore) return;
-        uint256 slice = o.aBefore * o.shares / o.supplyBefore;
+        uint256 supplyBasis = o.supplyBefore > o.drained ? o.supplyBefore - o.drained : 0;
+        if (supplyBasis == 0) return;
+        uint256 slice = o.aBefore * o.shares / supplyBasis;
         uint256 bound = slice * (SpecC.BPS - o.feeBps) / SpecC.BPS;
         lte(o.aBefore - o.aAfter, bound + bound * 25 / SpecC.BPS + 1e12, "SP-14: a redemption paid more than pro rata");
     }
@@ -2980,14 +3000,29 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         }
     }
 
-    /// @notice SP-24: `compound` never raises supply, and lowers it by exactly what it reported burning.
+    /// @notice SP-24: `compound` never raises supply, and lowers it by exactly what it reported burning plus
+    ///         whatever the inventory-burn stream settled inside the same call.
     /// @dev SHOULD-HOLD — rev-6/7 amendment to I33; x-ray E-1 enumerates the burn sites.
+    /// @dev **The settlement term is a harness correction rather than a protocol finding** (campaign 6; fix-log
+    ///      wave 5). A `compound` settles the 24-hour inventory-burn stream twice over — once in the forwarder's
+    ///      own pre-read (`AmpsVault._beforePlacement`, finding 1) and once in the exit `_checkpoint` that then
+    ///      finds nothing due — and that burn is `Burn(amount, "redeemInventory")`, not the `burned` figure
+    ///      `compound` returns. The equality without it is false for any `compound` run in the day after a
+    ///      redemption, which is exactly when the campaign found it.
     /// @param supplyBefore Supply before the call.
     /// @param supplyAfter Supply after it.
     /// @param burned The `burned` figure `compound` returned.
-    function property_compoundBurnIsExact(uint256 supplyBefore, uint256 supplyAfter, uint256 burned) internal {
+    /// @param settled The fall in `pendingInventoryBurn()` across the call. A `compound` never queues, so the
+    ///        queue can only fall, and the fall is exactly what the stream burned.
+    function property_compoundBurnIsExact(uint256 supplyBefore, uint256 supplyAfter, uint256 burned, uint256 settled)
+        internal
+    {
         lte(supplyAfter, supplyBefore, "SP-24: a compound raised totalSupply");
-        eq(supplyBefore - supplyAfter, burned, "SP-24: supply did not fall by exactly the reported burn");
+        eq(
+            supplyBefore - supplyAfter,
+            burned + settled,
+            "SP-24: supply did not fall by the reported burn plus the stream's settlement"
+        );
     }
 
     /// @notice SP-25: the creator's slice of a compound is bounded by the fees it collected, and is zero once the

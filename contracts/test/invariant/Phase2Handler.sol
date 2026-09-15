@@ -329,7 +329,14 @@ contract Phase2Handler is CommonBase, StdCheats, StdUtils {
             // actually used, which is what keeps this an independent check of I23 rather than a copy of the view.
             uint256 drained = supply - AMPS.totalSupply() - shares;
             uint256 basis = supply - drained;
-            uint256 expectedRelease = ((ampsBefore - drained) * shares) / basis;
+            // Wave-5 finding 4: the pro-rata base is also net of what the stream is **still owed** after that
+            // settlement — AMPS an earlier redemption queued is spoken for and is not this one's to slice — so
+            // the two netted terms cancel the drain and the base is simply the pre-call balance less the pre-call
+            // queue. Saturating at zero, exactly as `VaultRedeemLib.redemption` does.
+            uint256 base = ampsBefore > drained ? ampsBefore - drained : 0;
+            uint256 promised = pendingBefore - drained;
+            base = base > promised ? base - promised : 0;
+            uint256 expectedRelease = (base * shares) / basis;
 
             burnedShares += shares;
             queuedInventory += expectedRelease;

@@ -403,7 +403,25 @@ of linear drain is settled by every checkpoint and by every redemption. Each set
 `Burn(amount, "redeemInventory")`, so the `Burn` handler's running supply is correct without
 knowing anything about the stream, and `burn_event` shows the drain as the several small burns it
 actually is rather than one large one. A `redemption` row's `inventoryReleased` is therefore what
-was *added to the queue* at that block, not what left the supply in it.
+was *added to the queue* at that block, not what left the supply in it — and since audit wave 5's
+lead L-13 that is the pro-rata release **plus** the AMPS-side fees the position removal realised,
+which is what `pendingInventoryBurn()` rises by and what the event reports. `previewRedeem`'s third
+return is the pro-rata figure alone (a `view` cannot ask v4 what fees a removal will realise), so an
+indexer reconciling the two should expect the event to be the larger of the pair, never the smaller.
+
+**A ladder cell's `amount` does not follow a redemption.** `IAmpsVault.ladderAt`'s `amount` is what placements
+committed into the cell less what the *placement engine* took out — the buyback burn and a retired-bid withdrawal
+pro-rate it, a pro-rata redemption does not (wave-5 lead L-13(b): the write is a cold `SLOAD` plus a dirty `SSTORE`
+per live cell on the one path that must fit one transaction, and it measured +5,499 gas a cell). So after a
+`Redeem` a cell's `liquidity` has fallen and its `amount` has not. An indexer that needs live inventory should
+either scale `amount` by the liquidity it has watched leave, or read `LadderPositionValuer.amountsOf`, which
+decomposes the position itself at the reference price.
+
+**The burn stream's deadline moves by a little, not by a day.** `burnStreamStart()` is the
+*amount-weighted* opening of the window (wave-5 finding 2), so a later redemption slides the
+deadline by `(now − start) × added / (pending + added)` — at most `24 h × added / pending`. A
+`burn_stream` row that jumps a whole day on a dust redemption is the bug that rule removed, and is
+worth an alert if it is ever seen again.
 
 **`nav-drift` — L-1, the convergence step.** NAV/share falling between two checkpoints with nothing
 between them that is allowed to move it. `Bond`, `Redeem`, `Placement`, `Compound` and a pool `Swap`

@@ -54,6 +54,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         MockNonCanonicalToken hostile = _registerNonCanonicalConstituent();
         hostile.setBoolAnswer(2);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the evacuation completed on a non-canonical `true`");
@@ -66,6 +67,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         MockNonCanonicalToken hostile = _registerNonCanonicalConstituent();
         hostile.setBoolAnswer(0); // `isBlocked` false; `transfer` then also answers 0, i.e. an explicit failure.
 
+        matureStandby();
         // An explicit `false` from `transfer` is a failed probe, and one failed probe is not the pattern.
         vm.prank(GUARDIAN);
         vm.expectRevert(IAmpsVault.MigrationPredicateNotMet.selector);
@@ -73,6 +75,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
 
         // The second failed probe is: pausing a real Stock Token is the other half of the pattern.
         stock.pause();
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "two failed probes met the predicate");
@@ -96,6 +99,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         uint256 wethClaim = claimOf(address(weth));
         uint256 pol = amps.balanceOf(address(vault));
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -112,6 +116,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         stock.pause();
         stock2.pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -125,6 +130,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         stock.setBalanceOfReverts(true);
         stock2.pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the evacuation completed with a constituent's view unavailable");
@@ -140,6 +146,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         stock.pause();
         stock2.pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -156,6 +163,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         stock.pause();
         stock2.pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -169,6 +177,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         stock.pause();
         stock2.pause();
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(registry.vault(), STANDBY, "the registry moved and the missing hook was skipped");
@@ -196,6 +205,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         assertLt(live, stored * 995 / 1000, "the live NAV is far below the stale checkpoint: 20x the bound");
 
         vm.recordLogs();
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -215,6 +225,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
         // looks like: intercept the second leg of the evacuation and swallow the WETH.
         vm.mockCall(address(vault), abi.encodeWithSignature("assetsUsd18Of(address)", STANDBY), abi.encode(uint256(1)));
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vm.expectPartialRevert(NavBleedExceeded.selector);
         vault.emergencyMigrate(STANDBY);
@@ -231,6 +242,7 @@ contract VaultMigrationTest is AmpsVaultFixture {
 
         vm.expectEmit(true, true, true, true, address(vault));
         emit IAmpsVault.MigrationBleedUnchecked(bytes32("navBefore"));
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the evacuation still completed");

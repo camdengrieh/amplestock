@@ -227,12 +227,17 @@ contract VaultRedeemTest is PlacementFixture {
 
         // Revision 8, ruling U: the release is queued, so supply falls by the shares alone until the stream runs.
         assertEq(supplyBefore - amps.totalSupply(), 500e18, "burned the shares, and only the shares");
-        assertEq(vault.pendingInventoryBurn(), previewRelease, "the preview's figure is what was queued");
+        // **The preview is the floor of what was queued since audit wave 5's lead L-13.** The redemption queues
+        // the pro-rata release *plus* the AMPS-side fees the position removal realised — a `view` cannot ask v4
+        // what those will be, so `previewRedeem`'s third return is the pro-rata figure alone and the queue is the
+        // larger of the pair. `_leaveAnAmpsClaim` trades, so there are fees here.
+        uint256 queued = vault.pendingInventoryBurn();
+        assertGe(queued, previewRelease, "the preview's figure is the floor of what was queued");
         assertEq(claimOf(address(amps)), 0, "and the claim was swept to ERC-20 so the stream can burn it");
 
         warpBy(Constants.REDEEM_BURN_STREAM_SECONDS);
         vault.checkpoint();
-        assertEq(supplyBefore - amps.totalSupply(), 500e18 + previewRelease, "a window on, the whole preview burned");
+        assertEq(supplyBefore - amps.totalSupply(), 500e18 + queued, "a window on, the whole queue burned");
     }
 
     /// @notice And the sweep is not a giveaway. The claim is swept to ERC-20 so the stream's burn *can* happen,
@@ -499,8 +504,16 @@ contract VaultRedeemTest is PlacementFixture {
         assertEq(supplyBefore - amps.totalSupply(), queued, "and burn exactly what was queued");
     }
 
-    /// @notice A second redemption mid-window restarts one window for the **combined** amount rather than stacking
-    ///         a second schedule beside the first, and `burnStreamStart() + D` stays the single deadline.
+    /// @notice A second redemption mid-window re-opens one window for the **combined** amount rather than
+    ///         stacking a second schedule beside the first, and `burnStreamStart() + D` stays the single deadline.
+    ///
+    /// @dev **The re-opening is amount-weighted since audit wave 5 (finding 2).** It used to be
+    ///      `burnStreamStart = block.timestamp` outright, which re-dated an arbitrarily large outstanding burn by
+    ///      a full day for the price of a dust redemption. The opening now lies between the old one and `now`,
+    ///      weighted by the amounts the two carry, so it moves in proportion to what the queue adds — which is
+    ///      what this test asserts instead of the old "the window restarted here".
+    ///      `VaultWave5.t.sol::test_w5_02_aQueueMovesTheDeadlineInProportionToWhatItAdds` is the finding's own
+    ///      test; this one keeps the "one window for the combined amount" property it has always been about.
     function test_r8_aSecondQueueRestartsOneWindowForTheCombinedAmount() public {
         vm.prank(ALICE);
         vault.redeemProRata(200e18, ALICE);
@@ -509,6 +522,7 @@ contract VaultRedeemTest is PlacementFixture {
 
         warpBy(Constants.REDEEM_BURN_STREAM_SECONDS / 2);
 
+        uint256 openedAt = vault.burnStreamStart();
         uint256 supplyBeforeSecond = amps.totalSupply();
         (,, uint256 secondRelease) = vault.previewRedeem(200e18);
         vm.prank(ALICE);
@@ -517,7 +531,8 @@ contract VaultRedeemTest is PlacementFixture {
         uint256 settled = supplyBeforeSecond - amps.totalSupply() - 200e18;
         assertApproxEqAbs(settled, first / 2, 1, "the second redemption settled the accrued half first");
         assertEq(vault.pendingInventoryBurn(), first - settled + secondRelease, "then one queue for the combined sum");
-        assertEq(vault.burnStreamStart(), block.timestamp, "the window restarted here");
+        assertGt(vault.burnStreamStart(), openedAt, "the window's opening moved toward now");
+        assertLt(vault.burnStreamStart(), block.timestamp, "but not all the way to it: the opening is weighted");
 
         // A whole window from the restart retires everything, with nothing left over from the first redemption.
         uint256 combined = vault.pendingInventoryBurn();
@@ -540,6 +555,7 @@ contract VaultRedeemTest is PlacementFixture {
         stocks[0].blockAccounts(blocked);
 
         assertEq(vault.pendingInventoryBurn(), 0, "nothing queued before");
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
@@ -561,6 +577,7 @@ contract VaultRedeemTest is PlacementFixture {
         blocked[0] = address(vault);
         stocks[0].blockAccounts(blocked);
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
 
