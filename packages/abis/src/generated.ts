@@ -5095,12 +5095,8 @@ export const ampsVaultAbi = [
   { type: 'error', inputs: [], name: 'MigrationPredicateNotMet' },
   {
     type: 'error',
-    inputs: [
-      { name: 'navBefore', internalType: 'uint256', type: 'uint256' },
-      { name: 'navAfter', internalType: 'uint256', type: 'uint256' },
-      { name: 'maxBleedBps', internalType: 'uint16', type: 'uint16' },
-    ],
-    name: 'NavBleedExceeded',
+    inputs: [{ name: 'currency0', internalType: 'address', type: 'address' }],
+    name: 'NotAmpsPool',
   },
   {
     type: 'error',
@@ -5152,6 +5148,14 @@ export const ampsVaultAbi = [
     name: 'OutOfBand',
   },
   { type: 'error', inputs: [], name: 'Phase3NotImplemented' },
+  {
+    type: 'error',
+    inputs: [
+      { name: 'registeredAt', internalType: 'uint32', type: 'uint32' },
+      { name: 'readyAt', internalType: 'uint256', type: 'uint256' },
+    ],
+    name: 'StandbyNotMatured',
+  },
   {
     type: 'error',
     inputs: [{ name: 'slot', internalType: 'bytes32', type: 'bytes32' }],
