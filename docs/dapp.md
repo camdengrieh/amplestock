@@ -363,13 +363,25 @@ deployment; every merge to `main` redeploys production.
 
 * Production: `https://amplestock-web-zeta.vercel.app` (aliases
   `amplestock-web-camdengriehs-projects.vercel.app`, `amplestock-web-git-main-camdengriehs-projects.vercel.app`).
-* Deployment protection: the project shipped with Vercel Authentication on for every deployment (visitors are
-  redirected to a Vercel login). The 2026-09-07 decision is to make production public: in the Vercel dashboard,
-  Settings → Deployment Protection → Vercel Authentication → "Only Preview Deployments" (a custom domain also
-  bypasses it). The integration used from Claude Code cannot change project settings (403), so this is a manual
-  step.
-* Environment (Settings → Environment Variables, then redeploy — `NEXT_PUBLIC_*` is inlined at build time):
-  `NEXT_PUBLIC_AMPS_CHAIN_ID=46630`, `GEO_PROVIDER=vercel`, `NEXT_PUBLIC_REOWN_PROJECT_ID=<your Reown project id>`.
+* Deployment protection: the project shipped with Vercel Authentication on for every deployment except custom
+  domains (visitors are redirected to a Vercel login). The 2026-09-07 decision is to make production public: in
+  the Vercel dashboard, Settings → Deployment Protection → Vercel Authentication → "Only Preview Deployments" (a
+  custom domain also bypasses it). The Vercel connector used from Claude Code can read the project but not
+  update it (403 on the protection setting as of 2026-09-24), so the owner makes this switch.
+* Environment (Settings → Environment Variables, all three environments, plain type; then Redeploy production,
+  because `NEXT_PUBLIC_*` is inlined at build time):
+
+  ```
+  NEXT_PUBLIC_AMPS_CHAIN_ID=46630
+  GEO_PROVIDER=vercel
+  NEXT_PUBLIC_FLAG_TESTNET_BANNER=1
+  NEXT_PUBLIC_REOWN_PROJECT_ID=<your Reown project id>
+  ```
+
+  The connector also returns 403 on listing and creating environment variables, so the owner sets these too.
+  With the CLI and a token that has write access to the project, the equivalent is
+  `vercel env add <KEY> production` (repeat for `preview` and `development`) followed by
+  `vercel redeploy <latest production deployment URL>`.
   The contract addresses and `NEXT_PUBLIC_AMPS_INDEXER_URL` follow the 46630 deployment; until then every
   surface renders its "not deployed on this chain" state and the indexed panels read "indexer unavailable".
 
