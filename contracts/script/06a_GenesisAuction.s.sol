@@ -417,10 +417,19 @@ contract GenesisAuction is Script {
     }
 
     /// @dev WETH's 18-decimal USD price out of the configured feed registry, or zero when it cannot be read.
+    /// @dev **The freshness flag is honoured** (audit lead wave 5, L-16). This answer sets the ETH auction's
+    ///      floor price and, through `.eth.requiredUsd18`, its graduation bar: both are figures the launch is
+    ///      measured against once and cannot revise. `latestAnswerUsd18`'s third return is the registry's own
+    ///      "this answer is inside its session-scaled `maxAge`" verdict, and discarding it meant a stale but
+    ///      non-zero answer — a feed that stopped updating over a weekend, exactly when a launch is prepared —
+    ///      priced both. Reading it as zero makes the caller `revert EthUsdUnavailable()`, and the operator's
+    ///      explicit `AMPS_ETH_USD_X18` (or `.ethUsdX18` in the file) still wins outright, because it is read
+    ///      *before* this is consulted at all. The failure is loud and the override is deliberate, which is the
+    ///      right shape for a number nobody can change afterwards.
     function _feedEthUsdX18(Wiring memory w) private view returns (uint256 price18) {
         if (w.feedRegistry == address(0) || w.weth9 == address(0)) return 0;
-        try IFeedRegistry(w.feedRegistry).latestAnswerUsd18(w.weth9) returns (uint256 answer, uint32, bool) {
-            return answer;
+        try IFeedRegistry(w.feedRegistry).latestAnswerUsd18(w.weth9) returns (uint256 answer, uint32, bool fresh) {
+            return fresh ? answer : 0;
         } catch {
             return 0;
         }

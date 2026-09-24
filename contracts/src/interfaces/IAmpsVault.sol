@@ -134,12 +134,18 @@ interface IAmpsVault {
     /// @param owner The redeemer.
     /// @param to The recipient.
     /// @param shares AMPS wei burned from the redeemer.
-    /// @param inventoryReleased Additional AMPS wei released from the vault's own inventory and **queued** into
-    ///        the 24-hour inventory-burn stream, not burned in this transaction (revision 8, ruling U). It is
-    ///        still the amount the redemption retires from supply; `totalSupply` falls by it over the day that
-    ///        follows, through the `Burn(amount, "redeemInventory")` the stream emits as it drains, and
-    ///        {pendingInventoryBurn} is what has not drained yet. `totalSupply` falls by exactly `shares` in this
-    ///        transaction, plus whatever the stream settled on entry.
+    /// @param inventoryReleased Additional AMPS wei **queued** into the 24-hour inventory-burn stream, not burned
+    ///        in this transaction (revision 8, ruling U). It is still the amount the redemption retires from
+    ///        supply; `totalSupply` falls by it over the day that follows, through the
+    ///        `Burn(amount, "redeemInventory")` the stream emits as it drains, and {pendingInventoryBurn} is what
+    ///        has not drained yet. `totalSupply` falls by exactly `shares` in this transaction, plus whatever the
+    ///        stream settled on entry. **It is the pro-rata release of the vault's own inventory *plus* the
+    ///        AMPS-side fees the position removal realised** (audit fix wave 5, lead L-13), which are the one fee
+    ///        realisation in the protocol that cannot pass `VaultPlacementLib`'s creator-and-burn split — the
+    ///        redemption floor may not reach a library that knows what a gate is — and which used to be left as
+    ///        ask inventory the ladder could sell again. {previewRedeem}'s third return is the pro-rata figure
+    ///        alone, because a `view` cannot ask v4 what fees a removal would realise; this figure is what
+    ///        {pendingInventoryBurn} actually rises by.
     /// @param feeBps The redemption fee applied.
     event Redeem(address indexed owner, address indexed to, uint256 shares, uint256 inventoryReleased, uint16 feeBps);
 
@@ -308,6 +314,25 @@ interface IAmpsVault {
     /// @param proposed The rejected address.
     /// @param standby The registered standby.
     error NotStandbyVault(address proposed, address standby);
+
+    /// @notice {emergencyMigrate} was called before the standby vault's own 14-day tier had elapsed.
+    /// @dev The standby is the address a no-delay guardian call hands five `onlyVault` roles and the whole estate
+    ///      to, and `Constants.TIMELOCK_STANDBY_SECONDS` is the tier the governance documents give that
+    ///      registration. Until this check existed the tier was enforced only by the timelock's own 48-hour
+    ///      `minDelay` — i.e. by convention (audit lead wave 5, L-3). {setStandbyVault} stamps the registration
+    ///      and this is where the stamp is read.
+    /// @param registeredAt When the standby was registered.
+    /// @param readyAt The earliest instant the migration may use it.
+    error StandbyNotMatured(uint32 registeredAt, uint256 readyAt);
+
+    /// @notice A pool whose `currency0` is not AMPS was handed to {initializePool}.
+    /// @dev Every Amplestocks pool is `AMPS/<counter>` with AMPS as `currency0`, and the whole vault rests on it:
+    ///      `redeemProRata`'s unwind takes `currency0` out as the AMPS to burn, `_placeLadder` reads `currency1`
+    ///      as the counter, and `A` values `currency1` alone. `PoolRegistry` already orders the pair, so this is
+    ///      the vault refusing to depend on the registry for the one fact it cannot survive being wrong about
+    ///      (audit lead wave 5, L-15).
+    /// @param currency0 The rejected `currency0`.
+    error NotAmpsPool(address currency0);
 
     /// @notice A Phase 3 entry point was called. {place}, {compound}, {rollout}, {deployBonded} and
     ///         {withdrawRetiredBids} are part of the final ABI — the bytecode is immutable, so they have to be —
@@ -482,8 +507,12 @@ interface IAmpsVault {
     /// @return tokens The assets that would be paid.
     /// @return amounts The raw amounts, parallel to `tokens`, net of `redeemFeeBps`.
     /// @return inventoryReleased Additional AMPS wei that would be released from inventory and **queued** into the
-    ///         24-hour burn stream — the figure {Redeem} reports and the amount {pendingInventoryBurn} would rise
-    ///         by. It is not burned in the redeeming transaction (revision 8, ruling U).
+    ///         24-hour burn stream. It is not burned in the redeeming transaction (revision 8, ruling U), and it
+    ///         is a **lower bound** on what {pendingInventoryBurn} rises by: the redemption also queues the
+    ///         AMPS-side fees its position removal realises, which a `view` cannot predict (audit fix wave 5,
+    ///         lead L-13). {Redeem}'s `inventoryReleased` reports the figure that was actually queued. The token
+    ///         amounts above are exact — preview and payout agree to the wei — and so is this figure's own
+    ///         arithmetic; what it cannot see is v4's `feesAccrued`.
     function previewRedeem(uint256 shares)
         external
         view
@@ -497,13 +526,23 @@ interface IAmpsVault {
     /// @return amount The pending amount, in AMPS wei.
     function pendingInventoryBurn() external view returns (uint256 amount);
 
-    /// @notice When the current inventory-burn window opened. Zero before the first redemption.
+    /// @notice The **amount-weighted** opening of the current inventory-burn window. Zero before the first
+    ///         redemption.
     /// @dev **`burnStreamStart() + Constants.REDEEM_BURN_STREAM_SECONDS` is the deadline**: the whole of
-    ///      {pendingInventoryBurn} is burned by then. Only a redemption moves this — a settlement does not — so
-    ///      the deadline does not slide as keepers checkpoint, and the schedule is one straight line to it
-    ///      whatever the settlement frequency. A later redemption restarts one window for the *combined* pending
-    ///      amount rather than opening a second schedule beside the first.
-    /// @return timestamp The window's opening, as a Unix timestamp.
+    ///      {pendingInventoryBurn} is burned by then, as the vault's idle AMPS permits. Only a redemption moves
+    ///      this — a settlement does not — so the deadline does not slide as keepers checkpoint, and the schedule
+    ///      is one straight line to it whatever the settlement frequency. A later redemption re-opens one window
+    ///      for the *combined* pending amount rather than opening a second schedule beside the first.
+    ///
+    /// @dev **A queue moves the deadline in proportion to what it adds** (audit fix wave 5, finding 2). Queueing
+    ///      `a` against a pending `P` at time `t` rewrites the opening to `start x P/(P + a) + t x a/(P + a)`, so
+    ///      the deadline slides by `(t - start) x a/(P + a)` — at most `REDEEM_BURN_STREAM_SECONDS x a / P`
+    ///      seconds. A dust queue moves it by dust; a queue that doubles the outstanding amount moves it half
+    ///      way. The old rule restarted the whole window at `t` for the combined amount, which let a few tens of
+    ///      wei of shares — the floor division's own threshold — push an arbitrarily large outstanding burn out
+    ///      by a full day, once per block, and turn the linear stream into an unbounded geometric tail. A dApp
+    ///      showing this as a countdown should expect it to move by minutes when someone redeems, never by a day.
+    /// @return timestamp The window's amount-weighted opening, as a Unix timestamp.
     function burnStreamStart() external view returns (uint256 timestamp);
 
     /// @notice The creator fee in force at `timestamp`, in bps of sell volume.

@@ -145,20 +145,36 @@ contract VaultNavResilienceTest is AmpsVaultFixture {
         assertGt(assets, 0, "`A` was computed from the answer's first word");
     }
 
-    /// @notice An answer shorter than the declared tuple is still an answer when the word is there, and no answer
-    ///         at all when it is not — and "no answer" is `FeedNotSet`, the deliberate conservative failure, not a
-    ///         `Panic` in the vault's frame.
-    function test_aTruncatedFeedAnswerIsReadAsAWordOrAsNothing() public {
+    /// @notice An answer shorter than `IFeedRegistry.latestAnswer`'s own three words is **no answer at all**, at
+    ///         any length — and "no answer" is `FeedNotSet`, the deliberate conservative failure, not a `Panic` in
+    ///         the vault's frame.
+    ///
+    /// @dev **Restated for audit wave 5, lead L-12.** One word used to be enough here while
+    ///      `VaultPlacementLib._answer` — the same registry, the same selector — has always required 96 bytes, so
+    ///      a malformed registry was *trusted by NAV* and *read as absent by placements*: `A` priced a constituent
+    ///      off an answer the placement path would not anchor to, and the divergence check that path would have
+    ///      run was skipped. The two readers now share one acceptance rule, which is the interface's.
+    function test_aTruncatedFeedAnswerIsNoAnswerAtAll() public {
         vm.mockCall(
             address(feeds),
             abi.encodeCall(IFeedRegistry.latestAnswer, (address(stock))),
             abi.encode(uint256(STOCK_USD8))
         );
+        vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedNotSet.selector, address(stock)));
         vault.checkpoint();
 
         vm.mockCall(address(feeds), abi.encodeCall(IFeedRegistry.latestAnswer, (address(stock))), hex"01");
         vm.expectRevert(abi.encodeWithSelector(IFeedRegistry.FeedNotSet.selector, address(stock)));
         vault.checkpoint();
+
+        // The interface's own shape is read, and the vault carries on.
+        vm.mockCall(
+            address(feeds),
+            abi.encodeCall(IFeedRegistry.latestAnswer, (address(stock))),
+            abi.encode(uint256(STOCK_USD8), uint32(block.timestamp), true)
+        );
+        vault.checkpoint();
+        assertGt(vault.totalAssetsUsd18(), 0, "three words is the answer, and it is read");
     }
 
     // -------------------------------------------------------------------------------------------------------------

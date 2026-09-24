@@ -878,6 +878,10 @@ contract VaultRolloutTest is PlacementFixture {
     ///      governance bid on a valuation artefact. {VaultPlacementLib-_cells}' bid branch already takes
     ///      `min(fromAnchor, fromTick)`, so the reference anchor can only pull the ladder *down*, never up
     ///      through the tick.
+    ///
+    /// @dev **Wave-5 lead L-8 proposed removing the `+ tickSpacing` term and was measured and not taken**, so the
+    ///      one-spacing tolerance below stands; see `VaultPlacementLib._cells`' bid branch for the arithmetic and
+    ///      `VaultWave5.t.sol::test_w5_L8_theBidAnchorKeepsItsOneSpacingTolerance` for the two cases it covers.
     function test_r10_theBidLadderAnchorsAtTheReferenceAndStaysBelowIt() public {
         PoolId spoke = spokePools[0];
         bondDeposit(address(stocks[0]), 20e18);

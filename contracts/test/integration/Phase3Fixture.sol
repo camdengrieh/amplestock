@@ -1208,4 +1208,21 @@ abstract contract Phase3Fixture is V4TestBase {
             require(uint160(address(amps)) < uint160(address(stocks[i])), "AMPS < stock");
         }
     }
+
+    /// @notice TEST ONLY. Makes the registered standby vault's 14-day tier elapsed.
+    ///
+    /// @dev `AmpsVault.emergencyMigrate` requires `block.timestamp >= registeredAt +
+    ///      Constants.TIMELOCK_STANDBY_SECONDS` since audit wave 5 (lead L-3), which puts the tier the governance
+    ///      documents claim for the standby on chain. The stamp lives in slot 14's upper bits beside the standby
+    ///      pointer (`docs/phase2-state-model.md` §1.1), so it is zeroed directly rather than by warping fourteen
+    ///      days — which would move every other clock a migration test depends on: feed freshness, the gate's
+    ///      trading calendar, the creator's decay. A fixture whose own clock starts before the tier could have
+    ///      elapsed is warped the minimum that makes `0 + TIMELOCK_STANDBY_SECONDS` reachable, and no more.
+    ///      `VaultWave5.t.sol::test_w5_L3_theStandbyTierIsEnforcedOnChain` exercises the real wait and the real
+    ///      refusal.
+    function matureStandby() internal {
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(14))));
+        vm.store(address(vault), bytes32(uint256(14)), bytes32(word & type(uint160).max));
+        if (block.timestamp < Constants.TIMELOCK_STANDBY_SECONDS) vm.warp(Constants.TIMELOCK_STANDBY_SECONDS);
+    }
 }

@@ -243,20 +243,49 @@ contract VaultLayoutTest is AmpsVaultFixture {
         assertEq(uint256(vm.load(address(vault), bytes32(uint256(20)))), 4242e18, "and the setter writes slot 20");
     }
 
-    /// @notice Slot 21 [0..7]: `bool navUnconfirmed`. **Audit fix wave 2, finding 4.**
-    /// @dev Appended for the same reason slot 20 was, and it is the *whole* slot: a checkpoint that priced any
-    ///      asset off a `!fresh` or `unconfirmed` answer understates `A`, and `A` is what `navPerShareX18` — the
-    ///      denominator of the bond floor — is built from. `AmpsBonds` reads it back through
-    ///      `IAmpsVault.navUnconfirmed()`, so the slot is part of the layout a standby vault must reproduce.
-    function test_slot21_navUnconfirmedIsAppendedAfterTheDocumentedLayout() public {
-        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 0, "genesis checkpointed on live answers");
+    /// @notice Slot 21 [0..7]: `bool navUnconfirmed`; [8..135]: `uint128 checkpointSupply`. **Audit fix wave 2,
+    ///         finding 4, and wave 5, lead L-7.**
+    /// @dev Appended for the same reason slot 20 was. The flag: a checkpoint that priced any asset off a `!fresh`
+    ///      or `unconfirmed` answer understates `A`, and `A` is what `navPerShareX18` — the denominator of the
+    ///      bond floor — is built from, so `AmpsBonds` reads it back through `IAmpsVault.navUnconfirmed()`. The
+    ///      supply beside it: `spokeWeightBps` reconstructs `A` as `navPerShareX18 x (T + VIRTUAL_SHARES)` and
+    ///      used the **live** `totalSupply()`, so every burn and vesting mint between checkpoints biased every
+    ///      spoke's weight — and the inventory-burn stream moves `T` continuously for a day after any redemption.
+    ///      Both are written by `_checkpoint` in one `SSTORE`, which is why they share a slot. A standby vault
+    ///      must reproduce both.
+    function test_slot21_navUnconfirmedAndTheCheckpointSupplyShareTheAppendedSlot() public {
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(21))));
+        assertEq(word & 0xff, 0, "genesis checkpointed on live answers");
         assertFalse(vault.navUnconfirmed(), "and the getter agrees");
+        assertEq((word >> 8) & type(uint128).max, amps.totalSupply(), "the checkpoint recorded its own supply");
+        assertEq(word >> 136, 0, "and slot 21 [136..255] is the declared filler, still empty");
 
         feeds.setUnconfirmed(address(weth), true);
         vault.checkpoint();
 
-        assertEq(uint256(vm.load(address(vault), bytes32(uint256(21)))), 1, "the flag sits alone in slot 21");
+        word = uint256(vm.load(address(vault), bytes32(uint256(21))));
+        assertEq(word & 0xff, 1, "the flag is the slot's low byte");
         assertTrue(vault.navUnconfirmed(), "and the getter reads it");
+        assertEq((word >> 8) & type(uint128).max, amps.totalSupply(), "the supply beside it followed the checkpoint");
+        assertEq(word >> 136, 0, "nothing was squeezed into the filler");
+    }
+
+    /// @notice Slot 14 [160..191]: `uint32 standbyRegisteredAt`, beside the standby pointer. **Audit wave 5,
+    ///         lead L-3.**
+    /// @dev `Constants.TIMELOCK_STANDBY_SECONDS` is the 14-day tier the governance documents give the address
+    ///      `emergencyMigrate` hands five `onlyVault` roles and the whole estate to, and no contract read it. The
+    ///      stamp is packed into the pointer's own free upper bits rather than appended, because the numbered
+    ///      layout a standby vault is written against gains no slot that way.
+    function test_slot14_theStandbyRegistrationIsStampedBesideThePointer() public {
+        assertEq(uint256(vm.load(address(vault), bytes32(uint256(14)))) >> 160, 0, "unregistered, unstamped");
+
+        vm.prank(TIMELOCK);
+        vault.setStandbyVault(STANDBY);
+
+        uint256 word = uint256(vm.load(address(vault), bytes32(uint256(14))));
+        assertEq(address(uint160(word)), STANDBY, "the pointer is the low 160 bits");
+        assertEq(uint32(word >> 160), uint32(block.timestamp), "and the stamp the next 32");
+        assertEq(word >> 192, 0, "slot 14 [192..255] stays free");
     }
 
     /// @notice The immutables carry no slot at all: they live in the bytecode, as section 1.1 says.

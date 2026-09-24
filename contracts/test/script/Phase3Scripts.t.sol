@@ -848,6 +848,35 @@ contract Phase3Scripts is V4TestBase {
         assertEq(cfg.ethLeg.requiredCurrencyRaised, 1e18, "and the file's zero derives 1 WETH at ETH/USD = 2,500");
     }
 
+    /// @notice **Audit wave 5, lead L-16.** `_feedEthUsdX18` discarded the registry's freshness flag, so a
+    ///         stale-but-non-zero ETH/USD answer priced the ETH auction's floor **and**, through
+    ///         `.eth.requiredUsd18`, its graduation bar — two figures nobody can revise once the auction is
+    ///         created. A `!fresh` answer now reads as zero, which makes `loadConfig` refuse; the operator's
+    ///         explicit price still wins outright, because it is read before the feed is consulted at all.
+    function test_w5_L16_aStaleEthUsdAnswerRefusesUnlessTheOperatorOverridesIt() public {
+        testnetScript.installFeedsOnly(_core(), assets);
+        string memory json = vm.readFile("./script/config/genesis.json");
+
+        GenesisAuction.LaunchConfig memory cfg = auctionScript.loadConfigFrom(_auctionWiring(), json);
+        assertEq(cfg.ethUsdX18, ETH_USD_X18, "a fresh answer is taken off the feed");
+
+        // Thirty days without a republication is past every heartbeat the registry admits.
+        vm.warp(block.timestamp + 30 days);
+        vm.expectRevert(GenesisAuction.EthUsdUnavailable.selector);
+        auctionScript.loadConfigFrom(_auctionWiring(), json);
+
+        uint256 named = 3000e18;
+        vm.setEnv("AMPS_ETH_USD_X18", "3000000000000000000000");
+        cfg = auctionScript.loadConfigFrom(_auctionWiring(), json);
+        assertEq(cfg.ethUsdX18, named, "the operator's explicit price is read before the feed and wins");
+        assertEq(
+            uint256(cfg.ethLeg.requiredCurrencyRaised),
+            (2500e18 * 1e18) / named,
+            "and the graduation bar is derived at the price the operator named"
+        );
+        vm.setEnv("AMPS_ETH_USD_X18", "0");
+    }
+
     // -----------------------------------------------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------------------------------------------

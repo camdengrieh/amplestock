@@ -69,3 +69,6 @@ contracts/fizz_data/crytic-export/
 
 # Temporary config variants written by the script tests (removed by the test; kept out of the tree if one aborts)
 contracts/script/config/*.tmp.json
+
+# transient bundle directories created by the solidity-auditor skill (removed after each report)
+.audit-*/

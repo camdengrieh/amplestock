@@ -450,12 +450,22 @@ struct Checkpoint {
 /// @param buckets The ladder's bucket count at placement time.
 /// @param above True for an ask bucket, false for a bid bucket.
 /// @param placedAt Placement timestamp.
-/// @param amount The token amount the cell holds: what placements committed into it, less what removals took out.
-///        Pro-rated on a partial removal and zeroed on a whole one (the buyback burn, a retired-bid withdrawal, a
-///        pro-rata redemption), so it describes the cell's live inventory rather than its lifetime gross — which
+/// @param amount The token amount the cell holds: what placements committed into it, less what the **placement
+///        engine** took out. Pro-rated on a partial removal and zeroed on a whole one by the buyback burn and by a
+///        retired-bid withdrawal, so it describes the cell's live inventory rather than its lifetime gross — which
 ///        is what it used to do, and what made every off-chain reader over-report the ladder (audit fix,
 ///        2026-09-08). It is a disclosure field: the liquidity is authoritative, and `amount` is what makes a
 ///        ladder auditable cell by cell against `ILadderPolicy`'s own weight vector.
+///
+///        **A pro-rata redemption is the one removal it does not follow** (audit lead wave 5, L-13(b), measured
+///        and not taken; the older wording claimed it did). `VaultRedeemLib.unwind` runs on the structurally
+///        ungated redemption floor, once per live cell, and this field is in the record's *second* slot: writing
+///        it costs a cold `SLOAD` plus a dirty `SSTORE` a cell, which measured **+5,499 gas per live cell** and
+///        put `redeemProRata` at 25,206,709 against the 24,000,000 one-transaction bound `VaultRedeem.t.sol`
+///        asserts, where without it the same measurement is 22,391,221. So after a
+///        redemption a cell's `liquidity` has fallen and its `amount` has not, and a reader that needs the live
+///        inventory should scale `amount` by the liquidity it has watched leave — or read
+///        `LadderPositionValuer.amountsOf`, which decomposes the position itself.
 /// @param tiltX18 The tilt in force at placement.
 /// @param anchorTick The ladder anchor.
 struct PlacementRecord {

@@ -162,6 +162,17 @@ error SweepDirty(address token, uint256 balance);
 /// @param available The amount still available.
 error CapacityExceeded(uint256 requested, uint256 available);
 
+/// @notice The vault's registered asset list is at `Constants.MAX_COLLATERALS` and a new asset was offered.
+///
+/// @dev Thrown by both `_registerAsset` implementations — `AmpsVault`'s, reached from `initializePool` and
+///      `depositBonded`, and `VaultNavLib`'s, reached from `genesisSettle` — which is why it is shared. The list
+///      is append-only and is walked once per registered asset by `A`, by `sweepClean` and by the structurally
+///      ungated redemption floor, and `test/unit/VaultRedeem.t.sol` asserts the floor fits one transaction at
+///      exactly `MAX_COLLATERALS` assets and `MAX_LIVE_CELLS` live cells. Until this error existed the cap was a
+///      number three writers were trusted to respect, not one any of them enforced (audit lead wave 5, L-6).
+/// @param cap The ceiling, `Constants.MAX_COLLATERALS`.
+error CollateralSetFull(uint16 cap);
+
 // -------------------------------------------------------------------------------------------------------------
 // The fee wall and the placement gauntlet (Phase 3)
 // -------------------------------------------------------------------------------------------------------------

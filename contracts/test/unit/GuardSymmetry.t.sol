@@ -362,6 +362,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         for (uint256 s; s < REFUSING_STATES.length; ++s) {
             gate.setDefaultState(REFUSING_STATES[s]);
 
+            matureStandby();
             vm.prank(GUARDIAN);
             vm.expectRevert(IAmpsVault.MigrationPredicateNotMet.selector);
             vault.emergencyMigrate(STANDBY);
@@ -384,6 +385,7 @@ contract GuardSymmetryTest is AmpsVaultFixture {
         gate.setDefaultState(GateState.WATCHDOG);
         gate.setProtocolFreezeUntil(uint32(block.timestamp + 7 days));
 
+        matureStandby();
         vm.prank(GUARDIAN);
         vault.emergencyMigrate(STANDBY);
         assertEq(amps.vault(), STANDBY, "the vault role moved while everything else was refused");
