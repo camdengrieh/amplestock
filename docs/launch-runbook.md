@@ -21,7 +21,7 @@ Do not start §2 until all of these are true. They are the plan's Phase 6 exit c
 | 4 | Every incident runbook in §8 rehearsed on 46630, including a full `emergencyMigrate` | drill log |
 | 5 | Governance drills in §9 passed on 46630 | drill log |
 | 6 | `00_Preflight` on 4663 reports zero `FAIL` and zero `TODO` | `script/config/preflight-report.json` |
-| 7 | Counsel sign-off on the structure, the geo-block set and discounted issuance through bonds | written |
+| 7 | *Removed by the owner's decision of 2026-09-23: no counsel engagement is required before launch. The number is kept so the references to later rows stay valid.* | — |
 | 8 | Written contact with Robinhood chain/BD, including bond-collateral custody | written |
 | 9 | Proposer Safe 3/5 and guardian Safe 2/4 deployed on 4663, signers confirmed, hardware keys in hand | Safe addresses |
 | 10 | Deployer key is a fresh hardware key used for nothing else | key ceremony note |
